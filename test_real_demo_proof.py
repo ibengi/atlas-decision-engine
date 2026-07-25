@@ -238,3 +238,50 @@ class TestIntegrationScriptGuards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAuthDependencyFailFast(unittest.TestCase):
+    """Regression du bug production 2026-07-25 : 'No module named
+    cryptography' etait avale en warning puis 401 silencieux a chaque
+    cycle. Desormais : arret FATAL (exit 4) si la dependance manque, et
+    refus EXPLICITE avant envoi pour tout /portfolio sans cle chargee."""
+
+    def test_missing_cryptography_is_fatal_exit_4(self):
+        blocked = {}
+        for name in list(sys.modules):
+            if name == "cryptography" or name.startswith("cryptography."):
+                blocked[name] = sys.modules.pop(name)
+        sys.modules["cryptography"] = None          # force ImportError
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                bot.KalshiClient("demo")
+            self.assertEqual(cm.exception.code, 4)
+        finally:
+            sys.modules.pop("cryptography", None)
+            sys.modules.update(blocked)
+
+    def test_portfolio_without_key_refused_before_send(self):
+        # cles 'test' (non-PEM) -> _pk None -> /portfolio doit etre refuse
+        # AVANT tout envoi reseau, avec un message actionnable.
+        cli = bot.KalshiClient("demo")
+        self.assertIsNone(cli._pk)
+        with self.assertRaises(bot.KalshiAPIError) as cm:
+            cli._req("GET", "/portfolio/balance")
+        self.assertIn("cle", str(cm.exception).lower())
+        self.assertIn("cryptography", str(cm.exception))
+        # get_balance() l'absorbe en warning et rend None (cycle bloque
+        # proprement par le balance gate, pas de crash-loop)
+        self.assertIsNone(cli.get_balance())
+
+    def test_public_paths_not_blocked_by_missing_key(self):
+        cli = bot.KalshiClient("demo")
+
+        class _Sess:
+            def request(self, *a, **k):
+                raise bot.requests.ConnectionError("no network in tests")
+        cli.session = _Sess()
+        # /markets ne doit PAS etre refuse par la garde /portfolio ;
+        # il echoue ici sur le reseau (normal en test), pas sur la cle.
+        with self.assertRaises(bot.KalshiAPIError) as cm:
+            cli._req("GET", "/markets", retries=0)
+        self.assertIn("reseau", str(cm.exception))

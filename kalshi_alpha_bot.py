@@ -258,13 +258,28 @@ class KalshiClient:
     def _load_key(self, key_pem: str):
         try:
             from cryptography.hazmat.primitives import serialization
-            key_text = key_pem.strip()
+        except ImportError:
+            # Sans ce paquet, AUCUNE requete authentifiee ne peut aboutir :
+            # continuer produirait un 401 silencieux a chaque cycle (bug
+            # observe en production le 2026-07-25). Arret net + remede.
+            log.critical(
+                "[FATAL] Le paquet 'cryptography' est absent : impossible de "
+                "signer les requetes Kalshi (KALSHI-ACCESS-SIGNATURE). "
+                "Remede: l'ajouter aux dependances installees au deploiement "
+                "(requirements.txt: cryptography>=42) puis redeployer.")
+            raise SystemExit(4)
+        try:
+            key_text = (key_pem or "").strip()
             if not key_text.startswith("-----"):
-                log_api.warning("Cle privee absente ou non-PEM -- requetes non signees.")
+                log_api.warning("Cle privee absente ou non-PEM -- les "
+                                "endpoints /portfolio seront REFUSES "
+                                "explicitement (pas de 401 silencieux).")
                 return None
             return serialization.load_pem_private_key(key_text.encode(), password=None)
         except Exception as e:
-            log_api.warning(f"Chargement cle RSA impossible: {e}")
+            log_api.warning(f"Chargement cle RSA impossible: {e} -- les "
+                            f"endpoints /portfolio seront REFUSES "
+                            f"explicitement.")
             return None
 
     def _sign_headers(self, method: str, url: str) -> dict:
@@ -289,6 +304,13 @@ class KalshiClient:
 
     # -- Requete avec retry/backoff ------------------------------------------
     def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
+        if self._pk is None and path.startswith("/portfolio"):
+            raise KalshiAPIError(
+                0, f"{method} {path}: requete authentifiee IMPOSSIBLE — cle "
+                   f"RSA non chargee (cle absente/non-PEM ou dependance "
+                   f"manquante). Verifier KALSHI_DEMO_PRIVATE_KEY (PEM "
+                   f"complet avec les lignes -----BEGIN/END-----) et le "
+                   f"paquet 'cryptography'.")
         url = self.base_url + path
         attempt, delay = 0, 1.0
         while True:

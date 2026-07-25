@@ -1,2 +1,6 @@
-# Dependance d'execution unique (verifie par grep des imports)
+# Dependances d'execution (verifiees contre les imports du code)
 requests>=2.31
+# Signature RSA-PSS des requetes Kalshi (KALSHI-ACCESS-SIGNATURE).
+# Son absence sur Railway causait: "Chargement cle RSA impossible:
+# No module named 'cryptography'" puis HTTP 401 sur tous les endpoints.
+cryptography>=42

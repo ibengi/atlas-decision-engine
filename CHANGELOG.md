@@ -1,5 +1,18 @@
 # Changelog
 
+## [12.2.1] — 2026-07-25
+### Corrige (bug production Railway du 2026-07-25)
+- `requirements.txt` : ajout de `cryptography>=42` (signature RSA-PSS des
+  requetes Kalshi). Son absence causait "No module named 'cryptography'"
+  avale en warning, puis HTTP 401 silencieux sur /portfolio a chaque cycle.
+- Fail-fast : dependance `cryptography` absente => [FATAL] + exit 4 au
+  demarrage, avec le remede dans le log.
+- Cle RSA non chargee (absente/non-PEM) => tout appel /portfolio est
+  refuse EXPLICITEMENT avant envoi (message actionnable), plus jamais de
+  boucle de 401 muets ; les chemins publics ne sont pas bloques.
+### Tests
+- 98 tests (3 nouveaux), 0 echec.
+
 ## [12.2.0] — 2026-07-25
 ### Ajoute
 - Mode EXECUTION_MODE=real_demo avec garde anti-mock FATAL (exit 3) : aucun
