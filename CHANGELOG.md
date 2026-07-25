@@ -1,5 +1,24 @@
 # Changelog
 
+## [12.3.0] — 2026-07-25
+### Fournisseur de donnees BTC tolerant aux pannes (panne Binance en prod)
+- Cause racine journalisee : klines Binance = point unique de defaillance ;
+  son echec (code HTTP avale) annulait la volatilite => 100% des marches
+  BTC rejetes no_model_probability.
+- [DATA_PROVIDER] par fournisseur : http_status, elapsed_ms, error,
+  accepted=true|false + raison (accepte=DEBUG, rejete=INFO).
+- Chaine de secours klines : Binance -> Kraken OHLC -> Coinbase candles
+  (ordre configurable KLINES_PROVIDER_ORDER) ; plus aucune dependance
+  exclusive a Binance.
+- Cache des dernieres bougies VALIDES (borne KLINES_STALE_MAX_S=600s) :
+  une panne temporaire de tous les fournisseurs ne bloque plus les
+  decisions ; en mode cache le MOMENTUM est neutralise (jamais rechauffe)
+  et le score de qualite est penalise au prorata de l'age.
+- Raisons distinctes et testees : aucune_donnee:klines|spot,
+  donnees_insuffisantes:klines(n/11)|spot(n/2), volatilite_nulle.
+### Tests
+- 120 tests (10 nouveaux), 0 echec.
+
 ## [12.2.3] — 2026-07-25
 ### Audit Probability Engine (model_evaluated=0 avec supported>0)
 - [MODEL_TRACE] par marche supporte : ticker, market_type, strategie,

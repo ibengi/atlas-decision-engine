@@ -49,18 +49,42 @@ def _cached(key, ttl, fn):
 
 # ── Fetchers par defaut (reseau) — remplacables par injection ────────────────
 
-def _http_get_json(url, params=None):
+def _http_get_json_meta(url, params=None):
+    """GET JSON avec telemetrie complete : (data|None, meta).
+    meta = {http_status, elapsed_ms, error} — plus JAMAIS de code HTTP
+    avale en debug (audit 2026-07-25 : Binance echouait sans trace)."""
     import requests
+    meta = {"http_status": None, "elapsed_ms": None, "error": None}
     last = None
     for _ in range(1 + MAX_RETRIES):
+        t0 = time.time()
         try:
             r = requests.get(url, params=params, timeout=HTTP_TIMEOUT_S)
+            meta["elapsed_ms"] = round((time.time() - t0) * 1000, 1)
+            meta["http_status"] = r.status_code
             r.raise_for_status()
-            return r.json()
+            return r.json(), meta
         except Exception as e:            # noqa: BLE001 — retry limite
+            meta["elapsed_ms"] = round((time.time() - t0) * 1000, 1)
+            meta["error"] = f"{type(e).__name__}: {e}"[:160]
             last = e
-    log.debug(f"source {url}: {last}")
-    return None
+    return None, meta
+
+
+def _http_get_json(url, params=None):
+    return _http_get_json_meta(url, params)[0]
+
+
+def _report_provider(provider, kind, meta, accepted, reason):
+    """Journal par fournisseur : accepte (DEBUG) ou rejete (INFO) avec
+    code HTTP, delai et erreur — exigence d'audit."""
+    line = (f"[DATA_PROVIDER] provider={provider} kind={kind} "
+            f"http_status={meta.get('http_status')} "
+            f"elapsed_ms={meta.get('elapsed_ms')} "
+            f"accepted={str(accepted).lower()} reason={reason}")
+    if meta.get("error"):
+        line += f" error={meta['error']}"
+    (log.debug if accepted else log.info)(line)
 
 
 def fetch_coinbase() -> Optional[dict]:
@@ -95,17 +119,111 @@ def fetch_bitstamp() -> Optional[dict]:
         return None
 
 
-def fetch_klines_binance(limit: int = 30) -> Optional[list]:
-    d = _http_get_json("https://api.binance.com/api/v3/klines",
-                       {"symbol": "BTCUSDT", "interval": "1m", "limit": limit})
+def fetch_klines_binance(limit: int = 30):
+    d, meta = _http_get_json_meta(
+        "https://api.binance.com/api/v3/klines",
+        {"symbol": "BTCUSDT", "interval": "1m", "limit": limit})
     if not d:
-        return None
+        return None, meta
     try:
-        return [{"ts": k[0] / 1000.0, "open": float(k[1]), "high": float(k[2]),
-                 "low": float(k[3]), "close": float(k[4]),
-                 "volume": float(k[5])} for k in d]
+        return [{"ts": k[0] / 1000.0, "open": float(k[1]),
+                 "high": float(k[2]), "low": float(k[3]),
+                 "close": float(k[4]), "volume": float(k[5])}
+                for k in d], meta
     except (TypeError, ValueError, IndexError):
-        return None
+        meta["error"] = "parse_error"
+        return None, meta
+
+
+def fetch_klines_kraken(limit: int = 30):
+    """Secours n°1 : Kraken OHLC 1m (public, accessible depuis les IP US,
+    contrairement a Binance qui geo-bloque frequemment en HTTP 451)."""
+    d, meta = _http_get_json_meta("https://api.kraken.com/0/public/OHLC",
+                                  {"pair": "XBTUSD", "interval": 1})
+    try:
+        rows = d["result"]["XXBTZUSD"]
+        out = [{"ts": float(k[0]), "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]),
+                "volume": float(k[6])} for k in rows][-limit:]
+        return out, meta
+    except (KeyError, TypeError, ValueError, IndexError):
+        meta["error"] = meta.get("error") or "parse_error"
+        return None, meta
+
+
+def fetch_klines_coinbase(limit: int = 30):
+    """Secours n°2 : Coinbase Exchange candles 60s (public).
+    Reponse triee du plus RECENT au plus ancien -> inversee."""
+    d, meta = _http_get_json_meta(
+        "https://api.exchange.coinbase.com/products/BTC-USD/candles",
+        {"granularity": 60})
+    try:
+        rows = sorted(d, key=lambda k: k[0])[-limit:]
+        out = [{"ts": float(k[0]), "low": float(k[1]), "high": float(k[2]),
+                "open": float(k[3]), "close": float(k[4]),
+                "volume": float(k[5])} for k in rows]
+        return out, meta
+    except (TypeError, ValueError, IndexError, KeyError):
+        meta["error"] = meta.get("error") or "parse_error"
+        return None, meta
+
+
+DEFAULT_KLINES_PROVIDERS = (("binance", fetch_klines_binance),
+                            ("kraken", fetch_klines_kraken),
+                            ("coinbase", fetch_klines_coinbase))
+
+# cache des DERNIERES bougies valides : une panne TEMPORAIRE des
+# fournisseurs ne bloque plus toutes les decisions (mode degrade borne)
+KLINES_STALE_MAX_S = 600.0         # au-dela : donnees refusees
+_last_good_klines = {"kl": None, "ts": 0.0, "provider": None}
+
+
+def fetch_klines_with_fallback(limit: int = 30, providers=None, now=None):
+    """Essaie chaque fournisseur dans l'ordre ; journalise chacun ;
+    retourne (klines, source_info). source_info distingue :
+      - fresh:<provider>                  donnees fraiches completes
+      - partial:<provider>(n)             reponses mais < MIN_KLINES
+      - stale_cache:<provider>(age)       secours cache borne
+      - none                              AUCUNE donnee nulle part"""
+    import os as _os
+    now = now if now is not None else time.time()
+    if providers is None:
+        order = [p.strip() for p in _os.getenv(
+            "KLINES_PROVIDER_ORDER", "binance,kraken,coinbase").split(",")]
+        by_name = dict(DEFAULT_KLINES_PROVIDERS)
+        providers = [(n, by_name[n]) for n in order if n in by_name]
+    best_partial, best_name = None, None
+    for name, fn in providers:
+        try:
+            res = fn(limit)
+        except Exception as e:            # noqa: BLE001
+            _report_provider(name, "klines",
+                             {"http_status": None, "elapsed_ms": None,
+                              "error": f"{type(e).__name__}: {e}"[:160]},
+                             False, "exception")
+            continue
+        kl, meta = res if isinstance(res, tuple) else (res, {})
+        n = len(kl or [])
+        if kl and n >= MIN_KLINES:
+            _report_provider(name, "klines", meta, True, f"ok({n})")
+            _last_good_klines.update(kl=kl, ts=now, provider=name)
+            return kl, f"fresh:{name}"
+        _report_provider(name, "klines", meta, False,
+                         f"insuffisant({n}/{MIN_KLINES})" if kl
+                         else "aucune_donnee")
+        if kl and (best_partial is None or n > len(best_partial)):
+            best_partial, best_name = kl, name
+    stale = _last_good_klines["kl"]
+    age = now - _last_good_klines["ts"]
+    if stale and age <= KLINES_STALE_MAX_S:
+        log.warning(f"[DATA_PROVIDER] klines: TOUS les fournisseurs "
+                    f"indisponibles -- secours cache "
+                    f"({_last_good_klines['provider']}, age {age:.0f}s)")
+        return stale, (f"stale_cache:{_last_good_klines['provider']}"
+                       f"({age:.0f}s)")
+    if best_partial:
+        return best_partial, f"partial:{best_name}({len(best_partial)})"
+    return None, "none"
 
 
 DEFAULT_SPOT_SOURCES = (fetch_coinbase, fetch_kraken, fetch_bitstamp)
@@ -181,10 +299,32 @@ def get_btc_context(strike: Optional[float] = None,
     avec 'reason' explicite si les donnees sont insuffisantes."""
     now = now if now is not None else time.time()
     spot_sources = spot_sources or DEFAULT_SPOT_SOURCES
-    klines_fn = klines_fn or fetch_klines_binance
+    # klines_fn=None => chaine multi-fournisseurs avec secours (defaut).
+    # L'injection d'un fournisseur unique reste possible (tests).
 
     def pull():
-        return [f() for f in spot_sources]
+        out = []
+        for f in spot_sources:
+            name = getattr(f, "__name__", "spot").replace("fetch_", "")
+            t0 = time.time()
+            try:
+                r = f()
+            except Exception as e:        # noqa: BLE001
+                _report_provider(name, "spot",
+                                 {"http_status": None,
+                                  "elapsed_ms": round((time.time()-t0)*1e3, 1),
+                                  "error": f"{type(e).__name__}: {e}"[:160]},
+                                 False, "exception")
+                out.append(None)
+                continue
+            _report_provider(
+                name, "spot",
+                {"http_status": None,
+                 "elapsed_ms": round((time.time() - t0) * 1e3, 1),
+                 "error": None},
+                bool(r), "ok" if r else "aucune_donnee")
+            out.append(r)
+        return out
     raw = _cached("spot_sources", CACHE_TTL_S, pull) if use_cache else pull()
     sources, flags = _validate_sources(raw or [], now)
 
@@ -194,7 +334,9 @@ def get_btc_context(strike: Optional[float] = None,
                            strike=strike, minutes_remaining=minutes_remaining)
 
     if len(sources) < MIN_VALID_SOURCES:
-        ctx.reason = (f"sources_spot_insuffisantes "
+        n_resp = len([r for r in (raw or []) if r])
+        ctx.reason = ("aucune_donnee:spot" if n_resp == 0 else
+                      f"donnees_insuffisantes:spot"
                       f"({len(sources)}/{MIN_VALID_SOURCES})")
         return ctx
 
@@ -202,15 +344,29 @@ def get_btc_context(strike: Optional[float] = None,
     ctx.spot = statistics.median(prices)
     ctx.dispersion_pct = round((max(prices) - min(prices)) / ctx.spot * 100, 4)
 
-    kl = (_cached("klines", CACHE_TTL_S, lambda: klines_fn())
-          if use_cache else klines_fn()) or []
+    if klines_fn is not None:
+        # compat tests/injection : un seul fournisseur, sortie brute
+        raw_kl = (_cached("klines", CACHE_TTL_S, lambda: klines_fn())
+                  if use_cache else klines_fn())
+        raw_kl = raw_kl[0] if isinstance(raw_kl, tuple) else raw_kl
+        kl, kl_src = (raw_kl or []), ("fresh:injected" if raw_kl else "none")
+    else:
+        def pull_kl():
+            return fetch_klines_with_fallback(now=now)
+        kl, kl_src = (_cached("klines_fb", CACHE_TTL_S, pull_kl)
+                      if use_cache else pull_kl())
+        kl = kl or []
+    is_stale = kl_src.startswith("stale_cache")
+    if kl_src != "none":
+        flags.append(f"klines:source={kl_src}")
     # validation des timestamps des bougies (chronologie + fraicheur)
     kl = [k for k in kl if isinstance(k.get("close"), (int, float))
           and k["close"] > 0]
     if kl and any(kl[i]["ts"] >= kl[i + 1]["ts"] for i in range(len(kl) - 1)):
         flags.append("klines:timestamps_non_monotones")
         kl = []
-    if kl and now - kl[-1]["ts"] > 3 * 60:
+    max_age = KLINES_STALE_MAX_S if is_stale else 3 * 60
+    if kl and now - kl[-1]["ts"] > max_age:
         flags.append("klines:perimees")
         kl = []
     ctx.klines_count = len(kl)
@@ -219,12 +375,21 @@ def get_btc_context(strike: Optional[float] = None,
         closes = [k["close"] for k in kl]
         def lr(n):  # log-rendement sur n minutes
             return math.log(closes[-1] / closes[-1 - n])
-        ctx.returns = {"1m": lr(1), "3m": lr(3), "5m": lr(5), "10m": lr(10)}
+        if is_stale:
+            # mode degrade : la volatilite (ordre de grandeur stable sur
+            # quelques minutes) reste utilisable ; le MOMENTUM (directionnel,
+            # perime en secondes) est NEUTRALISE, jamais rechauffe.
+            ctx.returns = {}
+            ctx.momentum_per_min = None
+            flags.append("klines:momentum_neutralise_car_cache")
+        else:
+            ctx.returns = {"1m": lr(1), "3m": lr(3), "5m": lr(5),
+                           "10m": lr(10)}
+            ctx.momentum_per_min = (closes[-1] - closes[-6]) / 5 \
+                if len(closes) >= 6 else None
         rets = [math.log(closes[i + 1] / closes[i])
                 for i in range(len(closes) - 1)]
         ctx.realized_vol_1m = statistics.pstdev(rets) if len(rets) >= 2 else None
-        ctx.momentum_per_min = (closes[-1] - closes[-6]) / 5 \
-            if len(closes) >= 6 else None
     else:
         flags.append(f"klines:insuffisantes({len(kl)}/{MIN_KLINES})")
 
@@ -240,11 +405,27 @@ def get_btc_context(strike: Optional[float] = None,
     if ctx.realized_vol_1m is not None and ctx.realized_vol_1m > 0:
         score += 25.0                                       # vol mesurable
     if ctx.klines_count >= MIN_KLINES:
-        score += 15.0                                       # historique 1m
+        if is_stale:
+            age = now - _last_good_klines["ts"]
+            score += 15.0 * max(0.0, 1.0 - age / KLINES_STALE_MAX_S)
+        else:
+            score += 15.0                                   # historique 1m
     ctx.data_quality_score = round(score, 1)
 
     if ctx.realized_vol_1m is None or ctx.realized_vol_1m <= 0:
-        ctx.reason = "volatilite_indisponible_ou_nulle"
+        # Distinction exigee par l'audit :
+        #  - aucune_donnee : AUCUN fournisseur n'a repondu ET pas de cache
+        #  - donnees_insuffisantes : reponses partielles (< MIN_KLINES)
+        #  - volatilite_nulle : donnees completes mais variance nulle
+        if ctx.klines_count == 0:
+            ctx.reason = ("aucune_donnee:klines" if kl_src == "none"
+                          else f"donnees_insuffisantes:klines"
+                               f"(0/{MIN_KLINES},{kl_src})")
+        elif ctx.klines_count < MIN_KLINES:
+            ctx.reason = (f"donnees_insuffisantes:klines"
+                          f"({ctx.klines_count}/{MIN_KLINES},{kl_src})")
+        else:
+            ctx.reason = "volatilite_nulle"
         return ctx
 
     ctx.valid = True
