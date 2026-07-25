@@ -336,6 +336,11 @@ class KalshiClient:
                 time.sleep(wait); delay = min(delay * 2, 8); continue
 
             self.last_http_status = r.status_code
+            if r.status_code == 410 and "deprecated" in (r.text or "").lower():
+                raise KalshiAPIError(
+                    410, f"{method} {path}: ENDPOINT V1 OBSOLETE cote Kalshi "
+                         f"-- migrer ce chemin vers son equivalent V2 "
+                         f"(cf. docs.kalshi.com)", r.text)
             if r.status_code >= 400:
                 raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
 
@@ -380,22 +385,72 @@ class KalshiClient:
             log_api.warning(f"get_balance: {e}")
             return None
 
+    # Create Order V2 (docs.kalshi.com/api-reference/orders/create-order-v2,
+    # OpenAPI 3.20.0). L'ancien POST /portfolio/orders repond HTTP 410
+    # deprecated_v1_order_endpoint depuis 2026 (observe en prod 2026-07-25).
+    ORDERS_V2_PATH = "/portfolio/events/orders"
+
     def create_order(self, ticker: str, side: str, count: int,
                      price_cents: int, client_order_id: str = None) -> dict:
+        """Ordre limite ACHAT via le schema V2 : tout est cote sur le carnet
+        YES ('bid'=acheter YES ; 'ask'=vendre YES = acheter NO a 1-prix),
+        prix en dollars fixed-point, quantite en chaine. La reponse V2 n'a
+        PAS de champ status : il est DERIVE de fill/remaining, et la reponse
+        est normalisee vers le schema interne (compteurs entiers, prix en
+        cents ramene a NOTRE cote)."""
+        price_cents = int(price_cents)
+        if side == "yes":
+            v2_side, v2_price_c = "bid", price_cents
+        else:                       # acheter NO a n cents == ask YES a 100-n
+            v2_side, v2_price_c = "ask", 100 - price_cents
         payload = {
             "ticker":          ticker,
             "client_order_id": client_order_id or f"alpha_{uuid.uuid4().hex}",
-            "action":          "buy",
-            "side":            side,                    # "yes" | "no"
-            "type":            "limit",
-            "count":           int(count),
+            "side":            v2_side,
+            "count":           str(int(count)),
+            "price":           f"{v2_price_c / 100:.4f}",
+            "time_in_force":   "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
         }
-        payload["yes_price" if side == "yes" else "no_price"] = int(price_cents)
-        r = self._req("POST", "/portfolio/orders", json=payload)
-        self._log_raw_once("create_order", r)
-        out = r.get("order", r) or {}
-        out.setdefault("client_order_id", payload["client_order_id"])
-        return out
+        r = self._req("POST", self.ORDERS_V2_PATH, json=payload)
+        self._log_raw_once("create_order_v2", r)
+        raw = r.get("order", r) or {}
+
+        def _fp_int(v):
+            try:
+                return int(round(float(v)))
+            except (TypeError, ValueError):
+                return None
+        filled = _fp_int(raw.get("fill_count"))
+        remaining = _fp_int(raw.get("remaining_count"))
+        if filled is not None and filled >= int(count):
+            status = "executed"
+        elif remaining is not None and remaining > 0:
+            status = "resting"
+        elif filled and filled > 0:
+            status = "canceled"     # reste annule (IOC partiel)
+        else:
+            status = str(raw.get("status") or "resting")
+        avg = None
+        if raw.get("average_fill_price") is not None:
+            try:
+                yes_c = round(float(raw["average_fill_price"]) * 100)
+                avg = yes_c if side == "yes" else 100 - yes_c
+            except (TypeError, ValueError):
+                avg = None
+        return {
+            "order_id": raw.get("order_id"),
+            "client_order_id": raw.get("client_order_id")
+            or payload["client_order_id"],
+            "status": status,
+            "taker_fill_count": filled if filled is not None else 0,
+            "remaining_count": remaining,
+            "avg_price_cents": avg,
+            "average_fee_paid": raw.get("average_fee_paid"),
+            "ts_ms": raw.get("ts_ms"),
+            "v2_side": v2_side, "v2_price": payload["price"],
+            "raw": raw,
+        }
 
     def get_order(self, order_id: str) -> dict:
         r = self._req("GET", f"/portfolio/orders/{order_id}")
@@ -786,6 +841,10 @@ def log_execution_banner(client):
     log.info(f"environment={'DEMO' if client.env == 'demo' else 'PROD'}")
     log.info(f"api_base_url={getattr(client, 'base_url', '?')}")
     log.info(f"execution_mode={CFG.EXECUTION_MODE.upper()}")
+    if client.env == "demo" and CFG.EXECUTION_MODE != "real_demo":
+        log.info("conseil: definir EXECUTION_MODE=real_demo (Railway) pour "
+                 "activer le garde anti-mock ; les chemins d'execution sont "
+                 "IDENTIQUES (verifie par test), seule la protection change.")
     log.info(f"dry_run={str(CFG.DRY_RUN or CFG.SHADOW_MODE).lower()}")
     log.info(f"mock_enabled={str(not genuine).lower()}")
     log.info(f"order_submission_enabled="
@@ -871,11 +930,17 @@ class OrderManager:
             else "PROD"
         # Exigence 4 : preuve d'envoi AVANT l'appel. Jamais de cle, secret,
         # signature ni token dans les logs (seuls les champs metier).
+        v2_side = "bid" if side == "yes" else "ask"
+        v2_price = (limit_cents if side == "yes"
+                    else 100 - limit_cents) / 100.0
         log_api.info("[ORDER_SUBMIT_ATTEMPT] "
                      f"ticker={ticker} side={side} action=buy count={count} "
                      f"price_cents={limit_cents} "
+                     f"(V2: side={v2_side} price={v2_price:.4f}) "
                      f"client_order_id={client_order_id} "
-                     f"environment={env_name} endpoint=/portfolio/orders")
+                     f"environment={env_name} "
+                     f"endpoint="
+                     f"{getattr(self.client, 'ORDERS_V2_PATH', '/portfolio/events/orders')}")
         try:
             order = self.client.create_order(ticker, side, count, limit_cents,
                                              client_order_id=client_order_id)
@@ -1859,8 +1924,9 @@ def banner(client: KalshiClient, capital: float):
     log.info(f"               ORDRES REELS -- aucun dry-run, aucune simulation")
     log.info(f"Identifiants  : {client.cred_src}")
     log.info(f"Solde compte  : {f'{bal:,.2f}$' if bal is not None else 'indisponible (verifier cles/env)'}")
-    log.info(f"Capital ref.  : {capital:,.2f}$ (sizing)")
     eff = min(capital, bal) if bal is not None else capital
+    log.info(f"Capital       : plafond configure {capital:,.2f}$ | "
+             f"EFFECTIF (sizing/risque) = min(plafond, solde) = {eff:,.2f}$")
     stop = min(CFG.MAX_DAILY_LOSS, eff * CFG.MAX_DAILY_LOSS_PCT / 100.0)
     log.info(f"Risque        : stop jour -{stop:.2f}$ "
              f"({CFG.MAX_DAILY_LOSS_PCT:g}% du capital effectif "

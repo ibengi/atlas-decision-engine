@@ -109,16 +109,15 @@ def _minutes_to_close(m: dict, now_dt: datetime):
     return (close_dt - now_dt).total_seconds() / 60.0
 
 
-def price_to_cents(v):
+def price_to_cents(v, dollars=None):
     """Prix Kalshi -> cents entiers 1..99, sinon None.
-    Tolere TOUS les formats observes/attendus de l'API :
-      48, 48.0, "48", "48.00"      -> 48   (cents)
-      0.48, "0.4800"               -> 48   (dollars ; l'API v2 double
-                                            desormais les champs en
-                                            *_dollars, cf. [RAW:balance])
-      0, "0", "0.0000"             -> None (carnet VIDE, pas un prix)
-    Un prix strictement entre 0 et 1 ne peut etre que des dollars
-    (les prix Kalshi sont des cents entiers)."""
+    dollars=True  : la valeur est en DOLLARS ("0.5400"->54 ; "1.0000"=1,00$
+                    = cote VIDE -> None). REGRESSION corrigee (2026-07-25) :
+                    no_ask_dollars="1.0000" etait parse 1 cent, produisant
+                    un edge +0.96 fantome et des ordres a 1c sur des cotes
+                    vides.
+    dollars=False : cents legacy (48, "48.00" -> 48 ; 1 -> 1c).
+    dollars=None  : heuristique pour champ ambigu (0<x<1 -> dollars)."""
     if v is None:
         return None
     try:
@@ -127,17 +126,20 @@ def price_to_cents(v):
         return None
     if x <= 0:
         return None
-    if x < 1.0:
-        x *= 100.0                       # dollars -> cents
+    if dollars is True:
+        x *= 100.0
+    elif dollars is None and x < 1.0:
+        x *= 100.0                       # heuristique : dollars -> cents
     c = int(round(x))
     return c if 1 <= c <= 99 else None
 
 
 def read_price(m: dict, name: str):
-    """Lit un prix en essayant le champ cents PUIS sa variante *_dollars."""
-    c = price_to_cents(m.get(name))
+    """Lit un prix : champ cents legacy PUIS variante *_dollars (traitee
+    STRICTEMENT en dollars — jamais l'heuristique sur ces champs)."""
+    c = price_to_cents(m.get(name), dollars=False)
     if c is None:
-        c = price_to_cents(m.get(name + "_dollars"))
+        c = price_to_cents(m.get(name + "_dollars"), dollars=True)
     return c
 
 

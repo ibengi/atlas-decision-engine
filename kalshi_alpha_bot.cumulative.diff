@@ -1,5 +1,5 @@
 --- /mnt/user-data/uploads/kalshi_alpha_bot.py	2026-07-24 12:40:17.850185000 +0000
-+++ src/engine/kalshi_alpha_bot.py	2026-07-25 19:17:24.945045883 +0000
++++ src/engine/kalshi_alpha_bot.py	2026-07-25 19:53:04.380591600 +0000
 @@ -75,13 +75,25 @@
      ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", True)
      MIN_MINUTES       = _env_f("BTC_MIN_MINUTES", 5.0)
@@ -85,40 +85,103 @@
          url = self.base_url + path
          attempt, delay = 0, 1.0
          while True:
-@@ -300,6 +335,7 @@
+@@ -300,6 +335,12 @@
                                  f"retry {attempt}/{retries} dans {wait:.0f}s")
                  time.sleep(wait); delay = min(delay * 2, 8); continue
  
 +            self.last_http_status = r.status_code
++            if r.status_code == 410 and "deprecated" in (r.text or "").lower():
++                raise KalshiAPIError(
++                    410, f"{method} {path}: ENDPOINT V1 OBSOLETE cote Kalshi "
++                         f"-- migrer ce chemin vers son equivalent V2 "
++                         f"(cf. docs.kalshi.com)", r.text)
              if r.status_code >= 400:
                  raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
  
-@@ -344,10 +380,11 @@
+@@ -344,19 +385,72 @@
              log_api.warning(f"get_balance: {e}")
              return None
  
 -    def create_order(self, ticker: str, side: str, count: int, price_cents: int) -> dict:
++    # Create Order V2 (docs.kalshi.com/api-reference/orders/create-order-v2,
++    # OpenAPI 3.20.0). L'ancien POST /portfolio/orders repond HTTP 410
++    # deprecated_v1_order_endpoint depuis 2026 (observe en prod 2026-07-25).
++    ORDERS_V2_PATH = "/portfolio/events/orders"
++
 +    def create_order(self, ticker: str, side: str, count: int,
 +                     price_cents: int, client_order_id: str = None) -> dict:
++        """Ordre limite ACHAT via le schema V2 : tout est cote sur le carnet
++        YES ('bid'=acheter YES ; 'ask'=vendre YES = acheter NO a 1-prix),
++        prix en dollars fixed-point, quantite en chaine. La reponse V2 n'a
++        PAS de champ status : il est DERIVE de fill/remaining, et la reponse
++        est normalisee vers le schema interne (compteurs entiers, prix en
++        cents ramene a NOTRE cote)."""
++        price_cents = int(price_cents)
++        if side == "yes":
++            v2_side, v2_price_c = "bid", price_cents
++        else:                       # acheter NO a n cents == ask YES a 100-n
++            v2_side, v2_price_c = "ask", 100 - price_cents
          payload = {
              "ticker":          ticker,
 -            "client_order_id": f"alpha_{uuid.uuid4().hex}",
+-            "action":          "buy",
+-            "side":            side,                    # "yes" | "no"
+-            "type":            "limit",
+-            "count":           int(count),
 +            "client_order_id": client_order_id or f"alpha_{uuid.uuid4().hex}",
-             "action":          "buy",
-             "side":            side,                    # "yes" | "no"
-             "type":            "limit",
-@@ -356,7 +393,9 @@
-         payload["yes_price" if side == "yes" else "no_price"] = int(price_cents)
-         r = self._req("POST", "/portfolio/orders", json=payload)
-         self._log_raw_once("create_order", r)
++            "side":            v2_side,
++            "count":           str(int(count)),
++            "price":           f"{v2_price_c / 100:.4f}",
++            "time_in_force":   "good_till_canceled",
++            "self_trade_prevention_type": "taker_at_cross",
++        }
++        r = self._req("POST", self.ORDERS_V2_PATH, json=payload)
++        self._log_raw_once("create_order_v2", r)
++        raw = r.get("order", r) or {}
++
++        def _fp_int(v):
++            try:
++                return int(round(float(v)))
++            except (TypeError, ValueError):
++                return None
++        filled = _fp_int(raw.get("fill_count"))
++        remaining = _fp_int(raw.get("remaining_count"))
++        if filled is not None and filled >= int(count):
++            status = "executed"
++        elif remaining is not None and remaining > 0:
++            status = "resting"
++        elif filled and filled > 0:
++            status = "canceled"     # reste annule (IOC partiel)
++        else:
++            status = str(raw.get("status") or "resting")
++        avg = None
++        if raw.get("average_fill_price") is not None:
++            try:
++                yes_c = round(float(raw["average_fill_price"]) * 100)
++                avg = yes_c if side == "yes" else 100 - yes_c
++            except (TypeError, ValueError):
++                avg = None
++        return {
++            "order_id": raw.get("order_id"),
++            "client_order_id": raw.get("client_order_id")
++            or payload["client_order_id"],
++            "status": status,
++            "taker_fill_count": filled if filled is not None else 0,
++            "remaining_count": remaining,
++            "avg_price_cents": avg,
++            "average_fee_paid": raw.get("average_fee_paid"),
++            "ts_ms": raw.get("ts_ms"),
++            "v2_side": v2_side, "v2_price": payload["price"],
++            "raw": raw,
+         }
+-        payload["yes_price" if side == "yes" else "no_price"] = int(price_cents)
+-        r = self._req("POST", "/portfolio/orders", json=payload)
+-        self._log_raw_once("create_order", r)
 -        return r.get("order", r) or {}
-+        out = r.get("order", r) or {}
-+        out.setdefault("client_order_id", payload["client_order_id"])
-+        return out
  
      def get_order(self, order_id: str) -> dict:
          r = self._req("GET", f"/portfolio/orders/{order_id}")
-@@ -575,6 +614,7 @@
+@@ -575,6 +669,7 @@
              "fill_ids": (extra or {}).get("fill_ids", []),
              "state": "open",
              "strategy": (extra or {}).get("strategy"),
@@ -126,7 +189,7 @@
              "market_score": (extra or {}).get("market_score"),
              "entry_edge": (extra or {}).get("entry_edge"),
              "entry_ev": (extra or {}).get("entry_ev"),
-@@ -707,6 +747,54 @@
+@@ -707,6 +802,58 @@
          self.avg_price, self.status, self.state = avg_price, status, state
          # state: "filled" | "partial" | "cancelled" | "rejected" | "unknown"
  
@@ -169,6 +232,10 @@
 +    log.info(f"environment={'DEMO' if client.env == 'demo' else 'PROD'}")
 +    log.info(f"api_base_url={getattr(client, 'base_url', '?')}")
 +    log.info(f"execution_mode={CFG.EXECUTION_MODE.upper()}")
++    if client.env == "demo" and CFG.EXECUTION_MODE != "real_demo":
++        log.info("conseil: definir EXECUTION_MODE=real_demo (Railway) pour "
++                 "activer le garde anti-mock ; les chemins d'execution sont "
++                 "IDENTIQUES (verifie par test), seule la protection change.")
 +    log.info(f"dry_run={str(CFG.DRY_RUN or CFG.SHADOW_MODE).lower()}")
 +    log.info(f"mock_enabled={str(not genuine).lower()}")
 +    log.info(f"order_submission_enabled="
@@ -181,7 +248,7 @@
  class OrderManager:
      TERMINAL = {"executed", "canceled", "cancelled", "expired", "filled"}
  
-@@ -772,14 +860,64 @@
+@@ -772,14 +919,70 @@
              return ExecutionResult(None, count, 0, limit_cents,
                                     "blocked:no_executable_ask", "rejected")
          limit_cents = int(limit_cents)
@@ -196,11 +263,17 @@
 +            else "PROD"
 +        # Exigence 4 : preuve d'envoi AVANT l'appel. Jamais de cle, secret,
 +        # signature ni token dans les logs (seuls les champs metier).
++        v2_side = "bid" if side == "yes" else "ask"
++        v2_price = (limit_cents if side == "yes"
++                    else 100 - limit_cents) / 100.0
 +        log_api.info("[ORDER_SUBMIT_ATTEMPT] "
 +                     f"ticker={ticker} side={side} action=buy count={count} "
 +                     f"price_cents={limit_cents} "
++                     f"(V2: side={v2_side} price={v2_price:.4f}) "
 +                     f"client_order_id={client_order_id} "
-+                     f"environment={env_name} endpoint=/portfolio/orders")
++                     f"environment={env_name} "
++                     f"endpoint="
++                     f"{getattr(self.client, 'ORDERS_V2_PATH', '/portfolio/events/orders')}")
          try:
 -            order = self.client.create_order(ticker, side, count, limit_cents)
 +            order = self.client.create_order(ticker, side, count, limit_cents,
@@ -249,7 +322,7 @@
          if not order_id:
              log_api.error(f"Reponse d'ordre sans identifiant -- trade NON enregistre. "
                            f"Reponse: {json.dumps(order)[:300]}")
-@@ -790,10 +928,16 @@
+@@ -790,10 +993,16 @@
                                        "placed_at": now_iso()}
          self.flush()
  
@@ -268,7 +341,7 @@
              try:
                  order = self.client.get_order(order_id)
                  status, filled = self._extract(order, count)
-@@ -801,8 +945,15 @@
+@@ -801,8 +1010,15 @@
                  log_api.warning(f"Suivi ordre {order_id}: {e}")
  
          if status not in self.TERMINAL and filled < count:
@@ -286,7 +359,7 @@
              self.client.cancel_order(order_id)
              try:
                  order = self.client.get_order(order_id)
-@@ -824,10 +975,24 @@
+@@ -824,10 +1040,24 @@
                               f"-- {filled} contrat(s) confirme(s) via /fills.")
  
          if filled <= 0:
@@ -311,7 +384,7 @@
          return ExecutionResult(order_id, count, filled, avg, status or "executed", state)
  
      def reconcile_startup(self, tlog: TradeLogger, posmgr: PositionManager):
-@@ -906,12 +1071,35 @@
+@@ -906,12 +1136,35 @@
          cur_dd = peak - curve
          return cur_dd
  
@@ -349,7 +422,7 @@
          if cycle_trades >= CFG.MAX_TRADES_CYCLE:
              return False, f"max {CFG.MAX_TRADES_CYCLE} trades/cycle atteint"
          open_risk = self.posmgr.open_risk()
-@@ -1073,14 +1261,16 @@
+@@ -1073,14 +1326,16 @@
      def normalize_book(m: dict) -> Optional[dict]:
          """Carnet coherent ou None. Derive le cote NO du cote YES si absent."""
          def cents(*names):
@@ -374,7 +447,7 @@
          yb, ya = cents("yes_bid"), cents("yes_ask")
          nb, na = cents("no_bid"),  cents("no_ask")
          if nb is None and ya is not None: nb = 100 - ya
-@@ -1286,9 +1476,10 @@
+@@ -1286,9 +1541,10 @@
      a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
  
      def __init__(self, client: KalshiClient, capital: float):
@@ -387,7 +460,7 @@
          from shadow_prediction_store import ShadowPredictionStore
          self.client   = client
          self.configured_capital = capital           # PLAFOND, pas la verite
-@@ -1299,12 +1490,21 @@
+@@ -1299,12 +1555,21 @@
          self.risk     = RiskManager(self.tlog, self.posmgr, capital)
          self.stats    = StatsEngine(self.tlog)
          self.strategy = BtcStrategy(client)          # analyse crypto existante
@@ -415,7 +488,7 @@
          self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
          self.gates = GateConfig(
              MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
-@@ -1318,7 +1518,11 @@
+@@ -1318,7 +1583,11 @@
          self.pipeline = MarketOpportunityPipeline(
              client, self.router, gates=self.gates,
              fresh_book_fn=self.fresh_book,
@@ -428,7 +501,7 @@
          # Recovery apres crash + broker source de verite
          self.orders.reconcile_startup(self.tlog, self.posmgr)
          self.posmgr.reconcile_startup()
-@@ -1382,6 +1586,44 @@
+@@ -1382,6 +1651,44 @@
          return False, ("solde indisponible; en demo, ALLOW_FALLBACK_CAPITAL=1 "
                         "requis pour un secours explicite")
  
@@ -473,7 +546,7 @@
      def cycle(self, n: int) -> int:
          log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
          self.stats.maybe_daily_report()
-@@ -1435,15 +1677,32 @@
+@@ -1435,15 +1742,32 @@
              if placed >= CFG.MAX_TRADES_CYCLE:
                  break
              placed += self._execute_decision(dec, report)
@@ -512,7 +585,7 @@
          JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
          JsonStore.save(_p("pipeline_stats.json"), {
              "cycle": n,
-@@ -1460,10 +1719,6 @@
+@@ -1460,10 +1784,6 @@
          })
          JsonStore.save(_p("reject_reasons.json"),
                         {"cycle": n, "reject_reasons": report["rejections"]})
@@ -523,7 +596,7 @@
          if placed == 0:
              self.stats.log_summary()
          return placed
-@@ -1485,7 +1740,12 @@
+@@ -1485,7 +1805,12 @@
          entry = int(ask)
  
          # 5b) budgets risque categorie / marche (sur capital effectif)
@@ -537,7 +610,7 @@
          if self.posmgr.open_risk_on(ticker) >= \
                  self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
              report["rejections"]["risk_blocked"] = \
-@@ -1548,10 +1808,37 @@
+@@ -1548,10 +1873,37 @@
                        "strategy": dec.strategy},
              order_id=exec_res.order_id, order_status=exec_res.status)
          self.posmgr.open_position(trade, extra={
@@ -576,13 +649,16 @@
          snap = self.risk.snapshot()
          log_rsk.info(f"risque_ouvert={snap['open_risk']}$ "
                       f"pnl_jour={snap['daily_realized_pnl']}$ "
-@@ -1573,8 +1860,15 @@
+@@ -1572,9 +1924,17 @@
+     log.info(f"               ORDRES REELS -- aucun dry-run, aucune simulation")
      log.info(f"Identifiants  : {client.cred_src}")
      log.info(f"Solde compte  : {f'{bal:,.2f}$' if bal is not None else 'indisponible (verifier cles/env)'}")
-     log.info(f"Capital ref.  : {capital:,.2f}$ (sizing)")
+-    log.info(f"Capital ref.  : {capital:,.2f}$ (sizing)")
 -    log.info(f"Risque        : stop jour -{CFG.MAX_DAILY_LOSS:.2f}$ (PnL REALISE) | "
 -             f"max {CFG.MAX_POS_PCT:g}%/position | budget ouvert {CFG.RISK_BUDGET_PCT:g}%")
 +    eff = min(capital, bal) if bal is not None else capital
++    log.info(f"Capital       : plafond configure {capital:,.2f}$ | "
++             f"EFFECTIF (sizing/risque) = min(plafond, solde) = {eff:,.2f}$")
 +    stop = min(CFG.MAX_DAILY_LOSS, eff * CFG.MAX_DAILY_LOSS_PCT / 100.0)
 +    log.info(f"Risque        : stop jour -{stop:.2f}$ "
 +             f"({CFG.MAX_DAILY_LOSS_PCT:g}% du capital effectif "
@@ -594,7 +670,7 @@
      log.info(f"Protections   : entree<={CFG.MAX_ENTRY_CENTS}c | "
               f"1 trade/marche={'OUI' if CFG.ONE_TRADE_PER_MKT else 'NON'} | "
               f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
-@@ -1602,7 +1896,13 @@
+@@ -1602,7 +1962,13 @@
      ap.add_argument("--shadow", action="store_true",
                      help="mode shadow: pipeline et decisions complets, "
                           "AUCUN ordre envoye")

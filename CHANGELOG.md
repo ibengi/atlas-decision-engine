@@ -1,5 +1,33 @@
 # Changelog
 
+## [12.4.0] — 2026-07-25
+### Migration Create Order V2 (HTTP 410 deprecated_v1_order_endpoint)
+- create_order migre vers POST /portfolio/events/orders, schema verifie
+  contre l'OpenAPI officielle 3.20.0 (docs.kalshi.com) : side bid|ask sur
+  le carnet YES uniquement (yes->bid ; achat NO a n cents -> ask a
+  (100-n)/100 $), price en dollars fixed-point, count en chaine,
+  time_in_force=good_till_canceled, self_trade_prevention=taker_at_cross.
+- Reponse V2 SANS champ status : statut DERIVE de fill_count/
+  remaining_count ; reponse normalisee vers le schema interne (compteurs
+  entiers, average_fill_price dollars YES reconverti en cents sur NOTRE
+  cote). accepted != filled preserve.
+- Tout futur 410 "deprecated" sur un autre chemin leve une erreur de
+  migration explicite ; audit : plus aucun POST /portfolio/orders dans le
+  projet (teste par inspection de source), GET/DELETE ordres, fills,
+  positions, markets, balance confirmes fonctionnels par les logs prod.
+### Corrige — edge fantome +0.96 (bug revele par les memes logs)
+- no_ask_dollars="1.0000" (=1,00$ = cote VIDE) etait parse 1 cent -> le
+  moteur croyait acheter NO a 1c sur des cotes vides. Les champs *_dollars
+  sont desormais STRICTEMENT interpretes en dollars ("1.0000"->None) ;
+  1 legacy reste 1c. Le carnet KXBTCD reel du RAW ne produit plus de book.
+### Remarques utilisateur
+- Banner capital unifie : "plafond configure X$ | EFFECTIF = min(plafond,
+  solde) = Y$" (plus d'affichage 500$ ambigu).
+- Banner : conseil explicite EXECUTION_MODE=real_demo en demo ; chemins
+  d'execution identiques (teste), seule la protection anti-mock change.
+### Tests
+- 131 tests (11 nouveaux), 0 echec.
+
 ## [12.3.0] — 2026-07-25
 ### Fournisseur de donnees BTC tolerant aux pannes (panne Binance en prod)
 - Cause racine journalisee : klines Binance = point unique de defaillance ;
