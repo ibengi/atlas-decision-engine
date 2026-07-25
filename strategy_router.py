@@ -131,6 +131,10 @@ class Strategy:
         telecharger des marches qui seront rejetes no_model_probability."""
         return True
 
+    def provider_desc(self) -> str:
+        """Description humaine de la source de probabilite (audit)."""
+        return "modele interne"
+
 
 class RegistryValidationError(RuntimeError):
     pass
@@ -309,6 +313,11 @@ class ProviderBackedStrategy(Strategy):
 
     def has_probability_source(self) -> bool:
         return self._provider is not None
+
+    def provider_desc(self) -> str:
+        if self._provider is None:
+            return "AUCUN fournisseur injecte (provider indisponible)"
+        return getattr(self._provider, "__name__", "fournisseur externe")
 
     def evaluate(self, market, book, minutes_remaining) -> ModelOutput:
         if self._provider is None:

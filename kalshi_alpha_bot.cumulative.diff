@@ -1,5 +1,5 @@
 --- /mnt/user-data/uploads/kalshi_alpha_bot.py	2026-07-24 12:40:17.850185000 +0000
-+++ src/engine/kalshi_alpha_bot.py	2026-07-25 19:06:39.213391884 +0000
++++ src/engine/kalshi_alpha_bot.py	2026-07-25 19:17:24.945045883 +0000
 @@ -75,13 +75,25 @@
      ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", True)
      MIN_MINUTES       = _env_f("BTC_MIN_MINUTES", 5.0)
@@ -415,7 +415,7 @@
          self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
          self.gates = GateConfig(
              MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
-@@ -1318,7 +1518,10 @@
+@@ -1318,7 +1518,11 @@
          self.pipeline = MarketOpportunityPipeline(
              client, self.router, gates=self.gates,
              fresh_book_fn=self.fresh_book,
@@ -424,10 +424,56 @@
 +            scanner=self.scanner, data_dir=CFG.DATA_DIR)
 +        assert_real_demo_integrity(client, CFG.SHADOW_MODE)
 +        log_execution_banner(client)
++        self._probability_engine_report()
          # Recovery apres crash + broker source de verite
          self.orders.reconcile_startup(self.tlog, self.posmgr)
          self.posmgr.reconcile_startup()
-@@ -1435,15 +1638,32 @@
+@@ -1382,6 +1586,44 @@
+         return False, ("solde indisponible; en demo, ALLOW_FALLBACK_CAPITAL=1 "
+                        "requis pour un secours explicite")
+ 
++    def _probability_engine_report(self):
++        """Audit du Probability Engine au demarrage : pour chaque strategie,
++        sa source de probabilite ; puis une sonde REELLE du fournisseur BTC
++        (valid/reason/spot/qualite/sources) pour reveler immediatement dans
++        les logs Railway pourquoi un modele ne produirait rien.
++        PROBE_PROVIDERS_ON_START=0 pour desactiver (tests hors-ligne)."""
++        log.info("[PROBABILITY_ENGINE]")
++        for mt, st in sorted(self.router._by_type.items()):
++            src = "OUI" if st.has_probability_source() else "NON"
++            log.info(f"  {mt:24} strategie={st.name:24} "
++                     f"source_probabilite={src} ({st.provider_desc()})")
++        if os.getenv("PROBE_PROVIDERS_ON_START", "1") != "1":
++            return
++        if not BTC_AVAILABLE:
++            log.warning("  sonde BTC: btc_context ABSENT (module non "
++                        "importable) -> tout candidat crypto sera rejete "
++                        "no_model_probability:btc_context_absent")
++            return
++        try:
++            ctx = get_btc_context()
++            n_src = getattr(ctx, "n_valid_sources", "?")
++            log.info(f"  sonde BTC: valid={getattr(ctx, 'valid', False)} "
++                     f"reason='{getattr(ctx, 'reason', '')}' "
++                     f"spot={getattr(ctx, 'spot', None)} "
++                     f"sources_valides={n_src} "
++                     f"qualite={getattr(ctx, 'data_quality_score', None)} "
++                     f"vol_1m={getattr(ctx, 'realized_vol_1m', None)} "
++                     f"flags={getattr(ctx, 'quality_flags', [])}")
++            if not getattr(ctx, "valid", False):
++                log.warning("  sonde BTC INVALIDE: chaque marche BTC sera "
++                            "rejete no_model_probability tant que le "
++                            "fournisseur de donnees ne repond pas — "
++                            "verifier l'acces sortant de Railway vers "
++                            "les APIs spot (Coinbase/Kraken/Bitstamp) et "
++                            "klines (Binance).")
++        except Exception as e:                              # noqa: BLE001
++            log.warning(f"  sonde BTC: EXCEPTION {type(e).__name__}: {e}")
++
+     def cycle(self, n: int) -> int:
+         log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
+         self.stats.maybe_daily_report()
+@@ -1435,15 +1677,32 @@
              if placed >= CFG.MAX_TRADES_CYCLE:
                  break
              placed += self._execute_decision(dec, report)
@@ -466,7 +512,7 @@
          JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
          JsonStore.save(_p("pipeline_stats.json"), {
              "cycle": n,
-@@ -1460,10 +1680,6 @@
+@@ -1460,10 +1719,6 @@
          })
          JsonStore.save(_p("reject_reasons.json"),
                         {"cycle": n, "reject_reasons": report["rejections"]})
@@ -477,7 +523,7 @@
          if placed == 0:
              self.stats.log_summary()
          return placed
-@@ -1485,7 +1701,12 @@
+@@ -1485,7 +1740,12 @@
          entry = int(ask)
  
          # 5b) budgets risque categorie / marche (sur capital effectif)
@@ -491,7 +537,7 @@
          if self.posmgr.open_risk_on(ticker) >= \
                  self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
              report["rejections"]["risk_blocked"] = \
-@@ -1548,10 +1769,37 @@
+@@ -1548,10 +1808,37 @@
                        "strategy": dec.strategy},
              order_id=exec_res.order_id, order_status=exec_res.status)
          self.posmgr.open_position(trade, extra={
@@ -530,7 +576,7 @@
          snap = self.risk.snapshot()
          log_rsk.info(f"risque_ouvert={snap['open_risk']}$ "
                       f"pnl_jour={snap['daily_realized_pnl']}$ "
-@@ -1573,8 +1821,15 @@
+@@ -1573,8 +1860,15 @@
      log.info(f"Identifiants  : {client.cred_src}")
      log.info(f"Solde compte  : {f'{bal:,.2f}$' if bal is not None else 'indisponible (verifier cles/env)'}")
      log.info(f"Capital ref.  : {capital:,.2f}$ (sizing)")
@@ -548,7 +594,7 @@
      log.info(f"Protections   : entree<={CFG.MAX_ENTRY_CENTS}c | "
               f"1 trade/marche={'OUI' if CFG.ONE_TRADE_PER_MKT else 'NON'} | "
               f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
-@@ -1602,7 +1857,13 @@
+@@ -1602,7 +1896,13 @@
      ap.add_argument("--shadow", action="store_true",
                      help="mode shadow: pipeline et decisions complets, "
                           "AUCUN ordre envoye")

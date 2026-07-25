@@ -126,6 +126,31 @@ class MarketOpportunityPipeline:
                 S["rejections_by_reason"].get(r, 0) + n
 
         accepted, deep = [], 0
+        S["model_rejections_detailed"] = {}
+        S["model_executed"] = {}
+        _mt_logged = [0]
+        _mt_max = int(os.getenv("MODEL_LOG_MAX", "10"))
+        _mt_all = os.getenv("MODEL_DEBUG", "0") == "1"
+
+        def _model_trace(ticker, mtype, strat_name, model):
+            """Exigence audit Probability Engine : pour CHAQUE marche
+            supporte, strategie choisie, modele, execute ou non, et raison
+            precise. Plafond MODEL_LOG_MAX/cycle (MODEL_DEBUG=1 = tout) ;
+            l'agregat complet part dans [MODEL-SUMMARY] + le rapport."""
+            executed = bool(model.valid)
+            mdl = (model.features or {}).get("model_version")                 if executed else "-"
+            reason = "ok" if executed else (model.reason or "inconnue")
+            key = reason if not executed else "executed"
+            if executed:
+                S["model_executed"][mdl] = S["model_executed"].get(mdl, 0) + 1
+            else:
+                S["model_rejections_detailed"][reason] =                     S["model_rejections_detailed"].get(reason, 0) + 1
+            if _mt_all or _mt_logged[0] < _mt_max:
+                log.info("[MODEL_TRACE] "
+                         f"ticker={ticker} market_type={mtype} "
+                         f"strategy={strat_name} model={mdl} "
+                         f"executed={str(executed).lower()} reason={reason}")
+                _mt_logged[0] += 1
         for m in scan["markets"]:
             ticker = m.get("ticker") or ""
             cls = m.get("_classification") or classify(m).to_dict()
@@ -167,6 +192,7 @@ class MarketOpportunityPipeline:
                            market_type=mtype, category=cat,
                            decision_id=f"{cycle_id}-{uuid.uuid4().hex[:8]}")
             model = strat.evaluate(m, book, mins)
+            _model_trace(ticker, mtype, strat.name, model)
             if model.valid:
                 S["model_evaluated"] += 1
             dec = price_and_gate(dec, model, book, self.gates, market=m)
@@ -227,6 +253,11 @@ class MarketOpportunityPipeline:
                           if prev else (100.0 if n else 0.0)}
             prev = n if n else prev
         S["funnel_conversion"] = conv
+        if S["model_rejections_detailed"] or S["model_executed"]:
+            log.info("[MODEL-SUMMARY] " + json.dumps(
+                {"executed": S["model_executed"],
+                 "rejections": S["model_rejections_detailed"]},
+                ensure_ascii=False, sort_keys=True))
         return {"report": S, "accepted": accepted}
 
 

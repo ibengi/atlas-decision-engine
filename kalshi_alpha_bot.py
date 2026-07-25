@@ -1522,6 +1522,7 @@ class ExecutionEngine:
             scanner=self.scanner, data_dir=CFG.DATA_DIR)
         assert_real_demo_integrity(client, CFG.SHADOW_MODE)
         log_execution_banner(client)
+        self._probability_engine_report()
         # Recovery apres crash + broker source de verite
         self.orders.reconcile_startup(self.tlog, self.posmgr)
         self.posmgr.reconcile_startup()
@@ -1584,6 +1585,44 @@ class ExecutionEngine:
             return True, "capital de secours (demo, journalise)"
         return False, ("solde indisponible; en demo, ALLOW_FALLBACK_CAPITAL=1 "
                        "requis pour un secours explicite")
+
+    def _probability_engine_report(self):
+        """Audit du Probability Engine au demarrage : pour chaque strategie,
+        sa source de probabilite ; puis une sonde REELLE du fournisseur BTC
+        (valid/reason/spot/qualite/sources) pour reveler immediatement dans
+        les logs Railway pourquoi un modele ne produirait rien.
+        PROBE_PROVIDERS_ON_START=0 pour desactiver (tests hors-ligne)."""
+        log.info("[PROBABILITY_ENGINE]")
+        for mt, st in sorted(self.router._by_type.items()):
+            src = "OUI" if st.has_probability_source() else "NON"
+            log.info(f"  {mt:24} strategie={st.name:24} "
+                     f"source_probabilite={src} ({st.provider_desc()})")
+        if os.getenv("PROBE_PROVIDERS_ON_START", "1") != "1":
+            return
+        if not BTC_AVAILABLE:
+            log.warning("  sonde BTC: btc_context ABSENT (module non "
+                        "importable) -> tout candidat crypto sera rejete "
+                        "no_model_probability:btc_context_absent")
+            return
+        try:
+            ctx = get_btc_context()
+            n_src = getattr(ctx, "n_valid_sources", "?")
+            log.info(f"  sonde BTC: valid={getattr(ctx, 'valid', False)} "
+                     f"reason='{getattr(ctx, 'reason', '')}' "
+                     f"spot={getattr(ctx, 'spot', None)} "
+                     f"sources_valides={n_src} "
+                     f"qualite={getattr(ctx, 'data_quality_score', None)} "
+                     f"vol_1m={getattr(ctx, 'realized_vol_1m', None)} "
+                     f"flags={getattr(ctx, 'quality_flags', [])}")
+            if not getattr(ctx, "valid", False):
+                log.warning("  sonde BTC INVALIDE: chaque marche BTC sera "
+                            "rejete no_model_probability tant que le "
+                            "fournisseur de donnees ne repond pas — "
+                            "verifier l'acces sortant de Railway vers "
+                            "les APIs spot (Coinbase/Kraken/Bitstamp) et "
+                            "klines (Binance).")
+        except Exception as e:                              # noqa: BLE001
+            log.warning(f"  sonde BTC: EXCEPTION {type(e).__name__}: {e}")
 
     def cycle(self, n: int) -> int:
         log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")

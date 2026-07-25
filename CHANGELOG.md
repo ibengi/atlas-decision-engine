@@ -1,5 +1,24 @@
 # Changelog
 
+## [12.2.3] — 2026-07-25
+### Audit Probability Engine (model_evaluated=0 avec supported>0)
+- [MODEL_TRACE] par marche supporte : ticker, market_type, strategie,
+  modele, executed=true|false, raison PRECISE (sous-raison complete :
+  provider indisponible, donnees insuffisantes, contexte invalide, horizon,
+  strike absent...). Plafond MODEL_LOG_MAX=10/cycle, MODEL_DEBUG=1 = tout.
+- [MODEL-SUMMARY] en fin de cycle + model_rejections_detailed /
+  model_executed dans le rapport : aucun marche supporte ne disparait
+  silencieusement (invariant teste : supported == executed + rejets).
+- [PROBABILITY_ENGINE] au demarrage : source de probabilite de chaque
+  strategie + SONDE REELLE du fournisseur BTC (valid/reason/spot/sources/
+  qualite) — revele immediatement dans Railway pourquoi un modele ne
+  produit rien. PROBE_PROVIDERS_ON_START=0 pour desactiver.
+- Verification EXECUTION_MODE : STANDARD ne restreint RIEN — seul le garde
+  anti-mock et le banner lisent cette variable (teste par inspection de
+  source + ordre place a l'identique en STANDARD).
+### Tests
+- 110 tests (5 nouveaux), 0 echec.
+
 ## [12.2.2] — 2026-07-25
 ### Corrige (audit no_liquidity : 80/80 rejetes en DEMO)
 - Parseur de prix tolerant `price_to_cents` : cents entiers (48, "48.00"),

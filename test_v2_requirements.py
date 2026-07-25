@@ -216,3 +216,109 @@ class TestPerformanceStats(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProbabilityEngineAudit(unittest.TestCase):
+    """Audit Probability Engine : aucun marche supporte ne disparait
+    silencieusement — trace par marche + resume detaille par cycle."""
+
+    def _cap(self):
+        import io, logging
+
+        class C:
+            def __enter__(sf):
+                sf.buf = io.StringIO()
+                sf.h = logging.StreamHandler(sf.buf)
+                for n in ("PIPELINE", "BOT"):
+                    logging.getLogger(n).addHandler(sf.h)
+                return sf
+
+            def __exit__(sf, *a):
+                for n in ("PIPELINE", "BOT"):
+                    logging.getLogger(n).removeHandler(sf.h)
+
+            @property
+            def text(sf):
+                return sf.buf.getvalue()
+        return C()
+
+    def test_model_trace_when_executed(self):
+        from test_pipeline_integration import FakeClient, make_engine
+        eng, tmp = make_engine(FakeClient(order_scenario="fill"))
+        with self._cap() as cap:
+            eng.cycle(1)
+        t = cap.text
+        self.assertIn("[MODEL_TRACE]", t)
+        self.assertIn("executed=true", t)
+        self.assertIn("strategy=btc_daily_above_strike", t)
+        self.assertIn("model=btc15m-v1.0-ref", t)
+        self.assertIn("[MODEL-SUMMARY]", t)
+
+    def test_model_trace_reason_when_provider_fails(self):
+        from test_pipeline_integration import FakeClient, make_engine
+
+        class DeadCtx:
+            valid = False
+            reason = "sources_spot_insuffisantes (0/2)"
+
+        def dead_provider(**kw):
+            return DeadCtx()
+        eng, tmp = make_engine(FakeClient())
+        from strategy_router import build_default_registry
+        eng.router = build_default_registry(btc_context_provider=dead_provider)
+        eng.pipeline.router = eng.router
+        with self._cap() as cap:
+            placed = eng.cycle(1)
+        t = cap.text
+        self.assertEqual(placed, 0)
+        self.assertIn("executed=false", t)
+        # raison PRECISE, pas la base generique
+        self.assertIn("sources_spot_insuffisantes", t)
+        # resume par categorie en fin de cycle + rapport disque
+        self.assertIn("[MODEL-SUMMARY]", t)
+        import json as _j
+        rep = _j.load(open(os.path.join(tmp, "cycle_report.json")))
+        det = rep["model_rejections_detailed"]
+        self.assertEqual(sum(det.values()), 1)
+        self.assertTrue(any("sources_spot_insuffisantes" in k for k in det))
+
+    def test_no_supported_market_vanishes_silently(self):
+        """supported == model_evaluated + somme des rejets detailles."""
+        from test_pipeline_integration import FakeClient, make_engine
+        eng, tmp = make_engine(FakeClient(order_scenario="fill"))
+        eng.cycle(1)
+        import json as _j
+        rep = _j.load(open(os.path.join(tmp, "cycle_report.json")))
+        accounted = rep["model_evaluated"] + \
+            sum(rep["model_rejections_detailed"].values())
+        self.assertEqual(rep["supported"], accounted)
+
+
+class TestExecutionModeStandardNotRestrictive(unittest.TestCase):
+    """Observation utilisateur : STANDARD ne doit rien restreindre par
+    rapport a REAL_DEMO. Preuve : EXECUTION_MODE n'est lu QUE par le garde
+    anti-mock et le banner — aucun chemin d'execution ne depend de lui."""
+
+    def test_execution_mode_only_gates_antimock(self):
+        import inspect
+        import kalshi_alpha_bot as b
+        src = inspect.getsource(b)
+        uses = [ln.strip() for ln in src.splitlines()
+                if "EXECUTION_MODE" in ln]
+        allowed = ("assert_real_demo_integrity",          # docstring du garde
+                   "real_demo",                           # test du garde
+                   "execution_mode=",                     # banner
+                   "os.getenv")                           # definition Config
+        for ln in uses:
+            self.assertTrue(any(a in ln for a in allowed),
+                            f"EXECUTION_MODE utilise ailleurs: {ln}")
+
+    def test_standard_mode_places_orders_identically(self):
+        from test_pipeline_integration import FakeClient, make_engine
+        import kalshi_alpha_bot as b
+        b.CFG.EXECUTION_MODE = "standard"
+        try:
+            eng, _ = make_engine(FakeClient(order_scenario="fill"))
+            self.assertEqual(eng.cycle(1), 1)     # ordre place normalement
+        finally:
+            b.CFG.EXECUTION_MODE = "standard"
