@@ -109,23 +109,80 @@ def _minutes_to_close(m: dict, now_dt: datetime):
     return (close_dt - now_dt).total_seconds() / 60.0
 
 
+def price_to_cents(v):
+    """Prix Kalshi -> cents entiers 1..99, sinon None.
+    Tolere TOUS les formats observes/attendus de l'API :
+      48, 48.0, "48", "48.00"      -> 48   (cents)
+      0.48, "0.4800"               -> 48   (dollars ; l'API v2 double
+                                            desormais les champs en
+                                            *_dollars, cf. [RAW:balance])
+      0, "0", "0.0000"             -> None (carnet VIDE, pas un prix)
+    Un prix strictement entre 0 et 1 ne peut etre que des dollars
+    (les prix Kalshi sont des cents entiers)."""
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if x <= 0:
+        return None
+    if x < 1.0:
+        x *= 100.0                       # dollars -> cents
+    c = int(round(x))
+    return c if 1 <= c <= 99 else None
+
+
+def read_price(m: dict, name: str):
+    """Lit un prix en essayant le champ cents PUIS sa variante *_dollars."""
+    c = price_to_cents(m.get(name))
+    if c is None:
+        c = price_to_cents(m.get(name + "_dollars"))
+    return c
+
+
+def _num(m, *names):
+    for k in names:
+        try:
+            v = float(m.get(k))
+            return v
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def liquidity_diag(m: dict) -> dict:
+    """Diagnostic complet de liquidite d'un marche (cote YES normalise :
+    best_bid/ask derives du cote NO si le cote YES est vide)."""
+    yb, ya = read_price(m, "yes_bid"), read_price(m, "yes_ask")
+    nb, na = read_price(m, "no_bid"), read_price(m, "no_ask")
+    best_bid = yb if yb is not None else (100 - na if na is not None else None)
+    best_ask = ya if ya is not None else (100 - nb if nb is not None else None)
+    vol = _num(m, "volume_24h", "volume") or 0.0
+    oi = _num(m, "open_interest") or 0.0
+    liq = _num(m, "liquidity", "liquidity_dollars") or 0.0
+    score = 0.0
+    if best_bid is not None or best_ask is not None:
+        score += 40.0
+    if best_bid is not None and best_ask is not None:
+        score += max(0.0, 20.0 - 2.0 * (best_ask - best_bid))
+    score += min(30.0, vol / 100.0) + min(10.0, oi / 100.0)
+    return {"ticker": m.get("ticker"),
+            "best_bid": best_bid, "best_ask": best_ask,
+            "bid_size": _num(m, "yes_bid_size", "bid_size"),
+            "ask_size": _num(m, "yes_ask_size", "ask_size"),
+            "volume": vol, "open_interest": oi, "liquidity_field": liq,
+            "liquidity_score": round(score, 1)}
+
+
 def _has_liquidity(m: dict) -> bool:
-    """Un cote executable au moins (prix 1..99 sur un ask), OU volume/
-    open_interest > 0. Kalshi renvoie 0 pour un carnet vide."""
-    for k in ("yes_ask", "no_ask", "yes_bid", "no_bid"):
-        try:
-            v = int(float(m.get(k)))
-        except (TypeError, ValueError):
-            continue
-        if 1 <= v <= 99:
-            return True
-    for k in ("volume", "volume_24h", "open_interest", "liquidity"):
-        try:
-            if float(m.get(k) or 0) > 0:
-                return True
-        except (TypeError, ValueError):
-            continue
-    return False
+    """Un cote executable au moins (prix 1..99, formats cents OU dollars
+    OU champs *_dollars), OU volume/open_interest/liquidity > 0."""
+    d = liquidity_diag(m)
+    if d["best_bid"] is not None or d["best_ask"] is not None:
+        return True
+    return (d["volume"] > 0 or d["open_interest"] > 0
+            or d["liquidity_field"] > 0)
 
 
 class MarketScanner:
@@ -229,11 +286,19 @@ class MarketScanner:
         re-lues (fraiches), fusionnees dans l'univers en cache."""
         fresh = {}
         for s in self.target_series():
+            first = True
             for m in (self.client.get_markets(s, status="open",
                                               limit=self.cfg.page_limit) or []):
                 tk = m.get("ticker")
                 if tk:
                     fresh[tk] = m
+                    if first and hasattr(self.client, "_log_raw_once"):
+                        # Trou d'observabilite corrige : on n'avait JAMAIS
+                        # vu un objet marche brut (donc jamais ses vrais
+                        # noms de champs). Un echantillon par serie, une
+                        # fois par process.
+                        self.client._log_raw_once(f"market_sample_{s}", m)
+                        first = False
         merged = {m.get("ticker"): m for m in (base or []) if m.get("ticker")}
         merged.update(fresh)
         return list(merged.values())
@@ -292,10 +357,32 @@ class MarketScanner:
         rep["funnel"]["after_time_window"] = len(kept)
 
         stage = []
+        liq_logged = 0
+        liq_max = int(os.getenv("LIQUIDITY_LOG_MAX", "10"))
+        liq_all = os.getenv("LIQUIDITY_DEBUG", "0") == "1"
+        rep["no_liquidity_details"] = []
         for m in kept:
             if not _has_liquidity(m):
+                d = liquidity_diag(m)
+                rep["no_liquidity_details"].append(d)   # TOUS, sur disque
+                if liq_all or liq_logged < liq_max:
+                    log.info(
+                        "[LIQUIDITY_REJECT] "
+                        f"ticker={d['ticker']} "
+                        f"best_bid={d['best_bid']} best_ask={d['best_ask']} "
+                        f"bid_size={d['bid_size']} ask_size={d['ask_size']} "
+                        f"volume={d['volume']} "
+                        f"open_interest={d['open_interest']} "
+                        f"liquidity_score={d['liquidity_score']} "
+                        f"rejected_reason=no_liquidity")
+                    liq_logged += 1
                 _excl("no_liquidity"); continue
             stage.append(m)
+        n_rej = len(rep["no_liquidity_details"])
+        if not liq_all and n_rej > liq_logged:
+            log.info(f"[LIQUIDITY_REJECT] ... et {n_rej - liq_logged} autres "
+                     f"(details complets dans le rapport scanner ; "
+                     f"LIQUIDITY_DEBUG=1 pour tout journaliser)")
         kept = stage
         rep["funnel"]["after_liquidity"] = len(kept)
 

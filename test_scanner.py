@@ -173,3 +173,81 @@ class TestFilters(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from market_scanner import price_to_cents, read_price, liquidity_diag, \
+    _has_liquidity  # noqa: E402
+
+
+class TestPriceParserFormats(unittest.TestCase):
+    """Regression de l'audit no_liquidity du 2026-07-25 : l'API v2 double
+    les champs en *_dollars et peut renvoyer des prix en dollars decimaux ;
+    int(float('0.48'))=0 rejetait alors 100% des marches."""
+
+    def test_cents_formats(self):
+        for v in (48, 48.0, "48", "48.00"):
+            self.assertEqual(price_to_cents(v), 48, repr(v))
+
+    def test_dollar_formats(self):
+        for v in (0.48, "0.48", "0.4800"):
+            self.assertEqual(price_to_cents(v), 48, repr(v))
+        self.assertEqual(price_to_cents("0.0200"), 2)
+
+    def test_empty_book_is_none_not_a_price(self):
+        for v in (0, "0", "0.0000", None, "", "abc", 100, 250, -5):
+            self.assertIsNone(price_to_cents(v), repr(v))
+
+    def test_read_price_falls_back_to_dollars_key(self):
+        m = {"yes_bid": 0, "yes_bid_dollars": "0.4600"}
+        self.assertEqual(read_price(m, "yes_bid"), 46)
+
+    def test_dollars_only_market_now_passes_liquidity(self):
+        # profil du bug production : champs cents a 0, *_dollars renseignes
+        m = {"ticker": "KXBTCD-X", "yes_bid": 0, "yes_ask": 0,
+             "yes_bid_dollars": "0.4600", "yes_ask_dollars": "0.4800",
+             "volume_24h": 0}
+        self.assertTrue(_has_liquidity(m))
+        d = liquidity_diag(m)
+        self.assertEqual(d["best_bid"], 46)
+        self.assertEqual(d["best_ask"], 48)
+        self.assertGreater(d["liquidity_score"], 40)
+
+    def test_truly_empty_book_still_rejected(self):
+        # seuil DEMO : un carnet reellement vide reste rejete (jamais
+        # d'ordre sans carnet) — le critere n'a PAS ete assoupli.
+        m = {"ticker": "KXBTCD-Y", "yes_bid": 0, "yes_ask": 0,
+             "volume": 0, "volume_24h": 0, "open_interest": 0}
+        self.assertFalse(_has_liquidity(m))
+        d = liquidity_diag(m)
+        self.assertIsNone(d["best_bid"])
+        self.assertIsNone(d["best_ask"])
+
+
+class TestLiquidityRejectLogging(unittest.TestCase):
+    def test_diag_line_and_report_details(self):
+        import io, logging
+        markets = [mk(f"KXBTCD-26JUL20-T{i}", yes_ask=0, yes_bid=0,
+                      volume_24h=0) for i in range(15)]
+        cli = FakeClient(by_series={"KXBTCD": markets})
+        buf = io.StringIO()
+        h = logging.StreamHandler(buf)
+        logging.getLogger("SCANNER").addHandler(h)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                sc = MarketScanner(cli, router=FakeRouter(), cfg=_cfg(),
+                                   data_dir=d)
+                res = sc.scan_cycle()
+        finally:
+            logging.getLogger("SCANNER").removeHandler(h)
+        t = buf.getvalue()
+        # format exact demande
+        self.assertIn("rejected_reason=no_liquidity", t)
+        for field in ("ticker=", "best_bid=", "best_ask=", "bid_size=",
+                      "ask_size=", "volume=", "open_interest=",
+                      "liquidity_score="):
+            self.assertIn(field, t, field)
+        # plafond par defaut 10/cycle + mention du reste
+        self.assertEqual(t.count("rejected_reason=no_liquidity"), 10)
+        self.assertIn("5 autres", t)
+        # TOUS les details dans le rapport
+        self.assertEqual(len(res["report"]["no_liquidity_details"]), 15)

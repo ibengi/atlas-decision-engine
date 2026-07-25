@@ -1261,14 +1261,16 @@ class MarketValidator:
     def normalize_book(m: dict) -> Optional[dict]:
         """Carnet coherent ou None. Derive le cote NO du cote YES si absent."""
         def cents(*names):
-            v = pick(m, *names, default=None)
-            try:
-                c = int(round(float(v))) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-            # Kalshi renvoie 0 pour un cote SANS ordres : c'est "vide",
-            # pas un prix. Seuls 1..99 sont des prix valides.
-            return c if c is not None and 1 <= c <= 99 else None
+            # Parseur tolerant partage avec le scanner : gere cents entiers,
+            # dollars decimaux (0.48 -> 48c) et variantes *_dollars.
+            # Corrige le bug "int(float('0.48'))=0 => carnet vide" qui
+            # rejetait 100% des marches si l'API renvoie des dollars.
+            from market_scanner import read_price
+            for n in names:
+                c = read_price(m, n)
+                if c is not None:
+                    return c
+            return None
         yb, ya = cents("yes_bid"), cents("yes_ask")
         nb, na = cents("no_bid"),  cents("no_ask")
         if nb is None and ya is not None: nb = 100 - ya

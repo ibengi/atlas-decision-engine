@@ -1,5 +1,25 @@
 # Changelog
 
+## [12.2.2] — 2026-07-25
+### Corrige (audit no_liquidity : 80/80 rejetes en DEMO)
+- Parseur de prix tolerant `price_to_cents` : cents entiers (48, "48.00"),
+  dollars decimaux (0.48, "0.4800" -> 48c) et variantes de champs
+  `*_dollars` (l'API v2 double desormais ses champs, cf. [RAW:balance]).
+  Bug corrige : int(float("0.48"))=0 => carnet considere vide => 100% des
+  marches rejetes no_liquidity. Meme correctif dans normalize_book.
+- Le critere de liquidite n'a PAS ete assoupli : un carnet reellement vide
+  (aucun prix, aucun volume/OI) reste rejete.
+### Ajoute
+- [LIQUIDITY_REJECT] par marche rejete : ticker, best_bid, best_ask,
+  bid_size, ask_size, volume, open_interest, liquidity_score,
+  rejected_reason=no_liquidity. Plafond LIQUIDITY_LOG_MAX=10/cycle
+  (LIQUIDITY_DEBUG=1 pour tout) ; details COMPLETS dans le rapport scanner.
+- [RAW:market_sample_<serie>] : un objet marche BRUT par serie journalise
+  une fois par process (trou d'observabilite : les vrais noms de champs de
+  l'API n'avaient jamais ete vus).
+### Tests
+- 105 tests (7 nouveaux), 0 echec.
+
 ## [12.2.1] — 2026-07-25
 ### Corrige (bug production Railway du 2026-07-25)
 - `requirements.txt` : ajout de `cryptography>=42` (signature RSA-PSS des

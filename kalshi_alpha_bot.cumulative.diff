@@ -1,5 +1,5 @@
 --- /mnt/user-data/uploads/kalshi_alpha_bot.py	2026-07-24 12:40:17.850185000 +0000
-+++ src/engine/kalshi_alpha_bot.py	2026-07-25 18:53:00.751719220 +0000
++++ src/engine/kalshi_alpha_bot.py	2026-07-25 19:06:39.213391884 +0000
 @@ -75,13 +75,25 @@
      ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", True)
      MIN_MINUTES       = _env_f("BTC_MIN_MINUTES", 5.0)
@@ -349,7 +349,32 @@
          if cycle_trades >= CFG.MAX_TRADES_CYCLE:
              return False, f"max {CFG.MAX_TRADES_CYCLE} trades/cycle atteint"
          open_risk = self.posmgr.open_risk()
-@@ -1286,9 +1474,10 @@
+@@ -1073,14 +1261,16 @@
+     def normalize_book(m: dict) -> Optional[dict]:
+         """Carnet coherent ou None. Derive le cote NO du cote YES si absent."""
+         def cents(*names):
+-            v = pick(m, *names, default=None)
+-            try:
+-                c = int(round(float(v))) if v is not None else None
+-            except (TypeError, ValueError):
+-                return None
+-            # Kalshi renvoie 0 pour un cote SANS ordres : c'est "vide",
+-            # pas un prix. Seuls 1..99 sont des prix valides.
+-            return c if c is not None and 1 <= c <= 99 else None
++            # Parseur tolerant partage avec le scanner : gere cents entiers,
++            # dollars decimaux (0.48 -> 48c) et variantes *_dollars.
++            # Corrige le bug "int(float('0.48'))=0 => carnet vide" qui
++            # rejetait 100% des marches si l'API renvoie des dollars.
++            from market_scanner import read_price
++            for n in names:
++                c = read_price(m, n)
++                if c is not None:
++                    return c
++            return None
+         yb, ya = cents("yes_bid"), cents("yes_ask")
+         nb, na = cents("no_bid"),  cents("no_ask")
+         if nb is None and ya is not None: nb = 100 - ya
+@@ -1286,9 +1476,10 @@
      a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
  
      def __init__(self, client: KalshiClient, capital: float):
@@ -362,7 +387,7 @@
          from shadow_prediction_store import ShadowPredictionStore
          self.client   = client
          self.configured_capital = capital           # PLAFOND, pas la verite
-@@ -1299,12 +1488,21 @@
+@@ -1299,12 +1490,21 @@
          self.risk     = RiskManager(self.tlog, self.posmgr, capital)
          self.stats    = StatsEngine(self.tlog)
          self.strategy = BtcStrategy(client)          # analyse crypto existante
@@ -390,7 +415,7 @@
          self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
          self.gates = GateConfig(
              MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
-@@ -1318,7 +1516,10 @@
+@@ -1318,7 +1518,10 @@
          self.pipeline = MarketOpportunityPipeline(
              client, self.router, gates=self.gates,
              fresh_book_fn=self.fresh_book,
@@ -402,7 +427,7 @@
          # Recovery apres crash + broker source de verite
          self.orders.reconcile_startup(self.tlog, self.posmgr)
          self.posmgr.reconcile_startup()
-@@ -1435,15 +1636,32 @@
+@@ -1435,15 +1638,32 @@
              if placed >= CFG.MAX_TRADES_CYCLE:
                  break
              placed += self._execute_decision(dec, report)
@@ -441,7 +466,7 @@
          JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
          JsonStore.save(_p("pipeline_stats.json"), {
              "cycle": n,
-@@ -1460,10 +1678,6 @@
+@@ -1460,10 +1680,6 @@
          })
          JsonStore.save(_p("reject_reasons.json"),
                         {"cycle": n, "reject_reasons": report["rejections"]})
@@ -452,7 +477,7 @@
          if placed == 0:
              self.stats.log_summary()
          return placed
-@@ -1485,7 +1699,12 @@
+@@ -1485,7 +1701,12 @@
          entry = int(ask)
  
          # 5b) budgets risque categorie / marche (sur capital effectif)
@@ -466,7 +491,7 @@
          if self.posmgr.open_risk_on(ticker) >= \
                  self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
              report["rejections"]["risk_blocked"] = \
-@@ -1548,10 +1767,37 @@
+@@ -1548,10 +1769,37 @@
                        "strategy": dec.strategy},
              order_id=exec_res.order_id, order_status=exec_res.status)
          self.posmgr.open_position(trade, extra={
@@ -505,7 +530,7 @@
          snap = self.risk.snapshot()
          log_rsk.info(f"risque_ouvert={snap['open_risk']}$ "
                       f"pnl_jour={snap['daily_realized_pnl']}$ "
-@@ -1573,8 +1819,15 @@
+@@ -1573,8 +1821,15 @@
      log.info(f"Identifiants  : {client.cred_src}")
      log.info(f"Solde compte  : {f'{bal:,.2f}$' if bal is not None else 'indisponible (verifier cles/env)'}")
      log.info(f"Capital ref.  : {capital:,.2f}$ (sizing)")
@@ -523,7 +548,7 @@
      log.info(f"Protections   : entree<={CFG.MAX_ENTRY_CENTS}c | "
               f"1 trade/marche={'OUI' if CFG.ONE_TRADE_PER_MKT else 'NON'} | "
               f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
-@@ -1602,7 +1855,13 @@
+@@ -1602,7 +1857,13 @@
      ap.add_argument("--shadow", action="store_true",
                      help="mode shadow: pipeline et decisions complets, "
                           "AUCUN ordre envoye")
