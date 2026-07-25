@@ -1,7 +1,2 @@
-# Dependances du bot Kalshi -- correspond aux imports reels du code.
-# NB : le paquet s'appelle python-dotenv (PAS "dotenv", qui est un autre
-# paquet obsolete sur PyPI).
-requests
-python-dotenv
-anthropic
-cryptography
+# Dependance d'execution unique (verifie par grep des imports)
+requests>=2.31

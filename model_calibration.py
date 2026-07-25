@@ -1,153 +1,96 @@
 """
-model_calibration.py — v1 (2026-07-12)
-Calibration des probabilites a partir de PREDICTIONS HISTORIQUES REGLEES.
+model_calibration.py — v1-ref (2026-07-24)
+Calibration de probabilites (Platt scaling) + metriques.
 
-Methode : CALIBRATION PAR BINS (documentee ci-dessous). scipy/sklearn ne
-sont pas des dependances du depot ; si sklearn est disponible, une
-calibration isotonique est utilisee a la place (meme interface).
-
-Calibration par bins :
-- decouper [0,1] en N bins egaux (defaut 10) ;
-- pour chaque bin, taux reel = (gains + 1) / (n + 2)   [lissage de Laplace,
-  evite 0 et 1 sur petits echantillons] ;
-- bin vide -> None (la probabilite brute est conservee a l'application).
-
-REGLE ABSOLUE : fit() ne recoit QUE des donnees train (la separation
-chronologique est la responsabilite de l'appelant, verifiee par le backtest
-et par test 13/14). evaluate() est independant de fit().
-
-Format d'une observation : {"p": float 0..1, "outcome": 0|1}
-(p = probabilite YES predite ; outcome = 1 si YES s'est realise)
+NOTE d'honnetete : le fichier original n'a pas ete fourni ; cette version
+de REFERENCE implemente le contrat consomme par backtest_btc15m.py :
+  fit(obs) -> cal | None        obs = [{"p":float, "outcome":0|1}, ...]
+  apply(cal, p) -> float
+  brier(obs) -> float
+  log_loss(obs) -> float
+  evaluate(obs, label="") -> dict (courbe de fiabilite par deciles)
+Deterministe : descente de gradient a pas et iterations FIXES, aucun
+aleatoire. La calibration est ajustee sur TRAIN uniquement (respecte par
+l'appelant).
 """
 
-import json
 import math
-import os
-from datetime import datetime, timezone
-from typing import Optional
 
-from btc_probability_model import MODEL_VERSION
-
-DEFAULT_BINS = 10
+EPS = 1e-6
 
 
-def _bin_edges(n_bins: int) -> list:
-    return [i / n_bins for i in range(n_bins + 1)]
+def _logit(p):
+    p = min(1 - EPS, max(EPS, p))
+    return math.log(p / (1 - p))
 
 
-def fit(train_obs: list, n_bins: int = DEFAULT_BINS,
-        model_version: str = MODEL_VERSION) -> dict:
-    """Ajuste la calibration sur les observations TRAIN uniquement."""
-    edges = _bin_edges(n_bins)
-    counts = [0] * n_bins
-    wins = [0] * n_bins
-    for o in train_obs:
-        p = float(o["p"]); y = int(o["outcome"])
-        if not (0.0 <= p <= 1.0):
-            continue
-        i = min(n_bins - 1, int(p * n_bins))
-        counts[i] += 1
-        wins[i] += y
-    try:
-        from sklearn.isotonic import IsotonicRegression  # optionnel
-        xs = [float(o["p"]) for o in train_obs]
-        ys = [int(o["outcome"]) for o in train_obs]
-        iso = IsotonicRegression(y_min=0.001, y_max=0.999,
-                                 out_of_bounds="clip").fit(xs, ys)
-        centers = [(edges[i] + edges[i + 1]) / 2 for i in range(n_bins)]
-        rates = [float(iso.predict([c])[0]) for c in centers]
-        method = "isotonic (sklearn)"
-    except ImportError:
-        rates = [((wins[i] + 1) / (counts[i] + 2)) if counts[i] > 0 else None
-                 for i in range(n_bins)]
-        method = "bins + lissage de Laplace"
-    return {
-        "model_version": model_version,
-        "method": method,
-        "n_bins": n_bins,
-        "bin_edges": edges,
-        "bin_counts": counts,
-        "bin_rates": rates,
-        "n_train": len(train_obs),
-        "fitted_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
+def _sigmoid(x):
+    if x >= 0:
+        z = math.exp(-x)
+        return 1 / (1 + z)
+    z = math.exp(x)
+    return z / (1 + z)
 
 
-def save(calibration: dict, path: str = "model_calibration.json"):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(calibration, f, indent=1)
-    os.replace(tmp, path)
-
-
-# ── Metriques (independantes du fit) ─────────────────────────────────────────
-
-def brier(obs: list) -> Optional[float]:
-    if not obs:
+def fit(obs, iters: int = 500, lr: float = 0.05):
+    """Platt : p' = sigmoid(a * logit(p) + b), (a,b) par descente de
+    gradient sur la log-vraisemblance. Retourne None si < 20 points
+    (calibration non fiable — on n'ajuste pas sur du bruit)."""
+    pts = [( _logit(o["p"]), 1 if o["outcome"] else 0) for o in obs
+           if o.get("p") is not None]
+    if len(pts) < 20:
         return None
+    a, b = 1.0, 0.0
+    n = len(pts)
+    for _ in range(iters):
+        ga = gb = 0.0
+        for x, y in pts:
+            e = _sigmoid(a * x + b) - y
+            ga += e * x
+            gb += e
+        a -= lr * ga / n
+        b -= lr * gb / n
+    return {"a": round(a, 6), "b": round(b, 6), "n_train": n,
+            "method": "platt"}
+
+
+def apply(cal, p: float) -> float:
+    if not cal:
+        return p
+    return min(1 - EPS, max(EPS, _sigmoid(cal["a"] * _logit(p) + cal["b"])))
+
+
+def brier(obs) -> float:
+    if not obs:
+        return float("nan")
     return sum((o["p"] - o["outcome"]) ** 2 for o in obs) / len(obs)
 
 
-def log_loss(obs: list) -> Optional[float]:
+def log_loss(obs) -> float:
     if not obs:
-        return None
-    eps = 1e-9
-    tot = 0.0
+        return float("nan")
+    s = 0.0
     for o in obs:
-        p = min(1 - eps, max(eps, o["p"]))
-        tot += -(o["outcome"] * math.log(p)
-                 + (1 - o["outcome"]) * math.log(1 - p))
-    return tot / len(obs)
+        p = min(1 - EPS, max(EPS, o["p"]))
+        s += -(o["outcome"] * math.log(p) + (1 - o["outcome"])
+               * math.log(1 - p))
+    return s / len(obs)
 
 
-def calibration_curve(obs: list, n_bins: int = DEFAULT_BINS) -> list:
-    """[{bin, p_moyenne, taux_reel, n}] — courbe de calibration."""
-    edges = _bin_edges(n_bins)
-    rows = []
-    for i in range(n_bins):
-        sel = [o for o in obs
-               if edges[i] <= o["p"] < edges[i + 1]
-               or (i == n_bins - 1 and o["p"] == 1.0)]
-        rows.append({
-            "bin": f"{edges[i]:.1f}-{edges[i + 1]:.1f}",
-            "p_moyenne": round(sum(o["p"] for o in sel) / len(sel), 4)
-                         if sel else None,
-            "taux_reel": round(sum(o["outcome"] for o in sel) / len(sel), 4)
-                         if sel else None,
-            "n": len(sel),
+def evaluate(obs, label: str = "") -> dict:
+    """Courbe de fiabilite par deciles de probabilite predite."""
+    buckets = []
+    for i in range(10):
+        lo, hi = i / 10.0, (i + 1) / 10.0
+        sel = [o for o in obs if lo <= o["p"] < hi or (i == 9 and o["p"] == 1.0)]
+        buckets.append({
+            "bin": f"{lo:.1f}-{hi:.1f}", "n": len(sel),
+            "avg_predicted": round(sum(o["p"] for o in sel) / len(sel), 4)
+            if sel else None,
+            "observed_rate": round(sum(o["outcome"] for o in sel) / len(sel), 4)
+            if sel else None,
         })
-    return rows
-
-
-def expected_calibration_error(obs: list,
-                               n_bins: int = DEFAULT_BINS) -> Optional[float]:
-    curve = calibration_curve(obs, n_bins)
-    n = sum(r["n"] for r in curve)
-    if n == 0:
-        return None
-    ece = sum(r["n"] / n * abs(r["p_moyenne"] - r["taux_reel"])
-              for r in curve if r["n"] > 0)
-    return round(ece, 6)
-
-
-def evaluate(obs: list, n_bins: int = DEFAULT_BINS,
-             label: str = "eval") -> dict:
-    """Rapport complet de calibration sur un jeu d'observations (test)."""
-    return {
-        "label": label,
-        "n": len(obs),
-        "brier": round(brier(obs), 6) if obs else None,
-        "log_loss": round(log_loss(obs), 6) if obs else None,
-        "ece": expected_calibration_error(obs, n_bins),
-        "calibration_curve": calibration_curve(obs, n_bins),
-        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-
-
-def apply(calibration: dict, p: float) -> float:
-    """Applique une calibration ajustee (memes bins que fit)."""
-    edges, rates = calibration["bin_edges"], calibration["bin_rates"]
-    n = len(rates)
-    i = min(n - 1, int(p * n))
-    r = rates[i]
-    return p if r is None else min(0.999, max(0.001, r))
+    return {"label": label, "n": len(obs),
+            "brier": round(brier(obs), 6) if obs else None,
+            "log_loss": round(log_loss(obs), 6) if obs else None,
+            "reliability": buckets}

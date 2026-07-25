@@ -75,13 +75,25 @@ class Config:
     ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", True)
     MIN_MINUTES       = _env_f("BTC_MIN_MINUTES", 5.0)
     MAX_SPREAD_PAY    = _env_i("MAX_SPREAD_PAY", 5)
-    # Risque
-    MAX_DAILY_LOSS    = _env_f("MAX_DAILY_LOSS", 50.0)      # $ PnL REALISE
+    # Risque — TOUTES les limites sont recalculees sur le CAPITAL EFFECTIF
+    # (= min(solde broker, plafond configure)) a chaque cycle. Une valeur $
+    # fixe fondee sur un capital de reference superieur au solde est
+    # INTERDITE (bug corrige : stop -50$ sur un compte de 93,26$ = 54 %).
+    MAX_DAILY_LOSS    = _env_f("MAX_DAILY_LOSS", 50.0)      # $ plafond ABSOLU
+    MAX_DAILY_LOSS_PCT = _env_f("MAX_DAILY_LOSS_PCT", 5.0)  # % du capital effectif
+    MAX_CONSECUTIVE_LOSSES = _env_i("MAX_CONSECUTIVE_LOSSES", 3)
     MAX_TRADES_CYCLE  = _env_i("MAX_TRADES_CYCLE", 3)
     MAX_POS_PCT       = _env_f("MAX_POSITION_PCT", 1.0)     # % capital / position (plafond dur)
     RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 5.0)      # % capital en risque ouvert total
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
-    MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 5)
+    MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
+    # Mode d'execution explicite (exigence 2). "real_demo" active le
+    # garde anti-mock : tout client non authentique => arret FATAL.
+    EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "standard").lower()
+    DRY_RUN           = _env_b("DRY_RUN", False)
+    ALLOW_ORDER_SUBMISSION = _env_b("ALLOW_ORDER_SUBMISSION", True)
+    ORDER_VERIFY_INTERVAL_S = _env_f("ORDER_VERIFY_INTERVAL_SECONDS", 3.0)
+    CANCEL_UNFILLED_ORDERS  = _env_b("CANCEL_UNFILLED_ORDERS", True)
     MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
     MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
     MAX_EQUITY_DRAWDOWN_PCT = _env_f("MAX_EQUITY_DRAWDOWN_PCT", 20.0)
@@ -99,7 +111,8 @@ class Config:
     SHADOW_MODE            = _env_b("SHADOW_MODE", False)   # decide, n'envoie pas
     KILL_SWITCH            = _env_b("KILL_SWITCH", False)   # coupe tout ordre
     # Ordres
-    ORDER_TTL_SECONDS = _env_i("ORDER_TTL_SECONDS", 45)
+    ORDER_TTL_SECONDS = _env_i("ORDER_FILL_TIMEOUT_SECONDS",
+                               _env_i("ORDER_TTL_SECONDS", 45))
     ORDER_POLL_START  = 1.0
     ORDER_POLL_MAX    = 5.0
     # Frais (A VERIFIER contre le bareme officiel Kalshi)
@@ -300,6 +313,7 @@ class KalshiClient:
                                 f"retry {attempt}/{retries} dans {wait:.0f}s")
                 time.sleep(wait); delay = min(delay * 2, 8); continue
 
+            self.last_http_status = r.status_code
             if r.status_code >= 400:
                 raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
 
@@ -344,10 +358,11 @@ class KalshiClient:
             log_api.warning(f"get_balance: {e}")
             return None
 
-    def create_order(self, ticker: str, side: str, count: int, price_cents: int) -> dict:
+    def create_order(self, ticker: str, side: str, count: int,
+                     price_cents: int, client_order_id: str = None) -> dict:
         payload = {
             "ticker":          ticker,
-            "client_order_id": f"alpha_{uuid.uuid4().hex}",
+            "client_order_id": client_order_id or f"alpha_{uuid.uuid4().hex}",
             "action":          "buy",
             "side":            side,                    # "yes" | "no"
             "type":            "limit",
@@ -356,7 +371,9 @@ class KalshiClient:
         payload["yes_price" if side == "yes" else "no_price"] = int(price_cents)
         r = self._req("POST", "/portfolio/orders", json=payload)
         self._log_raw_once("create_order", r)
-        return r.get("order", r) or {}
+        out = r.get("order", r) or {}
+        out.setdefault("client_order_id", payload["client_order_id"])
+        return out
 
     def get_order(self, order_id: str) -> dict:
         r = self._req("GET", f"/portfolio/orders/{order_id}")
@@ -575,6 +592,7 @@ class PositionManager:
             "fill_ids": (extra or {}).get("fill_ids", []),
             "state": "open",
             "strategy": (extra or {}).get("strategy"),
+            "category": (extra or {}).get("category", "Other"),
             "market_score": (extra or {}).get("market_score"),
             "entry_edge": (extra or {}).get("entry_edge"),
             "entry_ev": (extra or {}).get("entry_ev"),
@@ -707,6 +725,54 @@ class ExecutionResult:
         self.avg_price, self.status, self.state = avg_price, status, state
         # state: "filled" | "partial" | "cancelled" | "rejected" | "unknown"
 
+def _client_is_genuine(client) -> bool:
+    """Un client authentique est une instance de KalshiClient de CE module,
+    avec une base_url Kalshi reelle. Tout double de test (Fake/Mock/patch)
+    echoue ce test."""
+    return (type(client) is KalshiClient
+            and str(getattr(client, "base_url", ""))
+            .startswith("https://") and "kalshi.co" in
+            str(getattr(client, "base_url", "")))
+
+
+def assert_real_demo_integrity(client, shadow_mode: bool):
+    """Exigence 1 : en EXECUTION_MODE=real_demo, aucun mock, aucun dry-run,
+    aucune simulation ne peut remplacer l'appel API reel. Arret FATAL."""
+    if CFG.EXECUTION_MODE != "real_demo":
+        return
+    problems = []
+    if not _client_is_genuine(client):
+        problems.append(f"client non authentique: {type(client).__name__} "
+                        f"({type(client).__module__})")
+    if CFG.DRY_RUN:
+        problems.append("DRY_RUN=true")
+    if shadow_mode:
+        problems.append("SHADOW_MODE actif (= simulation)")
+    if not CFG.ALLOW_ORDER_SUBMISSION:
+        problems.append("ALLOW_ORDER_SUBMISSION=false")
+    if problems:
+        log.critical("[FATAL] Mock or simulation detected in REAL_DEMO mode: "
+                     + "; ".join(problems))
+        raise SystemExit(3)
+
+
+def log_execution_banner(client):
+    """Exigence 2 : etat d'execution explicite au demarrage. Les fonds sont
+    des fonds DEMO — jamais annonce comme argent reel."""
+    genuine = _client_is_genuine(client)
+    log.info("[EXECUTION]")
+    log.info(f"environment={'DEMO' if client.env == 'demo' else 'PROD'}")
+    log.info(f"api_base_url={getattr(client, 'base_url', '?')}")
+    log.info(f"execution_mode={CFG.EXECUTION_MODE.upper()}")
+    log.info(f"dry_run={str(CFG.DRY_RUN or CFG.SHADOW_MODE).lower()}")
+    log.info(f"mock_enabled={str(not genuine).lower()}")
+    log.info(f"order_submission_enabled="
+             f"{str(CFG.ALLOW_ORDER_SUBMISSION and not CFG.SHADOW_MODE).lower()}")
+    if client.env == "demo":
+        log.info("NOTE: ordres reels sur l'API DEMO — fonds DEMO uniquement, "
+                 "aucun argent reel.")
+
+
 class OrderManager:
     TERMINAL = {"executed", "canceled", "cancelled", "expired", "filled"}
 
@@ -772,14 +838,64 @@ class OrderManager:
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:no_executable_ask", "rejected")
         limit_cents = int(limit_cents)
+        assert_real_demo_integrity(self.client, CFG.SHADOW_MODE)
+        if not CFG.ALLOW_ORDER_SUBMISSION:
+            log_api.error("[ORDER_SUBMIT_ATTEMPT] bloque: "
+                          "ALLOW_ORDER_SUBMISSION=false")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:submission_disabled", "rejected")
+        client_order_id = f"alpha_{uuid.uuid4().hex}"
+        env_name = "DEMO" if getattr(self.client, "env", "demo") == "demo" \
+            else "PROD"
+        # Exigence 4 : preuve d'envoi AVANT l'appel. Jamais de cle, secret,
+        # signature ni token dans les logs (seuls les champs metier).
+        log_api.info("[ORDER_SUBMIT_ATTEMPT] "
+                     f"ticker={ticker} side={side} action=buy count={count} "
+                     f"price_cents={limit_cents} "
+                     f"client_order_id={client_order_id} "
+                     f"environment={env_name} endpoint=/portfolio/orders")
         try:
-            order = self.client.create_order(ticker, side, count, limit_cents)
+            order = self.client.create_order(ticker, side, count, limit_cents,
+                                             client_order_id=client_order_id)
         except KalshiAPIError as e:
-            log_api.error(f"ORDRE REFUSE {ticker} {side} x{count} @ {limit_cents}c "
-                          f"-> {e} | corps: {e.body}")
+            log_api.error("[ORDER_SUBMIT_FAILED] "
+                          f"http_status={e.status} error_code={e.status} "
+                          f"error_message={e} "
+                          f"response_body_sanitized={str(e.body)[:300]}")
             return ExecutionResult(None, count, 0, limit_cents, f"rejected:{e.status}",
                                    "rejected")
+        http_status = getattr(self.client, "last_http_status", None)
         order_id = str(pick(order, "order_id", "id", default="") or "")
+        log_api.info("[ORDER_SUBMIT_RESPONSE] "
+                     f"http_status={http_status} "
+                     f"request_id={order.get('request_id', '-')} "
+                     f"kalshi_order_id={order_id or '-'} "
+                     f"client_order_id={client_order_id} "
+                     f"status={pick(order, 'status', 'order_status', default='-')} "
+                     f"raw_response_sanitized="
+                     f"{json.dumps(order, default=str)[:400]}")
+        # Exigence 5 : relecture IMMEDIATE depuis l'API. Tant qu'elle n'a
+        # pas reussi, l'ordre n'est PAS considere comme confirme.
+        if order_id:
+            try:
+                verified = self.client.get_order(order_id)
+            except KalshiAPIError as e:
+                verified = {}
+                log_api.warning(f"[ORDER_VERIFY] relecture en erreur: {e}")
+            if verified:
+                v_status, v_filled = self._extract(verified, count)
+                log_api.info("[ORDER_VERIFY] "
+                             f"kalshi_order_id={order_id} status={v_status} "
+                             f"remaining_count={pick_int(verified, 'remaining_count', default=-1)} "
+                             f"filled_count={v_filled} "
+                             f"yes_price={verified.get('yes_price', '-')} "
+                             f"no_price={verified.get('no_price', '-')}")
+                order = verified
+            else:
+                log_api.error("[ORDER_VERIFY_FAILED] "
+                              "reason=order_not_found_after_submission")
+                return ExecutionResult(order_id, count, 0, limit_cents,
+                                       "unverified", "rejected")
         if not order_id:
             log_api.error(f"Reponse d'ordre sans identifiant -- trade NON enregistre. "
                           f"Reponse: {json.dumps(order)[:300]}")
@@ -790,10 +906,16 @@ class OrderManager:
                                       "placed_at": now_iso()}
         self.flush()
 
-        deadline, delay = time.time() + CFG.ORDER_TTL_SECONDS, CFG.ORDER_POLL_START
+        start = time.time()
+        deadline = start + CFG.ORDER_TTL_SECONDS
+        delay = max(2.0, min(5.0, CFG.ORDER_VERIFY_INTERVAL_S))
         status, filled = self._extract(order, count)
         while time.time() < deadline and status not in self.TERMINAL and filled < count:
-            time.sleep(delay); delay = min(delay + 1, CFG.ORDER_POLL_MAX)
+            log_api.info("[ORDER_WAITING_FOR_FILL] "
+                         f"elapsed_seconds={time.time() - start:.0f} "
+                         f"status={status or 'resting'} "
+                         f"remaining_count={count - filled}")
+            time.sleep(delay)
             try:
                 order = self.client.get_order(order_id)
                 status, filled = self._extract(order, count)
@@ -801,8 +923,15 @@ class OrderManager:
                 log_api.warning(f"Suivi ordre {order_id}: {e}")
 
         if status not in self.TERMINAL and filled < count:
-            log_api.info(f"TTL {CFG.ORDER_TTL_SECONDS}s atteint -- annulation "
-                         f"de l'ordre {order_id} (rempli {filled}/{count}).")
+            if not CFG.CANCEL_UNFILLED_ORDERS:
+                log_api.info(f"[ORDER_STILL_RESTING] {order_id} "
+                             f"(CANCEL_UNFILLED_ORDERS=false)")
+                return ExecutionResult(order_id, count, filled, limit_cents,
+                                       status or "resting", "resting")
+            log_api.info("[ORDER_CANCELED_UNFILLED] "
+                         f"kalshi_order_id={order_id} "
+                         f"timeout_seconds={CFG.ORDER_TTL_SECONDS} "
+                         f"filled={filled}/{count}")
             self.client.cancel_order(order_id)
             try:
                 order = self.client.get_order(order_id)
@@ -824,10 +953,24 @@ class OrderManager:
                              f"-- {filled} contrat(s) confirme(s) via /fills.")
 
         if filled <= 0:
+            log_api.info("[FILL_VERIFY] "
+                         f"kalshi_order_id={order_id} fills_count=0 "
+                         f"filled_contracts=0 average_fill_price=- fees=- "
+                         f"(ordre accepte par l'API mais AUCUN fill — "
+                         f"accepted != filled)")
             return ExecutionResult(order_id, count, 0, limit_cents,
                                    status or "unfilled", "cancelled")
+        fills = self.client.get_fills(order_id)
+        fees = sum(float(f.get("fees") or 0) for f in fills
+                   if str(f.get("fees", "")).replace(".", "", 1).isdigit())
         avg = self._avg_fill_price(order_id, side, limit_cents)
+        log_api.info("[FILL_VERIFY] "
+                     f"kalshi_order_id={order_id} fills_count={len(fills)} "
+                     f"filled_contracts={filled} average_fill_price={avg} "
+                     f"fees={fees}")
         state = "filled" if filled >= count else "partial"
+        log_api.info(f"[ORDER_FILLED] kalshi_order_id={order_id} "
+                     f"state={state} {filled}/{count} @ {avg}c")
         return ExecutionResult(order_id, count, filled, avg, status or "executed", state)
 
     def reconcile_startup(self, tlog: TradeLogger, posmgr: PositionManager):
@@ -906,12 +1049,35 @@ class RiskManager:
         cur_dd = peak - curve
         return cur_dd
 
+    def effective_daily_stop(self) -> float:
+        """Stop journalier en $ : min(plafond absolu, MAX_DAILY_LOSS_PCT du
+        CAPITAL EFFECTIF). Pour 93,26$ : min(50, 4.66) = 4,66$. Le capital
+        de reference (500$) ne peut plus influencer un solde inferieur."""
+        pct_stop = max(0.0, self.capital) * CFG.MAX_DAILY_LOSS_PCT / 100.0
+        return round(min(CFG.MAX_DAILY_LOSS, pct_stop), 2)
+
+    def consecutive_losses(self) -> int:
+        """Pertes consecutives en fin de sequence des trades regles."""
+        n = 0
+        for t in reversed(self.tlog.settled_trades()):
+            if t.get("net_pnl") is not None and t["net_pnl"] < 0:
+                n += 1
+            else:
+                break
+        return n
+
     # -- portes de risque ------------------------------------------------------
     def can_trade(self, cycle_trades: int) -> (bool, str):
         pnl = self.daily_realized_pnl()
-        if pnl <= -CFG.MAX_DAILY_LOSS:
+        stop = self.effective_daily_stop()
+        if pnl <= -stop:
             return False, (f"STOP JOURNALIER: PnL realise {pnl:+.2f}$ <= "
-                           f"-{CFG.MAX_DAILY_LOSS:.2f}$")
+                           f"-{stop:.2f}$ (={CFG.MAX_DAILY_LOSS_PCT:g}% du "
+                           f"capital effectif {self.capital:.2f}$)")
+        losses = self.consecutive_losses()
+        if losses >= CFG.MAX_CONSECUTIVE_LOSSES:
+            return False, (f"ARRET: {losses} pertes consecutives >= "
+                           f"{CFG.MAX_CONSECUTIVE_LOSSES}")
         if cycle_trades >= CFG.MAX_TRADES_CYCLE:
             return False, f"max {CFG.MAX_TRADES_CYCLE} trades/cycle atteint"
         open_risk = self.posmgr.open_risk()
@@ -1286,9 +1452,10 @@ class ExecutionEngine:
     a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
 
     def __init__(self, client: KalshiClient, capital: float):
-        from strategy_router import (StrategyRouter, GateConfig,
-                                     BtcModelStrategy)
+        from strategy_router import (GateConfig, build_default_registry,
+                                     RegistryValidationError)
         from opportunity_pipeline import MarketOpportunityPipeline
+        from market_scanner import MarketScanner
         from shadow_prediction_store import ShadowPredictionStore
         self.client   = client
         self.configured_capital = capital           # PLAFOND, pas la verite
@@ -1299,12 +1466,21 @@ class ExecutionEngine:
         self.risk     = RiskManager(self.tlog, self.posmgr, capital)
         self.stats    = StatsEngine(self.tlog)
         self.strategy = BtcStrategy(client)          # analyse crypto existante
-        self.router   = StrategyRouter()
-        # Strategie modele BTC 15 minutes : UNIQUEMENT la serie KXBTC15M
-        # (supports()). Tout autre marche -> no_compatible_strategy.
-        # Contexte invalide -> no_model_probability ; qualite de donnees
-        # insuffisante -> insufficient_data_quality. Rien n'est invente.
-        self.router.register(BtcModelStrategy())
+        # REGISTRE CANONIQUE indexe par market_type (correctif cause racine :
+        # la v1 n'enregistrait que la serie KXBTC15M, absente de l'univers,
+        # d'ou strategy_supported=0 et no_compatible_strategy partout).
+        # ECHEC DE DEMARRAGE si le registre est vide ou incomplet.
+        btc_enabled = _env_b("BTC_STRATEGY_ENABLED", True)
+        try:
+            self.router = build_default_registry(
+                btc_context_provider=(get_btc_context if BTC_AVAILABLE
+                                      else None),
+                btc_enabled=btc_enabled)
+        except RegistryValidationError as e:
+            log.error(f"REGISTRE DE STRATEGIES INVALIDE: {e} -- ARRET.")
+            raise SystemExit(2)
+        self.scanner = MarketScanner(client, router=self.router,
+                                     data_dir=CFG.DATA_DIR)
         self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
         self.gates = GateConfig(
             MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
@@ -1318,7 +1494,10 @@ class ExecutionEngine:
         self.pipeline = MarketOpportunityPipeline(
             client, self.router, gates=self.gates,
             fresh_book_fn=self.fresh_book,
-            observer=self._shadow_observer)
+            observer=self._shadow_observer,
+            scanner=self.scanner, data_dir=CFG.DATA_DIR)
+        assert_real_demo_integrity(client, CFG.SHADOW_MODE)
+        log_execution_banner(client)
         # Recovery apres crash + broker source de verite
         self.orders.reconcile_startup(self.tlog, self.posmgr)
         self.posmgr.reconcile_startup()
@@ -1435,15 +1614,32 @@ class ExecutionEngine:
             if placed >= CFG.MAX_TRADES_CYCLE:
                 break
             placed += self._execute_decision(dec, report)
+        report["fills"] = placed
+        # Tache 8 : pourcentages de conversion recalcules sur les compteurs
+        # FINAUX (risk/ordres/fills sont incrementes pendant l'execution).
+        conv = report.get("funnel_conversion") or {}
+        prev = None
+        for name in ("scanned_raw", "open_cached", "liquid", "supported",
+                     "model_evaluated", "positive_edge", "positive_net_ev",
+                     "risk_passed", "orders_submitted", "fills"):
+            n = int(report.get(name) or 0)
+            conv[name] = {"n": n,
+                          "pct_of_prev": round(100.0 * n / prev, 2)
+                          if prev else (100.0 if n else 0.0)}
+            prev = n if n else prev
+        report["funnel_conversion"] = conv
         report["fills_confirmed"] = placed
         report["orders"] = report.get("orders_submitted", 0)
-        funnel = {k: report.get(k, 0) for k in
-                  ("scanned", "valid", "eligible", "strategy_supported",
-                   "model_probability", "positive_edge", "positive_net_ev",
-                   "risk_passed", "accepted", "orders")}
+        # UN SEUL resume structure par cycle (exigence G). Les details par
+        # decision sont dans decisions.jsonl (rotatif), pas ici.
+        summary = {k: report.get(k) for k in
+                   ("cycle_id", "scanned_raw", "open_cached", "liquid",
+                    "supported", "model_evaluated", "positive_edge",
+                    "positive_net_ev", "risk_passed", "orders_submitted",
+                    "fills", "rejections_by_reason", "cycle_duration_ms")}
+        summary["cycle"] = n
         import json as _json
-        log.info(f"[STATS] {_json.dumps(funnel, ensure_ascii=False)}")
-        log.info(f"[STATS] {_json.dumps({'reject_reasons': report['rejections']}, ensure_ascii=False)}")
+        log.info(f"[CYCLE-SUMMARY] {_json.dumps(summary, ensure_ascii=False)}")
         JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
         JsonStore.save(_p("pipeline_stats.json"), {
             "cycle": n,
@@ -1460,10 +1656,6 @@ class ExecutionEngine:
         })
         JsonStore.save(_p("reject_reasons.json"),
                        {"cycle": n, "reject_reasons": report["rejections"]})
-        log.info(f"[CYCLE-REPORT] scanned={report['scanned']} "
-                 f"eligibles={report['ranker_eligible']} acceptes={report['accepted']} "
-                 f"ordres={report['orders_submitted']} fills={placed} "
-                 f"rejets={report['rejections']}")
         if placed == 0:
             self.stats.log_summary()
         return placed
@@ -1485,7 +1677,12 @@ class ExecutionEngine:
         entry = int(ask)
 
         # 5b) budgets risque categorie / marche (sur capital effectif)
-        cat = dec.strategy or "Other"
+        cat = getattr(dec, "category", None) or "Other"
+        cat_risk = self.posmgr.open_risk_by_category().get(cat, 0.0)
+        if cat_risk >= self.capital * CFG.MAX_CATEGORY_RISK_PCT / 100.0:
+            report["rejections"]["category_budget"] = \
+                report["rejections"].get("category_budget", 0) + 1
+            return 0
         if self.posmgr.open_risk_on(ticker) >= \
                 self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
             report["rejections"]["risk_blocked"] = \
@@ -1548,10 +1745,37 @@ class ExecutionEngine:
                       "strategy": dec.strategy},
             order_id=exec_res.order_id, order_status=exec_res.status)
         self.posmgr.open_position(trade, extra={
-            "strategy": dec.strategy, "market_score": None,
+            "strategy": dec.strategy, "category": cat, "market_score": None,
             "entry_edge": dec.net_edge, "entry_ev": dec.net_ev,
             "fill_ids": [f.get("fill_id") or f.get("id")
                          for f in fills if f.get("fill_id") or f.get("id")]})
+        # Exigence 7 : la position n'est declaree OUVERTE qu'apres avoir ete
+        # RETROUVEE dans /portfolio/positions. Sinon on le dit honnetement.
+        try:
+            brk = self.client.get_positions()
+        except KalshiAPIError as e:
+            brk = None
+            log_pos.warning(f"[POSITION_VERIFY] lecture impossible: {e}")
+        found = None
+        for p in (brk or []):
+            if str(pick(p, "ticker", "market_ticker", default="")) == dec.ticker:
+                found = p
+                break
+        if found is not None:
+            log_pos.info("[POSITION_VERIFY] "
+                         f"ticker={dec.ticker} position_found=true "
+                         f"net_position={pick_int(found, 'position', 'total_traded', default=exec_res.filled)} "
+                         f"market_exposure={found.get('market_exposure', '-')} "
+                         f"realized_pnl={found.get('realized_pnl', '-')} "
+                         f"fees_paid={found.get('fees_paid', '-')}")
+            log_pos.info(f"[POSITION_OPENED] {dec.ticker} confirme par l'API")
+        elif brk is not None:
+            log_pos.warning("[POSITION_VERIFY] "
+                            f"ticker={dec.ticker} position_found=false — "
+                            "fill confirme par /fills mais position pas "
+                            "encore visible dans /positions (position "
+                            "enregistree localement, statut POSITION_OPENED "
+                            "NON emis)")
         snap = self.risk.snapshot()
         log_rsk.info(f"risque_ouvert={snap['open_risk']}$ "
                      f"pnl_jour={snap['daily_realized_pnl']}$ "
@@ -1573,8 +1797,15 @@ def banner(client: KalshiClient, capital: float):
     log.info(f"Identifiants  : {client.cred_src}")
     log.info(f"Solde compte  : {f'{bal:,.2f}$' if bal is not None else 'indisponible (verifier cles/env)'}")
     log.info(f"Capital ref.  : {capital:,.2f}$ (sizing)")
-    log.info(f"Risque        : stop jour -{CFG.MAX_DAILY_LOSS:.2f}$ (PnL REALISE) | "
-             f"max {CFG.MAX_POS_PCT:g}%/position | budget ouvert {CFG.RISK_BUDGET_PCT:g}%")
+    eff = min(capital, bal) if bal is not None else capital
+    stop = min(CFG.MAX_DAILY_LOSS, eff * CFG.MAX_DAILY_LOSS_PCT / 100.0)
+    log.info(f"Risque        : stop jour -{stop:.2f}$ "
+             f"({CFG.MAX_DAILY_LOSS_PCT:g}% du capital effectif "
+             f"{eff:.2f}$, plafond {CFG.MAX_DAILY_LOSS:.2f}$) | "
+             f"max {CFG.MAX_POS_PCT:g}%/position | budget ouvert "
+             f"{CFG.RISK_BUDGET_PCT:g}% | arret apres "
+             f"{CFG.MAX_CONSECUTIVE_LOSSES} pertes consecutives | "
+             f"{CFG.MAX_OPEN_POSITIONS} positions max")
     log.info(f"Protections   : entree<={CFG.MAX_ENTRY_CENTS}c | "
              f"1 trade/marche={'OUI' if CFG.ONE_TRADE_PER_MKT else 'NON'} | "
              f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
@@ -1602,7 +1833,13 @@ def main():
     ap.add_argument("--shadow", action="store_true",
                     help="mode shadow: pipeline et decisions complets, "
                          "AUCUN ordre envoye")
+    ap.add_argument("--stats", action="store_true",
+                    help="affiche les statistiques de performance et sort")
     args = ap.parse_args()
+    if args.stats:
+        from performance import load_report, format_report
+        print(format_report(load_report(CFG.DATA_DIR, capital=args.capital)))
+        return
     if args.shadow:
         CFG.SHADOW_MODE = True
 

@@ -1,41 +1,55 @@
 """
-strategy_router.py — v1 (2026-07-11)
-Routeur de strategies + evaluateur de signal avec portes edge/EV STRICTES.
+strategy_router.py — v2 (2026-07-24)
+Registre canonique de strategies INDEXE PAR market_type + portes edge/EV.
 
-PRINCIPES NON NEGOCIABLES :
-- Un marche sans strategie compatible est rejete: no_compatible_strategy.
-- Une strategie ne peut etre routee QUE vers ses categories declarees
-  (jamais la strategie BTC vers un autre type de marche).
-- Aucune probabilite n'est inventee : si la strategie ne fournit pas
-  model_probability, rejet no_model_probability.
-- edge <= 0 ou EV net < seuil => AUCUN trade. Le score de tradabilite du
-  ranker n'est JAMAIS une preuve de rentabilite.
+CAUSE RACINE CORRIGEE : la v1 n'enregistrait qu'une seule strategie
+(BtcModelStrategy) dont supports() n'acceptait QUE la serie KXBTC15M —
+serie ABSENTE de l'univers scanne (0 occurrence dans les logs). Resultat :
+strategy_supported=0 et no_compatible_strategy pour 100 % des candidats,
+y compris KXBTCD (btc_above_strike_daily) pourtant compatible.
 
-Interface strategie (duck typing) :
-    strategy.categories : list[str]           categories servies
-    strategy.name       : str
-    strategy.evaluate(snapshot, fresh_market, book) -> dict | None
-        dict = {"side": "yes"|"no", "model_prob": float 0..1 (prob que le
-                cote choisi gagne), "confidence": int 0..10,
-                "reason": str, "taille": "0.5%"|"1%"|"2%" (indicatif)}
-        None = pas d'avis => rejet no_model_probability.
+v2 :
+  - registre indexe par market_type (jamais par serie ni par categorie
+    generale) ;
+  - validate_strategy_registry() : ECHEC DE DEMARRAGE si le registre est
+    vide ou si un market_type requis/active n'est pas servi ;
+  - strategies sports (moneyline/spread/total) et election_winner
+    ENREGISTREES pour le routage. HONNETETE : sans fournisseur de
+    probabilite calibre injecte, elles repondent no_model_probability —
+    aucune probabilite n'est inventee, aucun seuil n'est assoupli ;
+  - strategies BTC (15m et daily) branchees sur btc_probability_model +
+    btc_context : probabilite reelle, refusee si donnees insuffisantes ;
+  - le nom exact de la strategie choisie est journalise dans chaque
+    decision (champ strategy).
 """
 
 import math
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from typing import Optional, Callable
+
+from market_classifier import classify, SPORTS_TYPES  # noqa: F401
 
 log = logging.getLogger("ROUTER")
 
-REJECTION_REASONS = (
-    "no_model_probability", "no_compatible_strategy", "insufficient_confidence",
-    "no_positive_edge", "insufficient_net_edge", "negative_net_ev",
-    "spread_too_wide", "no_executable_ask", "market_quality_too_low",
-    "stale_book", "already_open", "risk_blocked",
-    "insufficient_data_quality", "model_not_calibrated",
-    "ambiguous_strategy_match",
-)
+ROUTER_VERSION = "router-v2-2026-07-24"
+
+# market_type qui DOIVENT etre servis par le registre par defaut.
+REQUIRED_MARKET_TYPES = ("sports_moneyline", "sports_spread", "sports_total",
+                         "btc_above_strike_daily", "election_winner")
+
+
+# ── Frais (partage avec le backtest : MEME formule) ─────────────────────────
+
+def estimated_fee_per_contract(price_cents: int, fee_rate: float = 0.07) -> float:
+    """Frais estime en $ par contrat : ceil(rate*P*(1-P)*100)/100.
+    A recaler sur fee_source=api apres les premiers fills reels."""
+    p = max(1, min(99, int(price_cents))) / 100.0
+    return math.ceil(fee_rate * p * (1 - p) * 100) / 100.0
+
+
+# ── Configuration des portes ────────────────────────────────────────────────
 
 @dataclass
 class GateConfig:
@@ -47,290 +61,387 @@ class GateConfig:
     MIN_MARKET_SCORE: float = 50.0
     MIN_FILL_PROXY: float = 40.0
     SLIPPAGE_BUFFER_CENTS: int = 1
-    UNCERTAINTY_BUFFER: float = 0.01     # marge d'incertitude modele (edge)
-    FEE_RATE: float = 0.07               # fallback local documente (a verifier)
-    REQUIRE_CALIBRATED: bool = False     # True en LIVE : modele calibre exige
+    FEE_RATE: float = 0.07
+    UNCERTAINTY_BUFFER: float = 0.01
+    MAX_ENTRY_CENTS: int = 85
+    MAX_DATA_AGE_S: float = 90.0
+
+
+# ── Sorties de modele et decisions ──────────────────────────────────────────
 
 @dataclass
-class SignalDecision:
+class ModelOutput:
+    valid: bool
+    reason: str = ""
+    probability_yes: Optional[float] = None
+    confidence: int = 0
+    features: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        return asdict(self)
+
+
+@dataclass
+class Decision:
     ticker: str
-    accepted: bool
+    accepted: bool = False
     rejection_reason: Optional[str] = None
-    side: Optional[str] = None
-    entry_price_cents: Optional[int] = None
-    market_probability: Optional[float] = None
-    model_probability: Optional[float] = None
+    strategy: Optional[str] = None
+    market_type: Optional[str] = None
+    category: Optional[str] = None
+    side: Optional[str] = None            # "yes" | "no"
+    entry_ask: Optional[int] = None       # ASK du cote achete (jamais last)
+    model_probability: Optional[float] = None   # prob. du cote choisi
+    market_probability: Optional[float] = None  # ask/100 du cote choisi
     gross_edge: Optional[float] = None
-    expected_gross_value: Optional[float] = None
-    estimated_fees: Optional[float] = None       # $ / contrat
-    expected_slippage: Optional[float] = None    # $ / contrat
     net_edge: Optional[float] = None
     net_ev: Optional[float] = None
     confidence: int = 0
-    strategy: Optional[str] = None
     taille: str = "0.5%"
     reason: str = ""
+    estimated_fees: Optional[float] = None
+    expected_slippage: Optional[float] = None
     model_output: Optional[dict] = None
+    decision_id: Optional[str] = None
+    spread: Optional[int] = None
+    liquidity: Optional[float] = None
+    kelly_fraction: Optional[float] = None
 
-def estimated_fee_per_contract(price_cents: int, fee_rate: float) -> float:
-    """Fallback LOCAL documente: ceil(rate*P*(1-P)) au cent, par contrat.
-    Utilise uniquement avant l'ordre; apres fill, les frais API priment."""
-    p = price_cents / 100.0
-    return math.ceil(fee_rate * p * (1 - p) * 100) / 100.0
+    def to_dict(self):
+        return asdict(self)
+
+
+# ── Base de strategie ───────────────────────────────────────────────────────
+
+class Strategy:
+    """Interface. market_types : tuple de market_type servis (canonique).
+    evaluate() retourne TOUJOURS un ModelOutput ; valid=False + reason si
+    la probabilite ne peut pas etre calculee honnetement."""
+    name = "base"
+    market_types: tuple = ()
+
+    def evaluate(self, market: dict, book: dict,
+                 minutes_remaining: Optional[float]) -> ModelOutput:
+        raise NotImplementedError
+
+    def has_probability_source(self) -> bool:
+        """True si la strategie peut REELLEMENT produire une probabilite
+        (modele interne ou fournisseur injecte). Une strategie routable
+        mais sans source est exclue du perimetre du scanner : inutile de
+        telecharger des marches qui seront rejetes no_model_probability."""
+        return True
+
+
+class RegistryValidationError(RuntimeError):
+    pass
+
 
 class StrategyRouter:
-    """Routeur STRICT. Chaque strategie DOIT exposer supports(snapshot).
-    - 0 correspondance  -> (None, "no_compatible_strategy")
-    - 1 correspondance  -> (strategie, None)
-    - >1 correspondance -> (None, "ambiguous_strategy_match")
-    Jamais de choix silencieux de la premiere strategie ; jamais de routage
-    par categorie generale seule."""
     def __init__(self):
-        self._strategies = []
+        self._by_type: dict = {}      # market_type -> Strategy
 
-    def register(self, strategy):
-        if not callable(getattr(strategy, "supports", None)):
-            log.warning(f"Strategie {getattr(strategy,'name',strategy)} sans "
-                        f"supports(): REFUSEE par le routeur strict.")
-            return
-        self._strategies.append(strategy)
+    def register(self, strategy: Strategy):
+        if not strategy.market_types:
+            raise RegistryValidationError(
+                f"strategie '{strategy.name}' sans market_types — refusee")
+        for mt in strategy.market_types:
+            if mt in self._by_type:
+                raise RegistryValidationError(
+                    f"market_type '{mt}' deja servi par "
+                    f"'{self._by_type[mt].name}' — doublon interdit "
+                    f"(tentative: '{strategy.name}')")
+            self._by_type[mt] = strategy
+        log.info(f"[REGISTRY] '{strategy.name}' -> "
+                 f"{', '.join(strategy.market_types)}")
+        return self
 
-    def strategies(self) -> list:
-        return list(self._strategies)
+    def route(self, market_type: str) -> Optional[Strategy]:
+        """Routage par market_type canonique UNIQUEMENT. Ne depend jamais
+        d'une categorie generale (qui peut etre erronee)."""
+        return self._by_type.get(market_type)
 
-    def resolve(self, snapshot):
-        """(strategie|None, raison_rejet|None)"""
-        matches = [s for s in self._strategies if s.supports(snapshot)]
-        if not matches:
-            return None, "no_compatible_strategy"
-        if len(matches) > 1:
-            names = [getattr(s, "name", s.__class__.__name__) for s in matches]
-            log.warning(f"{snapshot.ticker}: correspondance AMBIGUE "
-                        f"({names}) -- rejet.")
-            return None, "ambiguous_strategy_match"
-        return matches[0], None
+    def tradeable_market_types(self) -> tuple:
+        """market_types dont la strategie possede une source de
+        probabilite. Sous-ensemble de supported_market_types()."""
+        return tuple(sorted(mt for mt, st in self._by_type.items()
+                            if st.has_probability_source()))
 
-    # compat lecture seule (diagnostic)
-    def supported_categories(self) -> list:
-        cats = set()
-        for s in self._strategies:
-            cats.update(getattr(s, "categories", []))
-        return sorted(cats)
+    def supported_market_types(self) -> tuple:
+        return tuple(sorted(self._by_type))
 
-def evaluate_candidate(snapshot, fresh_market: dict, book: dict,
-                       router: StrategyRouter,
-                       gates: GateConfig) -> SignalDecision:
-    """Toutes les portes, dans l'ordre, avec raison explicite.
-    book = carnet FRAIS normalise {yes_bid,yes_ask,no_bid,no_ask,spread}."""
-    tk = snapshot.ticker
-    d = SignalDecision(ticker=tk, accepted=False)
+    def registry_matrix(self) -> dict:
+        """Matrice market_type -> nom de strategie (livrable 4)."""
+        return {mt: s.name for mt, s in sorted(self._by_type.items())}
 
-    # 0) qualite de marche (le ranker mesure la TRADABILITE, pas le profit)
-    q = getattr(snapshot, "quality", None)
-    if q is not None:
-        if q.total_score < gates.MIN_MARKET_SCORE:
-            d.rejection_reason = "market_quality_too_low"; return d
-        if q.fill_probability_score < gates.MIN_FILL_PROXY:
-            d.rejection_reason = "market_quality_too_low"; return d
-
-    # 1) resolution STRICTE par supports() (jamais par categorie seule)
-    strat, why = router.resolve(snapshot)
-    if strat is None:
-        d.rejection_reason = why; return d
-    d.strategy = getattr(strat, "name", strat.__class__.__name__)
-
-    # 2) carnet frais exploitable ?
-    if not book:
-        d.rejection_reason = "stale_book"; return d
-    spread = book.get("spread")
-    if spread is None or spread > gates.MAX_ACCEPTABLE_SPREAD:
-        d.rejection_reason = "spread_too_wide"; return d
-
-    # 3) probabilite modele INDEPENDANTE
-    out = strat.evaluate(snapshot, fresh_market, book)
-    if isinstance(out, dict) and out.get("rejection_reason"):
-        d.rejection_reason = out["rejection_reason"]        # ex: qualite data
-        d.reason = str(out.get("reason", ""))[:160]
-        return d
-    if not out or out.get("model_prob") is None:
-        d.rejection_reason = "no_model_probability"; return d
-    side = out.get("side")
-    if side not in ("yes", "no"):
-        d.rejection_reason = "no_model_probability"; return d
-    model_p = float(out["model_prob"])
-    if not (0.0 < model_p < 1.0) or model_p != model_p:
-        d.rejection_reason = "no_model_probability"; return d
-    d.side, d.model_probability = side, model_p
-    conf = out.get("confidence", 0)
-    # confiance acceptee en 0..1 (modele) ou 0..10 (legacy)
-    d.confidence = int(round(conf * 10)) if isinstance(conf, float) \
-        and conf <= 1.0 else int(conf)
-    d.taille = out.get("taille", "0.5%")
-    d.reason = str(out.get("reason", ""))[:160]
-    d.model_output = out.get("model_output")
-
-    if gates.REQUIRE_CALIBRATED and not out.get("calibrated", False):
-        d.rejection_reason = "model_not_calibrated"; return d
-    if d.confidence < gates.MIN_MODEL_CONFIDENCE:
-        d.rejection_reason = "insufficient_confidence"; return d
-
-    # 4) ask executable du cote achete (jamais inventer un prix)
-    ask = book.get("yes_ask") if side == "yes" else book.get("no_ask")
-    if ask is None or not (1 <= int(ask) <= 99):
-        d.rejection_reason = "no_executable_ask"; return d
-    d.entry_price_cents = int(ask)
-
-    # 5) edge & EV apres frais + slippage (formules par cote)
-    d.market_probability = d.entry_price_cents / 100.0
-    d.gross_edge = d.model_probability - d.market_probability
-    if d.gross_edge <= 0:
-        d.rejection_reason = "no_positive_edge"; return d
-    if d.gross_edge < gates.MIN_GROSS_EDGE:
-        d.rejection_reason = "insufficient_net_edge"; return d
-
-    p = d.market_probability
-    d.expected_gross_value = d.model_probability * (1 - p) \
-        - (1 - d.model_probability) * p              # EV brute / contrat ($)
-    d.estimated_fees = estimated_fee_per_contract(d.entry_price_cents,
-                                                  gates.FEE_RATE)
-    d.expected_slippage = gates.SLIPPAGE_BUFFER_CENTS / 100.0
-    d.net_edge = d.gross_edge - d.estimated_fees - d.expected_slippage \
-        - gates.UNCERTAINTY_BUFFER
-    d.net_ev = d.expected_gross_value - d.estimated_fees - d.expected_slippage \
-        - gates.UNCERTAINTY_BUFFER
-    if d.net_edge < gates.MIN_NET_EDGE:
-        d.rejection_reason = "insufficient_net_edge"; return d
-    if d.net_ev < gates.MIN_NET_EV:
-        d.rejection_reason = "negative_net_ev"; return d
-
-    d.accepted = True
-    return d
-
-# ── Strategie crypto court terme (adaptateur, ne s'applique QU'A Crypto) ────
-
-class CryptoShortTermStrategy:
-    """Adapte l'analyse BTC existante SI et SEULEMENT SI elle fournit une
-    probabilite modele independante (cle 'model_prob' ou 'prob_reelle'
-    distincte de la prob marche). Sinon retourne None -> rejet honnete
-    no_model_probability. AUCUNE probabilite n'est fabriquee ici."""
-    name = "crypto_short_term_v1"
-    categories = ["Crypto"]
-
-    def __init__(self, decision_fn=None):
-        # decision_fn(snapshot, market, book) -> dict de l'analyse existante
-        self.decision_fn = decision_fn
-
-    def evaluate(self, snapshot, fresh_market, book):
-        if self.decision_fn is None:
-            return None
-        try:
-            dec = self.decision_fn(snapshot, fresh_market, book) or {}
-        except Exception as e:
-            log.warning(f"{self.name}: decision_fn erreur: {e}")
-            return None
-        verdict = str(dec.get("verdict", "")).upper()
-        side = "yes" if "YES" in verdict else "no" if "NO" in verdict else None
-        model_p = dec.get("model_prob", dec.get("prob_reelle"))
-        market_p = dec.get("market_prob")
-        if side is None or model_p is None:
-            return None
-        # Une prob strictement egale a la prob marche n'est PAS un modele.
-        if market_p is not None and abs(float(model_p) - float(market_p)) < 1e-9:
-            return None
-        return {"side": side, "model_prob": float(model_p),
-                "confidence": int(dec.get("confidence", 0)),
-                "taille": dec.get("taille", "0.5%"),
-                "reason": dec.get("reason", "")}
+    def validate_strategy_registry(
+            self, required: tuple = REQUIRED_MARKET_TYPES) -> dict:
+        """ECHOUE (exception) si le registre est vide ou si un market_type
+        requis n'est pas servi. A appeler AU DEMARRAGE : le programme ne
+        doit pas tourner avec un registre incoherent."""
+        if not self._by_type:
+            raise RegistryValidationError(
+                "registre de strategies VIDE — demarrage refuse")
+        missing = [mt for mt in (required or ()) if mt not in self._by_type]
+        if missing:
+            raise RegistryValidationError(
+                "market_type requis sans strategie enregistree: "
+                + ", ".join(missing) + " — demarrage refuse")
+        matrix = self.registry_matrix()
+        log.info(f"[REGISTRY] validation OK — matrice: {matrix}")
+        return matrix
 
 
-# ── Strategie BTC 15 minutes basee sur le modele de probabilite ──────────────
+# fonction module-niveau demandee par le cahier des charges
+def validate_strategy_registry(router: StrategyRouter,
+                               required: tuple = REQUIRED_MARKET_TYPES) -> dict:
+    return router.validate_strategy_registry(required)
 
-class BtcModelStrategy:
-    """Strategie BTC15M : contexte via btc_context, probabilite via
-    btc_probability_model. NE S'APPLIQUE QU'AUX marches de la serie BTC 15
-    minutes (supports()) : ETH, sports, politique, meteo etc. restent
-    no_compatible_strategy. Si le contexte echoue -> no_model_probability ;
-    si la qualite des donnees est insuffisante -> insufficient_data_quality.
-    AUCUNE probabilite n'est inventee."""
-    name = "btc15m_model_v1"
-    categories = ["Crypto"]
-    SERIES_PREFIX = "KXBTC15M"
 
-    def __init__(self, context_provider=None, model_predict=None):
-        # injectables pour tests hors-ligne ; par defaut, les vrais modules
-        if context_provider is None or model_predict is None:
-            import btc_context as _ctx
-            import btc_probability_model as _mdl
-            context_provider = context_provider or _ctx.get_btc_context
-            model_predict = model_predict or _mdl.predict_or_reason
-        self.context_provider = context_provider
-        self.model_predict = model_predict
+# ── Utilitaires ─────────────────────────────────────────────────────────────
 
-    def supports(self, snapshot) -> bool:
-        """Triple verrou impose : categorie Crypto ET market_type
-        btc_above_strike_15m ET prefixe KXBTC15M. BTC horaire, ETH, daily
-        et tout le reste sont refuses ici."""
-        if getattr(snapshot, "category", None) != "Crypto":
-            return False
-        mt = getattr(snapshot, "market_type", None)
-        if mt is not None and mt != "btc_above_strike_15m":
-            return False
-        for attr in ("series_ticker", "ticker"):
-            v = str(getattr(snapshot, attr, None) or "").upper()
-            if v.startswith(self.SERIES_PREFIX):
-                return True
-        return False
-
-    @staticmethod
-    def _strike(market: dict):
-        for k in ("floor_strike", "cap_strike", "strike_price"):
-            v = market.get(k)
-            if v is not None:
-                try:
-                    return float(v)
-                except (TypeError, ValueError):
-                    pass
+def minutes_to_close(market: dict, now: Optional[datetime] = None) -> Optional[float]:
+    ct = (market or {}).get("close_time")
+    if not ct:
         return None
+    try:
+        close_dt = datetime.fromisoformat(str(ct).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    now = now or datetime.now(timezone.utc)
+    return (close_dt - now).total_seconds() / 60.0
 
-    def evaluate(self, snapshot, fresh_market, book):
-        strike = self._strike(fresh_market or {})
-        mins = getattr(snapshot, "minutes_remaining", None)
-        if strike is None or mins is None:
-            return {"rejection_reason": "no_model_probability",
-                    "reason": "strike ou temps restant absent"}
+
+def _strike_of(market: dict) -> Optional[float]:
+    for k in ("floor_strike", "cap_strike", "strike_price"):
+        v = (market or {}).get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+# ── Strategies BTC (probabilite REELLE via modele + contexte) ───────────────
+
+class _BtcAboveStrikeBase(Strategy):
+    """Base commune BTC 'au-dessus du strike'. context_provider est
+    INJECTABLE (tests hors-ligne) ; par defaut btc_context.get_btc_context.
+    Refuse toute evaluation si le contexte est invalide ou la qualite de
+    donnees insuffisante — rien n'est invente."""
+
+    max_minutes: float = 15.0 * 24 * 60   # surcharge par sous-classe
+
+    def __init__(self, context_provider: Callable = None):
+        if context_provider is None:
+            try:
+                from btc_context import get_btc_context
+                context_provider = get_btc_context
+            except ImportError:
+                context_provider = None
+        self._ctx = context_provider
+
+    def evaluate(self, market, book, minutes_remaining) -> ModelOutput:
+        from btc_probability_model import (probability_yes,
+                                           confidence_from_quality,
+                                           ModelInputError, MODEL_VERSION)
+        if self._ctx is None:
+            return ModelOutput(False, "no_model_probability:btc_context_absent")
+        strike = _strike_of(market)
+        if strike is None:
+            return ModelOutput(False, "no_model_probability:strike_absent")
+        t = minutes_remaining
+        if t is None or t <= 0:
+            return ModelOutput(False, "no_model_probability:horizon_invalide")
+        if t > self.max_minutes:
+            return ModelOutput(False, "no_model_probability:horizon_hors_perimetre")
+        ctx = self._ctx(strike=strike, minutes_remaining=t)
+        if ctx is None or not getattr(ctx, "valid", False):
+            return ModelOutput(False, "no_model_probability:"
+                               + str(getattr(ctx, "reason", "contexte_invalide")))
+        conf = confidence_from_quality(ctx.data_quality_score, t)
+        if conf <= 0:
+            return ModelOutput(False, "insufficient_data_quality:"
+                               f"score={ctx.data_quality_score}")
         try:
-            ctx = self.context_provider(strike=strike, minutes_remaining=mins)
-        except Exception as e:                    # echec contexte = pas de prob
-            return {"rejection_reason": "no_model_probability",
-                    "reason": f"btc_context: {e}"}
-        out, why = self.model_predict(ctx)
-        if out is None:
-            reason = ("insufficient_data_quality"
-                      if why and "insufficient_data_quality" in why
-                      else "no_model_probability")
-            return {"rejection_reason": reason, "reason": why or ""}
-        p_yes = out["probability_yes"]
-        side = "yes" if p_yes >= 0.5 else "no"
-        return {"side": side,
-                "model_prob": p_yes if side == "yes"
-                              else out["probability_no"],
-                "confidence": out["confidence"],          # 0..1 -> mappee
-                "calibrated": out.get("calibrated", False),
-                "taille": "0.5%",
-                "reason": f"{out['model_version']}: {out['reason'][:90]}",
-                "model_output": out}
+            p = probability_yes(ctx.spot, strike, ctx.realized_vol_1m, t,
+                                ret_5m=(ctx.returns or {}).get("5m"))
+        except ModelInputError as e:
+            return ModelOutput(False, f"no_model_probability:{e}")
+        return ModelOutput(True, "ok", probability_yes=p, confidence=conf,
+                           features={"model_version": MODEL_VERSION,
+                                     "spot": ctx.spot, "strike": strike,
+                                     "sigma_1m": ctx.realized_vol_1m,
+                                     "minutes_remaining": t,
+                                     "ret_5m": (ctx.returns or {}).get("5m"),
+                                     "data_quality": ctx.data_quality_score})
 
 
-# ── Registre central : UNIQUEMENT les strategies reelles et testees ──────────
-# Pas de fausse strategie Sports/Politics/Economics : ces marches restent
-# no_compatible_strategy tant qu'un vrai modele dedie n'existe pas.
+class BtcModelStrategy(_BtcAboveStrikeBase):
+    """BTC 15 minutes (serie KXBTC15M, market_type btc_15m_above_strike)."""
+    name = "btc15m_above_strike"
+    market_types = ("btc_15m_above_strike",)
+    max_minutes = 20.0
 
-def available_strategies() -> list:
-    return [BtcModelStrategy]
+
+class BtcDailyStrategy(_BtcAboveStrikeBase):
+    """BTC quotidien (serie KXBTCD, market_type btc_above_strike_daily).
+    MEME modele, horizon jusqu'a 26 h ; la confiance est reduite au-dela
+    de 24 h (voir confidence_from_quality)."""
+    name = "btc_daily_above_strike"
+    market_types = ("btc_above_strike_daily",)
+    max_minutes = 26.0 * 60
 
 
-def build_default_router() -> "StrategyRouter":
+# ── Strategies routees SANS modele par defaut (honnetete) ───────────────────
+
+class ProviderBackedStrategy(Strategy):
+    """Strategie dont la probabilite vient d'un fournisseur externe
+    calibre (ex.: flux de cotes sportives). SANS fournisseur injecte :
+    no_model_probability — le routage fonctionne (strategy_supported > 0),
+    mais AUCUNE probabilite n'est inventee et aucun trade n'est possible.
+    C'est le comportement exige : ne pas assouplir pour forcer des trades."""
+
+    def __init__(self, probability_provider: Callable = None):
+        # probability_provider(market, book, minutes_remaining)
+        #   -> (probability_yes, confidence) ou None
+        self._provider = probability_provider
+
+    def has_probability_source(self) -> bool:
+        return self._provider is not None
+
+    def evaluate(self, market, book, minutes_remaining) -> ModelOutput:
+        if self._provider is None:
+            return ModelOutput(
+                False, "no_model_probability:aucun_fournisseur_calibre")
+        try:
+            out = self._provider(market, book, minutes_remaining)
+        except Exception as e:                      # fournisseur defaillant
+            return ModelOutput(False, f"no_model_probability:fournisseur:{e}")
+        if not out:
+            return ModelOutput(False,
+                               "no_model_probability:fournisseur_sans_reponse")
+        p, conf = out
+        if p is None or not (0.0 < float(p) < 1.0):
+            return ModelOutput(False, "no_model_probability:prob_non_calibree")
+        return ModelOutput(True, "ok", probability_yes=float(p),
+                           confidence=int(conf or 0),
+                           features={"provider": "externe"})
+
+
+class SportsMoneylineStrategy(ProviderBackedStrategy):
+    name = "sports_moneyline_v1"
+    market_types = ("sports_moneyline",)
+
+
+class SportsSpreadStrategy(ProviderBackedStrategy):
+    name = "sports_spread_v1"
+    market_types = ("sports_spread",)
+
+
+class SportsTotalStrategy(ProviderBackedStrategy):
+    name = "sports_total_v1"
+    market_types = ("sports_total",)
+
+
+class ElectionWinnerStrategy(ProviderBackedStrategy):
+    name = "election_winner_v1"
+    market_types = ("election_winner",)
+
+
+# ── Construction du registre par defaut ─────────────────────────────────────
+
+def build_default_registry(btc_context_provider: Callable = None,
+                           sports_provider: Callable = None,
+                           election_provider: Callable = None,
+                           btc_enabled: bool = True) -> StrategyRouter:
+    """Registre canonique. Leve RegistryValidationError au moindre
+    probleme (doublon, registre vide, market_type requis manquant)."""
     r = StrategyRouter()
-    for cls in available_strategies():
-        r.register(cls())
+    if btc_enabled:
+        r.register(BtcModelStrategy(btc_context_provider))
+        r.register(BtcDailyStrategy(btc_context_provider))
+    r.register(SportsMoneylineStrategy(sports_provider))
+    r.register(SportsSpreadStrategy(sports_provider))
+    r.register(SportsTotalStrategy(sports_provider))
+    r.register(ElectionWinnerStrategy(election_provider))
+    r.validate_strategy_registry(REQUIRED_MARKET_TYPES
+                                 if btc_enabled else
+                                 tuple(t for t in REQUIRED_MARKET_TYPES
+                                       if not t.startswith("btc")))
     return r
+
+
+# ── Portes edge/EV (prix EXECUTABLE : ask a l'achat, jamais last_price) ────
+
+def price_and_gate(dec: Decision, model: ModelOutput, book: dict,
+                   gates: GateConfig, market: dict = None) -> Decision:
+    """Choisit le cote, calcule edge brut/net et EV net au prix ASK du cote
+    achete, applique toutes les portes. Modifie et retourne dec."""
+    if not model.valid:
+        dec.rejection_reason = model.reason
+        return dec
+    p_yes = model.probability_yes
+    dec.confidence = model.confidence
+    dec.model_output = model.to_dict()
+    if model.confidence < gates.MIN_MODEL_CONFIDENCE:
+        dec.rejection_reason = (f"low_model_confidence:"
+                                f"{model.confidence}<{gates.MIN_MODEL_CONFIDENCE}")
+        return dec
+    spread = book.get("spread")
+    dec.spread = spread
+    for _k in ("volume_24h", "volume", "open_interest"):
+        try:
+            dec.liquidity = max(dec.liquidity or 0.0,
+                                float((market or {}).get(_k) or 0))
+        except (TypeError, ValueError):
+            pass
+    if spread is not None and spread > gates.MAX_ACCEPTABLE_SPREAD:
+        dec.rejection_reason = f"spread_too_wide:{spread}"
+        return dec
+
+    best = None
+    for side, p_model in (("yes", p_yes), ("no", 1.0 - p_yes)):
+        ask = book.get(f"{side}_ask")
+        if ask is None or not (1 <= int(ask) <= 99):
+            continue                                 # pas de prix executable
+        ask = int(ask)
+        if ask > gates.MAX_ENTRY_CENTS:
+            continue
+        mkt_p = ask / 100.0
+        gross = p_model - mkt_p
+        if gross <= 0:
+            continue
+        fee = estimated_fee_per_contract(ask, gates.FEE_RATE)
+        slip = gates.SLIPPAGE_BUFFER_CENTS / 100.0
+        net_edge = gross - fee - slip - gates.UNCERTAINTY_BUFFER
+        net_ev = p_model * (1 - mkt_p) - (1 - p_model) * mkt_p - fee - slip
+        cand = (net_edge, side, ask, p_model, mkt_p, gross, fee, slip, net_ev)
+        if best is None or cand[0] > best[0]:
+            best = cand
+    if best is None:
+        dec.rejection_reason = "no_positive_edge"
+        return dec
+    net_edge, side, ask, p_model, mkt_p, gross, fee, slip, net_ev = best
+    dec.side, dec.entry_ask = side, ask
+    dec.model_probability, dec.market_probability = p_model, mkt_p
+    dec.gross_edge, dec.net_edge, dec.net_ev = gross, net_edge, net_ev
+    dec.estimated_fees, dec.expected_slippage = fee, slip
+    # Kelly binaire informatif (b = gain net/mise) — DIAGNOSTIC uniquement,
+    # le sizing reel reste le PositionSizer (% capital effectif).
+    b = (100 - ask) / ask
+    dec.kelly_fraction = round(max(0.0, p_model - (1 - p_model) / b), 4)
+    if gross < gates.MIN_GROSS_EDGE:
+        dec.rejection_reason = f"insufficient_gross_edge:{gross:.4f}"
+        return dec
+    if net_edge < gates.MIN_NET_EDGE:
+        dec.rejection_reason = f"insufficient_net_edge:{net_edge:.4f}"
+        return dec
+    if net_ev <= gates.MIN_NET_EV:
+        dec.rejection_reason = f"negative_net_ev:{net_ev:.4f}"
+        return dec
+    dec.accepted = True
+    dec.taille = "1%" if dec.confidence >= 8 else "0.5%"
+    dec.reason = (f"{dec.strategy}: p={p_model:.3f} vs ask={ask}c "
+                  f"edge_net={net_edge:+.3f} ev_net={net_ev:+.3f}")
+    return dec

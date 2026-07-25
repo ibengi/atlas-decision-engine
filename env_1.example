@@ -1,0 +1,30 @@
+# .env.example — kalshi_alpha_bot (v3, 2026-07-19). AUCUN SECRET ICI.
+# Booleens : uniquement 1/true/yes/on ou 0/false/no/off (toute casse).
+# Toute autre valeur est ignoree avec WARNING (get_env_bool canonique).
+
+# ── Scanner : univers CIBLE par defaut ───────────────────────────────────────
+SCANNER_GENERAL_CRAWL_ENABLED=false     # crawl /markets complet: diagnostic only
+SCANNER_PRIORITY_SERIES=                # vide => derive du registre de strategies
+SCANNER_PRIORITY_MAX_PAGES=5
+SCANNER_MAX_MARKETS_PER_CYCLE=300
+SCANNER_LOOKAHEAD_HOURS=24
+SCANNER_MIN_MINUTES=5
+
+# ── Pipeline ─────────────────────────────────────────────────────────────────
+SCAN_MAX_DEEP_ANALYSES_PER_CYCLE=50
+PIPELINE_REJECT_TTL_PERMANENT_S=3600
+PIPELINE_REJECT_TTL_TEMPORARY_S=120
+
+# ── Strategies ───────────────────────────────────────────────────────────────
+BTC_STRATEGY_ENABLED=true               # false => registre vide => REFUS de demarrer
+
+# ── Mode d'execution (les verrous existants du bot restent en vigueur) ───────
+SHADOW_MODE=1                           # decisions completes, AUCUN envoi d'ordre
+KILL_SWITCH=0
+# LIVE : jamais par defaut. Exige simultanement (deja implemente dans le bot):
+# KALSHI_ENV_CONFIRM=LIVE, LIVE_TRADING_CONFIRMED=YES, LIVE_TRADING=1,
+# MODEL_APPROVED_FOR_LIVE=YES + gatekeeper (rapport de validation recent).
+
+# ── Build info (a injecter par la CI/Railway) ────────────────────────────────
+# RAILWAY_GIT_COMMIT_SHA=  (fourni par Railway)
+# BUILD_TIMESTAMP=

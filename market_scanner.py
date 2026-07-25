@@ -1,472 +1,358 @@
 """
-market_scanner.py — v1 (2026-07-11)
-Scanner d'univers de marches Kalshi. INDEPENDANT du moteur d'execution :
-ce module ne connait ni OrderManager, ni RiskManager, ni PositionManager,
-ni TradeLogger, et ne contient AUCUN appel d'envoi d'ordre.
+market_scanner.py — v2 (2026-07-24)
+Scanner d'univers Kalshi : CIBLE d'abord, crawl complet EN CACHE.
 
-Il ne fait que : paginer /markets, normaliser, classer, filtrer, rapporter.
+CAUSES RACINES CORRIGEES (logs du 2026-07-20) :
+  - 40 001 marches re-scannes CHAQUE minute (cycle ~75 s dont ~14 s de
+    pagination) ;
+  - garde-fou MAX_PAGES=200 atteint a CHAQUE cycle (univers tronque,
+    alerte repetee 31 fois en 31 cycles) ;
+  - ~29 400 marches SANS liquidite re-telecharges et re-evalues a chaque
+    cycle.
 
-Le client passe en argument (duck typing) : tout objet exposant
-    _req(method, path, params=...) -> dict          (pagination)
-suffit — le KalshiClient v11 convient tel quel.
-
-AVERTISSEMENT D'INTEGRITE : le nom du parametre de pagination ("cursor",
-"limit") et le nom des champs de carnet suivent la documentation Kalshi v2
-telle que connue ; la premiere page brute est loggee ([RAW:markets_page])
-pour verification humaine au premier scan reel.
+v2 :
+  1. Scan CIBLE par series derivees du registre de strategies (quelques
+     pages par cycle, via GET /markets?series_ticker=...). C'est le chemin
+     par defaut : on ne re-telecharge JAMAIS l'univers entier chaque minute.
+  2. Crawl complet OPTIONNEL (SCANNER_GENERAL_CRAWL_ENABLED) mis en cache
+     >= 30 min (SCANNER_UNIVERSE_TTL_S), persiste sur disque, mise a jour
+     INCREMENTALE entre deux rafraichissements (les series prioritaires
+     seules sont re-lues). L'alerte MAX_PAGES ne peut plus apparaitre
+     qu'une fois par rafraichissement, PAS par cycle — et MAX_PAGES n'a
+     PAS ete augmente.
+  3. Filtres IMMEDIATS pendant le scan : expire/ferme, hors fenetre
+     temporelle, sans liquidite, market_type inconnu non tradable.
+     Metriques avant/apres CHAQUE filtre dans le rapport.
+  4. Plafond d'evaluation couteuse : seuls les SCANNER_MAX_MARKETS_PER_CYCLE
+     meilleurs marches tradables sortent du scanner.
 """
 
 import os
 import json
+import time
 import logging
-from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Optional, Callable
 
-from market_taxonomy import classify_market_type
+from market_classifier import classify
 
 log = logging.getLogger("SCANNER")
 
-# ── Configuration (surchargeables par variables d'environnement) ─────────────
+SCANNER_VERSION = "scanner-v2-2026-07-24"
+
 
 def _env_f(name, default):
-    try: return float(os.getenv(name, str(default)))
-    except ValueError: return default
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
 
 def _env_i(name, default):
-    try: return int(os.getenv(name, str(default)))
-    except ValueError: return default
-
-def _env_b(name, default):
-    return os.getenv(name, "1" if default else "0").strip().lower() \
-        not in ("0", "false", "no", "non")
-
-def _env_list(name):
-    raw = os.getenv(name, "").strip()
-    return [x.strip() for x in raw.split(",") if x.strip()] if raw else []
-
-class ScanConfig:
-    MIN_MINUTES        = _env_f("SCANNER_MIN_MINUTES", 5.0)
-    MAX_MINUTES        = _env_f("SCANNER_MAX_MINUTES", 60 * 24 * 90)  # 90 jours
-    MIN_VOLUME         = _env_i("SCANNER_MIN_VOLUME", 0)
-    MIN_OPEN_INTEREST  = _env_i("SCANNER_MIN_OPEN_INTEREST", 0)
-    MAX_SPREAD_CENTS   = _env_i("SCANNER_MAX_SPREAD_CENTS", 10)
-    REQUIRE_LIQUIDITY  = _env_b("SCANNER_REQUIRE_LIQUIDITY", True)
-    ALLOWED_CATEGORIES = _env_list("SCANNER_ALLOWED_CATEGORIES")   # vide = toutes
-    EXCLUDED_CATEGORIES= _env_list("SCANNER_EXCLUDED_CATEGORIES")
-    PAGE_LIMIT         = _env_i("SCANNER_PAGE_LIMIT", 200)
-    MAX_PAGES          = _env_i("SCANNER_MAX_PAGES", 200)  # garde-fou anti-boucle
-    # ── CORRECTION 2026-07-19 : series prioritaires (filtrage API niveau 1) ──
-    # Le crawl general /markets est TRONQUE a MAX_PAGES (observe en prod :
-    # 40 000 marches, warning "univers peut-etre incomplet" a chaque cycle).
-    # Consequence mesuree : AUCUN marche KXBTC15M — la seule serie servie par
-    # une strategie reelle — n'atteignait jamais le pipeline. Chaque serie
-    # listee ici est recuperee DIRECTEMENT via le parametre serveur
-    # `series_ticker` (deja utilise par KalshiClient.get_markets), puis
-    # fusionnee dans l'univers avec deduplication par ticker. L'inclusion des
-    # series supportees ne depend donc plus de l'ordre de pagination.
-    PRIORITY_SERIES    = _env_list("SCANNER_PRIORITY_SERIES") or ["KXBTC15M"]
-    PRIORITY_MAX_PAGES = _env_i("SCANNER_PRIORITY_MAX_PAGES", 5)
-    UNIVERSE_FILE      = os.getenv("SCANNER_UNIVERSE_FILE", "market_universe.json")
-    REPORT_FILE        = os.getenv("SCANNER_REPORT_FILE", "market_scanner_report.json")
-
-SCFG = ScanConfig()
-
-# ── Normalisation des nombres (cents / *_dollars / *_fp / strings / null) ────
-
-def parse_cents(market: dict, base: str) -> Optional[int]:
-    """Extrait un prix en cents 1..99 depuis toutes les variantes connues :
-       base (int cents), base_fp ("2.00" = cents a virgule fixe),
-       base_dollars (0.12 = dollars). 0/None = cote vide -> None.
-       Ne JAMAIS inventer de liquidite."""
-    for key, is_dollars in ((base, False), (f"{base}_fp", False),
-                            (f"{base}_dollars", True)):
-        v = market.get(key)
-        if v is None or v == "":
-            continue
-        try:
-            x = float(v)
-        except (TypeError, ValueError):
-            continue
-        cents = int(round(x * 100)) if is_dollars else int(round(x))
-        if 1 <= cents <= 99:
-            return cents
-        # 0 = cote vide ; >99/negatif = invalide -> on continue de chercher
-    return None
-
-def parse_number(market: dict, *keys) -> Optional[float]:
-    """Nombre generique (volume, OI, liquidite) : int, float, string, *_fp."""
-    for k in keys:
-        for cand in (k, f"{k}_fp", f"{k}_dollars"):
-            v = market.get(cand)
-            if v is None or v == "":
-                continue
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                continue
-    return None
-
-def parse_time(v) -> Optional[datetime]:
-    if not v:
-        return None
     try:
-        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        return int(os.getenv(name, str(default)))
     except ValueError:
-        return None
+        return default
 
-# ── Carnet : derivation YES<->NO sans inventer de liquidite ──────────────────
 
-def normalize_book(m: dict) -> dict:
-    """Retourne {'ok': bool, 'reason': str|None, yes_bid.., spread_yes..}.
-       0/None = cote vide. Derivation NO=100-YES uniquement quand l'autre
-       cote existe reellement. Carnet croise -> invalid_book."""
-    yb, ya = parse_cents(m, "yes_bid"), parse_cents(m, "yes_ask")
-    nb, na = parse_cents(m, "no_bid"),  parse_cents(m, "no_ask")
-    # derivations mathematiquement valides (complementarite YES/NO)
-    if nb is None and ya is not None: nb = 100 - ya
-    if na is None and yb is not None: na = 100 - yb
-    if yb is None and na is not None: yb = 100 - na
-    if ya is None and nb is not None: ya = 100 - nb
-    out = {"yes_bid": yb, "yes_ask": ya, "no_bid": nb, "no_ask": na,
-           "yes_mid": None, "no_mid": None,
-           "spread_yes": None, "spread_no": None}
-    if yb is None and ya is None and nb is None and na is None:
-        return {"ok": False, "reason": "no_liquidity", **out}
-    if yb is None or ya is None or nb is None or na is None:
-        # une seule jambe cotee et non derivable : inutilisable, pas invente
-        return {"ok": False, "reason": "no_liquidity", **out}
-    if ya < yb or na < nb:
-        return {"ok": False, "reason": "invalid_book", **out}
-    out.update({"yes_mid": round((yb + ya) / 2), "no_mid": round((nb + na) / 2),
-                "spread_yes": ya - yb, "spread_no": na - nb})
-    return {"ok": True, "reason": None, **out}
+def _env_b(name, default=False):
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    if v in ("1", "true", "yes", "on"):
+        return True
+    if v in ("0", "false", "no", "off"):
+        return False
+    log.warning(f"get_env_bool: valeur '{v}' ignoree pour {name} "
+                f"(defaut={default})")
+    return default
 
-# ── Classification par categorie ─────────────────────────────────────────────
 
-CATEGORIES = ["Crypto", "Sports", "Politics", "Elections", "Economics",
-              "Finance", "Commodities", "Climate", "Tech & Science",
-              "Culture", "Entertainment", "Other"]
-
-# Prefixes/mots-cles de series et d'events Kalshi (heuristique documentee ;
-# le champ 'category' natif de l'API, quand il existe, prime toujours).
-_SERIES_RULES = [
-    ("Crypto",        ("KXBTC", "KXETH", "BTC", "ETH", "CRYPTO", "SOL", "DOGE")),
-    ("Elections",     ("PRES", "SENATE", "HOUSE", "GOV", "MAYOR", "ELECT",
-                       "PRIMARY", "POTUS", "EC-")),
-    ("Politics",      ("SCOTUS", "CABINET", "IMPEACH", "SHUTDOWN", "VETO",
-                       "CONGRESS", "EXEC", "TREATY", "POLI")),
-    ("Economics",     ("CPI", "GDP", "FED", "FOMC", "PAYROLL", "NFP", "JOBS",
-                       "UNRATE", "INFLATION", "RECESS", "RATE")),
-    ("Finance",       ("INX", "NASDAQ", "SP500", "S&P", "DOW", "DJIA", "VIX",
-                       "TSLA", "AAPL", "EARNINGS", "IPO", "STOCK")),
-    ("Commodities",   ("OIL", "WTI", "BRENT", "GOLD", "SILVER", "GAS",
-                       "WHEAT", "CORN", "COMMOD")),
-    ("Climate",       ("HIGH", "LOW", "TEMP", "RAIN", "SNOW", "HURRICANE",
-                       "CLIMATE", "WEATHER", "HEAT", "STORM")),
-    ("Sports",        ("NFL", "NBA", "MLB", "NHL", "NCAA", "UFC", "F1",
-                       "TENNIS", "GOLF", "SOCCER", "EPL", "FIFA", "OLYMP",
-                       "SUPERBOWL", "WORLDCUP")),
-    ("Tech & Science",("AI", "OPENAI", "SPACEX", "NASA", "LAUNCH", "APPLE",
-                       "GOOGLE", "TECH", "CHIP", "QUANTUM", "FDA")),
-    ("Entertainment", ("OSCAR", "EMMY", "GRAMMY", "BOXOFFICE", "MOVIE",
-                       "NETFLIX", "ALBUM", "TVRATINGS")),
-    ("Culture",       ("TIME-", "PERSONOF", "WORD", "MISS", "ROYAL",
-                       "CELEB", "TWITTER", "TIKTOK")),
-]
-
-_NATIVE_MAP = {  # categories natives Kalshi -> nos categories
-    "crypto": "Crypto", "cryptocurrency": "Crypto",
-    "sports": "Sports",
-    "politics": "Politics", "world": "Politics",
-    "elections": "Elections",
-    "economics": "Economics", "economy": "Economics",
-    "financials": "Finance", "finance": "Finance", "companies": "Finance",
-    "commodities": "Commodities",
-    "climate": "Climate", "climate and weather": "Climate", "weather": "Climate",
-    "science and technology": "Tech & Science", "technology": "Tech & Science",
-    "science": "Tech & Science", "health": "Tech & Science",
-    "entertainment": "Entertainment",
-    "culture": "Culture", "social": "Culture",
+# Series par market_type — derivation du perimetre CIBLE depuis le registre.
+DEFAULT_SERIES_BY_MARKET_TYPE = {
+    "btc_15m_above_strike":  ["KXBTC15M"],
+    "btc_above_strike_daily": ["KXBTCD"],
+    "sports_moneyline": ["KXWNBAGAME", "KXMLBGAME", "KXNBAGAME", "KXNFLGAME",
+                         "KXNHLGAME", "KXCFLGAME", "KXATPMATCH", "KXWTAMATCH",
+                         "KXITFWMATCH", "KXATPCHALLENGERMATCH"],
+    "sports_spread": ["KXWNBASPREAD", "KXMLBSPREAD", "KXNBASPREAD",
+                      "KXNFLSPREAD", "KXATPGSPREAD"],
+    "sports_total":  ["KXWNBATOTAL", "KXMLBTOTAL", "KXNBATOTAL",
+                      "KXNFLTOTAL"],
+    "election_winner": ["KXPRES", "KXSENATE"],
 }
 
-def classify(m: dict) -> str:
-    """category native > series_ticker > event_ticker > titre. Jamais 'invente' :
-       si rien ne matche -> Other."""
-    native = str(m.get("category") or "").strip().lower()
-    if native in _NATIVE_MAP:
-        return _NATIVE_MAP[native]
-    hay = " ".join(str(m.get(k) or "") for k in
-                   ("series_ticker", "event_ticker", "ticker",
-                    "title", "subtitle")).upper()
-    for cat, keys in _SERIES_RULES:
-        if any(k in hay for k in keys):
-            return cat
-    return "Other"
 
-# ── Dataclass ────────────────────────────────────────────────────────────────
-
-@dataclass
-class MarketSnapshot:
-    ticker: str
-    event_ticker: Optional[str]
-    series_ticker: Optional[str]
-    title: Optional[str]
-    subtitle: Optional[str]
-    category: str
-    market_type: str
-    status: Optional[str]
-    open_time: Optional[str]
-    close_time: Optional[str]
-    expiration_time: Optional[str]
-    minutes_remaining: Optional[float]
-    yes_bid: Optional[int]
-    yes_ask: Optional[int]
-    no_bid: Optional[int]
-    no_ask: Optional[int]
-    yes_mid: Optional[int]
-    no_mid: Optional[int]
-    spread_yes: Optional[int]
-    spread_no: Optional[int]
-    volume: Optional[float]
-    volume_24h: Optional[float]
-    open_interest: Optional[float]
-    liquidity: Optional[float]
-    last_price: Optional[int]
-    market_url: Optional[str]
-    included: bool = True
-    exclusion_reason: Optional[str] = None
-    raw_market: dict = field(default_factory=dict, repr=False)
-
-# ── Construction d'un snapshot + filtres ─────────────────────────────────────
-
-def build_snapshot(m: dict, now: Optional[datetime] = None,
-                   cfg: ScanConfig = SCFG) -> MarketSnapshot:
-    now = now or datetime.now(timezone.utc)
-    close_dt = parse_time(m.get("close_time"))
-    mins = ((close_dt - now).total_seconds() / 60.0) if close_dt else None
-    book = normalize_book(m)
-    snap = MarketSnapshot(
-        ticker=str(m.get("ticker") or ""),
-        event_ticker=m.get("event_ticker"),
-        series_ticker=m.get("series_ticker"),
-        title=m.get("title"), subtitle=m.get("subtitle") or m.get("yes_sub_title"),
-        category=classify(m),
-        market_type=classify_market_type(m),
-        status=m.get("status"),
-        open_time=m.get("open_time"), close_time=m.get("close_time"),
-        expiration_time=m.get("expiration_time"),
-        minutes_remaining=round(mins, 2) if mins is not None else None,
-        yes_bid=book["yes_bid"], yes_ask=book["yes_ask"],
-        no_bid=book["no_bid"], no_ask=book["no_ask"],
-        yes_mid=book["yes_mid"], no_mid=book["no_mid"],
-        spread_yes=book["spread_yes"], spread_no=book["spread_no"],
-        volume=parse_number(m, "volume"),
-        volume_24h=parse_number(m, "volume_24h"),
-        open_interest=parse_number(m, "open_interest"),
-        liquidity=parse_number(m, "liquidity"),
-        last_price=parse_cents(m, "last_price"),
-        market_url=f"https://kalshi.com/markets/{m.get('ticker')}"
-                   if m.get("ticker") else None,
-        raw_market=m,
-    )
-    snap.exclusion_reason = _exclusion_reason(snap, book, cfg)
-    snap.included = snap.exclusion_reason is None
-    return snap
-
-def _exclusion_reason(s: MarketSnapshot, book: dict,
-                      cfg: ScanConfig) -> Optional[str]:
-    if not s.ticker:
-        return "unsupported"
-    if s.status and str(s.status).lower() not in ("open", "active"):
-        return "expired"
-    if s.minutes_remaining is not None and s.minutes_remaining <= 0:
-        return "expired"
-    if s.minutes_remaining is not None and s.minutes_remaining < cfg.MIN_MINUTES:
-        return "closes_too_soon"
-    if s.minutes_remaining is not None and s.minutes_remaining > cfg.MAX_MINUTES:
-        return "unsupported"
-    if book["reason"] == "invalid_book":
-        return "invalid_book"
-    if book["reason"] == "no_liquidity":
-        return "no_liquidity" if cfg.REQUIRE_LIQUIDITY else None
-    if book["ok"] and s.spread_yes is not None \
-            and s.spread_yes > cfg.MAX_SPREAD_CENTS:
-        return "spread_too_wide"
-    if cfg.MIN_VOLUME and (s.volume or 0) < cfg.MIN_VOLUME:
-        return "low_volume"
-    if cfg.MIN_OPEN_INTEREST and (s.open_interest or 0) < cfg.MIN_OPEN_INTEREST:
-        return "low_volume"
-    if cfg.ALLOWED_CATEGORIES and s.category not in cfg.ALLOWED_CATEGORIES:
-        return "unsupported"
-    if s.category in cfg.EXCLUDED_CATEGORIES:
-        return "unsupported"
-    return None
-
-# ── Pagination complete de /markets ──────────────────────────────────────────
-
-def fetch_all_markets(client, status: str = "open",
-                      cfg: ScanConfig = SCFG) -> (list, int, int):
-    """Pagine GET /markets par curseur. Retourne (markets, n_pages, n_errors).
-       Le parametre 'cursor' suit la doc Kalshi v2 ; la premiere page brute
-       est loggee pour verification ([RAW:markets_page])."""
-    markets, cursor, pages, errors = [], None, 0, 0
-    while pages < cfg.MAX_PAGES:
-        params = {"status": status, "limit": cfg.PAGE_LIMIT}
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            r = client._req("GET", "/markets", params=params)
-        except Exception as e:                      # KalshiAPIError ou autre
-            errors += 1
-            log.error(f"Pagination page {pages + 1}: {e}")
-            break
-        pages += 1
-        if pages == 1 and hasattr(client, "_log_raw_once"):
-            client._log_raw_once("markets_page",
-                                 {k: r.get(k) for k in ("cursor",)} |
-                                 {"markets_sample": (r.get("markets") or [])[:1]})
-        batch = r.get("markets", []) or []
-        markets.extend(batch)
-        cursor = r.get("cursor")
-        if not cursor or not batch:
-            break
-    else:
-        log.warning(f"Garde-fou MAX_PAGES={cfg.MAX_PAGES} atteint -- "
-                    f"pagination interrompue (univers peut-etre incomplet).")
-    return markets, pages, errors
+class ScannerConfig:
+    def __init__(self):
+        self.general_crawl = _env_b("SCANNER_GENERAL_CRAWL_ENABLED", False)
+        raw = os.getenv("SCANNER_PRIORITY_SERIES", "").strip()
+        self.priority_series = [s.strip().upper() for s in raw.split(",")
+                                if s.strip()] if raw else None
+        self.priority_max_pages = _env_i("SCANNER_PRIORITY_MAX_PAGES", 5)
+        self.max_markets_per_cycle = _env_i("SCANNER_MAX_MARKETS_PER_CYCLE", 300)
+        self.lookahead_hours = _env_f("SCANNER_LOOKAHEAD_HOURS", 24)
+        self.min_minutes = _env_f("SCANNER_MIN_MINUTES", 5)
+        self.universe_ttl_s = max(1800, _env_i("SCANNER_UNIVERSE_TTL_S", 1800))
+        self.crawl_max_pages = _env_i("SCANNER_CRAWL_MAX_PAGES", 200)
+        self.page_limit = _env_i("SCANNER_PAGE_LIMIT", 200)
 
 
-def fetch_series_markets(client, series: str, status: str = "open",
-                         cfg: ScanConfig = SCFG) -> (list, int, int):
-    """Recupere UNE serie via le filtre serveur `series_ticker` (pagination
-    bornee). Meme contrat de retour que fetch_all_markets."""
-    markets, cursor, pages, errors = [], None, 0, 0
-    while pages < cfg.PRIORITY_MAX_PAGES:
-        params = {"status": status, "limit": cfg.PAGE_LIMIT,
-                  "series_ticker": series}
-        if cursor:
-            params["cursor"] = cursor
-        try:
-            r = client._req("GET", "/markets", params=params)
-        except Exception as e:
-            errors += 1
-            log.error(f"Serie prioritaire {series} page {pages + 1}: {e}")
-            break
-        pages += 1
-        batch = r.get("markets", []) or []
-        markets.extend(batch)
-        cursor = r.get("cursor")
-        if not cursor or not batch:
-            break
-    return markets, pages, errors
-
-
-def fetch_universe(client, status: str = "open",
-                   cfg: ScanConfig = SCFG) -> dict:
-    """Series prioritaires (filtre serveur) PUIS crawl general, avec
-    deduplication par ticker. Garantit que les series servies par une
-    strategie reelle figurent dans l'univers meme si le crawl general est
-    tronque par MAX_PAGES."""
-    prio_markets, prio_pages, prio_errors = [], 0, 0
-    prio_counts, prio_empty = {}, []
-    for serie in (cfg.PRIORITY_SERIES or []):
-        mk, pg, er = fetch_series_markets(client, serie, status=status, cfg=cfg)
-        prio_markets.extend(mk)
-        prio_pages += pg
-        prio_errors += er
-        prio_counts[serie] = len(mk)
-        if not mk:
-            prio_empty.append(serie)
-            log.warning(f"Serie prioritaire '{serie}': 0 marche renvoye par "
-                        f"cet environnement -- la strategie associee ne "
-                        f"recevra aucun candidat ce cycle.")
-    gen_markets, gen_pages, gen_errors = fetch_all_markets(
-        client, status=status, cfg=cfg)
-    seen, merged, dups = set(), [], 0
-    for m in prio_markets + gen_markets:      # priorite d'abord => conservee
-        tk = m.get("ticker")
-        if tk in seen:
-            dups += 1
-            continue
-        seen.add(tk)
-        merged.append(m)
-    return {"markets": merged,
-            "pages": prio_pages + gen_pages,
-            "errors": prio_errors + gen_errors,
-            "priority_series": list(cfg.PRIORITY_SERIES or []),
-            "priority_markets_received": prio_counts,
-            "priority_series_empty": prio_empty,
-            "deduplicated": dups}
-
-# ── Scan complet + rapports ──────────────────────────────────────────────────
-
-def _top(snaps: list, key: str, n: int = 20) -> list:
-    rows = [s for s in snaps if getattr(s, key) is not None]
-    rows.sort(key=lambda s: getattr(s, key), reverse=True)
-    return [{"ticker": s.ticker, "title": s.title, "category": s.category,
-             key: getattr(s, key)} for s in rows[:n]]
-
-def run_scan(client, cfg: ScanConfig = SCFG, save: bool = True,
-             now: Optional[datetime] = None) -> dict:
-    """Scan complet. AUCUN ordre : ce module n'expose ni n'appelle aucune
-    fonction d'envoi d'ordre (garanti par test statique)."""
-    uni = fetch_universe(client, cfg=cfg)
-    raw_markets, pages, errors = uni["markets"], uni["pages"], uni["errors"]
-    snaps = [build_snapshot(m, now=now, cfg=cfg) for m in raw_markets]
-    valid = [s for s in snaps if s.included]
-    excl_by_reason = {}
-    for s in snaps:
-        if s.exclusion_reason:
-            excl_by_reason[s.exclusion_reason] = \
-                excl_by_reason.get(s.exclusion_reason, 0) + 1
-    if errors:
-        excl_by_reason["api_error_pages"] = errors
-    by_cat = {}
-    for s in snaps:
-        by_cat[s.category] = by_cat.get(s.category, 0) + 1
-    report = {
-        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "total_markets_received": len(raw_markets),
-        "api_pages": pages,
-        "api_error_pages": errors,
-        "priority_series": uni["priority_series"],
-        "priority_markets_received": uni["priority_markets_received"],
-        "priority_series_empty": uni["priority_series_empty"],
-        "deduplicated": uni["deduplicated"],
-        "valid_markets": len(valid),
-        "excluded_by_reason": excl_by_reason,
-        "by_category": by_cat,
-        "top20_volume": _top(valid, "volume"),
-        "top20_liquidity": _top(valid, "liquidity"),
-        "top20_open_interest": _top(valid, "open_interest"),
-        "empty_book_markets": [s.ticker for s in snaps
-                               if s.exclusion_reason == "no_liquidity"][:200],
-        "filters": {k: getattr(cfg, k) for k in
-                    ("MIN_MINUTES", "MAX_MINUTES", "MIN_VOLUME",
-                     "MIN_OPEN_INTEREST", "MAX_SPREAD_CENTS",
-                     "REQUIRE_LIQUIDITY", "ALLOWED_CATEGORIES",
-                     "EXCLUDED_CATEGORIES")},
-    }
-    if save:
-        _save_json(cfg.UNIVERSE_FILE,
-                   [_snap_dict(s) for s in snaps])
-        _save_json(cfg.REPORT_FILE, report)
-        log.info(f"Univers: {len(snaps)} marches ({len(valid)} valides) -> "
-                 f"{cfg.UNIVERSE_FILE} | rapport -> {cfg.REPORT_FILE}")
-    return {"snapshots": snaps, "report": report}
-
-def _snap_dict(s: MarketSnapshot) -> dict:
-    d = asdict(s)
-    d.pop("raw_market", None)          # l'univers reste lisible ; le brut
-    return d                           # est disponible en memoire si besoin
-
-def _save_json(path: str, data):
-    """Ecriture atomique locale (tmp + replace) — sans dependre du moteur."""
+def _minutes_to_close(m: dict, now_dt: datetime):
+    ct = m.get("close_time")
+    if not ct:
+        return None
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=1, ensure_ascii=False)
-        os.replace(tmp, path)
-    except Exception as e:
-        log.error(f"Ecriture {path}: {e}")
+        close_dt = datetime.fromisoformat(str(ct).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return (close_dt - now_dt).total_seconds() / 60.0
+
+
+def _has_liquidity(m: dict) -> bool:
+    """Un cote executable au moins (prix 1..99 sur un ask), OU volume/
+    open_interest > 0. Kalshi renvoie 0 pour un carnet vide."""
+    for k in ("yes_ask", "no_ask", "yes_bid", "no_bid"):
+        try:
+            v = int(float(m.get(k)))
+        except (TypeError, ValueError):
+            continue
+        if 1 <= v <= 99:
+            return True
+    for k in ("volume", "volume_24h", "open_interest", "liquidity"):
+        try:
+            if float(m.get(k) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+class MarketScanner:
+    """series_provider() -> liste de series cibles (derivee du registre si
+    non fournie). client doit exposer get_markets(series,...) et _req()."""
+
+    def __init__(self, client, router=None, cfg: ScannerConfig = None,
+                 data_dir: str = ".", now_fn=None):
+        self.client = client
+        self.router = router
+        self.cfg = cfg or ScannerConfig()
+        self.data_dir = data_dir
+        self.now_fn = now_fn or time.time
+        self._universe = None            # liste de marches (crawl complet)
+        self._universe_ts = 0.0
+        self._crawl_pages_last = 0
+        self._cache_path = os.path.join(data_dir, "universe_cache.json")
+        self._load_disk_cache()
+
+    # ── perimetre cible ────────────────────────────────────────────────────
+    def target_series(self) -> list:
+        if self.cfg.priority_series:
+            return self.cfg.priority_series
+        series = []
+        # Perimetre = types dont la strategie a une SOURCE de probabilite
+        # (Tache 4/6 : ne jamais telecharger un marche qui sera rejete
+        # no_model_probability ; s'etend automatiquement quand un
+        # fournisseur sports/election est branche).
+        if self.router and hasattr(self.router, "tradeable_market_types"):
+            supported = self.router.tradeable_market_types()
+        elif self.router:
+            supported = self.router.supported_market_types()
+        else:
+            supported = DEFAULT_SERIES_BY_MARKET_TYPE.keys()
+        for mt in supported:
+            series.extend(DEFAULT_SERIES_BY_MARKET_TYPE.get(mt, []))
+        # dedoublonnage en preservant l'ordre
+        return list(dict.fromkeys(series))
+
+    # ── crawl complet, EN CACHE (>= 30 min) + incremental ──────────────────
+    def _load_disk_cache(self):
+        try:
+            with open(self._cache_path, encoding="utf-8") as f:
+                d = json.load(f)
+            self._universe = d.get("markets") or None
+            self._universe_ts = float(d.get("fetched_at") or 0)
+        except (OSError, ValueError):
+            pass
+
+    def _save_disk_cache(self):
+        try:
+            tmp = self._cache_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"fetched_at": self._universe_ts,
+                           "scanner_version": SCANNER_VERSION,
+                           "markets": self._universe}, f)
+            os.replace(tmp, self._cache_path)
+        except OSError as e:
+            log.warning(f"cache univers non persiste: {e}")
+
+    def _crawl_universe(self) -> list:
+        """Pagination complete /markets (cursor). Appelee au maximum une
+        fois par universe_ttl_s. L'alerte MAX_PAGES est emise UNE fois par
+        rafraichissement si le plafond est atteint."""
+        out, cursor, pages = [], None, 0
+        while pages < self.cfg.crawl_max_pages:
+            params = {"status": "open", "limit": self.cfg.page_limit}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                r = self.client._req("GET", "/markets", params=params)
+            except Exception as e:               # noqa: BLE001
+                log.error(f"crawl page {pages}: {e}")
+                break
+            pages += 1
+            out.extend(r.get("markets", []) or [])
+            cursor = r.get("cursor")
+            if not cursor:
+                break
+        self._crawl_pages_last = pages
+        if pages >= self.cfg.crawl_max_pages:
+            log.warning(f"Garde-fou MAX_PAGES={self.cfg.crawl_max_pages} "
+                        f"atteint lors du RAFRAICHISSEMENT du cache "
+                        f"(prochain rafraichissement dans "
+                        f">={self.cfg.universe_ttl_s}s) — univers possiblement "
+                        f"incomplet ; le perimetre CIBLE n'est pas affecte.")
+        return out
+
+    def universe(self, force: bool = False) -> list:
+        now = self.now_fn()
+        if (not force and self._universe is not None
+                and now - self._universe_ts < self.cfg.universe_ttl_s):
+            return self._universe
+        self._universe = self._crawl_universe()
+        self._universe_ts = now
+        self._save_disk_cache()
+        return self._universe
+
+    def _incremental_refresh(self, base: list) -> list:
+        """Entre deux crawls complets : seules les series CIBLES sont
+        re-lues (fraiches), fusionnees dans l'univers en cache."""
+        fresh = {}
+        for s in self.target_series():
+            for m in (self.client.get_markets(s, status="open",
+                                              limit=self.cfg.page_limit) or []):
+                tk = m.get("ticker")
+                if tk:
+                    fresh[tk] = m
+        merged = {m.get("ticker"): m for m in (base or []) if m.get("ticker")}
+        merged.update(fresh)
+        return list(merged.values())
+
+    # ── cycle de scan ──────────────────────────────────────────────────────
+    def scan_cycle(self) -> dict:
+        """Retourne {"markets": [...], "report": {...}} avec metriques
+        avant/apres chaque filtre."""
+        t0 = time.time()
+        now_dt = datetime.now(timezone.utc)
+        rep = {"scanner_version": SCANNER_VERSION,
+               "mode": None, "from_cache": False,
+               "crawl_pages_last_refresh": self._crawl_pages_last,
+               "excluded_by_reason": {}, "funnel": {}}
+
+        if self.cfg.general_crawl:
+            cached = (self._universe is not None and
+                      self.now_fn() - self._universe_ts
+                      < self.cfg.universe_ttl_s)
+            base = self.universe()
+            rep["mode"] = "crawl+incremental"
+            rep["from_cache"] = cached
+            markets = self._incremental_refresh(base) if cached else base
+        else:
+            rep["mode"] = "targeted_series"
+            markets = self._incremental_refresh([])
+
+        def _excl(reason):
+            rep["excluded_by_reason"][reason] = \
+                rep["excluded_by_reason"].get(reason, 0) + 1
+
+        rep["funnel"]["scanned_raw"] = len(markets)
+
+        kept = []
+        for m in markets:
+            status = str(m.get("status") or "").lower()
+            if status and status not in ("open", "active"):
+                _excl("closed_or_settled"); continue
+            kept.append(m)
+        rep["funnel"]["after_status"] = len(kept)
+
+        stage = []
+        for m in kept:
+            mins = _minutes_to_close(m, now_dt)
+            if mins is None:
+                _excl("no_close_time"); continue
+            if mins <= 0:
+                _excl("expired"); continue
+            if mins < self.cfg.min_minutes:
+                _excl("closes_too_soon"); continue
+            if mins > self.cfg.lookahead_hours * 60:
+                _excl("outside_time_window"); continue
+            m["_minutes_remaining"] = mins
+            stage.append(m)
+        kept = stage
+        rep["funnel"]["after_time_window"] = len(kept)
+
+        stage = []
+        for m in kept:
+            if not _has_liquidity(m):
+                _excl("no_liquidity"); continue
+            stage.append(m)
+        kept = stage
+        rep["funnel"]["after_liquidity"] = len(kept)
+
+        stage = []
+        for m in kept:
+            c = classify(m)
+            m["_classification"] = c.to_dict()
+            if c.market_type == "unknown":
+                _excl("unknown_market_type"); continue
+            if self.router is not None:
+                sup = set(self.router.supported_market_types())
+                trd = set(self.router.tradeable_market_types()
+                          if hasattr(self.router, "tradeable_market_types")
+                          else sup)
+                if c.market_type not in sup:
+                    _excl("no_compatible_strategy"); continue
+                if c.market_type not in trd:
+                    _excl("no_probability_provider"); continue
+            stage.append(m)
+        kept = stage
+        rep["funnel"]["after_classification"] = len(kept)
+
+        # plafond d'evaluation couteuse : tri par (liquidite approx, temps)
+        def _cheap_score(m):
+            vol = 0.0
+            for k in ("volume_24h", "volume", "open_interest"):
+                try:
+                    vol = max(vol, float(m.get(k) or 0))
+                except (TypeError, ValueError):
+                    pass
+            return (vol, -m.get("_minutes_remaining", 1e9))
+        kept.sort(key=_cheap_score, reverse=True)
+        if len(kept) > self.cfg.max_markets_per_cycle:
+            for _ in kept[self.cfg.max_markets_per_cycle:]:
+                _excl("over_cycle_cap")
+            kept = kept[:self.cfg.max_markets_per_cycle]
+        rep["funnel"]["kept"] = len(kept)
+        rep["scan_duration_ms"] = int((time.time() - t0) * 1000)
+        return {"markets": kept, "report": rep}
+
+
+# ── Compat --scan-only ──────────────────────────────────────────────────────
+
+def run_scan(client, router=None) -> dict:
+    sc = MarketScanner(client, router=router)
+    res = sc.scan_cycle()
+    rep = res["report"]
+    out = {"report": {
+        "total_markets_received": rep["funnel"].get("scanned_raw", 0),
+        "api_pages": rep.get("crawl_pages_last_refresh", 0),
+        "valid_markets": rep["funnel"].get("kept", 0),
+        "excluded_by_reason": rep["excluded_by_reason"],
+        "funnel": rep["funnel"], "mode": rep["mode"],
+    }, "markets": res["markets"]}
+    try:
+        with open("market_scanner_report.json", "w", encoding="utf-8") as f:
+            json.dump(out["report"], f, indent=1)
+    except OSError:
+        pass
+    return out
