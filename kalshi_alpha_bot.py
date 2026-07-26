@@ -98,6 +98,10 @@ class Config:
     # panne de verification). 0 = desactive (tests uniquement).
     SUBMIT_DEDUP_TTL_S = _env_f("SUBMIT_DEDUP_TTL_SECONDS", 6 * 3600.0)
     EXCHANGE_503_COOLDOWN_S = _env_f("EXCHANGE_503_COOLDOWN_SECONDS", 300.0)
+    # Dashboard web (lecture seule des fichiers d'etat, zero dependance).
+    DASHBOARD_ENABLED = _env_b("DASHBOARD_ENABLED", True)
+    DASHBOARD_PORT = int(os.environ.get("PORT",
+                         os.environ.get("DASHBOARD_PORT", "8080")))
     CANCEL_UNFILLED_ORDERS  = _env_b("CANCEL_UNFILLED_ORDERS", True)
     MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
     MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
@@ -1724,6 +1728,7 @@ class ExecutionEngine:
         solde broker). Prod sans solde = blocage ; demo : secours possible
         via ALLOW_FALLBACK_CAPITAL=1, clairement journalise."""
         bal = self.client.get_balance()
+        self.last_balance = bal
         if bal is not None:
             self.capital = min(self.configured_capital, bal) \
                 if self.configured_capital else bal
@@ -1784,6 +1789,7 @@ class ExecutionEngine:
         # 0) Reglement des predictions shadow (journal de recherche)
         try:
             n_shadow = self.shadow_store.settle_pending(self.client.get_market)
+            self.shadow_settled_total = len(self.shadow_store.settled())
             if n_shadow:
                 log.info(f"[SHADOW] {n_shadow} prediction(s) reglee(s) "
                          f"(total regle: {len(self.shadow_store.settled())})")
@@ -1857,6 +1863,35 @@ class ExecutionEngine:
         import json as _json
         log.info(f"[CYCLE-SUMMARY] {_json.dumps(summary, ensure_ascii=False)}")
         JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
+        # Etat dashboard : UNIQUEMENT des donnees reelles du cycle (les
+        # champs non disponibles restent absents -- l'UI affiche « — »).
+        try:
+            cands = []
+            for d in (res.get("accepted") or []):
+                cands.append({
+                    "ticker": getattr(d, "ticker", None),
+                    "strategy": getattr(d, "strategy", None),
+                    "side": getattr(d, "side", None),
+                    "model_probability": getattr(d, "model_probability", None),
+                    "market_probability": getattr(d, "market_probability", None),
+                    "edge_net": getattr(d, "edge_net", None),
+                    "ev_net": getattr(d, "ev_net", None),
+                    "confidence": getattr(d, "confidence", None),
+                    "status": "submitted" if placed else "evalue",
+                })
+            JsonStore.save(_p("dashboard_state.json"), {
+                "ts": now_iso(), "version": ENGINE_VERSION,
+                "env": getattr(self.client, "env", "demo"),
+                "cycle": n, "balance": getattr(self, "last_balance", None),
+                "capital": self.capital,
+                "configured_capital": self.configured_capital,
+                "shadow_settled": getattr(self, "shadow_settled_total", None),
+                "exchange_paused": time.time() <
+                getattr(self.om, "exchange_pause_until", 0.0),
+                "candidates": cands,
+            })
+        except Exception as e:
+            log.warning(f"dashboard_state: {e}")
         JsonStore.save(_p("pipeline_stats.json"), {
             "cycle": n,
             "scanned": report["scanned"],
@@ -2032,6 +2067,24 @@ def banner(client: KalshiClient, capital: float):
              f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
     log.info("=" * 62)
 
+def _start_dashboard_if_enabled():
+    """Dashboard web en thread daemon. Zero dependance, lecture seule des
+    fichiers d'etat -- ne peut ni bloquer ni influencer le trading."""
+    if not CFG.DASHBOARD_ENABLED:
+        return None
+    try:
+        from dashboard_web import start_dashboard
+        srv = start_dashboard(CFG.DATA_DIR, CFG.DASHBOARD_PORT)
+        log.info(f"[DASHBOARD] http://0.0.0.0:{CFG.DASHBOARD_PORT} "
+                 f"(donnees: {CFG.DATA_DIR}) -- donnees REELLES uniquement, "
+                 f"low_sample affiche tant que n<30 trades regles.")
+        return srv
+    except Exception as e:
+        log.warning(f"[DASHBOARD] non demarre: {e} "
+                    "(le trading continue normalement)")
+        return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--btc", action="store_true", help="mode BTC 15min")
@@ -2092,6 +2145,7 @@ def main():
 
     client = KalshiClient(env)
     banner(client, args.capital)
+    _start_dashboard_if_enabled()
 
     if args.scan_only or args.rank_only:
         # Modes analyse : jamais d'ExecutionEngine, donc aucun chemin vers

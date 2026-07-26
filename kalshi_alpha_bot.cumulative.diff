@@ -1,6 +1,6 @@
 --- /mnt/user-data/uploads/kalshi_alpha_bot.py	2026-07-24 12:40:17.850185000 +0000
-+++ src/engine/kalshi_alpha_bot.py	2026-07-26 12:16:55.531871611 +0000
-@@ -75,13 +75,30 @@
++++ src/engine/kalshi_alpha_bot.py	2026-07-26 17:09:34.806406445 +0000
+@@ -75,13 +75,34 @@
      ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", True)
      MIN_MINUTES       = _env_f("BTC_MIN_MINUTES", 5.0)
      MAX_SPREAD_PAY    = _env_i("MAX_SPREAD_PAY", 5)
@@ -30,11 +30,15 @@
 +    # panne de verification). 0 = desactive (tests uniquement).
 +    SUBMIT_DEDUP_TTL_S = _env_f("SUBMIT_DEDUP_TTL_SECONDS", 6 * 3600.0)
 +    EXCHANGE_503_COOLDOWN_S = _env_f("EXCHANGE_503_COOLDOWN_SECONDS", 300.0)
++    # Dashboard web (lecture seule des fichiers d'etat, zero dependance).
++    DASHBOARD_ENABLED = _env_b("DASHBOARD_ENABLED", True)
++    DASHBOARD_PORT = int(os.environ.get("PORT",
++                         os.environ.get("DASHBOARD_PORT", "8080")))
 +    CANCEL_UNFILLED_ORDERS  = _env_b("CANCEL_UNFILLED_ORDERS", True)
      MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
      MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
      MAX_EQUITY_DRAWDOWN_PCT = _env_f("MAX_EQUITY_DRAWDOWN_PCT", 20.0)
-@@ -99,7 +116,8 @@
+@@ -99,7 +120,8 @@
      SHADOW_MODE            = _env_b("SHADOW_MODE", False)   # decide, n'envoie pas
      KILL_SWITCH            = _env_b("KILL_SWITCH", False)   # coupe tout ordre
      # Ordres
@@ -44,7 +48,7 @@
      ORDER_POLL_START  = 1.0
      ORDER_POLL_MAX    = 5.0
      # Frais (A VERIFIER contre le bareme officiel Kalshi)
-@@ -245,13 +263,28 @@
+@@ -245,13 +267,28 @@
      def _load_key(self, key_pem: str):
          try:
              from cryptography.hazmat.primitives import serialization
@@ -76,7 +80,7 @@
              return None
  
      def _sign_headers(self, method: str, url: str) -> dict:
-@@ -276,6 +309,13 @@
+@@ -276,6 +313,13 @@
  
      # -- Requete avec retry/backoff ------------------------------------------
      def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
@@ -90,7 +94,7 @@
          url = self.base_url + path
          attempt, delay = 0, 1.0
          while True:
-@@ -300,6 +340,12 @@
+@@ -300,6 +344,12 @@
                                  f"retry {attempt}/{retries} dans {wait:.0f}s")
                  time.sleep(wait); delay = min(delay * 2, 8); continue
  
@@ -103,7 +107,7 @@
              if r.status_code >= 400:
                  raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
  
-@@ -344,19 +390,72 @@
+@@ -344,19 +394,72 @@
              log_api.warning(f"get_balance: {e}")
              return None
  
@@ -186,7 +190,7 @@
  
      def get_order(self, order_id: str) -> dict:
          r = self._req("GET", f"/portfolio/orders/{order_id}")
-@@ -575,6 +674,7 @@
+@@ -575,6 +678,7 @@
              "fill_ids": (extra or {}).get("fill_ids", []),
              "state": "open",
              "strategy": (extra or {}).get("strategy"),
@@ -194,7 +198,7 @@
              "market_score": (extra or {}).get("market_score"),
              "entry_edge": (extra or {}).get("entry_edge"),
              "entry_ev": (extra or {}).get("entry_ev"),
-@@ -707,12 +807,74 @@
+@@ -707,12 +811,74 @@
          self.avg_price, self.status, self.state = avg_price, status, state
          # state: "filled" | "partial" | "cancelled" | "rejected" | "unknown"
  
@@ -269,7 +273,7 @@
  
      def flush(self):
          JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders)
-@@ -737,7 +899,10 @@
+@@ -737,7 +903,10 @@
          return status, min(filled, requested)
  
      def _avg_fill_price(self, order_id: str, side: str, fallback: int) -> int:
@@ -281,7 +285,7 @@
          tot_c, tot_px = 0, 0
          for f in fills:
              c  = pick_int(f, "count", "quantity", default=0)
-@@ -772,14 +937,113 @@
+@@ -772,14 +941,113 @@
              return ExecutionResult(None, count, 0, limit_cents,
                                     "blocked:no_executable_ask", "rejected")
          limit_cents = int(limit_cents)
@@ -398,7 +402,7 @@
          if not order_id:
              log_api.error(f"Reponse d'ordre sans identifiant -- trade NON enregistre. "
                            f"Reponse: {json.dumps(order)[:300]}")
-@@ -790,19 +1054,49 @@
+@@ -790,19 +1058,49 @@
                                        "placed_at": now_iso()}
          self.flush()
  
@@ -455,7 +459,7 @@
              self.client.cancel_order(order_id)
              try:
                  order = self.client.get_order(order_id)
-@@ -816,7 +1110,11 @@
+@@ -816,7 +1114,11 @@
          # si le statut pretend "executed"/"filled" sans compteur exploitable,
          # on interroge /portfolio/fills, source de verite.
          if filled <= 0 and status in ("executed", "filled"):
@@ -468,7 +472,7 @@
              filled = min(count, sum(pick_int(f, "count", "quantity", default=0)
                                      for f in fills))
              if filled > 0:
-@@ -824,10 +1122,30 @@
+@@ -824,10 +1126,30 @@
                               f"-- {filled} contrat(s) confirme(s) via /fills.")
  
          if filled <= 0:
@@ -499,7 +503,7 @@
          return ExecutionResult(order_id, count, filled, avg, status or "executed", state)
  
      def reconcile_startup(self, tlog: TradeLogger, posmgr: PositionManager):
-@@ -906,12 +1224,35 @@
+@@ -906,12 +1228,35 @@
          cur_dd = peak - curve
          return cur_dd
  
@@ -537,7 +541,7 @@
          if cycle_trades >= CFG.MAX_TRADES_CYCLE:
              return False, f"max {CFG.MAX_TRADES_CYCLE} trades/cycle atteint"
          open_risk = self.posmgr.open_risk()
-@@ -1073,14 +1414,16 @@
+@@ -1073,14 +1418,16 @@
      def normalize_book(m: dict) -> Optional[dict]:
          """Carnet coherent ou None. Derive le cote NO du cote YES si absent."""
          def cents(*names):
@@ -562,7 +566,7 @@
          yb, ya = cents("yes_bid"), cents("yes_ask")
          nb, na = cents("no_bid"),  cents("no_ask")
          if nb is None and ya is not None: nb = 100 - ya
-@@ -1286,9 +1629,10 @@
+@@ -1286,9 +1633,10 @@
      a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
  
      def __init__(self, client: KalshiClient, capital: float):
@@ -575,7 +579,7 @@
          from shadow_prediction_store import ShadowPredictionStore
          self.client   = client
          self.configured_capital = capital           # PLAFOND, pas la verite
-@@ -1299,12 +1643,21 @@
+@@ -1299,12 +1647,21 @@
          self.risk     = RiskManager(self.tlog, self.posmgr, capital)
          self.stats    = StatsEngine(self.tlog)
          self.strategy = BtcStrategy(client)          # analyse crypto existante
@@ -603,7 +607,7 @@
          self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
          self.gates = GateConfig(
              MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
-@@ -1318,7 +1671,11 @@
+@@ -1318,7 +1675,11 @@
          self.pipeline = MarketOpportunityPipeline(
              client, self.router, gates=self.gates,
              fresh_book_fn=self.fresh_book,
@@ -616,7 +620,15 @@
          # Recovery apres crash + broker source de verite
          self.orders.reconcile_startup(self.tlog, self.posmgr)
          self.posmgr.reconcile_startup()
-@@ -1382,6 +1739,44 @@
+@@ -1367,6 +1728,7 @@
+         solde broker). Prod sans solde = blocage ; demo : secours possible
+         via ALLOW_FALLBACK_CAPITAL=1, clairement journalise."""
+         bal = self.client.get_balance()
++        self.last_balance = bal
+         if bal is not None:
+             self.capital = min(self.configured_capital, bal) \
+                 if self.configured_capital else bal
+@@ -1382,6 +1744,44 @@
          return False, ("solde indisponible; en demo, ALLOW_FALLBACK_CAPITAL=1 "
                         "requis pour un secours explicite")
  
@@ -661,7 +673,15 @@
      def cycle(self, n: int) -> int:
          log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
          self.stats.maybe_daily_report()
-@@ -1435,15 +1830,32 @@
+@@ -1389,6 +1789,7 @@
+         # 0) Reglement des predictions shadow (journal de recherche)
+         try:
+             n_shadow = self.shadow_store.settle_pending(self.client.get_market)
++            self.shadow_settled_total = len(self.shadow_store.settled())
+             if n_shadow:
+                 log.info(f"[SHADOW] {n_shadow} prediction(s) reglee(s) "
+                          f"(total regle: {len(self.shadow_store.settled())})")
+@@ -1435,16 +1836,62 @@
              if placed >= CFG.MAX_TRADES_CYCLE:
                  break
              placed += self._execute_decision(dec, report)
@@ -698,9 +718,39 @@
 -        log.info(f"[STATS] {_json.dumps({'reject_reasons': report['rejections']}, ensure_ascii=False)}")
 +        log.info(f"[CYCLE-SUMMARY] {_json.dumps(summary, ensure_ascii=False)}")
          JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
++        # Etat dashboard : UNIQUEMENT des donnees reelles du cycle (les
++        # champs non disponibles restent absents -- l'UI affiche « — »).
++        try:
++            cands = []
++            for d in (res.get("accepted") or []):
++                cands.append({
++                    "ticker": getattr(d, "ticker", None),
++                    "strategy": getattr(d, "strategy", None),
++                    "side": getattr(d, "side", None),
++                    "model_probability": getattr(d, "model_probability", None),
++                    "market_probability": getattr(d, "market_probability", None),
++                    "edge_net": getattr(d, "edge_net", None),
++                    "ev_net": getattr(d, "ev_net", None),
++                    "confidence": getattr(d, "confidence", None),
++                    "status": "submitted" if placed else "evalue",
++                })
++            JsonStore.save(_p("dashboard_state.json"), {
++                "ts": now_iso(), "version": ENGINE_VERSION,
++                "env": getattr(self.client, "env", "demo"),
++                "cycle": n, "balance": getattr(self, "last_balance", None),
++                "capital": self.capital,
++                "configured_capital": self.configured_capital,
++                "shadow_settled": getattr(self, "shadow_settled_total", None),
++                "exchange_paused": time.time() <
++                getattr(self.om, "exchange_pause_until", 0.0),
++                "candidates": cands,
++            })
++        except Exception as e:
++            log.warning(f"dashboard_state: {e}")
          JsonStore.save(_p("pipeline_stats.json"), {
              "cycle": n,
-@@ -1460,10 +1872,6 @@
+             "scanned": report["scanned"],
+@@ -1460,10 +1907,6 @@
          })
          JsonStore.save(_p("reject_reasons.json"),
                         {"cycle": n, "reject_reasons": report["rejections"]})
@@ -711,7 +761,7 @@
          if placed == 0:
              self.stats.log_summary()
          return placed
-@@ -1485,7 +1893,12 @@
+@@ -1485,7 +1928,12 @@
          entry = int(ask)
  
          # 5b) budgets risque categorie / marche (sur capital effectif)
@@ -725,7 +775,7 @@
          if self.posmgr.open_risk_on(ticker) >= \
                  self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
              report["rejections"]["risk_blocked"] = \
-@@ -1529,7 +1942,11 @@
+@@ -1529,7 +1977,11 @@
              return 0
  
          # 5e) frais REELS d'abord (reponse d'ordre puis fills) (TEST M)
@@ -738,7 +788,7 @@
          fee_amt, fee_src = FeeModel.from_api({}, fills,
                                               exec_res.filled, exec_res.avg_price)
          trade = self.tlog.open_trade(
-@@ -1548,10 +1965,37 @@
+@@ -1548,10 +2000,37 @@
                        "strategy": dec.strategy},
              order_id=exec_res.order_id, order_status=exec_res.status)
          self.posmgr.open_position(trade, extra={
@@ -777,7 +827,7 @@
          snap = self.risk.snapshot()
          log_rsk.info(f"risque_ouvert={snap['open_risk']}$ "
                       f"pnl_jour={snap['daily_realized_pnl']}$ "
-@@ -1572,9 +2016,17 @@
+@@ -1572,14 +2051,40 @@
      log.info(f"               ORDRES REELS -- aucun dry-run, aucune simulation")
      log.info(f"Identifiants  : {client.cred_src}")
      log.info(f"Solde compte  : {f'{bal:,.2f}$' if bal is not None else 'indisponible (verifier cles/env)'}")
@@ -798,7 +848,30 @@
      log.info(f"Protections   : entree<={CFG.MAX_ENTRY_CENTS}c | "
               f"1 trade/marche={'OUI' if CFG.ONE_TRADE_PER_MKT else 'NON'} | "
               f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
-@@ -1602,7 +2054,13 @@
+     log.info("=" * 62)
+ 
++def _start_dashboard_if_enabled():
++    """Dashboard web en thread daemon. Zero dependance, lecture seule des
++    fichiers d'etat -- ne peut ni bloquer ni influencer le trading."""
++    if not CFG.DASHBOARD_ENABLED:
++        return None
++    try:
++        from dashboard_web import start_dashboard
++        srv = start_dashboard(CFG.DATA_DIR, CFG.DASHBOARD_PORT)
++        log.info(f"[DASHBOARD] http://0.0.0.0:{CFG.DASHBOARD_PORT} "
++                 f"(donnees: {CFG.DATA_DIR}) -- donnees REELLES uniquement, "
++                 f"low_sample affiche tant que n<30 trades regles.")
++        return srv
++    except Exception as e:
++        log.warning(f"[DASHBOARD] non demarre: {e} "
++                    "(le trading continue normalement)")
++        return None
++
++
+ def main():
+     ap = argparse.ArgumentParser()
+     ap.add_argument("--btc", action="store_true", help="mode BTC 15min")
+@@ -1602,7 +2107,13 @@
      ap.add_argument("--shadow", action="store_true",
                      help="mode shadow: pipeline et decisions complets, "
                           "AUCUN ordre envoye")
@@ -812,3 +885,11 @@
      if args.shadow:
          CFG.SHADOW_MODE = True
  
+@@ -1634,6 +2145,7 @@
+ 
+     client = KalshiClient(env)
+     banner(client, args.capital)
++    _start_dashboard_if_enabled()
+ 
+     if args.scan_only or args.rank_only:
+         # Modes analyse : jamais d'ExecutionEngine, donc aucun chemin vers

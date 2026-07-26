@@ -1,5 +1,28 @@
 # Changelog
 
+## [12.6.0] — 2026-07-26
+### Dashboard web (nouveau)
+- src/dashboard/dashboard_web.py : serveur HTTP stdlib (ZERO dependance),
+  thread daemon a cote du moteur ; GET / (UI sombre, polling 5 s, canvas)
+  et GET /api/state (JSON agrege).
+- Donnees 100 % REELLES lues dans les fichiers d'etat : solde/capital
+  effectif, courbe d'equity = PnL realise cumule des trades regles,
+  P&L/jour, P&L/strategie, candidats du dernier cycle (proba modele vs
+  marche, edge/EV, statut dont blocked:*), positions, ordres suivis,
+  funnel + rejets, compteur shadow, indicateur cooldown 503.
+- HONNETETE d'affichage : « — » quand une donnee n'existe pas ; bandeau
+  low_sample tant que n<30 trades regles ; note explicite que le modele
+  btc15m-v1.0-ref n'est PAS calibre. Les chiffres de la maquette d'origine
+  (WR 66,67 %, Sharpe 1.87, strategies ETH) etaient fictifs et ne sont
+  PAS reproduits.
+- Moteur : ecrit dashboard_state.json a chaque cycle (candidats, solde,
+  cycle, shadow, pause 503) ; DASHBOARD_ENABLED (defaut 1) ; port = $PORT
+  Railway sinon DASHBOARD_PORT (8080). Echec du dashboard = warning,
+  jamais d'impact trading.
+### Tests
+- 139 tests (4 nouveaux : agregation honnete, exposition, serveur HTTP),
+  0 echec. Demo locale validee sur donnees identiques a la prod.
+
 ## [12.5.0] — 2026-07-26
 ### CRITIQUE — fills reels non comptabilises + re-soumission en boucle
 Logs 2026-07-25 23:14+ : ordres V2 crees (201) et REMPLIS, mais
