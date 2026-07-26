@@ -93,6 +93,11 @@ class Config:
     DRY_RUN           = _env_b("DRY_RUN", False)
     ALLOW_ORDER_SUBMISSION = _env_b("ALLOW_ORDER_SUBMISSION", True)
     ORDER_VERIFY_INTERVAL_S = _env_f("ORDER_VERIFY_INTERVAL_SECONDS", 3.0)
+    # Verrou anti-doublon de session (s) : re-soumettre le meme ticker est
+    # refuse pendant ce delai meme sans trade local (defense contre toute
+    # panne de verification). 0 = desactive (tests uniquement).
+    SUBMIT_DEDUP_TTL_S = _env_f("SUBMIT_DEDUP_TTL_SECONDS", 6 * 3600.0)
+    EXCHANGE_503_COOLDOWN_S = _env_f("EXCHANGE_503_COOLDOWN_SECONDS", 300.0)
     CANCEL_UNFILLED_ORDERS  = _env_b("CANCEL_UNFILLED_ORDERS", True)
     MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
     MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
@@ -860,6 +865,16 @@ class OrderManager:
     def __init__(self, client: KalshiClient):
         self.client = client
         self.open_orders = JsonStore.load(_p(CFG.ORDERS_FILE), {})  # id -> meta
+        # Garde anti-doublon de SESSION, independante de l'enregistrement des
+        # trades : un ordre soumis (201) sur un ticker verrouille ce ticker
+        # pour la duree configuree, MEME si la verification echoue ensuite.
+        # Motif : bug 2026-07-25 (GET V1 404 sur ordres V2) -> le meme signal
+        # a ete re-soumis et REMPLI ~8 fois, solde debite sans aucun trade
+        # local. Ce verrou rend ce mode de defaillance impossible.
+        self.session_submitted = {}          # ticker -> epoch de soumission
+        # Cooldown apres 503 exchange (demo en pause/maintenance) : inutile
+        # et bruyant de marteler l'API a chaque cycle.
+        self.exchange_pause_until = 0.0
 
     def flush(self):
         JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders)
@@ -884,7 +899,10 @@ class OrderManager:
         return status, min(filled, requested)
 
     def _avg_fill_price(self, order_id: str, side: str, fallback: int) -> int:
-        fills = self.client.get_fills(order_id)
+        try:
+            fills = self.client.get_fills(order_id)
+        except KalshiAPIError:
+            fills = []
         tot_c, tot_px = 0, 0
         for f in fills:
             c  = pick_int(f, "count", "quantity", default=0)
@@ -925,6 +943,24 @@ class OrderManager:
                           "ALLOW_ORDER_SUBMISSION=false")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:submission_disabled", "rejected")
+        now = time.time()
+        if now < self.exchange_pause_until:
+            log_api.warning("[ORDER_SUBMIT_SKIPPED] exchange en cooldown "
+                            f"apres 503 (reprise dans "
+                            f"{self.exchange_pause_until - now:.0f}s)")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:exchange_unavailable_cooldown",
+                                   "rejected")
+        last = self.session_submitted.get(ticker)
+        if last is not None and now - last < CFG.SUBMIT_DEDUP_TTL_S:
+            log_api.warning("[ORDER_SUBMIT_SKIPPED] garde anti-doublon: un "
+                            f"ordre a deja ete soumis sur {ticker} il y a "
+                            f"{now - last:.0f}s (TTL "
+                            f"{CFG.SUBMIT_DEDUP_TTL_S:.0f}s) -- re-soumission "
+                            "refusee meme si le trade local est absent.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:duplicate_submission_guard",
+                                   "rejected")
         client_order_id = f"alpha_{uuid.uuid4().hex}"
         env_name = "DEMO" if getattr(self.client, "env", "demo") == "demo" \
             else "PROD"
@@ -949,8 +985,15 @@ class OrderManager:
                           f"http_status={e.status} error_code={e.status} "
                           f"error_message={e} "
                           f"response_body_sanitized={str(e.body)[:300]}")
+            if getattr(e, "status", None) == 503:
+                self.exchange_pause_until = time.time() + CFG.EXCHANGE_503_COOLDOWN_S
+                log_api.warning("[EXCHANGE_COOLDOWN] 503 exchange -- pause "
+                                f"des soumissions {CFG.EXCHANGE_503_COOLDOWN_S:.0f}s "
+                                "(demo probablement en maintenance).")
             return ExecutionResult(None, count, 0, limit_cents, f"rejected:{e.status}",
                                    "rejected")
+        self.exchange_pause_until = 0.0
+        self.session_submitted[ticker] = time.time()
         http_status = getattr(self.client, "last_http_status", None)
         order_id = str(pick(order, "order_id", "id", default="") or "")
         log_api.info("[ORDER_SUBMIT_RESPONSE] "
@@ -969,6 +1012,24 @@ class OrderManager:
             except KalshiAPIError as e:
                 verified = {}
                 log_api.warning(f"[ORDER_VERIFY] relecture en erreur: {e}")
+                # BUG CORRIGE (logs 2026-07-25 23:14+) : les ordres crees via
+                # V2 repondent 404 sur le GET V1 -> tous les fills REELS
+                # etaient rejetes "unverified", aucun trade enregistre, et le
+                # MEME signal etait re-soumis chaque cycle (solde debite en
+                # silence). La reponse de creation V2 vient du moteur
+                # d'appariement (order_id, fill_count, remaining_count,
+                # ts_ms) : c'est une source de verite valide. On l'utilise
+                # comme verification quand le GET est indisponible ; la
+                # confirmation finale reste FILL_VERIFY + POSITION_VERIFY.
+                if getattr(e, "status", None) == 404 and (
+                        order.get("ts_ms") or "fill_count" in
+                        (order.get("raw") or {})):
+                    verified = order
+                    log_api.info("[ORDER_VERIFY] "
+                                 "source=create_response_v2 (GET ordre "
+                                 "indisponible pour les ordres V2 -- etat "
+                                 "certifie par la reponse du moteur "
+                                 f"d'appariement, ts_ms={order.get('ts_ms')})")
             if verified:
                 v_status, v_filled = self._extract(verified, count)
                 log_api.info("[ORDER_VERIFY] "
@@ -997,6 +1058,7 @@ class OrderManager:
         deadline = start + CFG.ORDER_TTL_SECONDS
         delay = max(2.0, min(5.0, CFG.ORDER_VERIFY_INTERVAL_S))
         status, filled = self._extract(order, count)
+        get_order_available = True     # 404 V2 : suivi via /fills a la place
         while time.time() < deadline and status not in self.TERMINAL and filled < count:
             log_api.info("[ORDER_WAITING_FOR_FILL] "
                          f"elapsed_seconds={time.time() - start:.0f} "
@@ -1004,10 +1066,26 @@ class OrderManager:
                          f"remaining_count={count - filled}")
             time.sleep(delay)
             try:
-                order = self.client.get_order(order_id)
-                status, filled = self._extract(order, count)
+                if get_order_available:
+                    order = self.client.get_order(order_id)
+                    status, filled = self._extract(order, count)
+                else:
+                    raise KalshiAPIError(404, "get_order indisponible (V2)")
             except KalshiAPIError as e:
-                log_api.warning(f"Suivi ordre {order_id}: {e}")
+                if getattr(e, "status", None) == 404:
+                    get_order_available = False
+                    try:            # source de verite alternative : /fills
+                        fills = self.client.get_fills(order_id)
+                        got = sum(pick_int(fl, "count", "quantity", default=0)
+                                  for fl in fills)
+                        if got > filled:
+                            filled = min(count, got)
+                        if filled >= count:
+                            status = "executed"
+                    except KalshiAPIError as e2:
+                        log_api.warning(f"Suivi ordre {order_id} via fills: {e2}")
+                else:
+                    log_api.warning(f"Suivi ordre {order_id}: {e}")
 
         if status not in self.TERMINAL and filled < count:
             if not CFG.CANCEL_UNFILLED_ORDERS:
@@ -1032,7 +1110,11 @@ class OrderManager:
         # si le statut pretend "executed"/"filled" sans compteur exploitable,
         # on interroge /portfolio/fills, source de verite.
         if filled <= 0 and status in ("executed", "filled"):
-            fills = self.client.get_fills(order_id)
+            try:
+                fills = self.client.get_fills(order_id)
+            except KalshiAPIError as e:
+                log_api.warning(f"/fills indisponible pour {order_id}: {e}")
+                fills = []
             filled = min(count, sum(pick_int(f, "count", "quantity", default=0)
                                     for f in fills))
             if filled > 0:
@@ -1047,7 +1129,13 @@ class OrderManager:
                          f"accepted != filled)")
             return ExecutionResult(order_id, count, 0, limit_cents,
                                    status or "unfilled", "cancelled")
-        fills = self.client.get_fills(order_id)
+        try:
+            fills = self.client.get_fills(order_id)
+        except KalshiAPIError as e:
+            log_api.warning(f"/fills indisponible pour {order_id}: {e} -- "
+                            "frais/prix moyens estimes depuis la reponse de "
+                            "creation V2.")
+            fills = []
         fees = sum(float(f.get("fees") or 0) for f in fills
                    if str(f.get("fees", "")).replace(".", "", 1).isdigit())
         avg = self._avg_fill_price(order_id, side, limit_cents)
@@ -1854,7 +1942,11 @@ class ExecutionEngine:
             return 0
 
         # 5e) frais REELS d'abord (reponse d'ordre puis fills) (TEST M)
-        fills = self.client.get_fills(exec_res.order_id) if exec_res.order_id else []
+        try:
+            fills = self.client.get_fills(exec_res.order_id) \
+                if exec_res.order_id else []
+        except KalshiAPIError:
+            fills = []
         fee_amt, fee_src = FeeModel.from_api({}, fills,
                                              exec_res.filled, exec_res.avg_price)
         trade = self.tlog.open_trade(

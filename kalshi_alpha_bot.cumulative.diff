@@ -1,6 +1,6 @@
 --- /mnt/user-data/uploads/kalshi_alpha_bot.py	2026-07-24 12:40:17.850185000 +0000
-+++ src/engine/kalshi_alpha_bot.py	2026-07-25 19:53:04.380591600 +0000
-@@ -75,13 +75,25 @@
++++ src/engine/kalshi_alpha_bot.py	2026-07-26 12:16:55.531871611 +0000
+@@ -75,13 +75,30 @@
      ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", True)
      MIN_MINUTES       = _env_f("BTC_MIN_MINUTES", 5.0)
      MAX_SPREAD_PAY    = _env_i("MAX_SPREAD_PAY", 5)
@@ -25,11 +25,16 @@
 +    DRY_RUN           = _env_b("DRY_RUN", False)
 +    ALLOW_ORDER_SUBMISSION = _env_b("ALLOW_ORDER_SUBMISSION", True)
 +    ORDER_VERIFY_INTERVAL_S = _env_f("ORDER_VERIFY_INTERVAL_SECONDS", 3.0)
++    # Verrou anti-doublon de session (s) : re-soumettre le meme ticker est
++    # refuse pendant ce delai meme sans trade local (defense contre toute
++    # panne de verification). 0 = desactive (tests uniquement).
++    SUBMIT_DEDUP_TTL_S = _env_f("SUBMIT_DEDUP_TTL_SECONDS", 6 * 3600.0)
++    EXCHANGE_503_COOLDOWN_S = _env_f("EXCHANGE_503_COOLDOWN_SECONDS", 300.0)
 +    CANCEL_UNFILLED_ORDERS  = _env_b("CANCEL_UNFILLED_ORDERS", True)
      MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
      MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
      MAX_EQUITY_DRAWDOWN_PCT = _env_f("MAX_EQUITY_DRAWDOWN_PCT", 20.0)
-@@ -99,7 +111,8 @@
+@@ -99,7 +116,8 @@
      SHADOW_MODE            = _env_b("SHADOW_MODE", False)   # decide, n'envoie pas
      KILL_SWITCH            = _env_b("KILL_SWITCH", False)   # coupe tout ordre
      # Ordres
@@ -39,7 +44,7 @@
      ORDER_POLL_START  = 1.0
      ORDER_POLL_MAX    = 5.0
      # Frais (A VERIFIER contre le bareme officiel Kalshi)
-@@ -245,13 +258,28 @@
+@@ -245,13 +263,28 @@
      def _load_key(self, key_pem: str):
          try:
              from cryptography.hazmat.primitives import serialization
@@ -71,7 +76,7 @@
              return None
  
      def _sign_headers(self, method: str, url: str) -> dict:
-@@ -276,6 +304,13 @@
+@@ -276,6 +309,13 @@
  
      # -- Requete avec retry/backoff ------------------------------------------
      def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
@@ -85,7 +90,7 @@
          url = self.base_url + path
          attempt, delay = 0, 1.0
          while True:
-@@ -300,6 +335,12 @@
+@@ -300,6 +340,12 @@
                                  f"retry {attempt}/{retries} dans {wait:.0f}s")
                  time.sleep(wait); delay = min(delay * 2, 8); continue
  
@@ -98,7 +103,7 @@
              if r.status_code >= 400:
                  raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
  
-@@ -344,19 +385,72 @@
+@@ -344,19 +390,72 @@
              log_api.warning(f"get_balance: {e}")
              return None
  
@@ -181,7 +186,7 @@
  
      def get_order(self, order_id: str) -> dict:
          r = self._req("GET", f"/portfolio/orders/{order_id}")
-@@ -575,6 +669,7 @@
+@@ -575,6 +674,7 @@
              "fill_ids": (extra or {}).get("fill_ids", []),
              "state": "open",
              "strategy": (extra or {}).get("strategy"),
@@ -189,7 +194,7 @@
              "market_score": (extra or {}).get("market_score"),
              "entry_edge": (extra or {}).get("entry_edge"),
              "entry_ev": (extra or {}).get("entry_ev"),
-@@ -707,6 +802,58 @@
+@@ -707,12 +807,74 @@
          self.avg_price, self.status, self.state = avg_price, status, state
          # state: "filled" | "partial" | "cancelled" | "rejected" | "unknown"
  
@@ -248,7 +253,35 @@
  class OrderManager:
      TERMINAL = {"executed", "canceled", "cancelled", "expired", "filled"}
  
-@@ -772,14 +919,70 @@
+     def __init__(self, client: KalshiClient):
+         self.client = client
+         self.open_orders = JsonStore.load(_p(CFG.ORDERS_FILE), {})  # id -> meta
++        # Garde anti-doublon de SESSION, independante de l'enregistrement des
++        # trades : un ordre soumis (201) sur un ticker verrouille ce ticker
++        # pour la duree configuree, MEME si la verification echoue ensuite.
++        # Motif : bug 2026-07-25 (GET V1 404 sur ordres V2) -> le meme signal
++        # a ete re-soumis et REMPLI ~8 fois, solde debite sans aucun trade
++        # local. Ce verrou rend ce mode de defaillance impossible.
++        self.session_submitted = {}          # ticker -> epoch de soumission
++        # Cooldown apres 503 exchange (demo en pause/maintenance) : inutile
++        # et bruyant de marteler l'API a chaque cycle.
++        self.exchange_pause_until = 0.0
+ 
+     def flush(self):
+         JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders)
+@@ -737,7 +899,10 @@
+         return status, min(filled, requested)
+ 
+     def _avg_fill_price(self, order_id: str, side: str, fallback: int) -> int:
+-        fills = self.client.get_fills(order_id)
++        try:
++            fills = self.client.get_fills(order_id)
++        except KalshiAPIError:
++            fills = []
+         tot_c, tot_px = 0, 0
+         for f in fills:
+             c  = pick_int(f, "count", "quantity", default=0)
+@@ -772,14 +937,113 @@
              return ExecutionResult(None, count, 0, limit_cents,
                                     "blocked:no_executable_ask", "rejected")
          limit_cents = int(limit_cents)
@@ -258,6 +291,24 @@
 +                          "ALLOW_ORDER_SUBMISSION=false")
 +            return ExecutionResult(None, count, 0, limit_cents,
 +                                   "blocked:submission_disabled", "rejected")
++        now = time.time()
++        if now < self.exchange_pause_until:
++            log_api.warning("[ORDER_SUBMIT_SKIPPED] exchange en cooldown "
++                            f"apres 503 (reprise dans "
++                            f"{self.exchange_pause_until - now:.0f}s)")
++            return ExecutionResult(None, count, 0, limit_cents,
++                                   "blocked:exchange_unavailable_cooldown",
++                                   "rejected")
++        last = self.session_submitted.get(ticker)
++        if last is not None and now - last < CFG.SUBMIT_DEDUP_TTL_S:
++            log_api.warning("[ORDER_SUBMIT_SKIPPED] garde anti-doublon: un "
++                            f"ordre a deja ete soumis sur {ticker} il y a "
++                            f"{now - last:.0f}s (TTL "
++                            f"{CFG.SUBMIT_DEDUP_TTL_S:.0f}s) -- re-soumission "
++                            "refusee meme si le trade local est absent.")
++            return ExecutionResult(None, count, 0, limit_cents,
++                                   "blocked:duplicate_submission_guard",
++                                   "rejected")
 +        client_order_id = f"alpha_{uuid.uuid4().hex}"
 +        env_name = "DEMO" if getattr(self.client, "env", "demo") == "demo" \
 +            else "PROD"
@@ -285,8 +336,15 @@
 +                          f"http_status={e.status} error_code={e.status} "
 +                          f"error_message={e} "
 +                          f"response_body_sanitized={str(e.body)[:300]}")
++            if getattr(e, "status", None) == 503:
++                self.exchange_pause_until = time.time() + CFG.EXCHANGE_503_COOLDOWN_S
++                log_api.warning("[EXCHANGE_COOLDOWN] 503 exchange -- pause "
++                                f"des soumissions {CFG.EXCHANGE_503_COOLDOWN_S:.0f}s "
++                                "(demo probablement en maintenance).")
              return ExecutionResult(None, count, 0, limit_cents, f"rejected:{e.status}",
                                     "rejected")
++        self.exchange_pause_until = 0.0
++        self.session_submitted[ticker] = time.time()
 +        http_status = getattr(self.client, "last_http_status", None)
          order_id = str(pick(order, "order_id", "id", default="") or "")
 +        log_api.info("[ORDER_SUBMIT_RESPONSE] "
@@ -305,6 +363,24 @@
 +            except KalshiAPIError as e:
 +                verified = {}
 +                log_api.warning(f"[ORDER_VERIFY] relecture en erreur: {e}")
++                # BUG CORRIGE (logs 2026-07-25 23:14+) : les ordres crees via
++                # V2 repondent 404 sur le GET V1 -> tous les fills REELS
++                # etaient rejetes "unverified", aucun trade enregistre, et le
++                # MEME signal etait re-soumis chaque cycle (solde debite en
++                # silence). La reponse de creation V2 vient du moteur
++                # d'appariement (order_id, fill_count, remaining_count,
++                # ts_ms) : c'est une source de verite valide. On l'utilise
++                # comme verification quand le GET est indisponible ; la
++                # confirmation finale reste FILL_VERIFY + POSITION_VERIFY.
++                if getattr(e, "status", None) == 404 and (
++                        order.get("ts_ms") or "fill_count" in
++                        (order.get("raw") or {})):
++                    verified = order
++                    log_api.info("[ORDER_VERIFY] "
++                                 "source=create_response_v2 (GET ordre "
++                                 "indisponible pour les ordres V2 -- etat "
++                                 "certifie par la reponse du moteur "
++                                 f"d'appariement, ts_ms={order.get('ts_ms')})")
 +            if verified:
 +                v_status, v_filled = self._extract(verified, count)
 +                log_api.info("[ORDER_VERIFY] "
@@ -322,7 +398,7 @@
          if not order_id:
              log_api.error(f"Reponse d'ordre sans identifiant -- trade NON enregistre. "
                            f"Reponse: {json.dumps(order)[:300]}")
-@@ -790,10 +993,16 @@
+@@ -790,19 +1054,49 @@
                                        "placed_at": now_iso()}
          self.flush()
  
@@ -331,6 +407,7 @@
 +        deadline = start + CFG.ORDER_TTL_SECONDS
 +        delay = max(2.0, min(5.0, CFG.ORDER_VERIFY_INTERVAL_S))
          status, filled = self._extract(order, count)
++        get_order_available = True     # 404 V2 : suivi via /fills a la place
          while time.time() < deadline and status not in self.TERMINAL and filled < count:
 -            time.sleep(delay); delay = min(delay + 1, CFG.ORDER_POLL_MAX)
 +            log_api.info("[ORDER_WAITING_FOR_FILL] "
@@ -339,10 +416,29 @@
 +                         f"remaining_count={count - filled}")
 +            time.sleep(delay)
              try:
-                 order = self.client.get_order(order_id)
-                 status, filled = self._extract(order, count)
-@@ -801,8 +1010,15 @@
-                 log_api.warning(f"Suivi ordre {order_id}: {e}")
+-                order = self.client.get_order(order_id)
+-                status, filled = self._extract(order, count)
++                if get_order_available:
++                    order = self.client.get_order(order_id)
++                    status, filled = self._extract(order, count)
++                else:
++                    raise KalshiAPIError(404, "get_order indisponible (V2)")
+             except KalshiAPIError as e:
+-                log_api.warning(f"Suivi ordre {order_id}: {e}")
++                if getattr(e, "status", None) == 404:
++                    get_order_available = False
++                    try:            # source de verite alternative : /fills
++                        fills = self.client.get_fills(order_id)
++                        got = sum(pick_int(fl, "count", "quantity", default=0)
++                                  for fl in fills)
++                        if got > filled:
++                            filled = min(count, got)
++                        if filled >= count:
++                            status = "executed"
++                    except KalshiAPIError as e2:
++                        log_api.warning(f"Suivi ordre {order_id} via fills: {e2}")
++                else:
++                    log_api.warning(f"Suivi ordre {order_id}: {e}")
  
          if status not in self.TERMINAL and filled < count:
 -            log_api.info(f"TTL {CFG.ORDER_TTL_SECONDS}s atteint -- annulation "
@@ -359,7 +455,20 @@
              self.client.cancel_order(order_id)
              try:
                  order = self.client.get_order(order_id)
-@@ -824,10 +1040,24 @@
+@@ -816,7 +1110,11 @@
+         # si le statut pretend "executed"/"filled" sans compteur exploitable,
+         # on interroge /portfolio/fills, source de verite.
+         if filled <= 0 and status in ("executed", "filled"):
+-            fills = self.client.get_fills(order_id)
++            try:
++                fills = self.client.get_fills(order_id)
++            except KalshiAPIError as e:
++                log_api.warning(f"/fills indisponible pour {order_id}: {e}")
++                fills = []
+             filled = min(count, sum(pick_int(f, "count", "quantity", default=0)
+                                     for f in fills))
+             if filled > 0:
+@@ -824,10 +1122,30 @@
                               f"-- {filled} contrat(s) confirme(s) via /fills.")
  
          if filled <= 0:
@@ -370,7 +479,13 @@
 +                         f"accepted != filled)")
              return ExecutionResult(order_id, count, 0, limit_cents,
                                     status or "unfilled", "cancelled")
-+        fills = self.client.get_fills(order_id)
++        try:
++            fills = self.client.get_fills(order_id)
++        except KalshiAPIError as e:
++            log_api.warning(f"/fills indisponible pour {order_id}: {e} -- "
++                            "frais/prix moyens estimes depuis la reponse de "
++                            "creation V2.")
++            fills = []
 +        fees = sum(float(f.get("fees") or 0) for f in fills
 +                   if str(f.get("fees", "")).replace(".", "", 1).isdigit())
          avg = self._avg_fill_price(order_id, side, limit_cents)
@@ -384,7 +499,7 @@
          return ExecutionResult(order_id, count, filled, avg, status or "executed", state)
  
      def reconcile_startup(self, tlog: TradeLogger, posmgr: PositionManager):
-@@ -906,12 +1136,35 @@
+@@ -906,12 +1224,35 @@
          cur_dd = peak - curve
          return cur_dd
  
@@ -422,7 +537,7 @@
          if cycle_trades >= CFG.MAX_TRADES_CYCLE:
              return False, f"max {CFG.MAX_TRADES_CYCLE} trades/cycle atteint"
          open_risk = self.posmgr.open_risk()
-@@ -1073,14 +1326,16 @@
+@@ -1073,14 +1414,16 @@
      def normalize_book(m: dict) -> Optional[dict]:
          """Carnet coherent ou None. Derive le cote NO du cote YES si absent."""
          def cents(*names):
@@ -447,7 +562,7 @@
          yb, ya = cents("yes_bid"), cents("yes_ask")
          nb, na = cents("no_bid"),  cents("no_ask")
          if nb is None and ya is not None: nb = 100 - ya
-@@ -1286,9 +1541,10 @@
+@@ -1286,9 +1629,10 @@
      a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
  
      def __init__(self, client: KalshiClient, capital: float):
@@ -460,7 +575,7 @@
          from shadow_prediction_store import ShadowPredictionStore
          self.client   = client
          self.configured_capital = capital           # PLAFOND, pas la verite
-@@ -1299,12 +1555,21 @@
+@@ -1299,12 +1643,21 @@
          self.risk     = RiskManager(self.tlog, self.posmgr, capital)
          self.stats    = StatsEngine(self.tlog)
          self.strategy = BtcStrategy(client)          # analyse crypto existante
@@ -488,7 +603,7 @@
          self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
          self.gates = GateConfig(
              MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
-@@ -1318,7 +1583,11 @@
+@@ -1318,7 +1671,11 @@
          self.pipeline = MarketOpportunityPipeline(
              client, self.router, gates=self.gates,
              fresh_book_fn=self.fresh_book,
@@ -501,7 +616,7 @@
          # Recovery apres crash + broker source de verite
          self.orders.reconcile_startup(self.tlog, self.posmgr)
          self.posmgr.reconcile_startup()
-@@ -1382,6 +1651,44 @@
+@@ -1382,6 +1739,44 @@
          return False, ("solde indisponible; en demo, ALLOW_FALLBACK_CAPITAL=1 "
                         "requis pour un secours explicite")
  
@@ -546,7 +661,7 @@
      def cycle(self, n: int) -> int:
          log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
          self.stats.maybe_daily_report()
-@@ -1435,15 +1742,32 @@
+@@ -1435,15 +1830,32 @@
              if placed >= CFG.MAX_TRADES_CYCLE:
                  break
              placed += self._execute_decision(dec, report)
@@ -585,7 +700,7 @@
          JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
          JsonStore.save(_p("pipeline_stats.json"), {
              "cycle": n,
-@@ -1460,10 +1784,6 @@
+@@ -1460,10 +1872,6 @@
          })
          JsonStore.save(_p("reject_reasons.json"),
                         {"cycle": n, "reject_reasons": report["rejections"]})
@@ -596,7 +711,7 @@
          if placed == 0:
              self.stats.log_summary()
          return placed
-@@ -1485,7 +1805,12 @@
+@@ -1485,7 +1893,12 @@
          entry = int(ask)
  
          # 5b) budgets risque categorie / marche (sur capital effectif)
@@ -610,7 +725,20 @@
          if self.posmgr.open_risk_on(ticker) >= \
                  self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
              report["rejections"]["risk_blocked"] = \
-@@ -1548,10 +1873,37 @@
+@@ -1529,7 +1942,11 @@
+             return 0
+ 
+         # 5e) frais REELS d'abord (reponse d'ordre puis fills) (TEST M)
+-        fills = self.client.get_fills(exec_res.order_id) if exec_res.order_id else []
++        try:
++            fills = self.client.get_fills(exec_res.order_id) \
++                if exec_res.order_id else []
++        except KalshiAPIError:
++            fills = []
+         fee_amt, fee_src = FeeModel.from_api({}, fills,
+                                              exec_res.filled, exec_res.avg_price)
+         trade = self.tlog.open_trade(
+@@ -1548,10 +1965,37 @@
                        "strategy": dec.strategy},
              order_id=exec_res.order_id, order_status=exec_res.status)
          self.posmgr.open_position(trade, extra={
@@ -649,7 +777,7 @@
          snap = self.risk.snapshot()
          log_rsk.info(f"risque_ouvert={snap['open_risk']}$ "
                       f"pnl_jour={snap['daily_realized_pnl']}$ "
-@@ -1572,9 +1924,17 @@
+@@ -1572,9 +2016,17 @@
      log.info(f"               ORDRES REELS -- aucun dry-run, aucune simulation")
      log.info(f"Identifiants  : {client.cred_src}")
      log.info(f"Solde compte  : {f'{bal:,.2f}$' if bal is not None else 'indisponible (verifier cles/env)'}")
@@ -670,7 +798,7 @@
      log.info(f"Protections   : entree<={CFG.MAX_ENTRY_CENTS}c | "
               f"1 trade/marche={'OUI' if CFG.ONE_TRADE_PER_MKT else 'NON'} | "
               f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
-@@ -1602,7 +1962,13 @@
+@@ -1602,7 +2054,13 @@
      ap.add_argument("--shadow", action="store_true",
                      help="mode shadow: pipeline et decisions complets, "
                           "AUCUN ordre envoye")

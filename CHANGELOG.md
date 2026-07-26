@@ -1,5 +1,28 @@
 # Changelog
 
+## [12.5.0] — 2026-07-26
+### CRITIQUE — fills reels non comptabilises + re-soumission en boucle
+Logs 2026-07-25 23:14+ : ordres V2 crees (201) et REMPLIS, mais
+GET /portfolio/orders/{id} repond 404 pour les ordres V2 -> chaque fill
+reel etait rejete "unverified", AUCUN trade local, et le meme signal
+etait re-soumis chaque cycle (solde 80.21$ -> 74.93$ en ~8 cycles sur le
+MEME YES@74c ; reglements gagnants revenus ensuite : 74.67 -> 87.70$).
+Correctifs :
+- ORDER_VERIFY : si GET ordre repond 404 pour un ordre V2, la reponse de
+  creation (moteur d'appariement : order_id, fill_count, remaining_count,
+  ts_ms) sert de verification, loggee source=create_response_v2 ;
+  confirmation finale inchangee via FILL_VERIFY + POSITION_VERIFY.
+- Suivi d'ordre : bascule automatique sur /portfolio/fills quand le GET
+  est indisponible ; tous les appels get_fills blindes (une panne de
+  /fills ne peut plus interrompre un cycle).
+- Garde anti-doublon de SESSION (SUBMIT_DEDUP_TTL_SECONDS, defaut 6 h) :
+  un 201 sur un ticker verrouille le ticker, MEME si la verification
+  echoue ensuite -- ce mode de defaillance ne peut plus vider le compte.
+- Cooldown apres 503 exchange (EXCHANGE_503_COOLDOWN_SECONDS, defaut
+  300 s) : plus de martelement pendant les maintenances du demo.
+### Tests
+- 135 tests (4 nouveaux reproduisant le scenario de prod exact), 0 echec.
+
 ## [12.4.0] — 2026-07-25
 ### Migration Create Order V2 (HTTP 410 deprecated_v1_order_endpoint)
 - create_order migre vers POST /portfolio/events/orders, schema verifie
