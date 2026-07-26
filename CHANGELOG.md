@@ -203,3 +203,10 @@ Correctifs :
 - Resume de cycle structure unique `[CYCLE-SUMMARY]` + decisions JSONL rotatif.
 
 ## [11.x] — historique interne (pre-open-source)
+
+## v12.7.0 — Institutional Dashboard Replacement
+- Replaced the basic administrative layout with the Atlas Decision Engine terminal UI.
+- Added responsive sidebar navigation, live system status, institutional KPI cards, equity and daily P&L charts.
+- Added real-time opportunity table, positions/orders panel, risk gauges, cycle funnel, rejection diagnostics and activity stream.
+- Preserved the existing `/api/state` contract and honest-data policy: no fabricated metrics.
+- Kept the stdlib-only HTTP server and Railway `$PORT` compatibility.
