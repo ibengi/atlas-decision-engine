@@ -79,12 +79,12 @@ class Config:
     # (= min(solde broker, plafond configure)) a chaque cycle. Une valeur $
     # fixe fondee sur un capital de reference superieur au solde est
     # INTERDITE (bug corrige : stop -50$ sur un compte de 93,26$ = 54 %).
-    MAX_DAILY_LOSS    = _env_f("MAX_DAILY_LOSS", 50.0)      # $ plafond ABSOLU
-    MAX_DAILY_LOSS_PCT = _env_f("MAX_DAILY_LOSS_PCT", 5.0)  # % du capital effectif
+    MAX_DAILY_LOSS    = _env_f("MAX_DAILY_LOSS", 100.0)      # $ plafond ABSOLU
+    MAX_DAILY_LOSS_PCT = _env_f("MAX_DAILY_LOSS_PCT", 50.0)  # % du capital effectif
     MAX_CONSECUTIVE_LOSSES = _env_i("MAX_CONSECUTIVE_LOSSES", 3)
     MAX_TRADES_CYCLE  = _env_i("MAX_TRADES_CYCLE", 3)
     MAX_POS_PCT       = _env_f("MAX_POSITION_PCT", 1.0)     # % capital / position (plafond dur)
-    RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 5.0)      # % capital en risque ouvert total
+    RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 15.0)      # % capital en risque ouvert total
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
     MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
     # Mode d'execution explicite (exigence 2). "real_demo" active le
