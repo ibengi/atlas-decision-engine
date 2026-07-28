@@ -45,7 +45,7 @@ import requests
 
 load_dotenv()
 
-ENGINE_VERSION = "v11.3-mandatory-order-lifecycle-fix-2026-07-28"
+ENGINE_VERSION = "v11.4-audit-fixed-2026-07-28"
 
 # ══════════════════════════════════════════════════════════════════════════
 # S1. CONFIGURATION (centralisee, surchargeables par variables d'env)
