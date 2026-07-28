@@ -79,12 +79,21 @@ class Config:
     # (= min(solde broker, plafond configure)) a chaque cycle. Une valeur $
     # fixe fondee sur un capital de reference superieur au solde est
     # INTERDITE (bug corrige : stop -50$ sur un compte de 93,26$ = 54 %).
-    MAX_DAILY_LOSS    = _env_f("MAX_DAILY_LOSS", 100.0)      # $ plafond ABSOLU
-    MAX_DAILY_LOSS_PCT = _env_f("MAX_DAILY_LOSS_PCT", 50.0)  # % du capital effectif
+    MAX_DAILY_LOSS    = _env_f("MAX_DAILY_LOSS", 50.0)      # $ plafond ABSOLU
+    MAX_DAILY_LOSS_PCT = _env_f("MAX_DAILY_LOSS_PCT", 5.0)  # % du capital effectif
     MAX_CONSECUTIVE_LOSSES = _env_i("MAX_CONSECUTIVE_LOSSES", 3)
+    # CORRECTIF AUDIT 2026-07-28 : sans cooldown, le kill-switch ci-dessus
+    # est un blocage PERMANENT (aucun trade possible => aucun moyen
+    # d'obtenir le trade gagnant qui romprait la serie). Passe ce delai
+    # apres le dernier trade REGLE, un seul nouvel essai est autorise
+    # (circuit-breaker "demi-ouvert") ; s'il perd aussi, un nouveau
+    # cooldown redemarre a partir de son propre settled_at. L'historique
+    # de pertes n'est jamais efface silencieusement.
+    CONSECUTIVE_LOSS_COOLDOWN_S = _env_f(
+        "CONSECUTIVE_LOSS_COOLDOWN_SECONDS", 3600.0)      # 1h par defaut
     MAX_TRADES_CYCLE  = _env_i("MAX_TRADES_CYCLE", 3)
     MAX_POS_PCT       = _env_f("MAX_POSITION_PCT", 1.0)     # % capital / position (plafond dur)
-    RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 15.0)      # % capital en risque ouvert total
+    RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 5.0)      # % capital en risque ouvert total
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
     MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
     # Mode d'execution explicite (exigence 2). "real_demo" active le
@@ -1245,6 +1254,21 @@ class RiskManager:
                 break
         return n
 
+    def seconds_since_last_settlement(self) -> Optional[float]:
+        """Anciennete (s) du dernier trade REGLE, ou None si aucun trade
+        regle n'existe encore. Utilise pour le cooldown du kill-switch."""
+        settled = self.tlog.settled_trades()
+        if not settled:
+            return None
+        ts = settled[-1].get("settled_at")
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(ts)
+        except (TypeError, ValueError):
+            return None
+        return (datetime.now(timezone.utc) - dt).total_seconds()
+
     # -- portes de risque ------------------------------------------------------
     def can_trade(self, cycle_trades: int) -> (bool, str):
         pnl = self.daily_realized_pnl()
@@ -1255,8 +1279,24 @@ class RiskManager:
                            f"capital effectif {self.capital:.2f}$)")
         losses = self.consecutive_losses()
         if losses >= CFG.MAX_CONSECUTIVE_LOSSES:
-            return False, (f"ARRET: {losses} pertes consecutives >= "
-                           f"{CFG.MAX_CONSECUTIVE_LOSSES}")
+            elapsed = self.seconds_since_last_settlement()
+            cooldown = CFG.CONSECUTIVE_LOSS_COOLDOWN_S
+            if elapsed is None or elapsed < cooldown:
+                remaining = cooldown - (elapsed or 0.0)
+                return False, (
+                    f"ARRET: {losses} pertes consecutives >= "
+                    f"{CFG.MAX_CONSECUTIVE_LOSSES} -- reprise possible dans "
+                    f"{max(0.0, remaining):.0f}s (cooldown "
+                    f"{cooldown:.0f}s depuis le dernier trade regle)")
+            # Cooldown ecoule : UN seul nouvel essai est autorise (le
+            # compteur lui-meme n'est PAS remis a zero -- si ce nouvel
+            # essai perd aussi, il redevient la derniere perte de la
+            # sequence et un nouveau cooldown redemarre a partir de son
+            # propre settled_at ; seul un trade GAGNANT rompt reellement
+            # la serie).
+            log_rsk.warning(
+                f"[RISK] cooldown de {cooldown:.0f}s ecoule apres "
+                f"{losses} pertes consecutives -- 1 nouvel essai autorise.")
         if cycle_trades >= CFG.MAX_TRADES_CYCLE:
             return False, f"max {CFG.MAX_TRADES_CYCLE} trades/cycle atteint"
         open_risk = self.posmgr.open_risk()
@@ -1887,7 +1927,7 @@ class ExecutionEngine:
                 "configured_capital": self.configured_capital,
                 "shadow_settled": getattr(self, "shadow_settled_total", None),
                 "exchange_paused": time.time() <
-                getattr(self.om, "exchange_pause_until", 0.0),
+                getattr(self.orders, "exchange_pause_until", 0.0),
                 "candidates": cands,
             })
         except Exception as e:
