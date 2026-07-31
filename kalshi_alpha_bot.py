@@ -1797,7 +1797,7 @@ class SignalValidator:
                            f"{CFG.MAX_ENTRY_CENTS}c (ratio risque/gain)")
         if entry_price < 1 or entry_price > 99:
             return False, f"prix d'entree invalide: {entry_price}c"
-        if CFG.ONE_TRADE_PER_MKT and (ticker in posmgr.positions
+        if CFG.ONE_TRADE_PER_MKT and (ticker in posmgr.tickers_open()
                                       or tlog.has_open_on(ticker)):
             return False, "position deja prise sur ce marche (1 trade/marche)"
         return True, ""
