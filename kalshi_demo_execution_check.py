@@ -27,8 +27,9 @@ import uuid
 from datetime import datetime, timezone
 
 
-from kalshi_alpha_bot import (KalshiClient, KalshiAPIError, CFG,  # noqa: E402
+from kalshi_alpha_bot import (KalshiClient, KalshiAPIError,  # noqa: E402
                               pick, pick_int, _client_is_genuine)
+from config import CFG
 
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 MAX_ASK_CENTS = 30          # cout maximal accepte pour 1 contrat (fonds DEMO)
