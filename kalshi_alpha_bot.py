@@ -878,8 +878,24 @@ class PositionManager:
         chez Kalshi mais absentes localement (id stable => idempotent),
         marque 'ghost' les positions locales absentes du broker."""
         report = {"rebuilt": [], "ghost": [], "matched": []}
-        broker = self.client.get_positions()
+        MAX_RETRIES = 3
+        RETRY_BACKOFF_SECONDS = 2.0
+        broker = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            broker = self.client.get_positions()
+            if broker is not None:
+                break
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                log_pos.warning(
+                    f"get_positions() returned None (attempt {attempt}/{MAX_RETRIES}), "
+                    f"retrying in {wait:.0f}s..."
+                )
+                time.sleep(wait)
         if broker is None:
+            log_pos.error(
+                f"get_positions() failed after {MAX_RETRIES} attempts — reconciliation skipped"
+            )
             return report
         seen_tickers = set()
         for bp in broker:
