@@ -928,6 +928,15 @@ class PositionManager:
             if p["ticker"] not in seen_tickers and not tid.startswith("mig-"):
                 p["state"] = "ghost_local_only"
                 report["ghost"].append(p["ticker"])
+        # Clean up ghost positions that the broker doesn't know about
+        ghost_removed = []
+        for tid in list(self.positions.keys()):
+            if self.positions[tid].get("state") == "ghost_local_only":
+                self.positions.pop(tid, None)
+                ghost_removed.append(tid)
+        if ghost_removed:
+            self.flush()
+            log_pos.info(f"Ghost cleanup: removed {len(ghost_removed)} stale position(s): {ghost_removed}")
         if report["rebuilt"] or report["ghost"]:
             self.flush()
             JsonStore.save(_p("reconciliation_report.json"), report)
