@@ -1100,6 +1100,13 @@ class OrderManager:
                         f"suppose = prix limite ({fallback}c).")
         return fallback
 
+    @staticmethod
+    def _client_order_id(ticker: str, side: str, count: int,
+                         limit_cents: int) -> str:
+        """Return the stable Kalshi id used to make order retries idempotent."""
+        idempotency_key = f"{ticker}|{side}|{count}|{limit_cents}"
+        return f"alpha_{hashlib.sha256(idempotency_key.encode()).hexdigest()[:16]}"
+
     # -- cycle de vie complet d'un ordre --------------------------------------
     def place_and_track(self, ticker: str, side: str, count: int,
                         limit_cents: int) -> ExecutionResult:
@@ -1139,7 +1146,7 @@ class OrderManager:
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:duplicate_submission_guard",
                                    "rejected")
-        client_order_id = f"alpha_{uuid.uuid4().hex}"
+        client_order_id = self._client_order_id(ticker, side, count, limit_cents)
         env_name = "DEMO" if getattr(self.client, "env", "demo") == "demo" \
             else "PROD"
         # Exigence 4 : preuve d'envoi AVANT l'appel. Jamais de cle, secret,
