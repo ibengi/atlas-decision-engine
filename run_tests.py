@@ -16,6 +16,11 @@ add_src_to_path()
 def main():
     loader = unittest.TestLoader()
     suite = loader.discover("tests")
+    test_count = suite.countTestCases()
+    if test_count == 0:
+        print("CRITICAL: No tests discovered. Check that test files exist in tests/ directory.", file=sys.stderr)
+        sys.exit(1)
+    print(f"Discovered {test_count} tests in {len(suite._tests)} modules")
     runner = unittest.TextTestRunner(verbosity=2)
     res = runner.run(suite)
     report = {
