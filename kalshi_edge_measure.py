@@ -329,7 +329,7 @@ def _main():
         # effets de bord, lance plutot resolve depuis ton propre script en
         # appelant resolve_pending(kalshi.get_market).
         try:
-            from kalshi_alpha_bot import KalshiClient
+            from kalshi_client import KalshiClient
             kc = KalshiClient("prod")   # lecture seule : get_market uniquement (donnees publiques)
             summary = resolve_pending(kc.get_market, args.file)
             print(summary)
