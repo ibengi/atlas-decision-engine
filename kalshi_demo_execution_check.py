@@ -27,8 +27,8 @@ import uuid
 from datetime import datetime, timezone
 
 
-from kalshi_alpha_bot import (KalshiClient, KalshiAPIError,  # noqa: E402
-                              pick, pick_int, _client_is_genuine)
+from kalshi_client import (KalshiClient, KalshiAPIError, pick, pick_int)  # noqa: E402
+from kalshi_alpha_bot import _client_is_genuine
 from config import CFG
 
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
