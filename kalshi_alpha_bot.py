@@ -96,6 +96,7 @@ class Config:
     RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 5.0)      # % capital en risque ouvert total
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
     MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
+    MAX_POSITION_AGE_DAYS   = _env_i("MAX_POSITION_AGE_DAYS", 30)
     # Mode d'execution explicite (exigence 2). "real_demo" active le
     # garde anti-mock : tout client non authentique => arret FATAL.
     EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "standard").lower()
@@ -761,20 +762,89 @@ class PositionManager:
         """Interroge l'API pour les marches regles ; realise le PnL.
         Ecriture du reglement AVANT retrait de la position : un crash entre
         les deux laisse au pire un doublon detecte (trade deja settled),
-        jamais un trade zombie."""
+        jamais un trade zombie.
+
+        Changements P2.1 (2026-07-31) :
+        - result "void" reconnu comme reglement valide (perte limitee aux frais)
+        - statut settled/finalized avec result illisible => void_unreadable
+        - max-age escape hatch : positions de plus de MAX_POSITION_AGE_DAYS
+          sur des marches non "open" nettoyees comme expired_stale
+        - echec get_market() : log WARNING + cleanup si position trop vieille
+        """
         realized = []
+        now_dt = datetime.now(timezone.utc)
         for tid, p in list(self.positions.items()):
             if p.get("state", "open") != "open":
                 continue
             m = self.client.get_market(p["ticker"])
-            if not m: continue
+
+            # ── max-age escape hatch ──────────────────────────────────
+            opened_str = p.get("opened_at", "")
+            if opened_str:
+                try:
+                    opened = datetime.fromisoformat(opened_str)
+                    age_days = (now_dt - opened).total_seconds() / 86400.0
+                except (ValueError, TypeError):
+                    age_days = None
+            else:
+                age_days = None
+
+            if age_days is not None and age_days > CFG.MAX_POSITION_AGE_DAYS:
+                if not m or str(pick(m, "status", default="") or "").lower() != "open":
+                    gross = -p["fees"]   # conservative: lose fees on stale position
+                    net = gross - p["fees"]
+                    self.tlog.settle_trade(p["trade_id"], "expired_stale", False, gross, net)
+                    self.positions.pop(tid, None)
+                    self.flush()
+                    log_pos.warning(
+                        f"{p['ticker']}: position agee de {age_days:.0f}j > "
+                        f"{CFG.MAX_POSITION_AGE_DAYS}j, statut marche="
+                        f"{str(pick(m, 'status', default='N/A') or 'N/A').lower() if m else 'inaccessible'}"
+                        f" -- nettoyee comme expired_stale (gross={gross:+.2f}$)")
+                    continue
+
+            # ── API failure (m is None / empty) ───────────────────────
+            if not m:
+                if age_days is not None and age_days <= CFG.MAX_POSITION_AGE_DAYS:
+                    log_pos.warning(f"{p['ticker']}: get_market() a echoue -- "
+                                    f"position fraiche ({age_days:.0f}j), conservee.")
+                else:
+                    log_pos.warning(f"{p['ticker']}: get_market() a echoue, "
+                                    f"age={age_days}j -- conservee.")
+                continue
+
             result = str(pick(m, "result", default="") or "").lower()
             status = str(pick(m, "status", default="") or "").lower()
+
+            # ── void (legitimate settlement) ──────────────────────────
+            if result == "void":
+                gross = 0.0   # return of premium, net loss = fees only
+                net = gross - p["fees"]
+                self.tlog.settle_trade(p["trade_id"], "void", False, gross, net)
+                self.positions.pop(tid, None)
+                self.flush()
+                log_pos.info(f"{p['ticker']}: reglement VOID (remboursement premium, "
+                             f"perte={-net:.2f}$ frais)")
+                continue
+
+            # ── settled/finalized with unreadable result ──────────────
             if result not in ("yes", "no"):
                 if status in ("settled", "finalized"):
-                    log_pos.warning(f"{p['ticker']}: statut '{status}' mais champ "
-                                    f"'result' illisible -- verifier le schema API.")
-                continue
+                    gross = -p["fees"]   # conservative: assume loss
+                    net = gross - p["fees"]
+                    self.tlog.settle_trade(p["trade_id"], "void_unreadable", False, gross, net)
+                    self.positions.pop(tid, None)
+                    self.flush()
+                    log_pos.warning(
+                        f"{p['ticker']}: statut '{status}' mais result illisible "
+                        f"(raw={repr(pick(m, 'result', default=None))}) -- "
+                        f"traite comme void_unreadable (gross={gross:+.2f}$)")
+                    continue
+                else:
+                    # market still open or unknown → keep position
+                    continue
+
+            # ── happy path: yes / no ──────────────────────────────────
             won  = (result == p["side"])
             cost = p["count"] * p["avg_price"] / 100.0
             gross = (p["count"] * 1.0 - cost) if won else -cost
