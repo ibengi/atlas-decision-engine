@@ -2,15 +2,10 @@
 """Execute toute la suite et ecrit test_report.json (resultats REELS,
 consomme par model_gatekeeper). Code retour != 0 si un test echoue."""
 import json
-import os
 import sys
 import time
 import unittest
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "src", "utils"))
-from paths import add_src_to_path  # noqa: E402
-add_src_to_path()
 
 
 def main():
