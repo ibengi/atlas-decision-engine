@@ -793,9 +793,14 @@ class PositionManager:
                 if not m or str(pick(m, "status", default="") or "").lower() != "open":
                     gross = -p["fees"]   # conservative: lose fees on stale position
                     net = gross - p["fees"]
-                    self.tlog.settle_trade(p["trade_id"], "expired_stale", False, gross, net)
+                    t = self.tlog.settle_trade(p["trade_id"], "expired_stale", False, gross, net)
+                    if t is None:
+                        log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
+                        continue
                     self.positions.pop(tid, None)
                     self.flush()
+                    if t:
+                        realized.append(t)
                     log_pos.warning(
                         f"{p['ticker']}: position agee de {age_days:.0f}j > "
                         f"{CFG.MAX_POSITION_AGE_DAYS}j, statut marche="
@@ -820,9 +825,14 @@ class PositionManager:
             if result == "void":
                 gross = 0.0   # return of premium, net loss = fees only
                 net = gross - p["fees"]
-                self.tlog.settle_trade(p["trade_id"], "void", False, gross, net)
+                t = self.tlog.settle_trade(p["trade_id"], "void", False, gross, net)
+                if t is None:
+                    log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
+                    continue
                 self.positions.pop(tid, None)
                 self.flush()
+                if t:
+                    realized.append(t)
                 log_pos.info(f"{p['ticker']}: reglement VOID (remboursement premium, "
                              f"perte={-net:.2f}$ frais)")
                 continue
@@ -832,9 +842,14 @@ class PositionManager:
                 if status in ("settled", "finalized"):
                     gross = -p["fees"]   # conservative: assume loss
                     net = gross - p["fees"]
-                    self.tlog.settle_trade(p["trade_id"], "void_unreadable", False, gross, net)
+                    t = self.tlog.settle_trade(p["trade_id"], "void_unreadable", False, gross, net)
+                    if t is None:
+                        log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
+                        continue
                     self.positions.pop(tid, None)
                     self.flush()
+                    if t:
+                        realized.append(t)
                     log_pos.warning(
                         f"{p['ticker']}: statut '{status}' mais result illisible "
                         f"(raw={repr(pick(m, 'result', default=None))}) -- "
@@ -850,6 +865,9 @@ class PositionManager:
             gross = (p["count"] * 1.0 - cost) if won else -cost
             net   = gross - p["fees"]
             t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
+            if t is None:
+                log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
+                continue
             self.positions.pop(tid, None)
             self.flush()
             if t: realized.append(t)
