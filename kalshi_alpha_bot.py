@@ -57,7 +57,7 @@ def _env_f(name, default):
 def _env_i(name, default):
     try: return int(os.getenv(name, str(default)))
     except ValueError: return default
-def _env_b(name, default=True):
+def _env_b(name, *, default):
     return os.getenv(name, "1" if default else "0").strip().lower() not in ("0","false","no","non")
 
 class Config:
@@ -72,7 +72,7 @@ class Config:
     # Strategie / protections
     SERIES            = os.getenv("BTC_SERIES", "KXBTC15M")
     MAX_ENTRY_CENTS   = _env_i("MAX_ENTRY_CENTS", 85)
-    ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", True)
+    ONE_TRADE_PER_MKT = _env_b("ONE_TRADE_PER_MARKET", default=True)
     MIN_MINUTES       = _env_f("BTC_MIN_MINUTES", 5.0)
     MAX_SPREAD_PAY    = _env_i("MAX_SPREAD_PAY", 5)
     # Risque — TOUTES les limites sont recalculees sur le CAPITAL EFFECTIF
@@ -99,8 +99,8 @@ class Config:
     # Mode d'execution explicite (exigence 2). "real_demo" active le
     # garde anti-mock : tout client non authentique => arret FATAL.
     EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "standard").lower()
-    DRY_RUN           = _env_b("DRY_RUN", False)
-    ALLOW_ORDER_SUBMISSION = _env_b("ALLOW_ORDER_SUBMISSION", True)
+    DRY_RUN           = _env_b("DRY_RUN", default=False)
+    ALLOW_ORDER_SUBMISSION = _env_b("ALLOW_ORDER_SUBMISSION", default=True)
     ORDER_VERIFY_INTERVAL_S = _env_f("ORDER_VERIFY_INTERVAL_SECONDS", 3.0)
     # Verrou anti-doublon de session (s) : re-soumettre le meme ticker est
     # refuse pendant ce delai meme sans trade local (defense contre toute
@@ -108,10 +108,10 @@ class Config:
     SUBMIT_DEDUP_TTL_S = _env_f("SUBMIT_DEDUP_TTL_SECONDS", 6 * 3600.0)
     EXCHANGE_503_COOLDOWN_S = _env_f("EXCHANGE_503_COOLDOWN_SECONDS", 300.0)
     # Dashboard web (lecture seule des fichiers d'etat, zero dependance).
-    DASHBOARD_ENABLED = _env_b("DASHBOARD_ENABLED", True)
+    DASHBOARD_ENABLED = _env_b("DASHBOARD_ENABLED", default=True)
     DASHBOARD_PORT = int(os.environ.get("PORT",
                          os.environ.get("DASHBOARD_PORT", "8080")))
-    CANCEL_UNFILLED_ORDERS  = _env_b("CANCEL_UNFILLED_ORDERS", True)
+    CANCEL_UNFILLED_ORDERS  = _env_b("CANCEL_UNFILLED_ORDERS", default=True)
     MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
     MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
     MAX_EQUITY_DRAWDOWN_PCT = _env_f("MAX_EQUITY_DRAWDOWN_PCT", 20.0)
@@ -125,9 +125,9 @@ class Config:
     MIN_FILL_PROXY        = _env_f("MIN_FILL_PROXY", 40.0)
     SLIPPAGE_BUFFER_CENTS = _env_i("SLIPPAGE_BUFFER_CENTS", 1)
     # Solde / modes
-    ALLOW_FALLBACK_CAPITAL = _env_b("ALLOW_FALLBACK_CAPITAL", False)
-    SHADOW_MODE            = _env_b("SHADOW_MODE", False)   # decide, n'envoie pas
-    KILL_SWITCH            = _env_b("KILL_SWITCH", False)   # coupe tout ordre
+    ALLOW_FALLBACK_CAPITAL = _env_b("ALLOW_FALLBACK_CAPITAL", default=False)
+    SHADOW_MODE            = _env_b("SHADOW_MODE", default=False)   # decide, n'envoie pas
+    KILL_SWITCH            = _env_b("KILL_SWITCH", default=False)   # coupe tout ordre
     # Ordres
     ORDER_TTL_SECONDS = _env_i("ORDER_FILL_TIMEOUT_SECONDS",
                                _env_i("ORDER_TTL_SECONDS", 45))
@@ -1902,7 +1902,7 @@ class ExecutionEngine:
         # la v1 n'enregistrait que la serie KXBTC15M, absente de l'univers,
         # d'ou strategy_supported=0 et no_compatible_strategy partout).
         # ECHEC DE DEMARRAGE si le registre est vide ou incomplet.
-        btc_enabled = _env_b("BTC_STRATEGY_ENABLED", True)
+        btc_enabled = _env_b("BTC_STRATEGY_ENABLED", default=True)
         try:
             self.router = build_default_registry(
                 btc_context_provider=(get_btc_context if BTC_AVAILABLE
