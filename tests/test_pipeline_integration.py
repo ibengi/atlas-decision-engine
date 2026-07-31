@@ -301,7 +301,7 @@ class TestDemoLiveSeparation(unittest.TestCase):
                     "LIVE_TRADING", "DEMO_TRADING"):
             os.environ.pop(var, None)
         argv = sys.argv
-        sys.argv = ["kalshi_alpha_bot.py", "--btc"]
+        sys.argv = ["kalshi_alpha_bot.py"]
         try:
             with self.assertRaises(SystemExit) as cm:
                 bot.main()

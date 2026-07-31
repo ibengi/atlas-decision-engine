@@ -2368,7 +2368,6 @@ def _start_dashboard_if_enabled():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--btc", action="store_true", help="mode BTC 15min")
     ap.add_argument("--demo", action="store_true",
                     help="environnement Kalshi DEMO (ordres reels sur demo-api)")
     ap.add_argument("--loop", action="store_true")
