@@ -54,7 +54,7 @@ def _env_i(name, default):
         return default
 
 
-def _env_b(name, default=False):
+def _env_b(name, *, default):
     v = os.getenv(name)
     if v is None:
         return default
@@ -85,7 +85,7 @@ DEFAULT_SERIES_BY_MARKET_TYPE = {
 
 class ScannerConfig:
     def __init__(self):
-        self.general_crawl = _env_b("SCANNER_GENERAL_CRAWL_ENABLED", False)
+        self.general_crawl = _env_b("SCANNER_GENERAL_CRAWL_ENABLED", default=False)
         raw = os.getenv("SCANNER_PRIORITY_SERIES", "").strip()
         self.priority_series = [s.strip().upper() for s in raw.split(",")
                                 if s.strip()] if raw else None
