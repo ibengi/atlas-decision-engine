@@ -218,7 +218,6 @@ class TestIntegrationScriptGuards(unittest.TestCase):
         code = (
             "import os, sys, runpy\n"
             f"sys.path.insert(0, {ROOT + '/src/utils'!r})\n"
-            "from paths import add_src_to_path; add_src_to_path()\n"
             "import kalshi_alpha_bot as bot\n"
             "bot.CFG.DEMO_URL = "
             "'https://api.elections.kalshi.com/trade-api/v2'\n"

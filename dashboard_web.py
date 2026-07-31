@@ -23,11 +23,6 @@ import threading
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-try:                                  # sys.path plat du depot (idempotent)
-    from paths import add_src_to_path
-    add_src_to_path()
-except ImportError:
-    pass
 
 try:
     from performance import compute_stats
