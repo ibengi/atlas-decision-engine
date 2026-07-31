@@ -80,6 +80,43 @@ class TestSettlements(unittest.TestCase):
         self.assertEqual(call_args[0][1], "yes")
         self.assertTrue(call_args[0][2])  # won=True
 
+    def test_settle_trade_failure_keeps_position(self):
+        """A missing trade-log entry must leave the position for retry."""
+        pos = _make_position(trade_id="t-settle-failure")
+        self.pm.positions["t-settle-failure"] = pos
+        self.mock_client.get_market.return_value = {
+            "ticker": pos["ticker"],
+            "status": "settled",
+            "result": "yes",
+        }
+
+        with patch.object(self.mock_tlog, "settle_trade", return_value=None) as settle, \
+             self.assertLogs("POSITION", level="ERROR") as log_ctx:
+            realized = self.pm.check_settlements()
+
+        self.assertEqual(realized, [])
+        self.assertIn("t-settle-failure", self.pm.positions)
+        settle.assert_called_once()
+        self.assertTrue(any("position kept for retry" in msg for msg in log_ctx.output))
+
+    def test_settle_trade_success_pops_position(self):
+        """A successful trade-log settlement permits removing the position."""
+        pos = _make_position(trade_id="t-settle-success")
+        self.pm.positions["t-settle-success"] = pos
+        self.mock_client.get_market.return_value = {
+            "ticker": pos["ticker"],
+            "status": "settled",
+            "result": "yes",
+        }
+        trade = {"trade_id": "t-settle-success"}
+
+        with patch.object(self.mock_tlog, "settle_trade", return_value=trade) as settle:
+            realized = self.pm.check_settlements()
+
+        self.assertNotIn("t-settle-success", self.pm.positions)
+        self.assertEqual(realized, [trade])
+        settle.assert_called_once()
+
     # ── 2. test_settles_on_no ───────────────────────────────────────────
 
     def test_settles_on_no(self):
