@@ -30,6 +30,8 @@ from datetime import datetime, timezone
 from typing import Optional, Callable
 
 from market_classifier import classify, SPORTS_TYPES  # noqa: F401
+from sports_provider import (SportsProvider, build_sports_provider,
+                             sports_provider_to_callable)
 
 log = logging.getLogger("ROUTER")
 
@@ -338,17 +340,53 @@ class ProviderBackedStrategy(Strategy):
                            features={"provider": "externe"})
 
 
-class SportsMoneylineStrategy(ProviderBackedStrategy):
+class SportsProviderStrategy(ProviderBackedStrategy):
+    """ProviderBackedStrategy branche sur une instance SportsProvider
+    (interface P6.1 : get_probability(ticker, market_data) -> pct 0-100).
+
+    - fournisseur SportsProvider  : adapte en callable (p 0-1, confiance) ;
+    - callable pur                : compat leguee (tests existants) ;
+    - None                        : AUCUNE source -> no_model_probability
+      (comportement actuel, aucun changement).
+
+    has_probability_source() suit le fournisseur : un composite VIDE ou
+    un no-op ne rend PAS le type tradeable (le scanner ne telecharge pas
+    de marches condamnes). Brancher un vrai fournisseur elargit
+    automatiquement le perimetre (test_v2_requirements le verifie)."""
+
+    def __init__(self, sports_provider=None):
+        if isinstance(sports_provider, SportsProvider):
+            self._sports_provider = sports_provider
+            super().__init__(
+                sports_provider_to_callable(sports_provider))
+        else:
+            # callable pur (compat) ou None
+            self._sports_provider = None
+            super().__init__(sports_provider)
+
+    def has_probability_source(self) -> bool:
+        if self._sports_provider is not None:
+            return bool(self._sports_provider.has_source())
+        return super().has_probability_source()
+
+    def provider_desc(self) -> str:
+        if self._sports_provider is not None:
+            return getattr(self._sports_provider, "name",
+                           type(self._sports_provider).__name__)
+        return super().provider_desc()
+
+
+class SportsMoneylineStrategy(SportsProviderStrategy):
     name = "sports_moneyline_v1"
     market_types = ("sports_moneyline",)
 
 
-class SportsSpreadStrategy(ProviderBackedStrategy):
+class SportsSpreadStrategy(SportsProviderStrategy):
     name = "sports_spread_v1"
     market_types = ("sports_spread",)
 
 
-class SportsTotalStrategy(ProviderBackedStrategy):
+class SportsTotalStrategy(SportsProviderStrategy):
     name = "sports_total_v1"
     market_types = ("sports_total",)
 
@@ -365,11 +403,20 @@ def build_default_registry(btc_context_provider: Callable = None,
                            election_provider: Callable = None,
                            btc_enabled: bool = True) -> StrategyRouter:
     """Registre canonique. Leve RegistryValidationError au moindre
-    probleme (doublon, registre vide, market_type requis manquant)."""
+    probleme (doublon, registre vide, market_type requis manquant).
+
+    sports_provider : instance SportsProvider (P6.1) OU callable legue
+    (market, book, mins) -> (p_yes, conf) | None. Par defaut :
+    build_sports_provider() -> CompositeSportsProvider VIDE (env
+    SPORTS_PROVIDER=static|noop pour changer). Composite vide = aucune
+    source = strictement le comportement actuel (sports non tradeables,
+    marches sports exclus du scan sans probabilite inventee)."""
     r = StrategyRouter()
     if btc_enabled:
         r.register(BtcModelStrategy(btc_context_provider))
         r.register(BtcDailyStrategy(btc_context_provider))
+    if sports_provider is None:
+        sports_provider = build_sports_provider()   # env SPORTS_PROVIDER
     r.register(SportsMoneylineStrategy(sports_provider))
     r.register(SportsSpreadStrategy(sports_provider))
     r.register(SportsTotalStrategy(sports_provider))
