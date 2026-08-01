@@ -56,10 +56,9 @@ from config import Config, CFG, _env_b, _env_i, _env_f, _p
 # S2. LOGGING (canaux BOT / API / TRADE / RISK / POSITION / STATS)
 # ══════════════════════════════════════════════════════════════════════════
 
-_FMT = "%(asctime)s  %(levelname)-7s [%(name)s] %(message)s"
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(),
-                    format=_FMT, datefmt="%Y-%m-%d %H:%M:%S",
-                    stream=sys.stdout)   # stdout: Railway ne marque plus tout en 'error'
+from logging_config import setup_logging
+setup_logging()   # JSON-lines sur stdout (LOG_FORMAT=json) ou texte lisible
+                  # (LOG_FORMAT=text) ; niveau via LOG_LEVEL (defaut INFO).
 log      = logging.getLogger("BOT")
 log_api  = logging.getLogger("API")
 log_trd  = logging.getLogger("TRADE")
