@@ -5,6 +5,7 @@ Extrait de kalshi_alpha_bot.py (P3.15).
 import logging
 import os
 import time
+from typing import Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
 from config import CFG, _env_b, _p
@@ -141,6 +142,16 @@ class ExecutionEngine:
         self.orders.reconcile_startup(self.tlog, self.posmgr)
         self.posmgr.reconcile_startup()
         self.posmgr.reconcile_with_broker()
+        # ── P8 : parallelisme solde+sante vs scan (desactive par defaut).
+        # Executor paresseux a l'usage : aucun thread tant qu'un cycle
+        # parallele n'est execute.
+        self._parallel_enabled = bool(CFG.API_PARALLEL_ENABLED)
+        self._executor = None
+        if self._parallel_enabled:
+            from concurrent.futures import ThreadPoolExecutor
+            self._executor = ThreadPoolExecutor(
+                max_workers=max(1, CFG.API_PARALLEL_WORKERS),
+                thread_name_prefix="atlas-p8")
 
     def fresh_book(self, ticker: str):
         """Relecture du carnet JUSTE avant decision puis avant ordre."""
@@ -180,11 +191,14 @@ class ExecutionEngine:
         except Exception as e:
             log.warning(f"[SHADOW] enregistrement: {e}")
 
-    def _balance_gate(self):
+    def _balance_gate(self, bal: Optional[float] = None):
         """Solde reel a chaque cycle. effective_capital = min(plafond,
         solde broker). Prod sans solde = blocage ; demo : secours possible
-        via ALLOW_FALLBACK_CAPITAL=1, clairement journalise."""
-        bal = self.client.get_balance()
+        via ALLOW_FALLBACK_CAPITAL=1, clairement journalise.
+        P8 : `bal` peut etre le solde PRE-FETCHE par le thread parallele
+        (aucun second appel HTTP dans ce cas)."""
+        if bal is None:
+            bal = self.client.get_balance()
         self.last_balance = bal
         if bal is not None:
             self.capital = min(self.configured_capital, bal) \
@@ -200,6 +214,47 @@ class ExecutionEngine:
             return True, "capital de secours (demo, journalise)"
         return False, ("solde indisponible; en demo, ALLOW_FALLBACK_CAPITAL=1 "
                        "requis pour un secours explicite")
+
+    def _background_balance_health(self):
+        """Fetch du solde + checks de sante, execute dans le thread P8 en
+        PARALLELE du scan. Ne leve JAMAIS : un solde indisponible est un
+        simple None (traite par la porte de solde comme en sequentiel)."""
+        bal = self.client.get_balance()
+        try:
+            health = HEALTH.run_all()
+        except Exception as e:                              # noqa: BLE001
+            log.debug(f"health run_all: {e}")
+            health = None
+        self._last_health = health
+        return bal, health
+
+    def _post_balance_gates(self) -> bool:
+        """Portes de risque globales APRES le solde (capital effectif a
+        jour). Retourne False si le cycle doit s'arreter (le code retour
+        du chemin sequentiel est strictement identique)."""
+        ok, why = self.risk.can_trade(cycle_trades=0)
+        if not ok:
+            log_rsk.warning(f"Trading bloque: {why}",
+                            extra={"event": "trading_blocked", "reason": why})
+            return False
+        if self.posmgr.open_count() >= CFG.MAX_OPEN_POSITIONS:
+            log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.",
+                            extra={"event": "max_open_positions",
+                                   "open": self.posmgr.open_count(),
+                                   "limit": CFG.MAX_OPEN_POSITIONS})
+            return False
+        dd_pct = self.risk.rolling_drawdown_pct()
+        if dd_pct >= CFG.MAX_EQUITY_DRAWDOWN_PCT:
+            log_rsk.warning(
+                f"Drawdown {dd_pct:.1f}% "
+                f"({self.risk.rolling_drawdown():.2f}$) >= "
+                f"{CFG.MAX_EQUITY_DRAWDOWN_PCT:g}% -- trading coupe.",
+                extra={"event": "drawdown_limit",
+                       "drawdown_pct": dd_pct,
+                       "drawdown_amount": self.risk.rolling_drawdown(),
+                       "limit_pct": CFG.MAX_EQUITY_DRAWDOWN_PCT})
+            return False
+        return True
 
     def _probability_engine_report(self):
         """Audit du Probability Engine au demarrage : pour chaque strategie,
@@ -265,6 +320,17 @@ class ExecutionEngine:
         log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
         self.stats.maybe_daily_report()
 
+        # P8 : caches par cycle — purge AVANT tout fetch (aucune donnee
+        # d'un cycle precedent ne peut servir au cycle courant).
+        if getattr(self.client, "cache_enabled", False):
+            self.client.clear_caches()
+        if CFG.BTC_CONTEXT_CYCLE_CACHE:
+            try:
+                from btc_context import begin_cycle
+                begin_cycle()
+            except ImportError:
+                pass
+
         # 0) Reglement des predictions shadow (journal de recherche)
         try:
             n_shadow = self.shadow_store.settle_pending(self.client.get_market)
@@ -280,6 +346,13 @@ class ExecutionEngine:
             log_rsk.info(f"PnL jour realise: {self.risk.daily_realized_pnl():+.2f}$ "
                          f"/ limite -{CFG.MAX_DAILY_LOSS:.2f}$")
 
+        if self._parallel_enabled:
+            return self._cycle_parallel(n)
+        return self._cycle_sequential(n)
+
+    def _cycle_sequential(self, n: int) -> int:
+        """Chemin par defaut (P8 desactive) : kill switch, solde, portes de
+        risque globales, PUIS scan — ordre historique inchange."""
         # 2) Kill switch (seule porte qui ne depend pas du capital effectif)
         #    et 3-4) portes de risque globales — mesurees ensemble : ce sont
         #    les controles risque du cycle (P4.4).
@@ -303,28 +376,8 @@ class ExecutionEngine:
                 return 0
 
             # 4) Portes de risque globales (dependent desormais du capital a jour)
-            ok, why = self.risk.can_trade(cycle_trades=0)
-            if not ok:
-                log_rsk.warning(f"Trading bloque: {why}",
-                                extra={"event": "trading_blocked", "reason": why})
+            if not self._post_balance_gates():
                 self.stats.log_summary(); return 0
-            if self.posmgr.open_count() >= CFG.MAX_OPEN_POSITIONS:
-                log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.",
-                                extra={"event": "max_open_positions",
-                                       "open": self.posmgr.open_count(),
-                                       "limit": CFG.MAX_OPEN_POSITIONS})
-                return 0
-            dd_pct = self.risk.rolling_drawdown_pct()
-            if dd_pct >= CFG.MAX_EQUITY_DRAWDOWN_PCT:
-                log_rsk.warning(
-                    f"Drawdown {dd_pct:.1f}% "
-                    f"({self.risk.rolling_drawdown():.2f}$) >= "
-                    f"{CFG.MAX_EQUITY_DRAWDOWN_PCT:g}% -- trading coupe.",
-                    extra={"event": "drawdown_limit",
-                           "drawdown_pct": dd_pct,
-                           "drawdown_amount": self.risk.rolling_drawdown(),
-                           "limit_pct": CFG.MAX_EQUITY_DRAWDOWN_PCT})
-                return 0
 
         # 5) PIPELINE integre (multi-candidats, jamais bloque sur un ticker)
         res = self.pipeline.run_cycle(
@@ -332,6 +385,46 @@ class ExecutionEngine:
             skip_ticker_fn=(lambda tk: CFG.ONE_TRADE_PER_MKT and
                             (tk in self.posmgr.tickers_open()
                              or self.tlog.has_open_on(tk))))
+        return self._finish_cycle(n, res)
+
+    def _cycle_parallel(self, n: int) -> int:
+        """P8 : solde + checks de sante executes en PARALLELE du scan.
+        Le scan reste sur le thread principal (tracing/timing intacts) ;
+        le fetch du solde et la sonde de sante tournent en arriere-plan
+        (ThreadPoolExecutor, stdlib) et sont joints avant les portes de
+        risque. Resultats strictement identiques au sequentiel : solde et
+        scan sont independants (le scan ne lit ni n'ecrit self.capital /
+        self.risk — portes inchangees, executees apres la jointure)."""
+        # 2) Kill switch d'abord : aucun scan lance inutilement.
+        if CFG.KILL_SWITCH:
+            log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
+                            extra={"event": "kill_switch"})
+            return 0
+        bal_future = self._executor.submit(self._background_balance_health)
+        try:
+            # 5) PIPELINE integre — chevauche le fetch du solde.
+            res = self.pipeline.run_cycle(
+                max_accepted=CFG.MAX_TRADES_CYCLE,
+                skip_ticker_fn=(lambda tk: CFG.ONE_TRADE_PER_MKT and
+                                (tk in self.posmgr.tickers_open()
+                                 or self.tlog.has_open_on(tk))))
+        except Exception:
+            bal_future.result()          # join avant propagation (thread ok)
+            raise
+        bal, _health = bal_future.result()
+        # 3-4) Portes de risque globales (solde pre-fetche : aucun 2e appel)
+        with timed("risk_check"):
+            ok, why = self._balance_gate(bal)
+            log_rsk.info(f"[CAPITAL] {why}")
+            if not ok:
+                return 0
+            if not self._post_balance_gates():
+                self.stats.log_summary(); return 0
+        return self._finish_cycle(n, res)
+
+    def _finish_cycle(self, n: int, res: dict) -> int:
+        """Execution des candidats acceptes + rapports de fin de cycle
+        (partage sequentiel/parallele)."""
         report = res["report"]
         placed = 0
         for dec in res["accepted"]:

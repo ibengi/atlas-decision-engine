@@ -96,6 +96,15 @@ class ScannerConfig:
         self.universe_ttl_s = max(1800, _env_i("SCANNER_UNIVERSE_TTL_S", 1800))
         self.crawl_max_pages = _env_i("SCANNER_CRAWL_MAX_PAGES", 200)
         self.page_limit = _env_i("SCANNER_PAGE_LIMIT", 200)
+        # ── P8 : fetch PARALLELE des series cibles (desactive par defaut).
+        # Les pages /markets sont dependantes du curseur (l'API IGNORE le
+        # parametre offset — verifie 2026-08-01), donc le crawl complet ne
+        # peut pas etre pagine en parallele ; en revanche les series du
+        # perimetre cible sont INDEPENDANTES et peuvent etre lues
+        # simultanement. L'ordre du resultat reste strictement identique au
+        # sequentiel (assemblage dans l'ordre original des series).
+        self.parallel_series = _env_b("SCANNER_PARALLEL_SERIES", default=False)
+        self.parallel_workers = max(1, _env_i("SCANNER_PARALLEL_WORKERS", 4))
 
 
 def _minutes_to_close(m: dict, now_dt: datetime):
@@ -285,25 +294,57 @@ class MarketScanner:
 
     def _incremental_refresh(self, base: list) -> list:
         """Entre deux crawls complets : seules les series CIBLES sont
-        re-lues (fraiches), fusionnees dans l'univers en cache."""
-        fresh = {}
-        for s in self.target_series():
-            first = True
-            for m in (self.client.get_markets(s, status="open",
-                                              limit=self.cfg.page_limit) or []):
-                tk = m.get("ticker")
-                if tk:
-                    fresh[tk] = m
-                    if first and hasattr(self.client, "_log_raw_once"):
-                        # Trou d'observabilite corrige : on n'avait JAMAIS
-                        # vu un objet marche brut (donc jamais ses vrais
-                        # noms de champs). Un echantillon par serie, une
-                        # fois par process.
-                        self.client._log_raw_once(f"market_sample_{s}", m)
-                        first = False
+        re-lues (fraiches), fusionnees dans l'univers en cache.
+        P8 : lecture des series en PARALLELE (SCANNER_PARALLEL_SERIES=1)
+        avec des workers configurables ; le resultat est assemble dans
+        l'ORDRE ORIGINAL des series => identique au sequentiel (le tri
+        aval du scanner est alors byte-identical)."""
+        series = self.target_series()
+        if self.cfg.parallel_series and len(series) > 1:
+            fresh = self._fetch_series_parallel(series)
+        else:
+            fresh = {}
+            for s in series:
+                fresh.update(self._fetch_series(s))
         merged = {m.get("ticker"): m for m in (base or []) if m.get("ticker")}
         merged.update(fresh)
         return list(merged.values())
+
+    def _fetch_series(self, series: str) -> dict:
+        """Une serie -> {ticker: market}. Comportement strictement identique
+        a l'ancien corps de boucle (ordre de parcours, _log_raw_once)."""
+        fresh = {}
+        first = True
+        for m in (self.client.get_markets(series, status="open",
+                                          limit=self.cfg.page_limit) or []):
+            tk = m.get("ticker")
+            if tk:
+                fresh[tk] = m
+                if first and hasattr(self.client, "_log_raw_once"):
+                    # Trou d'observabilite corrige : on n'avait JAMAIS
+                    # vu un objet marche brut (donc jamais ses vrais
+                    # noms de champs). Un echantillon par serie, une
+                    # fois par process.
+                    self.client._log_raw_once(f"market_sample_{series}", m)
+                    first = False
+        return fresh
+
+    def _fetch_series_parallel(self, series: list) -> dict:
+        """Fetch concurrent des series via ThreadPoolExecutor (stdlib).
+        L'ordre d'insertion suit `series` (ordre original), quel que soit
+        l'ordre de completion des threads. Une serie en erreur ne bloque
+        pas les autres (meme tolerance que le chemin sequentiel : la
+        serie absente est simplement omise)."""
+        from concurrent.futures import ThreadPoolExecutor
+        fresh = {}
+        with ThreadPoolExecutor(max_workers=self.cfg.parallel_workers) as ex:
+            futures = {s: ex.submit(self._fetch_series, s) for s in series}
+            for s in series:
+                try:
+                    fresh.update(futures[s].result())
+                except Exception as e:           # noqa: BLE001
+                    log.error(f"fetch parallele serie {s}: {e}")
+        return fresh
 
     # ── cycle de scan ──────────────────────────────────────────────────────
     def scan_cycle(self) -> dict:
@@ -313,6 +354,7 @@ class MarketScanner:
         now_dt = datetime.now(timezone.utc)
         rep = {"scanner_version": SCANNER_VERSION,
                "mode": None, "from_cache": False,
+               "parallel_series": self.cfg.parallel_series,
                "crawl_pages_last_refresh": self._crawl_pages_last,
                "excluded_by_reason": {}, "funnel": {}}
 

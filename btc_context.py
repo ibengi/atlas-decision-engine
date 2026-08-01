@@ -15,6 +15,7 @@ Aucun secret dans ce fichier.
 """
 
 import math
+import os
 import time
 import logging
 import statistics
@@ -31,8 +32,38 @@ MAX_PRICE_AGE_S     = 90.0         # au-dela : donnee PERIMEE
 MAX_DISPERSION_PCT  = 0.5          # ecart max entre exchanges (aberrant sinon)
 MIN_VALID_SOURCES   = 2
 MIN_KLINES          = 11           # pour rendement 10m + vol realisee
+# P8 : cache PAR CYCLE (BTC_CONTEXT_CYCLE_CACHE=1). Le contexte BTC est
+# calcule UNE FOIS par cycle puis partage par TOUS les marches BTC : les
+# fetches reseau (spot + klines) utilisent alors un TTL long (borne par
+# CYCLE_CACHE_TTL_S) et le contexte complet est memoise par
+# (strike, minutes_remaining). begin_cycle() (appele par ExecutionEngine
+# en debut de cycle) purge les deux caches : aucun cycle ne voit les
+# donnees du precedent.
+CYCLE_CACHE_TTL_S = 3600.0
+
+
+def _cycle_cache_active() -> bool:
+    """Flag BTC_CONTEXT_CYCLE_CACHE, lu LAZY (testable sans reload)."""
+    v = os.getenv("BTC_CONTEXT_CYCLE_CACHE", "0").strip().lower()
+    return v not in ("0", "false", "no", "off", "")
+
 
 _cache = {}                        # key -> (value, ts)
+_cycle_ctx_cache = {}              # (strike, minutes_remaining) -> context
+
+
+def _data_ttl() -> float:
+    """TTL des fetches bruts : court (10 s) par defaut, LONG si le cache
+    de cycle est actif (les donnees sont alors figees pour tout le cycle)."""
+    return CYCLE_CACHE_TTL_S if _cycle_cache_active() else CACHE_TTL_S
+
+
+def begin_cycle() -> None:
+    """Debute un nouveau cycle : purge le cache brut ET le cache de
+    contexte. A appeler au DEBUT de chaque cycle d'execution quand
+    BTC_CONTEXT_CYCLE_CACHE=1 (ExecutionEngine._cycle)."""
+    _cache.clear()
+    _cycle_ctx_cache.clear()
 
 
 def _cached(key, ttl, fn):
@@ -298,6 +329,13 @@ def get_btc_context(strike: Optional[float] = None,
     (tests hors-ligne). Retourne TOUJOURS un BtcMarketContext ; valid=False
     avec 'reason' explicite si les donnees sont insuffisantes."""
     now = now if now is not None else time.time()
+    # P8 : contexte memoise PAR CYCLE — meme strike/meme horizon => meme
+    # objet contexte (les fetches reseau n'ont lieu qu'une fois par cycle).
+    # Seuls les contextes VALIDES sont memoises (un invalide peut devenir
+    # valide en cours de cycle sans nouveau fetch — on ne le fige pas).
+    cycle_key = (strike, minutes_remaining)
+    if use_cache and _cycle_cache_active() and cycle_key in _cycle_ctx_cache:
+        return _cycle_ctx_cache[cycle_key]
     spot_sources = spot_sources or DEFAULT_SPOT_SOURCES
     # klines_fn=None => chaine multi-fournisseurs avec secours (defaut).
     # L'injection d'un fournisseur unique reste possible (tests).
@@ -325,7 +363,7 @@ def get_btc_context(strike: Optional[float] = None,
                 bool(r), "ok" if r else "aucune_donnee")
             out.append(r)
         return out
-    raw = _cached("spot_sources", CACHE_TTL_S, pull) if use_cache else pull()
+    raw = _cached("spot_sources", _data_ttl(), pull) if use_cache else pull()
     sources, flags = _validate_sources(raw or [], now)
 
     ctx = BtcMarketContext(valid=False, reason="", generated_ts=now,
@@ -346,14 +384,14 @@ def get_btc_context(strike: Optional[float] = None,
 
     if klines_fn is not None:
         # compat tests/injection : un seul fournisseur, sortie brute
-        raw_kl = (_cached("klines", CACHE_TTL_S, lambda: klines_fn())
+        raw_kl = (_cached("klines", _data_ttl(), lambda: klines_fn())
                   if use_cache else klines_fn())
         raw_kl = raw_kl[0] if isinstance(raw_kl, tuple) else raw_kl
         kl, kl_src = (raw_kl or []), ("fresh:injected" if raw_kl else "none")
     else:
         def pull_kl():
             return fetch_klines_with_fallback(now=now)
-        kl, kl_src = (_cached("klines_fb", CACHE_TTL_S, pull_kl)
+        kl, kl_src = (_cached("klines_fb", _data_ttl(), pull_kl)
                       if use_cache else pull_kl())
         kl = kl or []
     is_stale = kl_src.startswith("stale_cache")
@@ -430,6 +468,8 @@ def get_btc_context(strike: Optional[float] = None,
 
     ctx.valid = True
     ctx.reason = "ok"
+    if use_cache and _cycle_cache_active():
+        _cycle_ctx_cache[cycle_key] = ctx
     return ctx
 
 
@@ -440,4 +480,6 @@ def get_btc_price(spot_sources: tuple = None) -> Optional[float]:
 
 
 def clear_cache():
+    """Purge caches brut + cycle (utilise par les tests)."""
     _cache.clear()
+    _cycle_ctx_cache.clear()

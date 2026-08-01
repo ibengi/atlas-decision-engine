@@ -43,7 +43,7 @@ class KalshiClient:
     env='prod' -> production. TOUT (donnees, ordres, reglements) passe par
     le MEME environnement, condition de coherence d'un vrai broker."""
 
-    def __init__(self, env: str = "demo"):
+    def __init__(self, env: str = "demo", cache_enabled: Optional[bool] = None):
         self.env      = env
         self.base_url = CFG.DEMO_URL if env == "demo" else CFG.PROD_URL
         if env == "demo":
@@ -61,6 +61,25 @@ class KalshiClient:
         self.session = requests.Session()
         self._pk = self._load_key(key_pem)
         self._raw_logged = set()   # types de reponses deja loggees en brut
+        # ── P8 : caches de requete TTL (desactives par defaut). Un cache
+        # ── n'est rempli qu'avec des resultats VALIDES (jamais None / liste
+        # ── vide) : une erreur API transitoire ne masque pas un
+        # ── retablissement. clear_caches() est appele au debut de chaque
+        # ── cycle (ExecutionEngine) : un cache ne traverse jamais un cycle.
+        self.cache_enabled = (CFG.API_CACHE_ENABLED
+                              if cache_enabled is None else bool(cache_enabled))
+        self._balance_cache = None
+        self._markets_cache = None
+        if self.cache_enabled:
+            from api_cache import TTLCache
+            self._balance_cache = TTLCache(CFG.API_BALANCE_TTL_S)
+            self._markets_cache = TTLCache(CFG.API_MARKET_TTL_S)
+
+    def clear_caches(self) -> None:
+        """Vide les caches de requete (appele en debut de cycle)."""
+        if self.cache_enabled:
+            self._balance_cache.clear()
+            self._markets_cache.clear()
 
     # -- Signature ----------------------------------------------------------
     def _load_key(self, key_pem: str):
@@ -166,13 +185,25 @@ class KalshiClient:
 
     # -- Endpoints -----------------------------------------------------------
     def get_markets(self, series: str, status: str = "open", limit: int = 50) -> list:
+        """Liste les marches d'une serie. P8 : cache TTL par (serie, status,
+        limit) — les listes VIDES ne sont jamais cachees (vide = soit serie
+        sans marche, soit erreur API : on ne fige pas une erreur)."""
+        key = (series, status, limit)
+        if self.cache_enabled:
+            hit = self._markets_cache.get(key)
+            if hit is not None:
+                log_api.debug(f"get_markets({series}): cache hit")
+                return hit
         try:
             r = self._req("GET", "/markets",
                           params={"series_ticker": series, "status": status, "limit": limit})
-            return r.get("markets", []) or []
+            markets = r.get("markets", []) or []
         except KalshiAPIError as e:
             log_api.error(f"get_markets({series}): {e}")
             return []
+        if self.cache_enabled and markets:
+            self._markets_cache.set(key, markets)
+        return markets
 
     def get_market(self, ticker: str) -> dict:
         try:
@@ -183,7 +214,20 @@ class KalshiClient:
             return {}
 
     def get_balance(self) -> Optional[float]:
-        """Solde du compte en $. Champ 'balance' attendu en cents (a verifier)."""
+        """Solde du compte en $. P8 : cache TTL par cycle — jamais de
+        resultat None (erreur API) mis en cache."""
+        if self.cache_enabled:
+            hit = self._balance_cache.get("balance")
+            if hit is not None:
+                log_api.debug("get_balance: cache hit")
+                return hit
+        bal = self._fetch_balance()
+        if self.cache_enabled and bal is not None:
+            self._balance_cache.set("balance", bal)
+        return bal
+
+    def _fetch_balance(self) -> Optional[float]:
+        """Champ 'balance' attendu en cents (a verifier)."""
         try:
             r = self._req("GET", "/portfolio/balance")
             self._log_raw_once("balance", r)
