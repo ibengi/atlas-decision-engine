@@ -16,6 +16,8 @@ cote du moteur (Railway fournit $PORT).
 Endpoints :
   GET /            page HTML
   GET /api/state   JSON agrege (etat moteur + trades + positions + stats)
+  GET /health      JSON sante du moteur (statut agrege + checks, P4.3) ;
+                   200 si healthy/degraded, 503 si unhealthy
 """
 import json
 import os
@@ -28,6 +30,11 @@ try:
     from performance import compute_stats
 except Exception:                                    # pragma: no cover
     compute_stats = None
+
+try:
+    from health_monitor import get_health_json
+except Exception:                                    # pragma: no cover
+    get_health_json = None
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -160,6 +167,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(build_state(self.data_dir),
                                        ensure_ascii=False, default=str),
                        "application/json")
+        elif self.path.startswith("/health"):
+            if get_health_json is None:
+                self._send(503, '{"status":"unhealthy",'
+                                '"error":"health_monitor unavailable"}',
+                           "application/json")
+                return
+            health = get_health_json(data_dir=self.data_dir)
+            code = 503 if health.get("status") == "unhealthy" else 200
+            self._send(code, json.dumps(health, ensure_ascii=False,
+                                        default=str), "application/json")
         elif self.path in ("/", "/index.html"):
             self._send(200, PAGE, "text/html")
         else:
