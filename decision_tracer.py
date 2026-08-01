@@ -43,7 +43,10 @@ class DecisionTracer:
         """Emit one market decision event with a stable schema."""
         if not self.active:
             return
-        fields = {"run_id": self.run_id, "ticker": ticker,
+        # run_id N'EST PAS passe via extra : la record factory (cf. module)
+        # l'injecte dans chaque LogRecord pendant une trace. Le repasser ici
+        # ferait lever KeyError("Attempt to overwrite 'run_id'") a INFO.
+        fields = {"ticker": ticker,
                   "event_type": event_type, "timestamp_ms": self.elapsed_ms()}
         if reason is not None:
             fields["reason"] = reason
@@ -57,7 +60,7 @@ class DecisionTracer:
     def event(self, event_type, **fields):
         if not self.active:
             return
-        fields.update(run_id=self.run_id, event_type=event_type,
+        fields.update(event_type=event_type,
                       timestamp_ms=self.elapsed_ms())
         self.logger.info("[DECISION_TRACE] run %s", event_type, extra=fields)
 
