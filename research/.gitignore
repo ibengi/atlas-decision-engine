@@ -1,0 +1,2 @@
+# Historical candle caches are real data and must stay out of git.
+data/*
