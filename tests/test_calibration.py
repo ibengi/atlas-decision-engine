@@ -48,7 +48,7 @@ def test_analyze_is_json_friendly_and_aliases_work():
     report = analyze([{"p": .2, "outcome": 1}, {"p": .8, "outcome": 0}], bins=2)
     assert report["count"] == 2
     assert report["brier_score"] == pytest.approx(.64)
-    assert math.isclose(report["expected_calibration_error"], .6)
+    assert math.isclose(report["expected_calibration_error"], .8)
 
 
 def test_invalid_bin_count_rejected():
