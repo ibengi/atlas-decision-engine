@@ -434,6 +434,13 @@ class ExecutionEngine:
         # 5b) budgets risque categorie / marche + taille (sur capital effectif)
         with timed("risk_check"):
             cat = getattr(dec, "category", None) or "Other"
+            # Emergency stop is checked before any sizing; concentration is
+            # checked again below with the actual proposed allocation.
+            ok, why = self.risk.portfolio_check(ticker, cat, 0.0)
+            if not ok:
+                report["rejections"]["portfolio_risk"] = report["rejections"].get("portfolio_risk", 0) + 1
+                log_rsk.info(f"[REJECT] {ticker}: {why}")
+                return 0
             cat_risk = self.posmgr.open_risk_by_category().get(cat, 0.0)
             if cat_risk >= self.capital * CFG.MAX_CATEGORY_RISK_PCT / 100.0:
                 report["rejections"]["category_budget"] = \
@@ -451,6 +458,13 @@ class ExecutionEngine:
                 self.risk.rolling_drawdown(), self.posmgr.open_risk(),
                 probability=getattr(dec, "model_probability", None),
                 side=getattr(dec, "side", "yes"))
+            count = int(count * self.risk.drawdown_size_factor())
+            proposed_risk = count * entry / 100.0
+            ok, why = self.risk.portfolio_check(ticker, cat, proposed_risk)
+            if not ok:
+                report["rejections"]["portfolio_risk"] = report["rejections"].get("portfolio_risk", 0) + 1
+                log_rsk.info(f"[REJECT] {ticker}: {why}")
+                return 0
             if count <= 0:
                 log_rsk.info(f"[REJECT] {ticker}: risk_blocked (taille=0)")
                 report["rejections"]["risk_blocked"] = \

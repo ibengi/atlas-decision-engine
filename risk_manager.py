@@ -160,10 +160,45 @@ class RiskManager:
         return True
 
     # -- portes de risque ------------------------------------------------------
+    @staticmethod
+    def _group_for(ticker: str, category: str = "Other") -> str:
+        # Keep this independent of a concrete PositionManager for testability.
+        return PositionManager.correlation_group(ticker, category)
+
+    def _group_limit_pct(self, group: str) -> float:
+        """Group cap as a percent of effective capital; zero disables it."""
+        return float(getattr(CFG, "MAX_CORRELATION_GROUP_PCT", 0.0) or 0.0)
+
+    def drawdown_size_factor(self) -> float:
+        """Multiplier for new size after portfolio drawdown throttle."""
+        threshold = float(getattr(CFG, "PORTFOLIO_DRAWDOWN_THROTTLE_PCT", 0.0) or 0.0)
+        if threshold <= 0 or self.rolling_drawdown_pct() < threshold:
+            return 1.0
+        return max(0.0, min(1.0, float(getattr(CFG, "DRAWDOWN_THROTTLE_FACTOR", 0.5))))
+
+    def portfolio_check(self, ticker: str, category: str = "Other",
+                        proposed_risk: float = 0.0) -> (bool, str):
+        """Check emergency stop and incremental portfolio concentration."""
+        pnl = self.daily_realized_pnl()
+        stop = self.effective_daily_stop()
+        if stop > 0 and pnl <= -stop:
+            return False, f"daily_loss_limit: realized PnL {pnl:+.2f} <= -{stop:.2f}"
+        total_limit = float(getattr(CFG, "MAX_PORTFOLIO_RISK_PCT", 0.0) or 0.0)
+        projected = self.posmgr.open_risk() + max(0.0, float(proposed_risk or 0.0))
+        if total_limit > 0 and projected > self.capital * total_limit / 100.0:
+            return False, f"portfolio_limit: {projected:.2f} > {total_limit:g}%"
+        group = self._group_for(ticker, category)
+        group_limit = self._group_limit_pct(group)
+        by_group = self.posmgr.open_risk_by_group()
+        group_projected = by_group.get(group, 0.0) + max(0.0, float(proposed_risk or 0.0))
+        if group_limit > 0 and group_projected > self.capital * group_limit / 100.0:
+            return False, f"correlation_group_limit:{group}: {group_projected:.2f} > {group_limit:g}%"
+        return True, ""
+
     def can_trade(self, cycle_trades: int) -> (bool, str):
         pnl = self.daily_realized_pnl()
         stop = self.effective_daily_stop()
-        if pnl <= -stop:
+        if stop > 0 and pnl <= -stop:
             return False, (f"STOP JOURNALIER: PnL realise {pnl:+.2f}$ <= "
                            f"-{stop:.2f}$ (={CFG.MAX_DAILY_LOSS_PCT:g}% du "
                            f"capital effectif {self.capital:.2f}$)")
