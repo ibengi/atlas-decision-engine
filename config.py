@@ -58,6 +58,20 @@ class Config:
     MAX_PORTFOLIO_RISK_PCT = _env_f("MAX_PORTFOLIO_RISK_PCT", 0.0)
     PORTFOLIO_DRAWDOWN_THROTTLE_PCT = _env_f("PORTFOLIO_DRAWDOWN_THROTTLE_PCT", 0.0)
     DRAWDOWN_THROTTLE_FACTOR = _env_f("DRAWDOWN_THROTTLE_FACTOR", 0.5)
+    # ── Performance (P8) : parallelisme + caches, TOUS DESACTIVES par
+    # ── defaut — sans flag, le moteur est strictement sequentiel et sans
+    # ── cache (zero changement de comportement).
+    API_CACHE_ENABLED     = _env_b("API_CACHE_ENABLED", default=False)
+    API_BALANCE_TTL_S     = _env_f("API_BALANCE_TTL_S", 15.0)   # cache solde
+    API_MARKET_TTL_S      = _env_f("API_MARKET_TTL_S", 30.0)    # cache listings
+    API_PARALLEL_ENABLED  = _env_b("API_PARALLEL_ENABLED", default=False)
+    API_PARALLEL_WORKERS  = max(1, _env_i("API_PARALLEL_WORKERS", 4))
+    SCANNER_PARALLEL_SERIES = _env_b("SCANNER_PARALLEL_SERIES", default=False)
+    SCANNER_PARALLEL_WORKERS = max(1, _env_i("SCANNER_PARALLEL_WORKERS", 4))
+    # Contexte BTC calcule UNE FOIS par cycle (au lieu d'un refresh reseau
+    # toutes les ~10 s) — voir btc_context.begin_cycle().
+    BTC_CONTEXT_CYCLE_CACHE = _env_b("BTC_CONTEXT_CYCLE_CACHE", default=False)
+    BTC_CONTEXT_CYCLE_TTL_S = _env_f("BTC_CONTEXT_CYCLE_TTL_S", 3600.0)
     # Mode d'execution explicite (exigence 2). "real_demo" active le
     # garde anti-mock : tout client non authentique => arret FATAL.
     EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "standard").lower()
