@@ -19,6 +19,7 @@ from risk_manager import RiskManager
 from stats_engine import StatsEngine
 from trade_logger import TradeLogger, now_iso
 from decision_tracer import DecisionTracer
+from health_monitor import HEALTH
 
 ENGINE_VERSION = "v11.4-audit-fixed-2026-07-28"
 
@@ -131,6 +132,7 @@ class ExecutionEngine:
             observer=self._shadow_observer,
             scanner=self.scanner, data_dir=CFG.DATA_DIR)
         self.tracer = DecisionTracer(log)
+        HEALTH.set_client(client)
         assert_real_demo_integrity(client, CFG.SHADOW_MODE)
         log_execution_banner(client)
         self._probability_engine_report()
@@ -242,7 +244,12 @@ class ExecutionEngine:
             trace.event("RUN_STARTED", cycle=n, market_count=0)
             try:
                 result = self._cycle(n)
+                HEALTH.record_run(ok=True, run_id=trace.run_id, cycle=n)
                 return result
+            except Exception as e:                        # noqa: BLE001
+                HEALTH.record_run(ok=False, run_id=trace.run_id, cycle=n,
+                                  error=f"{type(e).__name__}: {e}")
+                raise
             finally:
                 trace.event("RUN_ENDED", cycle=n)
                 log.info("[DECISION_TRACE] run complete",
