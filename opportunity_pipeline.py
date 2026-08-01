@@ -27,6 +27,7 @@ import logging
 from market_classifier import classify
 from strategy_router import (Decision, GateConfig, price_and_gate,
                              minutes_to_close)
+from decision_tracer import current_tracer
 
 log = logging.getLogger("PIPELINE")
 
@@ -111,20 +112,25 @@ class MarketOpportunityPipeline:
              "risk_passed": 0, "orders_submitted": 0, "fills": 0,
              "rejections_by_reason": {}, "cycle_duration_ms": None}
 
-        def _rej(reason):
+        def _rej(reason, ticker=None, price=None):
             base = reason.split(":", 1)[0]
             S["rejections_by_reason"][base] = \
                 S["rejections_by_reason"].get(base, 0) + 1
+            if tracer and ticker:
+                tracer.market(ticker, "REJECTED", reason=base, price=price)
 
         scan = self.scanner.scan_cycle()
         srep = scan["report"]
         S["scanned_raw"] = srep["funnel"].get("scanned_raw", 0)
+        self._trace_market_count = len(scan.get("markets") or [])
         S["open_cached"] = srep["funnel"].get("after_time_window", 0)
         S["liquid"] = srep["funnel"].get("after_liquidity", 0)
         for r, n in srep["excluded_by_reason"].items():
             S["rejections_by_reason"][r] = \
                 S["rejections_by_reason"].get(r, 0) + n
 
+        tracer = current_tracer()
+        self._trace_market_count = 0
         accepted, deep = [], 0
         S["model_rejections_detailed"] = {}
         S["model_executed"] = {}
@@ -156,18 +162,21 @@ class MarketOpportunityPipeline:
                 _mt_logged[0] += 1
         for m in scan["markets"]:
             ticker = m.get("ticker") or ""
+            self._trace_market_count += 1
+            if tracer:
+                tracer.market(ticker, "SCANNED")
             cls = m.get("_classification") or classify(m).to_dict()
             mtype, cat = cls["market_type"], cls["category"]
 
             if skip_ticker_fn and skip_ticker_fn(ticker):
-                _rej("already_positioned"); continue
+                _rej("already_positioned", ticker); continue
             cached = self._cached_reject(ticker)
             if cached:
-                _rej("cached:" + cached); continue
+                _rej("cached:" + cached, ticker); continue
 
             strat = self.router.route(mtype)
             if strat is None:
-                _rej("no_compatible_strategy")
+                _rej("no_compatible_strategy", ticker)
                 self._cache_reject(ticker, "no_compatible_strategy")
                 log.debug(f"[REJECT] {ticker} no_compatible_strategy "
                           f"(market_type={mtype})")
@@ -175,7 +184,7 @@ class MarketOpportunityPipeline:
             S["supported"] += 1
 
             if deep >= self.max_deep:
-                _rej("deep_analysis_cap"); continue
+                _rej("deep_analysis_cap", ticker); continue
             deep += 1
 
             # carnet FRAIS (ou celui du snapshot si pas de fetch dedie)
@@ -186,7 +195,7 @@ class MarketOpportunityPipeline:
                 from kalshi_alpha_bot import MarketValidator
                 book = MarketValidator.normalize_book(m)
             if not book:
-                _rej("no_liquidity")
+                _rej("no_liquidity", ticker)
                 self._cache_reject(ticker, "no_liquidity")
                 continue
 
@@ -199,6 +208,9 @@ class MarketOpportunityPipeline:
             if model.valid:
                 S["model_evaluated"] += 1
             dec = price_and_gate(dec, model, book, self.gates, market=m)
+            if tracer:
+                tracer.market(ticker, "EVALUATED", reason=(dec.rejection_reason if not dec.accepted else "accepted"),
+                              edge=dec.net_edge, price=dec.entry_ask)
             if dec.gross_edge is not None and dec.gross_edge > 0:
                 S["positive_edge"] += 1
             if dec.net_ev is not None and dec.net_ev > 0:
@@ -227,7 +239,7 @@ class MarketOpportunityPipeline:
                 if len(accepted) >= max_accepted:
                     break
             else:
-                _rej(dec.rejection_reason or "unspecified")
+                _rej(dec.rejection_reason or "unspecified", ticker, dec.entry_ask)
                 self._cache_reject(ticker, dec.rejection_reason or "unspecified")
                 log.debug(f"[REJECT] {ticker} {dec.rejection_reason}",
                           extra={"ticker": ticker,

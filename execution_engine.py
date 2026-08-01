@@ -18,6 +18,7 @@ from position_sizer import PositionSizer
 from risk_manager import RiskManager
 from stats_engine import StatsEngine
 from trade_logger import TradeLogger, now_iso
+from decision_tracer import DecisionTracer
 
 ENGINE_VERSION = "v11.4-audit-fixed-2026-07-28"
 
@@ -129,6 +130,7 @@ class ExecutionEngine:
             fresh_book_fn=self.fresh_book,
             observer=self._shadow_observer,
             scanner=self.scanner, data_dir=CFG.DATA_DIR)
+        self.tracer = DecisionTracer(log)
         assert_real_demo_integrity(client, CFG.SHADOW_MODE)
         log_execution_banner(client)
         self._probability_engine_report()
@@ -235,6 +237,21 @@ class ExecutionEngine:
             log.warning(f"  sonde BTC: EXCEPTION {type(e).__name__}: {e}")
 
     def cycle(self, n: int) -> int:
+        """Run one iteration inside a fresh end-to-end decision trace."""
+        with self.tracer.trace_run() as trace:
+            trace.event("RUN_STARTED", cycle=n, market_count=0)
+            try:
+                result = self._cycle(n)
+                return result
+            finally:
+                trace.event("RUN_ENDED", cycle=n)
+                log.info("[DECISION_TRACE] run complete",
+                         extra={"run_id": trace.run_id, "event_type": "RUN_ENDED",
+                                "cycle": n, "market_count": getattr(self, "_trace_market_count", 0),
+                                "duration_ms": trace.elapsed_ms(),
+                                "timestamp_ms": trace.elapsed_ms()})
+
+    def _cycle(self, n: int) -> int:
         log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
         self.stats.maybe_daily_report()
 
@@ -463,6 +480,11 @@ class ExecutionEngine:
                      extra={"ticker": ticker, "side": dec.side, "size": count,
                             "price": entry, "edge": dec.net_edge})
         exec_res = self.orders.place_and_track(ticker, dec.side, count, entry)
+        from decision_tracer import current_tracer
+        tracer = current_tracer()
+        if tracer:
+            tracer.market(ticker, "EXECUTED", edge=dec.net_edge, price=entry,
+                          reason="order_submitted")
         if exec_res.filled <= 0:
             # Ne pas consumer l'unique essai si aucune soumission n'a ete
             # acceptee, ou si l'annulation sans fill est explicitement confirmee.
