@@ -53,78 +53,10 @@ def fake_ctx(strike=None, minutes_remaining=None, **kw):
     return FakeCtx()
 
 
-class FakeClient:
-    """Client Kalshi factice : AUCUN reseau. Scenarios d'ordre pilotables."""
-    env = "demo"
-    base_url = "fake://demo"
-    cred_src = "fake"
+from mock_kalshi import MockKalshiClient
 
-    def __init__(self, market=None, order_scenario="fill"):
-        self.market = market or btcd_market()
-        self.scenario = order_scenario
-        self.created_orders = []
-        self.cancelled = []
-        self._orders = {}
-
-    # -- donnees --
-    def get_balance(self):
-        return 93.26
-
-    def get_markets(self, series, status="open", limit=200):
-        return [dict(self.market)] if series == "KXBTCD" else []
-
-    def get_market(self, ticker):
-        return dict(self.market) if ticker == self.market["ticker"] else {}
-
-    def get_positions(self):
-        # sert la position reelle des qu'un fill a eu lieu (POSITION_VERIFY)
-        out = []
-        for o in self._orders.values():
-            n = int(o.get("taker_fill_count") or 0)
-            if n > 0:
-                out.append({"ticker": self.market["ticker"],
-                            "position": n if o["side"] == "yes" else -n,
-                            "market_exposure": n * o["price"],
-                            "realized_pnl": 0, "fees_paid": 2})
-        return out
-
-    def _req(self, method, path, params=None, **kw):
-        return {"markets": [], "cursor": None}
-
-    # -- ordres --
-    def create_order(self, ticker, side, count, price_cents,
-                     client_order_id=None):
-        oid = f"o{len(self.created_orders) + 1}"
-        self.last_http_status = 201
-        self.created_orders.append({"order_id": oid, "ticker": ticker,
-                                    "side": side, "count": count,
-                                    "price": price_cents,
-                                    "client_order_id": client_order_id})
-        st = {"fill": ("executed", count),
-              "partial": ("canceled", max(0, count - 1)),
-              "none": ("resting", 0)}[self.scenario]
-        self._orders[oid] = {"order_id": oid, "status": st[0],
-                             "taker_fill_count": st[1],
-                             "side": side, "price": price_cents}
-        return dict(self._orders[oid])
-
-    def get_order(self, oid):
-        return dict(self._orders.get(oid, {}))
-
-    def cancel_order(self, oid):
-        self.cancelled.append(oid)
-        o = self._orders.get(oid)
-        if o and o["status"] not in ("executed",):
-            o["status"] = "canceled"
-        return dict(o or {})
-
-    def get_fills(self, order_id):
-        o = self._orders.get(order_id) or {}
-        n = int(o.get("taker_fill_count") or 0)
-        if n <= 0:
-            return []
-        return [{"fill_id": f"f-{order_id}", "count": n,
-                 f"{o['side']}_price": o["price"], "fees": "0.02"}]
+# Backwards-compatible fixture name used by the existing integration tests.
+FakeClient = MockKalshiClient
 
 
 def make_engine(client):
