@@ -255,7 +255,8 @@ class ExecutionEngine:
 
         # 2) Kill switch (seule porte qui ne depend pas du capital effectif)
         if CFG.KILL_SWITCH:
-            log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.")
+            log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
+                            extra={"event": "kill_switch"})
             return 0
 
         # 3) Solde reel du broker -- CORRECTIF AUDIT : deplace AVANT les
@@ -274,17 +275,25 @@ class ExecutionEngine:
         # 4) Portes de risque globales (dependent desormais du capital a jour)
         ok, why = self.risk.can_trade(cycle_trades=0)
         if not ok:
-            log_rsk.warning(f"Trading bloque: {why}")
+            log_rsk.warning(f"Trading bloque: {why}",
+                            extra={"event": "trading_blocked", "reason": why})
             self.stats.log_summary(); return 0
         if self.posmgr.open_count() >= CFG.MAX_OPEN_POSITIONS:
-            log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.")
+            log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.",
+                            extra={"event": "max_open_positions",
+                                   "open": self.posmgr.open_count(),
+                                   "limit": CFG.MAX_OPEN_POSITIONS})
             return 0
         dd_pct = self.risk.rolling_drawdown_pct()
         if dd_pct >= CFG.MAX_EQUITY_DRAWDOWN_PCT:
             log_rsk.warning(
                 f"Drawdown {dd_pct:.1f}% "
                 f"({self.risk.rolling_drawdown():.2f}$) >= "
-                f"{CFG.MAX_EQUITY_DRAWDOWN_PCT:g}% -- trading coupe.")
+                f"{CFG.MAX_EQUITY_DRAWDOWN_PCT:g}% -- trading coupe.",
+                extra={"event": "drawdown_limit",
+                       "drawdown_pct": dd_pct,
+                       "drawdown_amount": self.risk.rolling_drawdown(),
+                       "limit_pct": CFG.MAX_EQUITY_DRAWDOWN_PCT})
             return 0
 
         # 5) PIPELINE integre (multi-candidats, jamais bloque sur un ticker)
@@ -414,14 +423,22 @@ class ExecutionEngine:
             return 0
         report["risk_passed"] = report.get("risk_passed", 0) + 1
         log_rsk.info(f"[RISK] {ticker}: portes de risque PASSEES "
-                     f"(taille={count}, capital={self.capital:.2f}$)")
+                     f"(taille={count}, capital={self.capital:.2f}$)",
+                     extra={"ticker": ticker, "size": count,
+                            "capital": self.capital})
 
         est_fee_total = FeeModel.trading_fee(count, entry)
         log_trd.info(f"[SIGNAL VALIDE] {ticker} {dec.side.upper()} x{count} "
                      f"@ {entry}c | modele={dec.model_probability:.1%} "
                      f"marche={dec.market_probability:.1%} "
                      f"edge_net={dec.net_edge:+.3f} ev_net={dec.net_ev:+.3f} "
-                     f"strat={dec.strategy}")
+                     f"strat={dec.strategy}",
+                     extra={"ticker": ticker, "side": dec.side, "size": count,
+                            "price": entry,
+                            "model_probability": dec.model_probability,
+                            "market_probability": dec.market_probability,
+                            "edge_net": dec.net_edge, "ev_net": dec.net_ev,
+                            "strategy": dec.strategy})
 
         # 5d) SHADOW : decision complete journalisee, AUCUN ordre
         if CFG.SHADOW_MODE:
@@ -442,7 +459,9 @@ class ExecutionEngine:
 
         report["orders_submitted"] = report.get("orders_submitted", 0) + 1
         log_trd.info(f"[EXECUTION] {ticker} {dec.side.upper()} x{count} "
-                     f"@ {entry}c -> envoi de l'ordre")
+                     f"@ {entry}c -> envoi de l'ordre",
+                     extra={"ticker": ticker, "side": dec.side, "size": count,
+                            "price": entry, "edge": dec.net_edge})
         exec_res = self.orders.place_and_track(ticker, dec.side, count, entry)
         if exec_res.filled <= 0:
             # Ne pas consumer l'unique essai si aucune soumission n'a ete
@@ -455,7 +474,12 @@ class ExecutionEngine:
                 self.risk.release_half_open_attempt(ticker,
                     f"ordre confirme sans fill: {exec_res.status}")
             log_trd.warning(f"NON EXECUTE ({exec_res.state}: {exec_res.status}) "
-                            f"-- AUCUN trade enregistre.")
+                            f"-- AUCUN trade enregistre.",
+                            extra={"ticker": ticker, "side": dec.side,
+                                   "size": count, "price": entry,
+                                   "order_state": exec_res.state,
+                                   "order_status": exec_res.status,
+                                   "filled": exec_res.filled})
             return 0
 
         # 5e) frais REELS d'abord (reponse d'ordre puis fills) (TEST M)
@@ -505,7 +529,8 @@ class ExecutionEngine:
                          f"market_exposure={found.get('market_exposure', '-')} "
                          f"realized_pnl={found.get('realized_pnl', '-')} "
                          f"fees_paid={found.get('fees_paid', '-')}")
-            log_pos.info(f"[POSITION_OPENED] {dec.ticker} confirme par l'API")
+            log_pos.info(f"[POSITION_OPENED] {dec.ticker} confirme par l'API",
+                         extra={"ticker": dec.ticker})
         elif brk is not None:
             log_pos.warning("[POSITION_VERIFY] "
                             f"ticker={dec.ticker} position_found=false — "

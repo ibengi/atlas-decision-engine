@@ -132,7 +132,8 @@ class RiskManager:
         self.flush()
         log_rsk.warning(
             f"[RISK] essai demi-ouvert RESERVE pour {ticker}; aucune autre "
-            "soumission autorisee avant un nouveau reglement.")
+            "soumission autorisee avant un nouveau reglement.",
+            extra={"event": "half_open_reserved", "ticker": ticker})
         return True, ""
 
     def release_half_open_attempt(self, ticker: str, reason: str) -> bool:
@@ -153,7 +154,9 @@ class RiskManager:
             "half_open_release_reason": reason,
         })
         self.flush()
-        log_rsk.warning(f"[RISK] essai demi-ouvert LIBERE pour {ticker}: {reason}")
+        log_rsk.warning(f"[RISK] essai demi-ouvert LIBERE pour {ticker}: {reason}",
+                        extra={"event": "half_open_released",
+                               "ticker": ticker, "reason": reason})
         return True
 
     # -- portes de risque ------------------------------------------------------
@@ -185,7 +188,9 @@ class RiskManager:
                     "dernier trade regle; attendre son reglement")
             log_rsk.warning(
                 f"[RISK] cooldown de {cooldown:.0f}s ecoule apres "
-                f"{losses} pertes consecutives -- 1 nouvel essai disponible.")
+                f"{losses} pertes consecutives -- 1 nouvel essai disponible.",
+                extra={"event": "consecutive_loss_cooldown_elapsed",
+                       "losses": losses, "cooldown_s": cooldown})
         if cycle_trades >= CFG.MAX_TRADES_CYCLE:
             return False, f"max {CFG.MAX_TRADES_CYCLE} trades/cycle atteint"
         open_risk = self.posmgr.open_risk()

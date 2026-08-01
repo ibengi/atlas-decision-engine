@@ -149,7 +149,10 @@ class MarketOpportunityPipeline:
                 log.info("[MODEL_TRACE] "
                          f"ticker={ticker} market_type={mtype} "
                          f"strategy={strat_name} model={mdl} "
-                         f"executed={str(executed).lower()} reason={reason}")
+                         f"executed={str(executed).lower()} reason={reason}",
+                         extra={"ticker": ticker, "market_type": mtype,
+                                "strategy": strat_name, "model": mdl,
+                                "executed": executed, "reason": reason})
                 _mt_logged[0] += 1
         for m in scan["markets"]:
             ticker = m.get("ticker") or ""
@@ -215,14 +218,20 @@ class MarketOpportunityPipeline:
                 log.info(f"[CANDIDAT] {ticker} strat={dec.strategy} "
                          f"{(dec.side or '?').upper()} @ {dec.entry_ask}c "
                          f"edge_net={dec.net_edge:+.3f} "
-                         f"ev_net={dec.net_ev:+.3f} conf={dec.confidence}")
+                         f"ev_net={dec.net_ev:+.3f} conf={dec.confidence}",
+                         extra={"ticker": ticker, "strategy": dec.strategy,
+                                "side": dec.side, "price": dec.entry_ask,
+                                "edge_net": dec.net_edge, "ev_net": dec.net_ev,
+                                "confidence": dec.confidence})
                 accepted.append(dec)
                 if len(accepted) >= max_accepted:
                     break
             else:
                 _rej(dec.rejection_reason or "unspecified")
                 self._cache_reject(ticker, dec.rejection_reason or "unspecified")
-                log.debug(f"[REJECT] {ticker} {dec.rejection_reason}")
+                log.debug(f"[REJECT] {ticker} {dec.rejection_reason}",
+                          extra={"ticker": ticker,
+                                 "reason": dec.rejection_reason})
 
         S["cycle_duration_ms"] = int((time.time() - t0) * 1000)
         S["accepted"] = len(accepted)
