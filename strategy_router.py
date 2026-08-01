@@ -24,6 +24,7 @@ v2 :
 """
 
 import math
+import re
 import logging
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -218,14 +219,39 @@ def minutes_to_close(market: dict, now: Optional[datetime] = None) -> Optional[f
 
 
 def _strike_of(market: dict) -> Optional[float]:
+    """Compat : strike depuis les champs explicites du marche uniquement."""
+    s, _src = _strike_with_source(market, allow_ticker=False)
+    return s
+
+
+# Format Kalshi du strike encode dans le ticker (KXBTCD) :
+#   'KXBTCD-26AUG0111-T72799.99' -> 72799.99
+# Les segments non-conformes (ex. la minute '-30' des KXBTC15M) sont ignores.
+_TICKER_STRIKE_RE = re.compile(r"^[TtKk](\d+(?:\.\d+)?)$")
+
+
+def _strike_with_source(market: dict, allow_ticker: bool = True):
+    """(strike, source) — source : 'field' | 'ticker' | None.
+    field  : champs explicites floor_strike/cap_strike/strike_price ;
+    ticker : segment final du ticker 'T<prix>' (repli trou de donnees,
+             jamais une valeur inventee)."""
     for k in ("floor_strike", "cap_strike", "strike_price"):
         v = (market or {}).get(k)
         if v is not None:
             try:
-                return float(v)
+                return float(v), "field"
             except (TypeError, ValueError):
                 continue
-    return None
+    if allow_ticker:
+        tk = str((market or {}).get("ticker") or "")
+        last = tk.rsplit("-", 1)[-1] if "-" in tk else ""
+        mt = _TICKER_STRIKE_RE.match(last)
+        if mt:
+            try:
+                return float(mt.group(1)), "ticker"
+            except (TypeError, ValueError):
+                pass
+    return None, None
 
 
 # ── Strategies BTC (probabilite REELLE via modele + contexte) ───────────────
@@ -234,9 +260,27 @@ class _BtcAboveStrikeBase(Strategy):
     """Base commune BTC 'au-dessus du strike'. context_provider est
     INJECTABLE (tests hors-ligne) ; par defaut btc_context.get_btc_context.
     Refuse toute evaluation si le contexte est invalide ou la qualite de
-    donnees insuffisante — rien n'est invente."""
+    donnees insuffisante — rien n'est invente.
+
+    P6.2 (extension d'horizon) :
+      - extend_to_minutes : au-dela de max_minutes, la MEME formule du
+        modele est appliquee jusqu'a ce plafond, avec une vol ancree
+        (LONG_HORIZON_VOL_ANCHOR — on n'extrapole jamais une vol 1m calme
+        sur plusieurs jours) et une confiance plafonnee. Au-dela :
+        horizon_hors_perimetre (inchangé).
+      - strike_proxy_allowed : si le marche ne fournit AUCUN champ de
+        strike (trou de donnees API constate sur la demo), le spot
+        consensus sert de strike pour les marches BTC 'up/down'
+        (KXBTC15M : le strike EST le prix de reference a l'ouverture,
+        estime par le spot courant). Flag strike_source='spot_proxy' dans
+        les features, confiance plafonnee. Le spot est une donnee REELLE
+        du contexte — aucune valeur n'est inventee."""
 
     max_minutes: float = 15.0 * 24 * 60   # surcharge par sous-classe
+    extend_to_minutes: Optional[float] = None   # P6.2 : plafond d'extension
+    strike_proxy_allowed: bool = False          # P6.2 : repli strike=spot
+    LONG_HORIZON_VOL_ANCHOR: float = 0.0008     # ~2.9% vol quotidienne BTC
+    EXTENDED_HORIZON_CONFIDENCE: int = 6        # confiance max hors perimetre
 
     def __init__(self, context_provider: Callable = None):
         if context_provider is None:
@@ -253,15 +297,37 @@ class _BtcAboveStrikeBase(Strategy):
                                            ModelInputError, MODEL_VERSION)
         if self._ctx is None:
             return ModelOutput(False, "no_model_probability:btc_context_absent")
-        strike = _strike_of(market)
-        if strike is None:
-            return ModelOutput(False, "no_model_probability:strike_absent")
         t = minutes_remaining
         if t is None or t <= 0:
             return ModelOutput(False, "no_model_probability:horizon_invalide")
-        if t > self.max_minutes:
-            return ModelOutput(False, "no_model_probability:horizon_hors_perimetre")
-        ctx = self._ctx(strike=strike, minutes_remaining=t)
+        extended = t > self.max_minutes
+        if extended and not (self.extend_to_minutes
+                             and t <= self.extend_to_minutes):
+            return ModelOutput(False,
+                               "no_model_probability:horizon_hors_perimetre")
+        strike, strike_source = _strike_with_source(market)
+        ctx = None
+        if strike is None and self.strike_proxy_allowed:
+            # trou de donnees : strike absent -> spot consensus (marches
+            # BTC 'up/down' dont le strike est le prix de reference a
+            # l'ouverture, estime par le spot courant).
+            ctx = self._ctx(strike=None, minutes_remaining=t)
+            if ctx is None or not getattr(ctx, "valid", False):
+                return ModelOutput(False, "no_model_probability:"
+                                   + str(getattr(ctx, "reason",
+                                                 "contexte_invalide")))
+            try:
+                spot = float(ctx.spot)
+            except (TypeError, ValueError):
+                spot = None
+            if not spot or spot <= 0:
+                return ModelOutput(False,
+                                   "no_model_probability:spot_indisponible")
+            strike, strike_source = spot, "spot_proxy"
+        if strike is None:
+            return ModelOutput(False, "no_model_probability:strike_absent")
+        if ctx is None:
+            ctx = self._ctx(strike=strike, minutes_remaining=t)
         if ctx is None or not getattr(ctx, "valid", False):
             return ModelOutput(False, "no_model_probability:"
                                + str(getattr(ctx, "reason", "contexte_invalide")))
@@ -269,34 +335,56 @@ class _BtcAboveStrikeBase(Strategy):
         if conf <= 0:
             return ModelOutput(False, "insufficient_data_quality:"
                                f"score={ctx.data_quality_score}")
+        if strike_source == "spot_proxy":
+            # strike estime (spot au lieu du prix de reference exact) :
+            # confiance plafonnee, le flag strike_source l'expose.
+            conf = min(conf, self.EXTENDED_HORIZON_CONFIDENCE)
+        sigma = ctx.realized_vol_1m
+        features = {"model_version": MODEL_VERSION,
+                    "spot": ctx.spot, "strike": strike,
+                    "sigma_1m": ctx.realized_vol_1m,
+                    "minutes_remaining": t,
+                    "ret_5m": (ctx.returns or {}).get("5m"),
+                    "data_quality": ctx.data_quality_score}
+        if strike_source != "field":
+            features["strike_source"] = strike_source
+        if extended:
+            # MEME formule, vol ancree : les horizons multi-jours ne doivent
+            # pas extrapoler une vol 1m calmee sur plusieurs jours.
+            sigma = max(float(sigma or 0.0), self.LONG_HORIZON_VOL_ANCHOR)
+            conf = min(conf, self.EXTENDED_HORIZON_CONFIDENCE)
+            features["horizon_mode"] = "extended"
+            features["sigma_effective"] = sigma
         try:
-            p = probability_yes(ctx.spot, strike, ctx.realized_vol_1m, t,
+            p = probability_yes(ctx.spot, strike, sigma, t,
                                 ret_5m=(ctx.returns or {}).get("5m"))
         except ModelInputError as e:
             return ModelOutput(False, f"no_model_probability:{e}")
         return ModelOutput(True, "ok", probability_yes=p, confidence=conf,
-                           features={"model_version": MODEL_VERSION,
-                                     "spot": ctx.spot, "strike": strike,
-                                     "sigma_1m": ctx.realized_vol_1m,
-                                     "minutes_remaining": t,
-                                     "ret_5m": (ctx.returns or {}).get("5m"),
-                                     "data_quality": ctx.data_quality_score})
+                           features=features)
 
 
 class BtcModelStrategy(_BtcAboveStrikeBase):
-    """BTC 15 minutes (serie KXBTC15M, market_type btc_15m_above_strike)."""
+    """BTC 15 minutes (serie KXBTC15M, market_type btc_15m_above_strike).
+    Marche 'up/down' : le strike est le prix de reference a l'ouverture.
+    P6.2 : strike_proxy_allowed — si l'API omet le champ de strike (trou
+    de donnees constate sur la demo), le spot consensus sert de strike."""
     name = "btc15m_above_strike"
     market_types = ("btc_15m_above_strike",)
     max_minutes = 20.0
+    strike_proxy_allowed = True
 
 
 class BtcDailyStrategy(_BtcAboveStrikeBase):
     """BTC quotidien (serie KXBTCD, market_type btc_above_strike_daily).
     MEME modele, horizon jusqu'a 26 h ; la confiance est reduite au-dela
-    de 24 h (voir confidence_from_quality)."""
+    de 24 h (voir confidence_from_quality). P6.2 : extension jusqu'a
+    14 jours (toute la profondeur de cotation KXBTCD) — meme formule avec
+    vol ancree et confiance plafonnee."""
     name = "btc_daily_above_strike"
     market_types = ("btc_above_strike_daily",)
     max_minutes = 26.0 * 60
+    extend_to_minutes = 14 * 24 * 60
 
 
 # ── Strategies routees SANS modele par defaut (honnetete) ───────────────────
