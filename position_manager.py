@@ -89,6 +89,23 @@ class PositionManager:
             out[cat] = out.get(cat, 0.0) + p["count"] * p["avg_price"] / 100.0
         return out
 
+    @staticmethod
+    def correlation_group(ticker: str, category: str = "Other") -> str:
+        """Stable broad-underlying bucket used for portfolio concentration."""
+        t = str(ticker or "").upper()
+        for prefix, group in (("KXBTC", "BTC"), ("KXETH", "ETH"),
+                              ("KXXRP", "XRP")):
+            if t.startswith(prefix):
+                return group
+        return str(category or "Other").strip().upper() or "OTHER"
+
+    def open_risk_by_group(self) -> dict:
+        out = {}
+        for p in self._active_positions():
+            group = self.correlation_group(p.get("ticker"), p.get("category"))
+            out[group] = out.get(group, 0.0) + p["count"] * p["avg_price"] / 100.0
+        return out
+
     def open_risk_on(self, ticker: str) -> float:
         return sum(p["count"] * p["avg_price"] / 100.0
                    for p in self._active_positions() if p["ticker"] == ticker)

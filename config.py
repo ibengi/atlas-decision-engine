@@ -53,6 +53,11 @@ class Config:
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
     MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
     MAX_POSITION_AGE_DAYS   = _env_i("MAX_POSITION_AGE_DAYS", 30)
+    # Portfolio controls are opt-in (0 disables each percentage cap).
+    MAX_CORRELATION_GROUP_PCT = _env_f("MAX_CORRELATION_GROUP_PCT", 0.0)
+    MAX_PORTFOLIO_RISK_PCT = _env_f("MAX_PORTFOLIO_RISK_PCT", 0.0)
+    PORTFOLIO_DRAWDOWN_THROTTLE_PCT = _env_f("PORTFOLIO_DRAWDOWN_THROTTLE_PCT", 0.0)
+    DRAWDOWN_THROTTLE_FACTOR = _env_f("DRAWDOWN_THROTTLE_FACTOR", 0.5)
     # Mode d'execution explicite (exigence 2). "real_demo" active le
     # garde anti-mock : tout client non authentique => arret FATAL.
     EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "standard").lower()
