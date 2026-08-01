@@ -44,6 +44,11 @@ class Config:
         "CONSECUTIVE_LOSS_COOLDOWN_SECONDS", 3600.0)      # 1h par defaut
     MAX_TRADES_CYCLE  = _env_i("MAX_TRADES_CYCLE", 3)
     MAX_POS_PCT       = _env_f("MAX_POSITION_PCT", 1.0)     # % capital / position (plafond dur)
+    # Adaptive Kelly sizing is opt-in to preserve the legacy 1% behavior.
+    KELLY_ENABLED     = _env_b("KELLY_ENABLED", default=False)
+    KELLY_FRACTION    = _env_f("KELLY_FRACTION", 0.5)
+    KELLY_MAX_POS_PCT = _env_f("KELLY_MAX_POSITION_PCT", 10.0)
+    KELLY_MIN_BET     = _env_f("KELLY_MIN_BET", 1.0)
     RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 5.0)      # % capital en risque ouvert total
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
     MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
