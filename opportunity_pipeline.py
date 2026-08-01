@@ -28,6 +28,7 @@ from market_classifier import classify
 from strategy_router import (Decision, GateConfig, price_and_gate,
                              minutes_to_close)
 from decision_tracer import current_tracer
+from timing import timed
 
 log = logging.getLogger("PIPELINE")
 
@@ -119,7 +120,8 @@ class MarketOpportunityPipeline:
             if tracer and ticker:
                 tracer.market(ticker, "REJECTED", reason=base, price=price)
 
-        scan = self.scanner.scan_cycle()
+        with timed("api_fetch"):
+            scan = self.scanner.scan_cycle()
         srep = scan["report"]
         S["scanned_raw"] = srep["funnel"].get("scanned_raw", 0)
         self._trace_market_count = len(scan.get("markets") or [])
@@ -160,90 +162,93 @@ class MarketOpportunityPipeline:
                                 "strategy": strat_name, "model": mdl,
                                 "executed": executed, "reason": reason})
                 _mt_logged[0] += 1
-        for m in scan["markets"]:
-            ticker = m.get("ticker") or ""
-            self._trace_market_count += 1
-            if tracer:
-                tracer.market(ticker, "SCANNED")
-            cls = m.get("_classification") or classify(m).to_dict()
-            mtype, cat = cls["market_type"], cls["category"]
+        with timed("market_evaluation"):
+            for m in scan["markets"]:
+                ticker = m.get("ticker") or ""
+                self._trace_market_count += 1
+                if tracer:
+                    tracer.market(ticker, "SCANNED")
+                cls = m.get("_classification") or classify(m).to_dict()
+                mtype, cat = cls["market_type"], cls["category"]
 
-            if skip_ticker_fn and skip_ticker_fn(ticker):
-                _rej("already_positioned", ticker); continue
-            cached = self._cached_reject(ticker)
-            if cached:
-                _rej("cached:" + cached, ticker); continue
+                if skip_ticker_fn and skip_ticker_fn(ticker):
+                    _rej("already_positioned", ticker); continue
+                cached = self._cached_reject(ticker)
+                if cached:
+                    _rej("cached:" + cached, ticker); continue
 
-            strat = self.router.route(mtype)
-            if strat is None:
-                _rej("no_compatible_strategy", ticker)
-                self._cache_reject(ticker, "no_compatible_strategy")
-                log.debug(f"[REJECT] {ticker} no_compatible_strategy "
-                          f"(market_type={mtype})")
-                continue
-            S["supported"] += 1
+                strat = self.router.route(mtype)
+                if strat is None:
+                    _rej("no_compatible_strategy", ticker)
+                    self._cache_reject(ticker, "no_compatible_strategy")
+                    log.debug(f"[REJECT] {ticker} no_compatible_strategy "
+                              f"(market_type={mtype})")
+                    continue
+                S["supported"] += 1
 
-            if deep >= self.max_deep:
-                _rej("deep_analysis_cap", ticker); continue
-            deep += 1
+                if deep >= self.max_deep:
+                    _rej("deep_analysis_cap", ticker); continue
+                deep += 1
 
-            # carnet FRAIS (ou celui du snapshot si pas de fetch dedie)
-            if self.fresh_book_fn:
-                m2, book = self.fresh_book_fn(ticker)
-                m = m2 or m
-            else:
-                from kalshi_alpha_bot import MarketValidator
-                book = MarketValidator.normalize_book(m)
-            if not book:
-                _rej("no_liquidity", ticker)
-                self._cache_reject(ticker, "no_liquidity")
-                continue
+                # carnet FRAIS (ou celui du snapshot si pas de fetch dedie)
+                if self.fresh_book_fn:
+                    m2, book = self.fresh_book_fn(ticker)
+                    m = m2 or m
+                else:
+                    from kalshi_alpha_bot import MarketValidator
+                    book = MarketValidator.normalize_book(m)
+                if not book:
+                    _rej("no_liquidity", ticker)
+                    self._cache_reject(ticker, "no_liquidity")
+                    continue
 
-            mins = m.get("_minutes_remaining") or minutes_to_close(m)
-            dec = Decision(ticker=ticker, strategy=strat.name,
-                           market_type=mtype, category=cat,
-                           decision_id=f"{cycle_id}-{uuid.uuid4().hex[:8]}")
-            model = strat.evaluate(m, book, mins)
-            _model_trace(ticker, mtype, strat.name, model)
-            if model.valid:
-                S["model_evaluated"] += 1
-            dec = price_and_gate(dec, model, book, self.gates, market=m)
-            if tracer:
-                tracer.market(ticker, "EVALUATED", reason=(dec.rejection_reason if not dec.accepted else "accepted"),
-                              edge=dec.net_edge, price=dec.entry_ask)
-            if dec.gross_edge is not None and dec.gross_edge > 0:
-                S["positive_edge"] += 1
-            if dec.net_ev is not None and dec.net_ev > 0:
-                S["positive_net_ev"] += 1
+                mins = m.get("_minutes_remaining") or minutes_to_close(m)
+                dec = Decision(ticker=ticker, strategy=strat.name,
+                               market_type=mtype, category=cat,
+                               decision_id=f"{cycle_id}-{uuid.uuid4().hex[:8]}")
+                model = strat.evaluate(m, book, mins)
+                _model_trace(ticker, mtype, strat.name, model)
+                if model.valid:
+                    S["model_evaluated"] += 1
+                with timed("signal_check"):
+                    dec = price_and_gate(dec, model, book, self.gates,
+                                         market=m)
+                if tracer:
+                    tracer.market(ticker, "EVALUATED", reason=(dec.rejection_reason if not dec.accepted else "accepted"),
+                                  edge=dec.net_edge, price=dec.entry_ask)
+                if dec.gross_edge is not None and dec.gross_edge > 0:
+                    S["positive_edge"] += 1
+                if dec.net_ev is not None and dec.net_ev > 0:
+                    S["positive_net_ev"] += 1
 
-            if self.observer:
-                try:
-                    self.observer(_Snap(m, mins), book, dec)
-                except Exception as e:            # noqa: BLE001
-                    log.debug(f"observer: {e}")
+                if self.observer:
+                    try:
+                        self.observer(_Snap(m, mins), book, dec)
+                    except Exception as e:            # noqa: BLE001
+                        log.debug(f"observer: {e}")
 
-            d = dec.to_dict()
-            d["final_decision"] = "Accepted" if dec.accepted else \
-                f"Rejected: {(dec.rejection_reason or 'unspecified').split(':', 1)[0]}"
-            self.jsonl.write({"cycle_id": cycle_id, "decision": d})
-            if dec.accepted:
-                log.info(f"[CANDIDAT] {ticker} strat={dec.strategy} "
-                         f"{(dec.side or '?').upper()} @ {dec.entry_ask}c "
-                         f"edge_net={dec.net_edge:+.3f} "
-                         f"ev_net={dec.net_ev:+.3f} conf={dec.confidence}",
-                         extra={"ticker": ticker, "strategy": dec.strategy,
-                                "side": dec.side, "price": dec.entry_ask,
-                                "edge_net": dec.net_edge, "ev_net": dec.net_ev,
-                                "confidence": dec.confidence})
-                accepted.append(dec)
-                if len(accepted) >= max_accepted:
-                    break
-            else:
-                _rej(dec.rejection_reason or "unspecified", ticker, dec.entry_ask)
-                self._cache_reject(ticker, dec.rejection_reason or "unspecified")
-                log.debug(f"[REJECT] {ticker} {dec.rejection_reason}",
-                          extra={"ticker": ticker,
-                                 "reason": dec.rejection_reason})
+                d = dec.to_dict()
+                d["final_decision"] = "Accepted" if dec.accepted else \
+                    f"Rejected: {(dec.rejection_reason or 'unspecified').split(':', 1)[0]}"
+                self.jsonl.write({"cycle_id": cycle_id, "decision": d})
+                if dec.accepted:
+                    log.info(f"[CANDIDAT] {ticker} strat={dec.strategy} "
+                             f"{(dec.side or '?').upper()} @ {dec.entry_ask}c "
+                             f"edge_net={dec.net_edge:+.3f} "
+                             f"ev_net={dec.net_ev:+.3f} conf={dec.confidence}",
+                             extra={"ticker": ticker, "strategy": dec.strategy,
+                                    "side": dec.side, "price": dec.entry_ask,
+                                    "edge_net": dec.net_edge, "ev_net": dec.net_ev,
+                                    "confidence": dec.confidence})
+                    accepted.append(dec)
+                    if len(accepted) >= max_accepted:
+                        break
+                else:
+                    _rej(dec.rejection_reason or "unspecified", ticker, dec.entry_ask)
+                    self._cache_reject(ticker, dec.rejection_reason or "unspecified")
+                    log.debug(f"[REJECT] {ticker} {dec.rejection_reason}",
+                              extra={"ticker": ticker,
+                                     "reason": dec.rejection_reason})
 
         S["cycle_duration_ms"] = int((time.time() - t0) * 1000)
         S["accepted"] = len(accepted)

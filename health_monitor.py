@@ -36,6 +36,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from config import CFG
+from timing import TIMING_STATS
 
 log = logging.getLogger("BOT")
 
@@ -312,6 +313,7 @@ class HealthMonitor:
                             .isoformat() if self.last_run_ts else None),
             "run_count": self.run_count,
             "error_count": self.error_count,
+            "timing_stats": TIMING_STATS.snapshot(),
             "generated_at": now_iso(),
         }
 

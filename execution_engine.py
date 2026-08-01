@@ -20,6 +20,7 @@ from stats_engine import StatsEngine
 from trade_logger import TradeLogger, now_iso
 from decision_tracer import DecisionTracer
 from health_monitor import HEALTH
+from timing import timed
 
 ENGINE_VERSION = "v11.4-audit-fixed-2026-07-28"
 
@@ -243,7 +244,8 @@ class ExecutionEngine:
         with self.tracer.trace_run() as trace:
             trace.event("RUN_STARTED", cycle=n, market_count=0)
             try:
-                result = self._cycle(n)
+                with timed("full_cycle"):
+                    result = self._cycle(n)
                 HEALTH.record_run(ok=True, run_id=trace.run_id, cycle=n)
                 return result
             except Exception as e:                        # noqa: BLE001
@@ -252,8 +254,9 @@ class ExecutionEngine:
                 raise
             finally:
                 trace.event("RUN_ENDED", cycle=n)
+                # run_id injecte par la record factory (P4.2) — pas via extra.
                 log.info("[DECISION_TRACE] run complete",
-                         extra={"run_id": trace.run_id, "event_type": "RUN_ENDED",
+                         extra={"event_type": "RUN_ENDED",
                                 "cycle": n, "market_count": getattr(self, "_trace_market_count", 0),
                                 "duration_ms": trace.elapsed_ms(),
                                 "timestamp_ms": trace.elapsed_ms()})
@@ -278,47 +281,50 @@ class ExecutionEngine:
                          f"/ limite -{CFG.MAX_DAILY_LOSS:.2f}$")
 
         # 2) Kill switch (seule porte qui ne depend pas du capital effectif)
-        if CFG.KILL_SWITCH:
-            log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
-                            extra={"event": "kill_switch"})
-            return 0
+        #    et 3-4) portes de risque globales — mesurees ensemble : ce sont
+        #    les controles risque du cycle (P4.4).
+        with timed("risk_check"):
+            if CFG.KILL_SWITCH:
+                log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
+                                extra={"event": "kill_switch"})
+                return 0
 
-        # 3) Solde reel du broker -- CORRECTIF AUDIT : deplace AVANT les
-        # portes de risque (stop %, drawdown %, budget ouvert). Avant ce
-        # correctif, can_trade()/rolling_drawdown_pct() lisaient
-        # self.risk.capital, qui n'etait mis a jour QU'APRES ces controles
-        # (par le present appel) : les portes utilisaient donc le capital
-        # effectif du cycle PRECEDENT, pas le solde courant. En cas de
-        # variation de solde (depot/retrait/PnL importants), les limites
-        # de risque en % pouvaient etre evaluees sur un capital perime.
-        ok, why = self._balance_gate()
-        log_rsk.info(f"[CAPITAL] {why}")
-        if not ok:
-            return 0
+            # 3) Solde reel du broker -- CORRECTIF AUDIT : deplace AVANT les
+            # portes de risque (stop %, drawdown %, budget ouvert). Avant ce
+            # correctif, can_trade()/rolling_drawdown_pct() lisaient
+            # self.risk.capital, qui n'etait mis a jour QU'APRES ces controles
+            # (par le present appel) : les portes utilisaient donc le capital
+            # effectif du cycle PRECEDENT, pas le solde courant. En cas de
+            # variation de solde (depot/retrait/PnL importants), les limites
+            # de risque en % pouvaient etre evaluees sur un capital perime.
+            ok, why = self._balance_gate()
+            log_rsk.info(f"[CAPITAL] {why}")
+            if not ok:
+                return 0
 
-        # 4) Portes de risque globales (dependent desormais du capital a jour)
-        ok, why = self.risk.can_trade(cycle_trades=0)
-        if not ok:
-            log_rsk.warning(f"Trading bloque: {why}",
-                            extra={"event": "trading_blocked", "reason": why})
-            self.stats.log_summary(); return 0
-        if self.posmgr.open_count() >= CFG.MAX_OPEN_POSITIONS:
-            log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.",
-                            extra={"event": "max_open_positions",
-                                   "open": self.posmgr.open_count(),
-                                   "limit": CFG.MAX_OPEN_POSITIONS})
-            return 0
-        dd_pct = self.risk.rolling_drawdown_pct()
-        if dd_pct >= CFG.MAX_EQUITY_DRAWDOWN_PCT:
-            log_rsk.warning(
-                f"Drawdown {dd_pct:.1f}% "
-                f"({self.risk.rolling_drawdown():.2f}$) >= "
-                f"{CFG.MAX_EQUITY_DRAWDOWN_PCT:g}% -- trading coupe.",
-                extra={"event": "drawdown_limit",
-                       "drawdown_pct": dd_pct,
-                       "drawdown_amount": self.risk.rolling_drawdown(),
-                       "limit_pct": CFG.MAX_EQUITY_DRAWDOWN_PCT})
-            return 0
+            # 4) Portes de risque globales (dependent desormais du capital a jour)
+            ok, why = self.risk.can_trade(cycle_trades=0)
+            if not ok:
+                log_rsk.warning(f"Trading bloque: {why}",
+                                extra={"event": "trading_blocked", "reason": why})
+                self.stats.log_summary(); return 0
+            if self.posmgr.open_count() >= CFG.MAX_OPEN_POSITIONS:
+                log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.",
+                                extra={"event": "max_open_positions",
+                                       "open": self.posmgr.open_count(),
+                                       "limit": CFG.MAX_OPEN_POSITIONS})
+                return 0
+            dd_pct = self.risk.rolling_drawdown_pct()
+            if dd_pct >= CFG.MAX_EQUITY_DRAWDOWN_PCT:
+                log_rsk.warning(
+                    f"Drawdown {dd_pct:.1f}% "
+                    f"({self.risk.rolling_drawdown():.2f}$) >= "
+                    f"{CFG.MAX_EQUITY_DRAWDOWN_PCT:g}% -- trading coupe.",
+                    extra={"event": "drawdown_limit",
+                           "drawdown_pct": dd_pct,
+                           "drawdown_amount": self.risk.rolling_drawdown(),
+                           "limit_pct": CFG.MAX_EQUITY_DRAWDOWN_PCT})
+                return 0
 
         # 5) PIPELINE integre (multi-candidats, jamais bloque sur un ticker)
         res = self.pipeline.run_cycle(
@@ -410,46 +416,49 @@ class ExecutionEngine:
     def _execute_decision(self, dec, report) -> int:
         ticker = dec.ticker
         # 5a) carnet FRAIS une DERNIERE fois, juste avant l'ordre (TEST L)
-        m, book = self.fresh_book(ticker)
+        with timed("api_fetch"):
+            m, book = self.fresh_book(ticker)
         if not book:
             log.info(f"CARNET DISPARU avant execution sur {ticker} -- annule.")
             report["rejections"]["stale_book"] = \
                 report["rejections"].get("stale_book", 0) + 1
             return 0
-        ask = book.get("yes_ask") if dec.side == "yes" else book.get("no_ask")
-        if ask is None or not (1 <= int(ask) <= 99):
-            report["rejections"]["no_executable_ask"] = \
-                report["rejections"].get("no_executable_ask", 0) + 1
-            return 0
-        entry = int(ask)
+        with timed("signal_check"):
+            ask = book.get("yes_ask") if dec.side == "yes" else book.get("no_ask")
+            if ask is None or not (1 <= int(ask) <= 99):
+                report["rejections"]["no_executable_ask"] = \
+                    report["rejections"].get("no_executable_ask", 0) + 1
+                return 0
+            entry = int(ask)
 
-        # 5b) budgets risque categorie / marche (sur capital effectif)
-        cat = getattr(dec, "category", None) or "Other"
-        cat_risk = self.posmgr.open_risk_by_category().get(cat, 0.0)
-        if cat_risk >= self.capital * CFG.MAX_CATEGORY_RISK_PCT / 100.0:
-            report["rejections"]["category_budget"] = \
-                report["rejections"].get("category_budget", 0) + 1
-            return 0
-        if self.posmgr.open_risk_on(ticker) >= \
-                self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
-            report["rejections"]["risk_blocked"] = \
-                report["rejections"].get("risk_blocked", 0) + 1
-            return 0
+        # 5b) budgets risque categorie / marche + taille (sur capital effectif)
+        with timed("risk_check"):
+            cat = getattr(dec, "category", None) or "Other"
+            cat_risk = self.posmgr.open_risk_by_category().get(cat, 0.0)
+            if cat_risk >= self.capital * CFG.MAX_CATEGORY_RISK_PCT / 100.0:
+                report["rejections"]["category_budget"] = \
+                    report["rejections"].get("category_budget", 0) + 1
+                return 0
+            if self.posmgr.open_risk_on(ticker) >= \
+                    self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
+                report["rejections"]["risk_blocked"] = \
+                    report["rejections"].get("risk_blocked", 0) + 1
+                return 0
 
-        # 5c) taille sur capital EFFECTIF (solde reel plafonne) (TEST K)
-        count = PositionSizer.contracts(
-            self.capital, entry, dec.taille, dec.confidence,
-            self.risk.rolling_drawdown(), self.posmgr.open_risk())
-        if count <= 0:
-            log_rsk.info(f"[REJECT] {ticker}: risk_blocked (taille=0)")
-            report["rejections"]["risk_blocked"] = \
-                report["rejections"].get("risk_blocked", 0) + 1
-            return 0
-        report["risk_passed"] = report.get("risk_passed", 0) + 1
-        log_rsk.info(f"[RISK] {ticker}: portes de risque PASSEES "
-                     f"(taille={count}, capital={self.capital:.2f}$)",
-                     extra={"ticker": ticker, "size": count,
-                            "capital": self.capital})
+            # 5c) taille sur capital EFFECTIF (solde reel plafonne) (TEST K)
+            count = PositionSizer.contracts(
+                self.capital, entry, dec.taille, dec.confidence,
+                self.risk.rolling_drawdown(), self.posmgr.open_risk())
+            if count <= 0:
+                log_rsk.info(f"[REJECT] {ticker}: risk_blocked (taille=0)")
+                report["rejections"]["risk_blocked"] = \
+                    report["rejections"].get("risk_blocked", 0) + 1
+                return 0
+            report["risk_passed"] = report.get("risk_passed", 0) + 1
+            log_rsk.info(f"[RISK] {ticker}: portes de risque PASSEES "
+                         f"(taille={count}, capital={self.capital:.2f}$)",
+                         extra={"ticker": ticker, "size": count,
+                                "capital": self.capital})
 
         est_fee_total = FeeModel.trading_fee(count, entry)
         log_trd.info(f"[SIGNAL VALIDE] {ticker} {dec.side.upper()} x{count} "
@@ -486,7 +495,9 @@ class ExecutionEngine:
                      f"@ {entry}c -> envoi de l'ordre",
                      extra={"ticker": ticker, "side": dec.side, "size": count,
                             "price": entry, "edge": dec.net_edge})
-        exec_res = self.orders.place_and_track(ticker, dec.side, count, entry)
+        with timed("order_placement"):
+            exec_res = self.orders.place_and_track(ticker, dec.side, count,
+                                                   entry)
         from decision_tracer import current_tracer
         tracer = current_tracer()
         if tracer:
