@@ -448,7 +448,9 @@ class ExecutionEngine:
             # 5c) taille sur capital EFFECTIF (solde reel plafonne) (TEST K)
             count = PositionSizer.contracts(
                 self.capital, entry, dec.taille, dec.confidence,
-                self.risk.rolling_drawdown(), self.posmgr.open_risk())
+                self.risk.rolling_drawdown(), self.posmgr.open_risk(),
+                probability=getattr(dec, "model_probability", None),
+                side=getattr(dec, "side", "yes"))
             if count <= 0:
                 log_rsk.info(f"[REJECT] {ticker}: risk_blocked (taille=0)")
                 report["rejections"]["risk_blocked"] = \
