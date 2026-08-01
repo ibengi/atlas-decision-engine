@@ -93,12 +93,7 @@ from position_manager import PositionManager
 # ══════════════════════════════════════════════════════════════════════════
 # S9. ORDER MANAGER (placement, surveillance, TTL, fills partiels, recovery)
 # ══════════════════════════════════════════════════════════════════════════
-
-class ExecutionResult:
-    def __init__(self, order_id, requested, filled, avg_price, status, state):
-        self.order_id, self.requested, self.filled = order_id, requested, filled
-        self.avg_price, self.status, self.state = avg_price, status, state
-        # state: "filled" | "partial" | "cancelled" | "rejected" | "unknown"
+from execution_result import ExecutionResult
 
 def _client_is_genuine(client) -> bool:
     """Un client authentique est une instance de KalshiClient de CE module,
