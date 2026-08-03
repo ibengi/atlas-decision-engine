@@ -223,3 +223,20 @@ def test_determinism(tmp_path):
     assert s1["counts"] == s2["counts"]
     assert s1["clip"] == s2["clip"]
     assert _read_rows(out1) == _read_rows(out2)
+
+def test_atomic_writer_refuses_truncated_artifact(tmp_path, monkeypatch):
+    """A post-publish truncation is detected and never reported as success."""
+    out = str(tmp_path / "truncated.csv.gz")
+    rows = [{"event_id": 1, "decision_ts": 1, "expiry_ts": 2,
+             "date_utc": "2026-01-01", **{k: "" for k in rb.COLUMNS
+             if k not in {"event_id", "decision_ts", "expiry_ts", "date_utc"}}}]
+    real_replace = rb.os.replace
+    def truncate_after_replace(src, dst):
+        real_replace(src, dst)
+        with open(dst, "r+b") as f:
+            f.truncate(max(1, os.path.getsize(dst) // 2))
+    monkeypatch.setattr(rb.os, "replace", truncate_after_replace)
+    with pytest.raises((OSError, EOFError, gzip.BadGzipFile, RuntimeError)):
+        rb._write_dataset_atomic(rows, out)
+    assert not os.path.exists(out)
+    assert not os.path.exists(out + ".tmp")

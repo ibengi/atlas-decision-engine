@@ -54,6 +54,7 @@ import argparse
 import bisect
 import csv
 import gzip
+import hashlib
 import io
 import json
 import math
@@ -374,6 +375,48 @@ def iter_event_schedule(start_ts: int, end_open_ts: int):
 
 # ── the replay ───────────────────────────────────────────────────────────────
 
+def _write_dataset_atomic(rows: List[dict], out_csv: str) -> dict:
+    """Atomically write, fsync, publish, and verify a replay dataset."""
+    tmp = out_csv + ".tmp"
+    try:
+        with open(tmp, "wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+                with io.TextIOWrapper(gz, encoding="utf-8", newline="") as f:
+                    w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
+                    w.writeheader()
+                    for row in rows:
+                        w.writerow(row)
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(tmp, out_csv)
+        count = 0
+        with gzip.open(out_csv, "rt", encoding="utf-8", newline="") as f:
+            reader = csv.reader(f)
+            if next(reader, None) != COLUMNS:
+                raise RuntimeError("replay artifact header mismatch")
+            for row in reader:
+                if len(row) != len(COLUMNS):
+                    raise RuntimeError("replay artifact malformed row")
+                count += 1
+        if count != len(rows):
+            raise RuntimeError(f"replay artifact row count mismatch: expected {len(rows)}, got {count}")
+        digest = hashlib.sha256()
+        with open(out_csv, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return {"uncompressed_rows": count, "sha256": digest.hexdigest()}
+    except Exception:
+        try:
+            os.unlink(out_csv)
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
 def run_replay(cache_path: str, start_ts: int, end_open_ts: int,
                out_csv: str, out_summary: str, out_card: str) -> dict:
     t0 = time.time()
@@ -492,15 +535,8 @@ def run_replay(cache_path: str, start_ts: int, end_open_ts: int,
             ties += 1
         kept.append(r)
 
-    # Write the dataset (deterministic gzip: mtime=0 -> hashable output).
-    with open(out_csv, "wb") as raw:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
-            with io.TextIOWrapper(gz, encoding="utf-8", newline="") as f:
-                w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
-                w.writeheader()
-                for r in kept:
-                    w.writerow(r)
-
+    # Publish only after atomic write and post-write verification.
+    artifact = _write_dataset_atomic(kept, out_csv)
     # Fidelity check (pre-reg P-Sat-1) on the emitted rows.
     fid = fidelity_over_rows(kept)
 
@@ -508,7 +544,7 @@ def run_replay(cache_path: str, start_ts: int, end_open_ts: int,
     summary = build_summary(
         cache_path, start_ts, end_open_ts, events_attempted, rows_attempted,
         kept, excl, excl_events, ties, fid, runtime_s,
-        out_csv, out_summary, out_card)
+        out_csv, out_summary, out_card, artifact)
     with open(out_summary, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1, sort_keys=True)
     write_data_card(summary, out_card)
@@ -551,7 +587,7 @@ def fidelity_over_rows(rows: List[dict]) -> dict:
 
 def build_summary(cache_path, start_ts, end_open_ts, events_attempted,
                   rows_attempted, kept, excl, excl_events, ties, fid,
-                  runtime_s, out_csv, out_summary, out_card) -> dict:
+                  runtime_s, out_csv, out_summary, out_card, artifact=None) -> dict:
     n_emitted = len(kept)
     n_events_emitted = len({r["event_id"] for r in kept})
     y_vals = [r["y"] for r in kept]
@@ -617,6 +653,7 @@ def build_summary(cache_path, start_ts, end_open_ts, events_attempted,
                                 if not r["used_spot_proxy_strike"]),
             "n_spot_proxy": sum(r["used_spot_proxy_strike"] for r in kept),
         },
+        "artifact": artifact or {},
         "outputs": {
             "csv": os.path.basename(out_csv),
             "summary": os.path.basename(out_summary),
