@@ -22,8 +22,8 @@ results remain recorded in the section below; all figures above describe this fu
 | **Fidelity max-abs-deviation (P-Sat-1, capped rows)** | **0.000e+00** (PASS ≤ 1e-12) |
 | All-rows reconstruction max deviation (diagnostic) | 0.000e+00 |
 | Model version | btc15m-v1.0-ref (MOMENTUM_CAP=0.5, P_FLOOR=0.0001, P_CEIL=0.9999) |
-| Git SHA (engine) | `27cac67510ed8aff1785d93451a309866b26561d` |
-| Runtime | 32.12 s |
+| Git SHA (engine) | `f85dee39fef555f96677cc0c8d4d1db1976205d0` |
+| Runtime | 31.34 s |
 | Cache | btc_1m_binance.csv.gz (verified 260,640 candles, zero gaps) |
 
 > **The fidelity deviation is the audit's data-integrity gate (pre-registered
