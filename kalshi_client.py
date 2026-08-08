@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Optional
@@ -21,6 +22,112 @@ class KalshiAPIError(Exception):
         super().__init__(f"HTTP {status}: {message}")
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+# ══════════════════════════════════════════════════════════════════════════
+# S5b. TELEMETRIE DES APPELS API (OBSERVABILITE UNIQUEMENT)
+#
+# Un evenement structure par TENTATIVE. Aucune requete supplementaire n'est
+# emise, aucun parametre, aucune politique de retry, aucun timeout et aucune
+# semantique d'exception ne change : ce bloc ne fait que decrire ce qui se
+# passe deja.
+# ══════════════════════════════════════════════════════════════════════════
+
+#: Classes de resultat. Ensemble FERME : une etiquette de metrique doit avoir
+#: une cardinalite bornee, connue a l'avance.
+RESULT_CLASSES = frozenset({
+    "SUCCESS", "HTTP_ERROR", "TIMEOUT", "AUTH_ERROR", "RATE_LIMIT",
+    "TRANSPORT_ERROR", "PARSE_ERROR", "UNEXPECTED_ERROR",
+})
+
+#: Catalogue des chemins sortants : (methode, motif, operation, categorie).
+#: `operation` est la methode publique proprietaire du chemin ; `categorie`
+#: est l'etiquette bornee utilisee par les metriques. Les deux viennent de
+#: cette table unique, donc un nouvel endpoint ne peut pas produire
+#: silencieusement une etiquette non bornee. '/*' = exactement un segment.
+_ENDPOINT_TABLE = (
+    ("GET",    "/markets",                   "get_markets",   "markets_list"),
+    ("GET",    "/markets/*",                 "get_market",    "market_detail"),
+    ("GET",    "/portfolio/balance",         "get_balance",   "balance"),
+    ("GET",    "/portfolio/positions",       "get_positions", "positions"),
+    ("GET",    "/portfolio/fills",           "get_fills",     "fills"),
+    ("GET",    "/portfolio/orders/*",        "get_order",     "order_detail"),
+    ("POST",   "/portfolio/events/orders",   "create_order",  "orders_create"),
+    ("DELETE", "/portfolio/events/orders/*", "cancel_order",  "orders_cancel"),
+)
+
+#: Categories connues + le repli borne.
+ENDPOINT_CATEGORIES = frozenset(
+    [entry[3] for entry in _ENDPOINT_TABLE] + ["other"])
+
+#: Champs autorises dans un evenement de telemetrie. LISTE BLANCHE : tout ce
+#: qui n'est pas explicitement approuve est supprime, donc un champ ajoute
+#: plus tard et transportant un secret ne peut pas atteindre un log par
+#: simple oubli. La valeur par defaut est la redaction, jamais la
+#: publication.
+TELEMETRY_FIELDS = frozenset({
+    "event", "operation", "http_method", "endpoint_category", "environment",
+    "operation_id", "attempt_number", "max_attempts", "latency_ms",
+    "operation_latency_ms", "result_class", "http_status",
+    "kalshi_error_code", "response_size_class", "retry_scheduled",
+    "final_attempt", "resource_id", "exception_type",
+})
+
+#: Code d'erreur Kalshi extrait du corps. Le motif borne la valeur (64
+#: caracteres, alphabet sur), donc un corps hostile ne peut ni faire exploser
+#: la cardinalite ni injecter de contenu arbitraire dans un log.
+_ERROR_CODE_RE = re.compile(r'"code"\s*:\s*"([A-Za-z0-9_.\-]{1,64})"')
+
+
+def classify_endpoint(method: str, path: str) -> tuple:
+    """(operation, categorie, identifiant_de_ressource) pour un chemin.
+
+    L'identifiant (ticker, order_id) est un champ de LOG a des fins de
+    diagnostic : il ne doit jamais servir d'etiquette de metrique, sous peine
+    de cardinalite non bornee.
+    """
+    base = (path or "").split("?", 1)[0].rstrip("/") or "/"
+    verb = (method or "").upper()
+    for entry_method, pattern, operation, category in _ENDPOINT_TABLE:
+        if entry_method != verb:
+            continue
+        if pattern.endswith("/*"):
+            head = pattern[:-2]
+            if base.startswith(head + "/"):
+                tail = base[len(head) + 1:]
+                if tail and "/" not in tail:
+                    return operation, category, tail
+        elif base == pattern:
+            return operation, category, None
+    return "unknown", "other", None
+
+
+def response_size_class(size) -> str:
+    """Taille de reponse en classes bornees (jamais l'octet exact)."""
+    if not isinstance(size, int) or size < 0:
+        return "unknown"
+    if size == 0:
+        return "empty"
+    if size < 1024:
+        return "small"
+    if size < 65536:
+        return "medium"
+    return "large"
+
+
+def kalshi_error_code(body: str):
+    """Code d'erreur Kalshi si le corps en contient un, sinon None."""
+    match = _ERROR_CODE_RE.search(body or "")
+    return match.group(1) if match else None
+
+
+def redact_telemetry(fields: dict) -> dict:
+    """Ne conserve que les champs de la liste blanche.
+
+    Cle absente de TELEMETRY_FIELDS -> champ supprime. Aucune cle d'en-tete,
+    de signature, de payload ou d'authentification n'y figure, donc aucune ne
+    peut etre journalisee, y compris par accident.
+    """
+    return {k: v for k, v in fields.items() if k in TELEMETRY_FIELDS}
 
 def pick(d: dict, *names, default=None):
     """Extraction tolerante : retourne la premiere cle presente et non nulle."""
@@ -129,9 +236,33 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
         }
 
+    # -- Telemetrie (observabilite uniquement) --------------------------------
+    def _log_api_attempt(self, **fields) -> None:
+        """Journalise UNE tentative d'appel API. N'appelle jamais le reseau.
+
+        Toute exception de journalisation est avalee : la telemetrie ne doit
+        jamais pouvoir faire echouer un appel qui, lui, a reussi.
+        """
+        try:
+            event = redact_telemetry(
+                {"event": "kalshi_api_call", "environment": self.env, **fields})
+            log_api.info(
+                f"[API_RESULT] {event.get('operation')} "
+                f"{event.get('result_class')} "
+                f"attempt={event.get('attempt_number')}/"
+                f"{event.get('max_attempts')} "
+                f"status={event.get('http_status')} "
+                f"{event.get('latency_ms')}ms",
+                extra=event)
+        except Exception:                                     # noqa: BLE001
+            pass
+
     # -- Requete avec retry/backoff ------------------------------------------
     def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
         if self._pk is None and path.startswith("/portfolio"):
+            # Aucune tentative reseau n'a lieu : rien a mesurer, donc rien a
+            # journaliser. Compter ceci comme un appel fausserait le taux
+            # d'echec de l'API.
             raise KalshiAPIError(
                 0, f"{method} {path}: requete authentifiee IMPOSSIBLE — cle "
                    f"RSA non chargee (cle absente/non-PEM ou dependance "
@@ -139,42 +270,103 @@ class KalshiClient:
                    f"complet avec les lignes -----BEGIN/END-----) et le "
                    f"paquet 'cryptography'.")
         url = self.base_url + path
+        operation, category, resource_id = classify_endpoint(method, path)
+        operation_id = uuid.uuid4().hex[:12]
+        max_attempts = retries + 1
+        op_started = time.monotonic()
+        def _emit(attempt, started, result_class, **extra):
+            """Un evenement pour la tentative courante."""
+            self._log_api_attempt(
+                operation=operation, http_method=method.upper(),
+                endpoint_category=category, resource_id=resource_id,
+                operation_id=operation_id, attempt_number=attempt,
+                max_attempts=max_attempts,
+                latency_ms=round((time.monotonic() - started) * 1000, 3),
+                operation_latency_ms=round(
+                    (time.monotonic() - op_started) * 1000, 3),
+                result_class=result_class, **extra)
+
         attempt, delay = 0, 1.0
         while True:
             attempt += 1
+            started = time.monotonic()
             try:
                 r = self.session.request(method.upper(), url,
                                          headers=self._sign_headers(method, url),
                                          timeout=15, **kw)
             except (requests.Timeout, requests.ConnectionError) as e:
+                _emit(attempt, started,
+                      "TIMEOUT" if isinstance(e, requests.Timeout)
+                      else "TRANSPORT_ERROR",
+                      exception_type=type(e).__name__,
+                      retry_scheduled=attempt <= retries,
+                      final_attempt=attempt > retries)
                 if attempt > retries:
                     raise KalshiAPIError(0, f"reseau: {e}")
                 log_api.warning(f"{method} {path}: {type(e).__name__} -- "
                                 f"retry {attempt}/{retries} dans {delay:.0f}s")
                 time.sleep(delay); delay = min(delay * 2, 8); continue
+            except Exception as e:                            # noqa: BLE001
+                # Chemin d'exception jusqu'ici invisible : SSLError hors
+                # ConnectionError, TooManyRedirects, InvalidURL... `raise` nu,
+                # donc propagation et traceback rigoureusement inchanges.
+                _emit(attempt, started, "UNEXPECTED_ERROR",
+                      exception_type=type(e).__name__,
+                      retry_scheduled=False, final_attempt=True)
+                raise
+
+            body = getattr(r, "content", None)
+            size_class = response_size_class(
+                len(body) if isinstance(body, (bytes, bytearray)) else None)
 
             if r.status_code in RETRYABLE_STATUS and attempt <= retries:
                 wait = delay
                 if r.status_code == 429:
                     try: wait = max(wait, float(r.headers.get("Retry-After", delay)))
                     except ValueError: pass
+                _emit(attempt, started,
+                      "RATE_LIMIT" if r.status_code == 429 else "HTTP_ERROR",
+                      http_status=r.status_code,
+                      kalshi_error_code=kalshi_error_code(getattr(r, "text", "")),
+                      response_size_class=size_class,
+                      retry_scheduled=True, final_attempt=False)
                 log_api.warning(f"{method} {path}: HTTP {r.status_code} -- "
                                 f"retry {attempt}/{retries} dans {wait:.0f}s")
                 time.sleep(wait); delay = min(delay * 2, 8); continue
 
             self.last_http_status = r.status_code
             if r.status_code == 410 and "deprecated" in (r.text or "").lower():
+                _emit(attempt, started, "HTTP_ERROR", http_status=410,
+                      kalshi_error_code=kalshi_error_code(getattr(r, "text", "")),
+                      response_size_class=size_class,
+                      retry_scheduled=False, final_attempt=True)
                 raise KalshiAPIError(
                     410, f"{method} {path}: ENDPOINT V1 OBSOLETE cote Kalshi "
                          f"-- migrer ce chemin vers son equivalent V2 "
                          f"(cf. docs.kalshi.com)", r.text)
             if r.status_code >= 400:
+                _emit(attempt, started,
+                      "AUTH_ERROR" if r.status_code in (401, 403)
+                      else ("RATE_LIMIT" if r.status_code == 429
+                            else "HTTP_ERROR"),
+                      http_status=r.status_code,
+                      kalshi_error_code=kalshi_error_code(getattr(r, "text", "")),
+                      response_size_class=size_class,
+                      retry_scheduled=False, final_attempt=True)
                 raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
 
             try:
-                return r.json() if r.text.strip() else {}
+                payload = r.json() if r.text.strip() else {}
             except ValueError:
+                _emit(attempt, started, "PARSE_ERROR",
+                      http_status=r.status_code,
+                      response_size_class=size_class,
+                      retry_scheduled=False, final_attempt=True)
                 raise KalshiAPIError(r.status_code, f"{method} {path}: JSON invalide", r.text)
+            _emit(attempt, started, "SUCCESS", http_status=r.status_code,
+                  response_size_class=size_class,
+                  retry_scheduled=False, final_attempt=True)
+            return payload
 
     def _log_raw_once(self, kind: str, payload: dict):
         """Logge UNE FOIS la reponse brute de chaque type d'appel critique,
