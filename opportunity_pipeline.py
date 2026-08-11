@@ -45,6 +45,30 @@ def _env_i(name, default):
         return default
 
 
+_LINEAGE_CACHE = {}
+
+
+def _lineage() -> dict:
+    """The 008E lineage stamp, computed once and never allowed to raise.
+
+    Observability must not be able to break trading. If the export module is
+    missing or malformed, the stamp is empty and the cycle proceeds exactly as
+    it did before this program.
+    """
+    if "v" not in _LINEAGE_CACHE:
+        try:
+            import research_export
+            _LINEAGE_CACHE["v"] = research_export.lineage()
+        except Exception:                                # noqa: BLE001
+            _LINEAGE_CACHE["v"] = {}
+    return _LINEAGE_CACHE["v"]
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
 class RotatingJsonl:
     def __init__(self, path):
         self.path = path
@@ -230,7 +254,15 @@ class MarketOpportunityPipeline:
                 d = dec.to_dict()
                 d["final_decision"] = "Accepted" if dec.accepted else \
                     f"Rejected: {(dec.rejection_reason or 'unspecified').split(':', 1)[0]}"
-                self.jsonl.write({"cycle_id": cycle_id, "decision": d})
+                # Program 008E: lineage stamp. Purely additive metadata on a
+                # record that is written to a log and read back by nothing in
+                # this process. `dec` is not touched, so no downstream value
+                # can change. _lineage() is cached after its first call and
+                # cannot raise.
+                self.jsonl.write({"cycle_id": cycle_id, "decision": d,
+                                  "run_id": tracer.run_id if tracer else None,
+                                  "recorded_at": _now_iso(),
+                                  "lineage": _lineage()})
                 if dec.accepted:
                     log.info(f"[CANDIDAT] {ticker} strat={dec.strategy} "
                              f"{(dec.side or '?').upper()} @ {dec.entry_ask}c "

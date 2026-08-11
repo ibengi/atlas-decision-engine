@@ -1,0 +1,223 @@
+﻿{
+  "baseline_commit": "7a1195a",
+  "candidate_ref": "review/008e-evidence-exposure",
+  "decisions_compared": 1,
+  "business_fields_compared": 23,
+  "summary_before": {
+    "accepted": [
+      "Decision(ticker='KXBTCD-26JUL2017-T64999.99', accepted=True, rejection_reason=None, strategy='btc_daily_above_strike', market_type='btc_above_strike_daily', category='Crypto', side='yes', entry_ask=48, model_probability=0.764769224971066, market_probability=0.48, gross_edge=0.28476922497106605, net_edge=0.244769224971066, net_ev=0.254769224971066, confidence=8, taille='1%', reason='btc_daily_above_strike: p=0.765 vs ask=48c edge_net=+0.245 ev_net=+0.255', estimated_fees=0.02, expected_slippage=0.01, model_output={'valid': True, 'reason': 'ok', 'probability_yes': 0.764769224971066, 'confidence': 8, 'features': {'model_version': 'btc15m-v1.0-ref', 'spot': 65200.0, 'strike': 64999.99, 'sigma_1m': 0.0008, 'minutes_remaining': 299.99915606666667, 'ret_5m': 0.001, 'data_quality': 85.0}}, decision_id='71c8fec844-57cfbee3', spread=2, liquidity=5000.0, kelly_fraction=0.5476)"
+    ],
+    "report": {
+      "accepted": 1,
+      "cycle_duration_ms": 1,
+      "cycle_id": "71c8fec844",
+      "eligible": 1,
+      "fills": 0,
+      "funnel_conversion": {
+        "fills": {
+          "n": 0,
+          "pct_of_prev": 0.0
+        },
+        "liquid": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "model_evaluated": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "open_cached": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "orders_submitted": {
+          "n": 0,
+          "pct_of_prev": 0.0
+        },
+        "positive_edge": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "positive_net_ev": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "risk_passed": {
+          "n": 0,
+          "pct_of_prev": 0.0
+        },
+        "scanned_raw": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "supported": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        }
+      },
+      "liquid": 1,
+      "model_evaluated": 1,
+      "model_executed": {
+        "btc15m-v1.0-ref": 1
+      },
+      "model_probability": 1,
+      "model_rejections_detailed": {},
+      "open_cached": 1,
+      "orders_submitted": 0,
+      "pipeline_version": "pipeline-v2-2026-07-24",
+      "positive_edge": 1,
+      "positive_net_ev": 1,
+      "ranker_eligible": 1,
+      "rejections": {},
+      "rejections_by_reason": {},
+      "risk_passed": 0,
+      "scanned": 1,
+      "scanned_raw": 1,
+      "scanner_included": 1,
+      "scanner_report": {
+        "crawl_pages_last_refresh": 0,
+        "excluded_by_reason": {},
+        "from_cache": false,
+        "funnel": {
+          "after_classification": 1,
+          "after_liquidity": 1,
+          "after_status": 1,
+          "after_time_window": 1,
+          "kept": 1,
+          "scanned_raw": 1
+        },
+        "mode": "targeted_series",
+        "no_liquidity_details": [],
+        "parallel_series": false,
+        "scan_duration_ms": 0,
+        "scanner_version": "scanner-v2-2026-07-24"
+      },
+      "strategy_supported": 1,
+      "supported": 1,
+      "valid": 1
+    }
+  },
+  "summary_after": {
+    "accepted": [
+      "Decision(ticker='KXBTCD-26JUL2017-T64999.99', accepted=True, rejection_reason=None, strategy='btc_daily_above_strike', market_type='btc_above_strike_daily', category='Crypto', side='yes', entry_ask=48, model_probability=0.7647692253119387, market_probability=0.48, gross_edge=0.2847692253119387, net_edge=0.24476922531193868, net_ev=0.2547692253119387, confidence=8, taille='1%', reason='btc_daily_above_strike: p=0.765 vs ask=48c edge_net=+0.245 ev_net=+0.255', estimated_fees=0.02, expected_slippage=0.01, model_output={'valid': True, 'reason': 'ok', 'probability_yes': 0.7647692253119387, 'confidence': 8, 'features': {'model_version': 'btc15m-v1.0-ref', 'spot': 65200.0, 'strike': 64999.99, 'sigma_1m': 0.0008, 'minutes_remaining': 299.9991530666667, 'ret_5m': 0.001, 'data_quality': 85.0}}, decision_id='17f771350e-7d45a318', spread=2, liquidity=5000.0, kelly_fraction=0.5476)"
+    ],
+    "report": {
+      "accepted": 1,
+      "cycle_duration_ms": 51,
+      "cycle_id": "17f771350e",
+      "eligible": 1,
+      "fills": 0,
+      "funnel_conversion": {
+        "fills": {
+          "n": 0,
+          "pct_of_prev": 0.0
+        },
+        "liquid": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "model_evaluated": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "open_cached": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "orders_submitted": {
+          "n": 0,
+          "pct_of_prev": 0.0
+        },
+        "positive_edge": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "positive_net_ev": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "risk_passed": {
+          "n": 0,
+          "pct_of_prev": 0.0
+        },
+        "scanned_raw": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        },
+        "supported": {
+          "n": 1,
+          "pct_of_prev": 100.0
+        }
+      },
+      "liquid": 1,
+      "model_evaluated": 1,
+      "model_executed": {
+        "btc15m-v1.0-ref": 1
+      },
+      "model_probability": 1,
+      "model_rejections_detailed": {},
+      "open_cached": 1,
+      "orders_submitted": 0,
+      "pipeline_version": "pipeline-v2-2026-07-24",
+      "positive_edge": 1,
+      "positive_net_ev": 1,
+      "ranker_eligible": 1,
+      "rejections": {},
+      "rejections_by_reason": {},
+      "risk_passed": 0,
+      "scanned": 1,
+      "scanned_raw": 1,
+      "scanner_included": 1,
+      "scanner_report": {
+        "crawl_pages_last_refresh": 0,
+        "excluded_by_reason": {},
+        "from_cache": false,
+        "funnel": {
+          "after_classification": 1,
+          "after_liquidity": 1,
+          "after_status": 1,
+          "after_time_window": 1,
+          "kept": 1,
+          "scanned_raw": 1
+        },
+        "mode": "targeted_series",
+        "no_liquidity_details": [],
+        "parallel_series": false,
+        "scan_duration_ms": 0,
+        "scanner_version": "scanner-v2-2026-07-24"
+      },
+      "strategy_supported": 1,
+      "supported": 1,
+      "valid": 1
+    }
+  },
+  "orders_created_before": 0,
+  "orders_created_after": 0,
+  "control_runs": "baseline replayed twice to establish the non-determinism floor of the harness itself",
+  "control_differing_fields": [
+    "decision[0].gross_edge",
+    "decision[0].model_output",
+    "decision[0].model_probability",
+    "decision[0].net_edge",
+    "decision[0].net_ev",
+    "summary.accepted",
+    "summary.report"
+  ],
+  "control_note": "these fields differ between two runs of the SAME commit. They are derived from wall-clock time against a fixture close_time and are excluded from the verdict as harness noise, not as a 008E effect",
+  "raw_differences_before_control": [
+    "summary.accepted",
+    "summary.report",
+    "decision[0].model_probability",
+    "decision[0].gross_edge",
+    "decision[0].net_edge",
+    "decision[0].net_ev",
+    "decision[0].model_output"
+  ],
+  "business_differences": [],
+  "observability_only_new_keys": [
+    "lineage",
+    "recorded_at",
+    "run_id"
+  ],
+  "equivalent": true
+}

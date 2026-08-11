@@ -24,6 +24,7 @@ import os
 import threading
 from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 
 try:
@@ -162,7 +163,57 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # ── Research evidence (Program 008E) ────────────────────────────────
+    # Read-only. Served from this daemon thread, which was already off the
+    # trading critical path, and only from evidence already written to disk.
+    # Nothing here computes, alters or triggers engine behaviour.
+    def _research(self, route: str) -> bool:
+        try:
+            import research_export as rx
+        except Exception:                                # noqa: BLE001
+            self._send(503, '{"error":"research_export unavailable"}',
+                       "application/json")
+            return True
+        if not rx.authorised(self.headers.get("Authorization")):
+            self._send(401, '{"error":"unauthorized",'
+                            '"detail":"research evidence requires a bearer '
+                            'token in RESEARCH_API_TOKEN"}',
+                       "application/json")
+            return True
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        cursor = (query.get("cursor") or [""])[0]
+        limit = (query.get("limit") or ["100"])[0]
+        try:
+            limit_n = int(limit)
+        except ValueError:
+            limit_n = 100
+        try:
+            if route == "capabilities":
+                body = rx.capabilities(self.data_dir)
+            elif route == "decisions":
+                body = rx.decisions(self.data_dir, cursor, limit_n)
+            elif route == "settlements":
+                body = rx.settlements(self.data_dir, cursor, limit_n)
+            else:
+                self._send(404, '{"error":"not_found"}', "application/json")
+                return True
+        except Exception as e:                           # noqa: BLE001
+            # An evidence failure must never surface as a crash in the process
+            # that trades. It is reported and the thread carries on.
+            self._send(500, json.dumps({"error": "research_export_failed",
+                                        "detail": str(e)[:200]}),
+                       "application/json")
+            return True
+        self._send(200, json.dumps(body, ensure_ascii=False, default=str),
+                   "application/json")
+        return True
+
     def do_GET(self):
+        if self.path.startswith("/api/research/v1/"):
+            route = urlparse(self.path).path.rsplit("/", 1)[-1]
+            self._research(route)
+            return
         if self.path.startswith("/api/state"):
             self._send(200, json.dumps(build_state(self.data_dir),
                                        ensure_ascii=False, default=str),
