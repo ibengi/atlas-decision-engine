@@ -34,14 +34,22 @@ def write_decisions(directory, count=5, name="decisions.jsonl"):
     return path
 
 
-def write_trades(directory, count=3):
-    path = os.path.join(directory, "trades.json")
+def write_trades(directory, count=3, extra=None, name=None):
+    # T7-B: the fixture writes CFG.TRADES_FILE — the name the engine's
+    # TradeLogger actually persists to. The old fixture wrote "trades.json",
+    # which no engine code ever writes, so the suite validated the exporter
+    # against a file production could never produce.
+    from config import CFG
+    path = os.path.join(directory, name or CFG.TRADES_FILE)
     trades = [{
         "trade_id": f"t{i}", "order_id": f"o{i}", "timestamp": f"2026-08-0{i+1}",
         "ticker": f"KX-{i}", "state": "settled", "gross_pnl": 10.0,
         "fees": 2.0, "net_pnl": 8.0, "settled_at": f"2026-08-0{i+2}",
-        "avg_fill_price": 45, "filled_count": 5,
+        "avg_fill_price": 45, "filled_count": 5, "result": "yes",
+        "decision_id": f"c{i}-abcd",
     } for i in range(count)]
+    for row in (extra or []):
+        trades.append(row)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(trades, handle)
     return path
@@ -199,6 +207,187 @@ class TestSettlementExport(unittest.TestCase):
             result = rx.settlements(directory, "", 100)
             self.assertTrue(result["discrepancies"])
             self.assertEqual(result["rows"][0]["net_pnl"], 99.0)
+
+
+class TestSettlementEvidenceT7B(unittest.TestCase):
+    """T7-B — D1 (canonical source), D2 (settlement-time cursor),
+    D3 (decision_id lifecycle key)."""
+
+    def test_e1_canonical_trades_file_is_the_source(self):
+        from config import CFG
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 2)                        # writes CFG.TRADES_FILE
+            self.assertTrue(os.path.exists(os.path.join(d, CFG.TRADES_FILE)))
+            result = rx.settlements(d, "", 100)
+            self.assertEqual(len(result["rows"]), 2)
+
+    def test_e2_dead_names_are_no_longer_consulted(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 3, name="trades.json")    # the OLD dead name
+            result = rx.settlements(d, "", 100)
+            self.assertEqual(result["rows"], [])      # nothing read from it
+
+    def test_e3_e4_settled_exported_open_not(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 1, extra=[{
+                "trade_id": "topen", "order_id": "oo", "state": "open",
+                "timestamp": "2026-08-01", "ticker": "KX-O",
+                "result": None, "settled_at": None}])
+            result = rx.settlements(d, "", 100)
+            ids = [r["trade_id"] for r in result["rows"]]
+            self.assertIn("t0", ids)
+            self.assertNotIn("topen", ids)
+
+    def test_e5_void_and_expired_results_are_served_verbatim(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 0, extra=[
+                {"trade_id": "tv", "state": "settled", "result": "void",
+                 "settled_at": "2026-08-05", "ticker": "KX-V"},
+                {"trade_id": "te", "state": "settled",
+                 "result": "expired_stale", "settled_at": "2026-08-06",
+                 "ticker": "KX-E"}])
+            rows = rx.settlements(d, "", 100)["rows"]
+            self.assertEqual([r["result"] for r in rows],
+                             ["void", "expired_stale"])
+
+    def test_e5b_malformed_states_are_excluded_and_reported(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 1, extra=[
+                {"trade_id": "tw", "state": "weird", "result": "yes",
+                 "settled_at": "2026-08-05"},
+                {"trade_id": "tn", "state": "settled", "result": None,
+                 "settled_at": "2026-08-05"},
+                {"trade_id": "tm", "state": "settled", "result": "yes",
+                 "settled_at": None}])
+            result = rx.settlements(d, "", 100)
+            self.assertEqual([r["trade_id"] for r in result["rows"]], ["t0"])
+            self.assertEqual(result["excluded_count"], 3)
+
+    def test_e6_resolution_after_cursor_becomes_visible(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = write_trades(d, 2)                 # settled t0, t1
+            first = rx.settlements(d, "", 100)
+            cursor = first["next_cursor"]
+            self.assertEqual(len(first["rows"]), 2)
+            # a trade OPENED long ago now settles — later settled_at
+            with open(path, encoding="utf-8") as h:
+                trades = json.load(h)
+            trades.append({"trade_id": "aaa-old-open", "order_id": "ox",
+                           "timestamp": "2026-07-01", "ticker": "KX-OLD",
+                           "state": "settled", "result": "no",
+                           "settled_at": "2026-08-09", "gross_pnl": -5.0,
+                           "fees": 1.0, "net_pnl": -6.0})
+            with open(path, "w", encoding="utf-8") as h:
+                json.dump(trades, h)
+            second = rx.settlements(d, cursor, 100)
+            self.assertEqual([r["trade_id"] for r in second["rows"]],
+                             ["aaa-old-open"])
+            self.assertEqual(second["cursor_state"], "resumed")
+
+    def test_e7_equal_settled_at_orders_by_trade_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 0, extra=[
+                {"trade_id": "b", "state": "settled", "result": "yes",
+                 "settled_at": "2026-08-05"},
+                {"trade_id": "a", "state": "settled", "result": "no",
+                 "settled_at": "2026-08-05"}])
+            rows = rx.settlements(d, "", 100)["rows"]
+            self.assertEqual([r["trade_id"] for r in rows], ["a", "b"])
+
+    def test_e8_e9_pagination_no_loss_no_duplicates_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 7)
+            seen, cursor = [], ""
+            for _ in range(10):
+                page = rx.settlements(d, cursor, 2)
+                if not page["rows"]:
+                    break
+                seen.extend(r["trade_id"] for r in page["rows"])
+                cursor = page["next_cursor"]
+            self.assertEqual(seen, [f"t{i}" for i in range(7)])
+            replay = rx.settlements(d, cursor, 2)
+            self.assertEqual(replay["rows"], [])      # idempotent at tail
+            self.assertEqual(replay["next_cursor"], cursor)
+
+    def test_e10_malformed_cursor_reports_expired_never_crashes(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 2)
+            result = rx.settlements(d, "not|a|real|cursor", 100)
+            self.assertEqual(result["cursor_state"], "expired")
+            self.assertEqual(len(result["rows"]), 2)  # restart is explicit
+
+    def test_e13_settlement_export_includes_decision_id(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 1)
+            row = rx.settlements(d, "", 100)["rows"][0]
+            self.assertEqual(row["decision_id"], "c0-abcd")
+
+    def test_e14_legacy_trade_without_decision_id_still_served(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 0, extra=[
+                {"trade_id": "legacy", "state": "settled", "result": "yes",
+                 "settled_at": "2026-08-05", "ticker": "KX-L"}])
+            row = rx.settlements(d, "", 100)["rows"][0]
+            self.assertEqual(row["trade_id"], "legacy")
+            self.assertIsNone(row.get("decision_id"))
+
+    def test_e_capabilities_count_settled_only_and_declare_linkage(self):
+        with tempfile.TemporaryDirectory() as d:
+            write_trades(d, 2, extra=[{
+                "trade_id": "topen", "state": "open", "result": None,
+                "settled_at": None, "timestamp": "2026-08-01"}])
+            manifest = rx.capabilities(d)
+            settlements = next(x for x in manifest["datasets"]
+                               if x["name"] == "settlements")
+            self.assertEqual(settlements["row_count"], 2)
+            self.assertEqual(
+                settlements["linkage_availability"]["decision_id"], 2)
+            self.assertIn("settled trades only", settlements["known_gaps"])
+
+
+class TestDecisionIdPropagationT7B(unittest.TestCase):
+    """E11 + E12 — the lifecycle key is stamped at trade creation and
+    survives settlement mutation untouched."""
+
+    def _logger(self, directory):
+        # Point the logger at a temp dir WITHOUT reloading shared modules:
+        # a reload here leaks reconfigured module state into every test that
+        # runs after this one in the same process.
+        from config import CFG
+        import trade_logger as tl
+        self._saved_data_dir = CFG.DATA_DIR
+        CFG.DATA_DIR = directory
+        self.addCleanup(self._restore_data_dir)
+        return tl.TradeLogger()
+
+    def _restore_data_dir(self):
+        from config import CFG
+        CFG.DATA_DIR = self._saved_data_dir
+
+    def test_e11_e12_decision_id_attached_and_immutable(self):
+        with tempfile.TemporaryDirectory() as d:
+            tlog = self._logger(d)
+            rec = tlog.open_trade(
+                ticker="KX-1", market_title="m", side="yes", req_price=40,
+                avg_price=41, req_count=5, filled_count=5, spread=2,
+                fees=0.35, edge=0.05, ev=0.2, confidence=8, grade="B",
+                reason="", analysis={}, order_id="o1", order_status="filled",
+                decision_id="cyc1-deadbeef")
+            self.assertEqual(rec["decision_id"], "cyc1-deadbeef")
+            settled = tlog.settle_trade(rec["trade_id"], "yes", True, 2.5, 2.2)
+            self.assertEqual(settled["decision_id"], "cyc1-deadbeef")
+            self.assertEqual(settled["state"], "settled")
+
+    def test_e14b_open_trade_without_decision_id_stays_unjoinable(self):
+        with tempfile.TemporaryDirectory() as d:
+            tlog = self._logger(d)
+            rec = tlog.open_trade(
+                ticker="KX-2", market_title="m", side="no", req_price=40,
+                avg_price=41, req_count=1, filled_count=1, spread=2,
+                fees=0.1, edge=0.0, ev=0.0, confidence=0, grade="R",
+                reason="recovery", analysis={}, order_id="o2",
+                order_status="filled")
+            self.assertIsNone(rec["decision_id"])
 
 
 class TestCapabilityManifest(unittest.TestCase):

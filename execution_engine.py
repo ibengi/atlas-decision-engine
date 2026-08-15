@@ -653,7 +653,8 @@ class ExecutionEngine:
                       "estimated_fee_before_order": est_fee_total,
                       "actual_fee_after_fill": fee_amt,
                       "strategy": dec.strategy},
-            order_id=exec_res.order_id, order_status=exec_res.status)
+            order_id=exec_res.order_id, order_status=exec_res.status,
+            decision_id=dec.decision_id)
         self.posmgr.open_position(trade, extra={
             "strategy": dec.strategy, "category": cat, "market_score": None,
             "entry_edge": dec.net_edge, "entry_ev": dec.net_ev,
