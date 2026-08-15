@@ -33,9 +33,11 @@ import json
 import os
 from typing import Any, Iterator, Optional
 
+from config import CFG
+
 RESEARCH_CONTRACT_VERSION = 1
 
-SCHEMA_VERSIONS = {"decisions": 1, "settlements": 1}
+SCHEMA_VERSIONS = {"decisions": 1, "settlements": 2}
 
 #: Modules whose content defines the probability model. Hashing their source
 #: gives an identity that changes when the model changes and not otherwise.
@@ -253,26 +255,70 @@ def decisions(data_dir: str, cursor: str = "", limit: int = DEFAULT_PAGE) -> dic
 
 
 def _trades(data_dir: str) -> list[dict]:
-    for name in ("trades.json", "trade_history.json"):
-        path = os.path.join(data_dir, name)
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                data = json.load(handle)
-            if isinstance(data, list):
-                return [t for t in data if isinstance(t, dict)]
-        except (OSError, json.JSONDecodeError):
-            continue
+    """The authoritative trade ledger, exactly as TradeLogger writes it.
+
+    Reads CFG.TRADES_FILE — the configured name the engine's settlement
+    writer persists to. (T7-B: this previously probed two filenames no
+    engine code ever wrote, so the settlement surface served zero rows.)
+    """
+    path = os.path.join(data_dir, CFG.TRADES_FILE)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, list):
+        return [t for t in data if isinstance(t, dict)]
     return []
+
+
+def _settled_rows(trades: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Settlement evidence = settled trades only, in settlement order.
+
+    A row qualifies only when the ledger says the trade is terminal AND it
+    carries both a result and a settlement time. An open position is a live
+    trade, not an outcome, and is skipped silently; anything else that fails
+    to qualify is excluded AND reported — neither silently served nor
+    silently dropped. Ordering is (settled_at, trade_id): settlement is a
+    LATER state transition on a row created at open time, so an export
+    ordered by open time can hide a resolution behind a consumer's cursor
+    forever. Settlement-time ordering makes every new resolution appear
+    after everything already consumed.
+    """
+    rows: list[dict] = []
+    excluded: list[dict] = []
+    for t in trades:
+        state = str(t.get("state") or "")
+        if state == "open":
+            continue
+        if state != "settled":
+            excluded.append({"trade_id": t.get("trade_id"),
+                             "note": f"unrecognized state {state!r}; not "
+                                     f"served as settlement evidence"})
+            continue
+        if not t.get("result") or not t.get("settled_at"):
+            excluded.append({"trade_id": t.get("trade_id"),
+                             "note": "settled without result/settled_at; "
+                                     "cannot be interpreted as an outcome; "
+                                     "not served"})
+            continue
+        rows.append(t)
+    rows.sort(key=lambda t: (str(t.get("settled_at") or ""),
+                             str(t.get("trade_id") or "")))
+    return rows, excluded
 
 
 def settlements(data_dir: str, cursor: str = "",
                 limit: int = DEFAULT_PAGE) -> dict:
-    """Authoritative accounting records. Never recomputed here."""
-    rows = sorted(_trades(data_dir),
-                  key=lambda t: (str(t.get("timestamp") or ""),
-                                 str(t.get("trade_id") or "")))
+    """Authoritative settlement evidence. Never recomputed here.
+
+    Settled trades only, cursored by (settled_at, trade_id) so a trade
+    opened before a consumer's cursor position still becomes discoverable
+    at the moment it settles.
+    """
+    rows, excluded = _settled_rows(_trades(data_dir))
     discrepancies = []
     for trade in rows:
         gross, net, fees = (trade.get("gross_pnl"), trade.get("net_pnl"),
@@ -288,7 +334,8 @@ def settlements(data_dir: str, cursor: str = "",
                             "exposed, not corrected"})
         except (TypeError, ValueError):
             continue
-    page = _page(rows, cursor, limit, key=lambda t: str(t.get("trade_id") or ""))
+    page = _page(rows, cursor, limit,
+                 key=lambda t: f"{t.get('settled_at')}|{t.get('trade_id')}")
     return {
         "dataset": "settlements",
         "schema_version": SCHEMA_VERSIONS["settlements"],
@@ -298,6 +345,8 @@ def settlements(data_dir: str, cursor: str = "",
         "recompute_policy": ("no PnL is recomputed by this exposure layer; "
                              "the engine's figure is the authoritative one"),
         "discrepancies": discrepancies,
+        "excluded_rows": excluded[:20],
+        "excluded_count": len(excluded),
         **page,
     }
 
@@ -312,10 +361,10 @@ def _bounds(rows: list[dict], field: str) -> tuple[str, str]:
 def capabilities(data_dir: str) -> dict:
     """What this engine can actually serve. Declared, not inferred."""
     decision_rows = decisions(data_dir, "", MAX_PAGE)
-    trades = _trades(data_dir)
+    settled, _excluded = _settled_rows(_trades(data_dir))
     retained = [os.path.basename(p) for p in (
         os.path.join(data_dir, n) for n in DECISION_FILES) if os.path.exists(p)]
-    earliest, latest = _bounds(trades, "timestamp")
+    earliest, latest = _bounds(settled, "settled_at")
 
     linked = sum(1 for r in decision_rows["rows"] if r.get("run_id"))
     with_model = sum(1 for r in decision_rows["rows"]
@@ -352,13 +401,19 @@ def capabilities(data_dir: str) -> dict:
                 "schema_version": SCHEMA_VERSIONS["settlements"],
                 "retention": "durable JSON store with checksum and backups",
                 "permanent": True,
-                "row_count": len(trades),
+                "row_count": len(settled),
                 "earliest": earliest,
                 "latest": latest,
-                "known_gaps": "",
+                "known_gaps": ("settled trades only; open positions are "
+                               "never settlement evidence. Trades opened "
+                               "before decision linkage existed carry no "
+                               "decision_id and cannot be joined to a "
+                               "decision; none is invented for them"),
                 "linkage_availability": {
-                    "order_id": sum(1 for t in trades if t.get("order_id")),
-                    "trade_id": sum(1 for t in trades if t.get("trade_id")),
+                    "order_id": sum(1 for t in settled if t.get("order_id")),
+                    "trade_id": sum(1 for t in settled if t.get("trade_id")),
+                    "decision_id": sum(1 for t in settled
+                                       if t.get("decision_id")),
                 },
             },
         ],

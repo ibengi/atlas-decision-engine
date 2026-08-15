@@ -42,9 +42,17 @@ class TradeLogger:
 
     def open_trade(self, *, ticker, market_title, side, req_price, avg_price,
                    req_count, filled_count, spread, fees, edge, ev, confidence,
-                   grade, reason, analysis, order_id, order_status) -> dict:
+                   grade, reason, analysis, order_id, order_status,
+                   decision_id=None) -> dict:
+        # decision_id: the originating Decision's identifier, attached at the
+        # moment the trade row is born and never rewritten afterwards
+        # (settle_trade updates only settlement fields). It is the canonical
+        # Decision -> Trade -> Settlement lifecycle key; None means the trade
+        # did not originate from a traceable decision (e.g. crash recovery)
+        # and stays honestly unjoinable.
         rec = {
             "schema": self.SCHEMA, "trade_id": uuid.uuid4().hex[:12],
+            "decision_id": decision_id,
             "timestamp": now_iso(), "ticker": ticker, "market": market_title,
             "side": side, "requested_price": req_price, "avg_fill_price": avg_price,
             "requested_count": req_count, "filled_count": filled_count,
