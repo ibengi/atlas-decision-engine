@@ -136,6 +136,14 @@ class ExecutionEngine:
         self.scanner = MarketScanner(client, router=self.router,
                                      data_dir=CFG.DATA_DIR)
         self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
+        # T7-I: the BTC daily strategy has never produced a settled
+        # prediction, because _shadow_observer admits only btc15m*. Its
+        # evidence goes to a SEPARATE append-only store rather than into the
+        # shadow store: backtest_btc15m.py consumes that file with no strategy
+        # filter and 15-minute time buckets, so daily rows would silently
+        # contaminate a 15-minute analysis. Nothing here can affect an order.
+        from btc_daily_evidence import BtcDailyEvidenceStore
+        self.btc_daily_evidence = BtcDailyEvidenceStore(CFG.DATA_DIR)
         self.gates = GateConfig(
             MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
             MIN_GROSS_EDGE=CFG.MIN_GROSS_EDGE, MIN_NET_EDGE=CFG.MIN_NET_EDGE,
@@ -181,9 +189,26 @@ class ExecutionEngine:
         return m, MarketValidator.normalize_book(m)
 
     def _shadow_observer(self, snapshot, book, dec):
-        """Journalise CHAQUE candidat BTC evalue (accepte ou rejete) dans le
-        shadow store — base de la calibration et du backtest."""
+        """Journalise chaque candidat BTC evalue (accepte ou rejete).
+
+        btc15m* -> shadow store (inchange, consomme par backtest_btc15m.py).
+        btc_daily* -> store d'evidence dedie (T7-I). La docstring precedente
+        annoncait 'CHAQUE candidat BTC' alors que le filtre n'admettait que
+        btc15m : le modele daily n'a jamais produit une seule prediction
+        reglee. Aucun des deux chemins ne peut modifier une decision : dec est
+        deja fige, et l'appelant absorbe toute exception.
+        """
         try:
+            if (dec.strategy or "").startswith("btc_daily"):
+                self.btc_daily_evidence.record(
+                    decision=dec.to_dict(),
+                    model_output=getattr(dec, "model_output", None),
+                    market=getattr(snapshot, "raw_market", None) or {},
+                    book=book,
+                    minutes_remaining=getattr(snapshot, "minutes_remaining",
+                                              None),
+                    cycle_id=(dec.decision_id or "").split("-", 1)[0] or None)
+                return
             if not (dec.strategy or "").startswith("btc15m"):
                 return
             mo = getattr(dec, "model_output", None) or {}
@@ -424,6 +449,20 @@ class ExecutionEngine:
                          f"(total regle: {len(self.shadow_store.settled())})")
         except Exception as e:
             log.warning(f"[SHADOW] reglement: {e}")
+
+        # T7-I: settle matured BTC daily predictions. Only markets whose close
+        # time has already passed are polled, so an unsettled backlog costs
+        # zero API calls; the store swallows its own errors and can only ever
+        # return a count. No trading state is read or written here.
+        try:
+            n_daily = self.btc_daily_evidence.settle(self.client.get_market)
+            if n_daily:
+                cov = self.btc_daily_evidence.coverage()
+                log.info(f"[BTC_DAILY_EVIDENCE] {n_daily} prediction(s) "
+                         f"settled (predictions={cov['predictions']} "
+                         f"settled={cov['settled']})")
+        except Exception as e:                            # noqa: BLE001
+            log.warning(f"[BTC_DAILY_EVIDENCE] reglement: {e}")
 
         # 1) Reglements d'abord : le PnL realise conditionne les portes
         for _t in self.posmgr.check_settlements():
