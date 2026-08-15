@@ -195,6 +195,12 @@ class _Handler(BaseHTTPRequestHandler):
                 body = rx.decisions(self.data_dir, cursor, limit_n)
             elif route == "settlements":
                 body = rx.settlements(self.data_dir, cursor, limit_n)
+            # P0: additive routes. A v1 consumer that never requests them
+            # observes no change whatsoever in the existing three.
+            elif route == "cycles":
+                body = rx.cycles(self.data_dir, cursor, limit_n)
+            elif route == "funnel_rejections":
+                body = rx.funnel_rejections(self.data_dir, cursor, limit_n)
             else:
                 self._send(404, '{"error":"not_found"}', "application/json")
                 return True

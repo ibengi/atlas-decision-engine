@@ -370,9 +370,38 @@ class MarketScanner:
             rep["mode"] = "targeted_series"
             markets = self._incremental_refresh([])
 
-        def _excl(reason):
+        # P0 observability: every scanner-stage elimination now also records
+        # a per-market row, not only an aggregate count. Without it, a cycle
+        # that loses its whole universe here is indistinguishable from a
+        # cycle that never ran. Bounded by SCANNER_REJECT_DETAIL_MAX so a
+        # large universe cannot grow the report without limit; the aggregate
+        # counters remain exact no matter where the cap falls, and the number
+        # of rows suppressed by the cap is itself reported.
+        detail_max = _env_i("SCANNER_REJECT_DETAIL_MAX", 500)
+        rep["rejections_detail"] = []
+        rep["rejections_detail_truncated"] = 0
+
+        def _excl(reason, m=None, stage_name=None, minutes=None, liq=None):
             rep["excluded_by_reason"][reason] = \
                 rep["excluded_by_reason"].get(reason, 0) + 1
+            if stage_name is None:
+                return
+            if len(rep["rejections_detail"]) >= detail_max:
+                rep["rejections_detail_truncated"] += 1
+                return
+            row = {"ticker": (m or {}).get("ticker"),
+                   "rejection_stage": stage_name,
+                   "rejection_reason": reason}
+            # Absent facts stay absent: a field this stage did not compute is
+            # never defaulted. A missing key and a zero must stay different.
+            if minutes is not None:
+                row["minutes_remaining"] = minutes
+            if liq is not None:
+                row["liquidity_diagnostic"] = liq
+            mt = ((m or {}).get("_classification") or {}).get("market_type")
+            if mt:
+                row["market_type"] = mt
+            rep["rejections_detail"].append(row)
 
         rep["funnel"]["scanned_raw"] = len(markets)
 
@@ -380,7 +409,7 @@ class MarketScanner:
         for m in markets:
             status = str(m.get("status") or "").lower()
             if status and status not in ("open", "active"):
-                _excl("closed_or_settled"); continue
+                _excl("closed_or_settled", m, "status"); continue
             kept.append(m)
         rep["funnel"]["after_status"] = len(kept)
 
@@ -388,13 +417,13 @@ class MarketScanner:
         for m in kept:
             mins = _minutes_to_close(m, now_dt)
             if mins is None:
-                _excl("no_close_time"); continue
+                _excl("no_close_time", m, "time_window"); continue
             if mins <= 0:
-                _excl("expired"); continue
+                _excl("expired", m, "time_window", mins); continue
             if mins < self.cfg.min_minutes:
-                _excl("closes_too_soon"); continue
+                _excl("closes_too_soon", m, "time_window", mins); continue
             if mins > self.cfg.lookahead_hours * 60:
-                _excl("outside_time_window"); continue
+                _excl("outside_time_window", m, "time_window", mins); continue
             m["_minutes_remaining"] = mins
             stage.append(m)
         kept = stage
@@ -420,7 +449,8 @@ class MarketScanner:
                         f"liquidity_score={d['liquidity_score']} "
                         f"rejected_reason=no_liquidity")
                     liq_logged += 1
-                _excl("no_liquidity"); continue
+                _excl("no_liquidity", m, "liquidity",
+                      m.get("_minutes_remaining"), d); continue
             stage.append(m)
         n_rej = len(rep["no_liquidity_details"])
         if not liq_all and n_rej > liq_logged:
@@ -435,16 +465,19 @@ class MarketScanner:
             c = classify(m)
             m["_classification"] = c.to_dict()
             if c.market_type == "unknown":
-                _excl("unknown_market_type"); continue
+                _excl("unknown_market_type", m, "classification",
+                      m.get("_minutes_remaining")); continue
             if self.router is not None:
                 sup = set(self.router.supported_market_types())
                 trd = set(self.router.tradeable_market_types()
                           if hasattr(self.router, "tradeable_market_types")
                           else sup)
                 if c.market_type not in sup:
-                    _excl("no_compatible_strategy"); continue
+                    _excl("no_compatible_strategy", m, "classification",
+                          m.get("_minutes_remaining")); continue
                 if c.market_type not in trd:
-                    _excl("no_probability_provider"); continue
+                    _excl("no_probability_provider", m, "classification",
+                          m.get("_minutes_remaining")); continue
             stage.append(m)
         kept = stage
         rep["funnel"]["after_classification"] = len(kept)
@@ -460,8 +493,9 @@ class MarketScanner:
             return (vol, -m.get("_minutes_remaining", 1e9))
         kept.sort(key=_cheap_score, reverse=True)
         if len(kept) > self.cfg.max_markets_per_cycle:
-            for _ in kept[self.cfg.max_markets_per_cycle:]:
-                _excl("over_cycle_cap")
+            for _m in kept[self.cfg.max_markets_per_cycle:]:
+                _excl("over_cycle_cap", _m, "cycle_cap",
+                      _m.get("_minutes_remaining"))
             kept = kept[:self.cfg.max_markets_per_cycle]
         rep["funnel"]["kept"] = len(kept)
         rep["scan_duration_ms"] = int((time.time() - t0) * 1000)
