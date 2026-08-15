@@ -105,6 +105,13 @@ class MarketOpportunityPipeline:
         self.scanner = scanner or MarketScanner(client, router=router,
                                                 data_dir=data_dir)
         self.jsonl = RotatingJsonl(os.path.join(data_dir, "decisions.jsonl"))
+        # P0: scanner-stage rejections have their own sink. They are kept out
+        # of decisions.jsonl on purpose — a decision row means the model was
+        # given a market and produced a verdict, and a market the scanner
+        # dropped never got that far. Merging the two would make the decision
+        # dataset mean two different things.
+        self.funnel_jsonl = RotatingJsonl(
+            os.path.join(data_dir, "funnel_rejections.jsonl"))
         self.max_deep = _env_i("SCAN_MAX_DEEP_ANALYSES_PER_CYCLE", 50)
         self.ttl_perm = _env_i("PIPELINE_REJECT_TTL_PERMANENT_S", 3600)
         self.ttl_temp = _env_i("PIPELINE_REJECT_TTL_TEMPORARY_S", 120)
@@ -128,11 +135,41 @@ class MarketOpportunityPipeline:
             return None
         return e[1]
 
+    def _write_funnel_rejections(self, cycle_id: str, observed_at: str,
+                                 srep: dict) -> int:
+        """Persist one row per scanner-eliminated market. Observability only.
+
+        Never raises: evidence capture must not be able to break a trading
+        cycle. A write that fails is logged and the cycle continues exactly
+        as it would have before this method existed.
+        """
+        rows = srep.get("rejections_detail") or []
+        written = 0
+        try:
+            for row in rows:
+                self.funnel_jsonl.write({
+                    "cycle_id": cycle_id,
+                    "observed_at": observed_at,
+                    "scanner_version": srep.get("scanner_version"),
+                    "rejection": row,
+                })
+                written += 1
+        except Exception as e:                              # noqa: BLE001
+            log.warning(f"[FUNNEL_EVIDENCE] write failed: {e}")
+        return written
+
     def run_cycle(self, max_accepted: int = 3, skip_ticker_fn=None) -> dict:
         t0 = time.time()
         cycle_id = uuid.uuid4().hex[:10]
         S = {"cycle_id": cycle_id, "pipeline_version": PIPELINE_VERSION,
+             "occurred_at": _now_iso(),
              "scanned_raw": 0, "open_cached": 0, "liquid": 0, "supported": 0,
+             # P0: the scanner's intermediate stages were collapsed into
+             # open_cached/liquid, so after_status and after_classification
+             # had no representation outside the scanner's in-memory report.
+             # They are carried explicitly now.
+             "after_status": 0, "after_time_window": 0, "after_liquidity": 0,
+             "after_classification": 0, "scanner_kept": 0,
              "model_evaluated": 0, "positive_edge": 0, "positive_net_ev": 0,
              "risk_passed": 0, "orders_submitted": 0, "fills": 0,
              "rejections_by_reason": {}, "cycle_duration_ms": None}
@@ -151,6 +188,16 @@ class MarketOpportunityPipeline:
         self._trace_market_count = len(scan.get("markets") or [])
         S["open_cached"] = srep["funnel"].get("after_time_window", 0)
         S["liquid"] = srep["funnel"].get("after_liquidity", 0)
+        for _k in ("after_status", "after_time_window", "after_liquidity",
+                   "after_classification"):
+            S[_k] = srep["funnel"].get(_k, 0)
+        S["scanner_kept"] = srep["funnel"].get("kept", 0)
+        # P0: scanner-stage eliminations become durable per-market evidence.
+        # Markets dropped by the scanner never reach the evaluation loop
+        # below, so no decision row is ever written for them. This write is
+        # what makes "the universe was eliminated upstream" provable instead
+        # of inferred from an absence of rows.
+        self._write_funnel_rejections(cycle_id, S["occurred_at"], srep)
         for r, n in srep["excluded_by_reason"].items():
             S["rejections_by_reason"][r] = \
                 S["rejections_by_reason"].get(r, 0) + n

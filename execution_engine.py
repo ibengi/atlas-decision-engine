@@ -41,6 +41,23 @@ def _client_is_genuine(client) -> bool:
             str(getattr(client, "base_url", "")))
 
 
+#: P0 observability. `RiskManager.can_trade()` returns one prose string for
+#: three different guards. Atlas needs a stable identifier, so the prose is
+#: mapped onto one — and onto "risk_can_trade_unclassified" when the wording
+#: matches none of them, because guessing would be worse than admitting it.
+def _classify_can_trade_guard(why: str) -> str:
+    w = str(why or "")
+    if "STOP JOURNALIER" in w:
+        return "daily_loss_stop"
+    if "pertes consecutives" in w or "demi-ouvert" in w:
+        return "consecutive_loss_breaker"
+    if "trades/cycle" in w:
+        return "max_trades_cycle"
+    if "budget de risque" in w:
+        return "open_risk_budget"
+    return "risk_can_trade_unclassified"
+
+
 def assert_real_demo_integrity(client, shadow_mode: bool):
     """Exigence 1 : en EXECUTION_MODE=real_demo, aucun mock, aucun dry-run,
     aucune simulation ne peut remplacer l'appel API reel. Arret FATAL."""
@@ -134,6 +151,11 @@ class ExecutionEngine:
             observer=self._shadow_observer,
             scanner=self.scanner, data_dir=CFG.DATA_DIR)
         self.tracer = DecisionTracer(log)
+        # P0 observability: one durable row per cycle, written on EVERY exit
+        # path including the early returns at the global guards. Shares the
+        # pipeline's rotating-jsonl writer so retention behaves identically.
+        from opportunity_pipeline import RotatingJsonl as _RotatingJsonl
+        self.cycles_jsonl = _RotatingJsonl(_p("cycles.jsonl"))
         HEALTH.set_client(client)
         assert_real_demo_integrity(client, CFG.SHADOW_MODE)
         log_execution_banner(client)
@@ -228,21 +250,25 @@ class ExecutionEngine:
         self._last_health = health
         return bal, health
 
-    def _post_balance_gates(self) -> bool:
+    def _post_balance_gates(self) -> tuple:
         """Portes de risque globales APRES le solde (capital effectif a
-        jour). Retourne False si le cycle doit s'arreter (le code retour
-        du chemin sequentiel est strictement identique)."""
+        jour). Retourne (ok, guard) ; ok=False si le cycle doit s'arreter.
+
+        P0: `guard` NOMME la porte qui bloque. L'ORDRE D'EVALUATION ET LES
+        VALEURS DE RETOUR SONT INCHANGES — seul le nom du bloqueur, jusqu'ici
+        perdu, est desormais rendu au cycle pour etre journalise.
+        """
         ok, why = self.risk.can_trade(cycle_trades=0)
         if not ok:
             log_rsk.warning(f"Trading bloque: {why}",
                             extra={"event": "trading_blocked", "reason": why})
-            return False
+            return False, _classify_can_trade_guard(why)
         if self.posmgr.open_count() >= CFG.MAX_OPEN_POSITIONS:
             log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.",
                             extra={"event": "max_open_positions",
                                    "open": self.posmgr.open_count(),
                                    "limit": CFG.MAX_OPEN_POSITIONS})
-            return False
+            return False, "max_open_positions"
         dd_pct = self.risk.rolling_drawdown_pct()
         if dd_pct >= CFG.MAX_EQUITY_DRAWDOWN_PCT:
             log_rsk.warning(
@@ -253,8 +279,66 @@ class ExecutionEngine:
                        "drawdown_pct": dd_pct,
                        "drawdown_amount": self.risk.rolling_drawdown(),
                        "limit_pct": CFG.MAX_EQUITY_DRAWDOWN_PCT})
-            return False
-        return True
+            return False, "equity_drawdown"
+        return True, None
+
+    #: P0 observability. Funnel stage names carried from the pipeline report
+    #: into the cycle evidence row, in funnel order.
+    _FUNNEL_KEYS = ("scanned_raw", "after_status", "after_time_window",
+                    "after_liquidity", "after_classification", "scanner_kept",
+                    "supported", "model_evaluated", "positive_edge",
+                    "positive_net_ev", "risk_passed", "orders_submitted",
+                    "fills", "accepted")
+
+    def _record_cycle_evidence(self, n: int, execution_path: str,
+                               blocking_global_guard=None, detail: str = "",
+                               pipeline: dict = None) -> dict:
+        """Write exactly one durable evidence row per cycle. Observability only.
+
+        Before P0 a cycle that returned early at a global guard wrote nothing
+        at all, so "no decisions this cycle" had three indistinguishable
+        causes: a guard blocked it, the scan found nothing, or the engine was
+        not running. This row separates them.
+
+        Funnel counters are emitted ONLY when the pipeline actually ran. When
+        a guard fires before the scan, the counters are genuinely unknown and
+        are therefore ABSENT — never zero. A zero here would assert that the
+        scanner looked and found nothing, which would be a fabricated fact.
+
+        Never raises: evidence must not be able to break a trading cycle.
+        """
+        row = {
+            "cycle": n,
+            "occurred_at": now_iso(),
+            "engine_version": ENGINE_VERSION,
+            "execution_path": execution_path,
+            "blocking_global_guard": blocking_global_guard,
+            "scan_executed": pipeline is not None,
+        }
+        if detail:
+            row["blocking_detail"] = str(detail)[:300]
+        if pipeline is not None:
+            report = pipeline.get("report") or {}
+            row["cycle_id"] = report.get("cycle_id")
+            row["pipeline_version"] = report.get("pipeline_version")
+            row["cycle_duration_ms"] = report.get("cycle_duration_ms")
+            row["funnel"] = {k: report.get(k) for k in self._FUNNEL_KEYS
+                             if report.get(k) is not None}
+            row["rejections_by_reason"] = report.get("rejections_by_reason") or {}
+            row["model_rejections_detailed"] = \
+                report.get("model_rejections_detailed") or {}
+        try:
+            self.cycles_jsonl.write(row)
+        except Exception as e:                              # noqa: BLE001
+            log.warning(f"[CYCLE_EVIDENCE] write failed: {e}")
+        log.info(f"[CYCLE_EVIDENCE] cycle={n} path={execution_path} "
+                 f"blocking_global_guard={blocking_global_guard} "
+                 f"scan_executed={row['scan_executed']}",
+                 extra={"event": "cycle_evidence", "cycle": n,
+                        "execution_path": execution_path,
+                        "blocking_global_guard": blocking_global_guard,
+                        "scan_executed": row["scan_executed"]})
+        return row
 
     def _probability_engine_report(self):
         """Audit du Probability Engine au demarrage : pour chaque strategie,
@@ -360,6 +444,7 @@ class ExecutionEngine:
             if CFG.KILL_SWITCH:
                 log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
                                 extra={"event": "kill_switch"})
+                self._record_cycle_evidence(n, "sequential", "kill_switch")
                 return 0
 
             # 3) Solde reel du broker -- CORRECTIF AUDIT : deplace AVANT les
@@ -373,10 +458,14 @@ class ExecutionEngine:
             ok, why = self._balance_gate()
             log_rsk.info(f"[CAPITAL] {why}")
             if not ok:
+                self._record_cycle_evidence(n, "sequential", "balance_gate",
+                                            detail=why)
                 return 0
 
             # 4) Portes de risque globales (dependent desormais du capital a jour)
-            if not self._post_balance_gates():
+            gates_ok, guard = self._post_balance_gates()
+            if not gates_ok:
+                self._record_cycle_evidence(n, "sequential", guard)
                 self.stats.log_summary(); return 0
 
         # 5) PIPELINE integre (multi-candidats, jamais bloque sur un ticker)
@@ -385,7 +474,7 @@ class ExecutionEngine:
             skip_ticker_fn=(lambda tk: CFG.ONE_TRADE_PER_MKT and
                             (tk in self.posmgr.tickers_open()
                              or self.tlog.has_open_on(tk))))
-        return self._finish_cycle(n, res)
+        return self._finish_cycle(n, res, "sequential")
 
     def _cycle_parallel(self, n: int) -> int:
         """P8 : solde + checks de sante executes en PARALLELE du scan.
@@ -399,6 +488,7 @@ class ExecutionEngine:
         if CFG.KILL_SWITCH:
             log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
                             extra={"event": "kill_switch"})
+            self._record_cycle_evidence(n, "parallel", "kill_switch")
             return 0
         bal_future = self._executor.submit(self._background_balance_health)
         try:
@@ -417,12 +507,18 @@ class ExecutionEngine:
             ok, why = self._balance_gate(bal)
             log_rsk.info(f"[CAPITAL] {why}")
             if not ok:
+                self._record_cycle_evidence(n, "parallel", "balance_gate",
+                                            detail=why, pipeline=res)
                 return 0
-            if not self._post_balance_gates():
+            gates_ok, guard = self._post_balance_gates()
+            if not gates_ok:
+                self._record_cycle_evidence(n, "parallel", guard,
+                                            pipeline=res)
                 self.stats.log_summary(); return 0
-        return self._finish_cycle(n, res)
+        return self._finish_cycle(n, res, "parallel")
 
-    def _finish_cycle(self, n: int, res: dict) -> int:
+    def _finish_cycle(self, n: int, res: dict,
+                      execution_path: str = "sequential") -> int:
         """Execution des candidats acceptes + rapports de fin de cycle
         (partage sequentiel/parallele)."""
         report = res["report"]
@@ -502,6 +598,10 @@ class ExecutionEngine:
         })
         JsonStore.save(_p("reject_reasons.json"),
                        {"cycle": n, "reject_reasons": report["rejections"]})
+        # P0: the cycle ran end to end. blocking_global_guard is None here,
+        # which is itself the evidence that no global guard fired — the fact
+        # that distinguishes "no opportunity" from "blocked before looking".
+        self._record_cycle_evidence(n, execution_path, None, pipeline=res)
         if placed == 0:
             self.stats.log_summary()
         return placed

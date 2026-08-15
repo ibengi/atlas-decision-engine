@@ -37,7 +37,11 @@ from config import CFG
 
 RESEARCH_CONTRACT_VERSION = 1
 
-SCHEMA_VERSIONS = {"decisions": 1, "settlements": 2}
+#: Datasets are versioned independently. P0 adds two NEW datasets and changes
+#: no existing one, so `decisions` and `settlements` keep their versions and a
+#: v1 consumer that never asks for the new routes is unaffected.
+SCHEMA_VERSIONS = {"decisions": 1, "settlements": 2,
+                   "cycles": 1, "funnel_rejections": 1}
 
 #: Modules whose content defines the probability model. Hashing their source
 #: gives an identity that changes when the model changes and not otherwise.
@@ -49,6 +53,13 @@ CALIBRATION_SOURCES = ("calibration.py", "model_calibration.py",
 #: The rotating decision log and its historical generations, oldest first.
 DECISION_FILES = ("decisions.jsonl.3", "decisions.jsonl.2",
                   "decisions.jsonl.1", "decisions.jsonl")
+
+#: P0 rotating-jsonl families, oldest generation first (same convention as
+#: DECISION_FILES so cursor ordering is identical across all three datasets).
+CYCLE_FILES = ("cycles.jsonl.3", "cycles.jsonl.2",
+               "cycles.jsonl.1", "cycles.jsonl")
+FUNNEL_FILES = ("funnel_rejections.jsonl.3", "funnel_rejections.jsonl.2",
+                "funnel_rejections.jsonl.1", "funnel_rejections.jsonl")
 
 MAX_PAGE = 500
 DEFAULT_PAGE = 100
@@ -230,6 +241,88 @@ def _page(items: list, cursor: str, limit: int, key) -> dict:
     }
 
 
+def _jsonl_rows(data_dir: str, names: tuple[str, ...]) -> tuple[list, int]:
+    """Parse a rotating jsonl family, oldest generation first.
+
+    Same content-hash record_id as the decision reader, so cursors stay
+    stable across the rotation that renames files underneath them.
+    """
+    rows: list[dict] = []
+    unreadable = 0
+    for name in names:
+        path = os.path.join(data_dir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    text = line.strip()
+                    if not text:
+                        continue
+                    try:
+                        parsed = json.loads(text)
+                    except json.JSONDecodeError:
+                        unreadable += 1
+                        continue
+                    if not isinstance(parsed, dict):
+                        unreadable += 1
+                        continue
+                    parsed["record_id"] = hashlib.sha256(
+                        text.encode("utf-8")).hexdigest()[:20]
+                    rows.append(parsed)
+        except OSError:
+            continue
+    return rows, unreadable
+
+
+def cycles(data_dir: str, cursor: str = "", limit: int = DEFAULT_PAGE) -> dict:
+    """P0: one row per engine cycle, including cycles that never scanned.
+
+    This is the dataset that makes a quiet period explainable. A row whose
+    `blocking_global_guard` is non-null says a global guard stopped the cycle
+    before evaluation; a row with `scan_executed: false` says no funnel
+    counters exist for that cycle because the scan never ran, which is
+    different from a scan that returned nothing.
+    """
+    rows, unreadable = _jsonl_rows(data_dir, CYCLE_FILES)
+    page = _page(rows, cursor, limit, key=lambda r: r["record_id"])
+    return {
+        "dataset": "cycles",
+        "schema_version": SCHEMA_VERSIONS["cycles"],
+        "contract_version": RESEARCH_CONTRACT_VERSION,
+        "engine_commit": engine_commit(),
+        "unreadable_lines": unreadable,
+        "recomputed": False,
+        "absent_funnel_note": (
+            "funnel counters are omitted, never zeroed, when scan_executed "
+            "is false: the scanner did not run, so there is no population to "
+            "report and a zero would assert a measurement nobody made"),
+        **page,
+    }
+
+
+def funnel_rejections(data_dir: str, cursor: str = "",
+                      limit: int = DEFAULT_PAGE) -> dict:
+    """P0: per-market scanner-stage eliminations.
+
+    Markets dropped by the scanner never reach the model, so they can never
+    appear in the decisions dataset. Before P0 they existed only as aggregate
+    counts, which made "the universe was eliminated upstream" unprovable at
+    market granularity.
+    """
+    rows, unreadable = _jsonl_rows(data_dir, FUNNEL_FILES)
+    page = _page(rows, cursor, limit, key=lambda r: r["record_id"])
+    return {
+        "dataset": "funnel_rejections",
+        "schema_version": SCHEMA_VERSIONS["funnel_rejections"],
+        "contract_version": RESEARCH_CONTRACT_VERSION,
+        "engine_commit": engine_commit(),
+        "unreadable_lines": unreadable,
+        "recomputed": False,
+        **page,
+    }
+
+
 def decisions(data_dir: str, cursor: str = "", limit: int = DEFAULT_PAGE) -> dict:
     """Historical decision records, exactly as they were written."""
     rows: list[dict] = []
@@ -361,6 +454,8 @@ def _bounds(rows: list[dict], field: str) -> tuple[str, str]:
 def capabilities(data_dir: str) -> dict:
     """What this engine can actually serve. Declared, not inferred."""
     decision_rows = decisions(data_dir, "", MAX_PAGE)
+    cycle_rows = cycles(data_dir, "", MAX_PAGE)
+    funnel_rows = funnel_rejections(data_dir, "", MAX_PAGE)
     settled, _excluded = _settled_rows(_trades(data_dir))
     retained = [os.path.basename(p) for p in (
         os.path.join(data_dir, n) for n in DECISION_FILES) if os.path.exists(p)]
@@ -395,6 +490,29 @@ def capabilities(data_dir: str) -> dict:
                 "model_version_availability":
                     f"{with_model}/{len(decision_rows['rows'])} of the sampled "
                     f"page; absent on records written before this build",
+            },
+            {
+                "name": "cycles",
+                "schema_version": SCHEMA_VERSIONS["cycles"],
+                "retention": "rotating: 5 MB x 4 generations, oldest deleted",
+                "permanent": False,
+                "row_count": cycle_rows["available_rows"],
+                "known_gaps": ("one row per cycle from this build onward; "
+                               "cycles that ran before P0 wrote no row and "
+                               "none is reconstructed for them. Funnel "
+                               "counters are absent, never zero, when "
+                               "scan_executed is false"),
+            },
+            {
+                "name": "funnel_rejections",
+                "schema_version": SCHEMA_VERSIONS["funnel_rejections"],
+                "retention": "rotating: 5 MB x 4 generations, oldest deleted",
+                "permanent": False,
+                "row_count": funnel_rows["available_rows"],
+                "known_gaps": ("scanner-stage eliminations only; per-cycle "
+                               "detail is capped at SCANNER_REJECT_DETAIL_MAX "
+                               "and the suppressed count is reported on the "
+                               "cycle rather than silently dropped"),
             },
             {
                 "name": "settlements",

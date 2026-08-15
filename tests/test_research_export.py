@@ -397,7 +397,12 @@ class TestCapabilityManifest(unittest.TestCase):
             write_trades(directory, 2)
             manifest = rx.capabilities(directory)
             names = {d["name"] for d in manifest["datasets"]}
-            self.assertEqual(names, {"decisions", "settlements"})
+            # P0 added `cycles` and `funnel_rejections`. The assertion stays
+            # exact rather than becoming a subset check: a dataset appearing
+            # here without anyone deciding to add it is exactly the kind of
+            # silent contract drift this test exists to catch.
+            self.assertEqual(names, {"decisions", "settlements",
+                                     "cycles", "funnel_rejections"})
             decisions = next(d for d in manifest["datasets"]
                              if d["name"] == "decisions")
             self.assertFalse(decisions["permanent"])
