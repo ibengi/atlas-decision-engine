@@ -25,6 +25,12 @@ from timing import timed
 
 ENGINE_VERSION = "v11.4-audit-fixed-2026-07-28"
 
+
+def _json_shadow(counters: dict) -> str:
+    """Compact one-line render of the T7-K shadow counters (logging only)."""
+    import json as _j
+    return _j.dumps(counters, ensure_ascii=False, sort_keys=True)
+
 # Module-level loggers (memes canaux que dans kalshi_alpha_bot.py)
 log     = logging.getLogger("BOT")
 log_rsk = logging.getLogger("RISK")
@@ -144,6 +150,13 @@ class ExecutionEngine:
         # contaminate a 15-minute analysis. Nothing here can affect an order.
         from btc_daily_evidence import BtcDailyEvidenceStore
         self.btc_daily_evidence = BtcDailyEvidenceStore(CFG.DATA_DIR)
+        # T7-K: evidence-only observation of markets the scanner rejects for
+        # no_liquidity. OFF unless BTC_DAILY_SHADOW_ENABLED is set. It holds
+        # no risk/order/position component and produces no Decision, so a
+        # market observed here cannot become an order candidate.
+        from btc_daily_shadow import BtcDailyShadowEvaluator
+        self.btc_daily_shadow = BtcDailyShadowEvaluator(
+            self.router, self.btc_daily_evidence)
         self.gates = GateConfig(
             MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
             MIN_GROSS_EDGE=CFG.MIN_GROSS_EDGE, MIN_NET_EDGE=CFG.MIN_NET_EDGE,
@@ -582,6 +595,18 @@ class ExecutionEngine:
         report["funnel_conversion"] = conv
         report["fills_confirmed"] = placed
         report["orders"] = report.get("orders_submitted", 0)
+        # T7-K: evidence-only observation, run AFTER every order decision is
+        # final so it cannot influence one. Its counters live under their own
+        # key — no production funnel counter is reused or touched. A failure
+        # here is logged and discarded; it can never create an order.
+        try:
+            shadow = self.btc_daily_shadow.run(
+                self.scanner.shadow_population(), report.get("cycle_id"))
+            if shadow.get("shadow_daily_predicted"):
+                log.info(f"[SHADOW_DAILY] {_json_shadow(shadow)}")
+            report["shadow_daily"] = shadow
+        except Exception as e:                            # noqa: BLE001
+            log.warning(f"[SHADOW_DAILY] {e}")
         # UN SEUL resume structure par cycle (exigence G). Les details par
         # decision sont dans decisions.jsonl (rotatif), pas ici.
         summary = {k: report.get(k) for k in

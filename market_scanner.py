@@ -210,8 +210,20 @@ class MarketScanner:
         self._universe = None            # liste de marches (crawl complet)
         self._universe_ts = 0.0
         self._crawl_pages_last = 0
+        # T7-K: markets eliminated at the liquidity stage of the LAST cycle,
+        # retained for evidence-only observation. Held as scanner state and
+        # deliberately NOT placed in the report: the report is serialised to
+        # disk and read by research consumers, and this list is neither
+        # evidence nor a funnel figure. Nothing downstream of the scanner
+        # reads it, so a market here can never re-enter the candidate path.
+        self._shadow_population = []
         self._cache_path = os.path.join(data_dir, "universe_cache.json")
         self._load_disk_cache()
+
+    def shadow_population(self) -> list:
+        """Markets the last cycle rejected for no_liquidity. Read-only view
+        for the T7-K evidence path; never consumed by trading."""
+        return list(self._shadow_population)
 
     # ── perimetre cible ────────────────────────────────────────────────────
     def target_series(self) -> list:
@@ -434,10 +446,12 @@ class MarketScanner:
         liq_max = int(os.getenv("LIQUIDITY_LOG_MAX", "10"))
         liq_all = os.getenv("LIQUIDITY_DEBUG", "0") == "1"
         rep["no_liquidity_details"] = []
+        self._shadow_population = []      # T7-K: rebuilt every cycle
         for m in kept:
             if not _has_liquidity(m):
                 d = liquidity_diag(m)
                 rep["no_liquidity_details"].append(d)   # TOUS, sur disque
+                self._shadow_population.append(m)       # T7-K, evidence only
                 if liq_all or liq_logged < liq_max:
                     log.info(
                         "[LIQUIDITY_REJECT] "

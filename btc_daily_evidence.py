@@ -100,9 +100,20 @@ def make_record_id(*, cycle_id, ticker, observed_at, model_version) -> str:
 
 def build_prediction_record(*, decision, model_output, market, book,
                             minutes_remaining, cycle_id, observed_at=None,
-                            strategy_version=None) -> dict:
+                            strategy_version=None, record_id=None,
+                            extra=None) -> dict:
     """The T7-I evidence contract. Absent values are recorded as explicit
-    null — nothing is invented, and a missing field never becomes a zero."""
+    null — nothing is invented, and a missing field never becomes a zero.
+
+    T7-K additions, both optional and both defaulting to prior behaviour:
+      record_id — supply a caller-derived id instead of the content hash.
+        Needed by the pre-liquidity shadow path, whose dedup key must be
+        stable across cycles and restarts and therefore must NOT include
+        observed_at.
+      extra — additional fields merged into the record. Reserved keys are
+        never overwritten, so a caller cannot silently redefine the
+        contract.
+    """
     dec = decision or {}
     mo = model_output or {}
     m = market or {}
@@ -120,11 +131,11 @@ def build_prediction_record(*, decision, model_output, market, book,
     if mins is None:
         mins = _num(feats.get("minutes_remaining"))
 
-    return {
+    row = {
         "schema_version": EVIDENCE_SCHEMA_VERSION,
-        "record_id": make_record_id(cycle_id=cycle_id, ticker=ticker,
-                                    observed_at=observed_at,
-                                    model_version=model_version),
+        "record_id": record_id or make_record_id(
+            cycle_id=cycle_id, ticker=ticker, observed_at=observed_at,
+            model_version=model_version),
         "decision_id": dec.get("decision_id"),
         "cycle_id": cycle_id,
         "ticker": ticker,
@@ -162,6 +173,10 @@ def build_prediction_record(*, decision, model_output, market, book,
         "decision_accepted": bool(dec.get("accepted")),
         "rejection_reason": dec.get("rejection_reason"),
     }
+    for k, v in (extra or {}).items():
+        if k not in row:            # the contract's own keys always win
+            row[k] = v
+    return row
 
 
 class BtcDailyEvidenceStore:
@@ -324,6 +339,45 @@ class BtcDailyEvidenceStore:
             "unsettled_excluded": True,
         })
         return rep
+
+    def observation_keys(self) -> set:
+        """Every `observation_key` already on disk (T7-K dedup index).
+
+        Read once at construction by the shadow evaluator, so a process
+        restart cannot re-record an observation the store already holds.
+        """
+        return {r["observation_key"] for r in self.predictions()
+                if r.get("observation_key")}
+
+    def statistics(self) -> dict:
+        """T7-K Phase 7 counting. Raw rows and independent outcomes are
+        reported separately and never conflated.
+
+        `independent_outcomes` counts DISTINCT settled expiries, not rows:
+        every KXBTCD strike sharing a close time resolves from one
+        underlying price at one instant, so N strikes on one expiry are one
+        realisation of the underlying, not N experiments. Different strikes
+        do probe different regions of the predicted distribution, so their
+        information is not zero — but it is not independent either, and this
+        is the conservative count. No effective-N formula is invented here.
+        """
+        preds = self.predictions()
+        settled = self.settlements()
+        s_rows = [r for r in preds if r.get("record_id") in settled]
+        return {
+            "prediction_rows": len(preds),
+            "settled_prediction_rows": len(s_rows),
+            "unique_tickers": len({r.get("ticker") for r in preds} - {None}),
+            "unique_expiries": len({r.get("market_close_time")
+                                    for r in preds} - {None}),
+            "settled_unique_tickers": len({r.get("ticker")
+                                           for r in s_rows} - {None}),
+            "independent_outcomes": len({r.get("market_close_time")
+                                         for r in s_rows} - {None}),
+            "independent_outcome_basis": "distinct settled market_close_time",
+            "by_checkpoint": _hist(preds, "observation_checkpoint"),
+            "settled_by_checkpoint": _hist(s_rows, "observation_checkpoint"),
+        }
 
     def coverage(self) -> dict:
         """Evidence inventory. Cheap enough to log every cycle."""
