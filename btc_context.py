@@ -34,8 +34,9 @@ MIN_VALID_SOURCES   = 2
 MIN_KLINES          = 11           # pour rendement 10m + vol realisee
 # P8 : cache PAR CYCLE (BTC_CONTEXT_CYCLE_CACHE=1). Le contexte BTC est
 # calcule UNE FOIS par cycle puis partage par TOUS les marches BTC : les
-# fetches reseau (spot + klines) utilisent alors un TTL long (borne par
-# CYCLE_CACHE_TTL_S) et le contexte complet est memoise par
+# fetches reseau (spot + klines) utilisent alors un TTL long
+# (BTC_CONTEXT_CYCLE_TTL_S, defaut CYCLE_CACHE_TTL_S) et le contexte
+# complet est memoise par
 # (strike, minutes_remaining). begin_cycle() (appele par ExecutionEngine
 # en debut de cycle) purge les deux caches : aucun cycle ne voit les
 # donnees du precedent.
@@ -48,6 +49,17 @@ def _cycle_cache_active() -> bool:
     return v not in ("0", "false", "no", "off", "")
 
 
+def _cycle_ttl_s() -> float:
+    """TTL long du cache de cycle : BTC_CONTEXT_CYCLE_TTL_S, lu LAZY comme
+    le flag ci-dessus. Semantique identique a config._env_f : valeur
+    invalide => defaut CYCLE_CACHE_TTL_S."""
+    try:
+        return float(os.getenv("BTC_CONTEXT_CYCLE_TTL_S",
+                               str(CYCLE_CACHE_TTL_S)))
+    except ValueError:
+        return CYCLE_CACHE_TTL_S
+
+
 _cache = {}                        # key -> (value, ts)
 _cycle_ctx_cache = {}              # (strike, minutes_remaining) -> context
 
@@ -55,7 +67,7 @@ _cycle_ctx_cache = {}              # (strike, minutes_remaining) -> context
 def _data_ttl() -> float:
     """TTL des fetches bruts : court (10 s) par defaut, LONG si le cache
     de cycle est actif (les donnees sont alors figees pour tout le cycle)."""
-    return CYCLE_CACHE_TTL_S if _cycle_cache_active() else CACHE_TTL_S
+    return _cycle_ttl_s() if _cycle_cache_active() else CACHE_TTL_S
 
 
 def begin_cycle() -> None:
