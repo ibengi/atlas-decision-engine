@@ -7,6 +7,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
+import accounting
 from config import CFG, _p
 from kalshi_client import KalshiClient, pick, pick_int
 from persistence import JsonStore
@@ -77,6 +78,13 @@ class PositionManager:
 
     def tickers_open(self) -> set:
         return {p["ticker"] for p in self._active_positions()}
+
+    def unresolved_settlement_count(self) -> int:
+        """Positions parked as settlement_unknown (AIR-001 W7): the
+        realized PnL of these is UNKNOWN, so risk aggregates built on
+        realized PnL are unreliable until an operator resolves them."""
+        return sum(1 for p in self.positions.values()
+                   if p.get("state") == "settlement_unknown")
 
     def open_count(self) -> int:
         return sum(1 for _ in self._active_positions())
@@ -157,8 +165,13 @@ class PositionManager:
 
             if age_days is not None and age_days > CFG.MAX_POSITION_AGE_DAYS:
                 if not m or str(pick(m, "status", default="") or "").lower() != "open":
-                    gross = -p["fees"]   # conservative: lose fees on stale position
-                    net = gross - p["fees"]
+                    # AIR-001 W7: conservative = WORST case (full cost +
+                    # fees, once). The old code recorded only -fees as
+                    # gross and subtracted fees AGAIN in net.
+                    acct = accounting.settle_forced_conservative(
+                        count=p["count"], avg_price_cents=p["avg_price"],
+                        fees_dollars=p["fees"])
+                    gross, net = acct["gross"], acct["net"]
                     t = self.tlog.settle_trade(p["trade_id"], "expired_stale", False, gross, net)
                     if t is None:
                         log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
@@ -189,8 +202,8 @@ class PositionManager:
 
             # ── void (legitimate settlement) ──────────────────────────
             if result == "void":
-                gross = 0.0   # return of premium, net loss = fees only
-                net = gross - p["fees"]
+                acct = accounting.settle_void(fees_dollars=p["fees"])
+                gross, net = acct["gross"], acct["net"]
                 t = self.tlog.settle_trade(p["trade_id"], "void", False, gross, net)
                 if t is None:
                     log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
@@ -206,30 +219,34 @@ class PositionManager:
             # ── settled/finalized with unreadable result ──────────────
             if result not in ("yes", "no"):
                 if status in ("settled", "finalized"):
-                    gross = -p["fees"]   # conservative: assume loss
-                    net = gross - p["fees"]
-                    t = self.tlog.settle_trade(p["trade_id"], "void_unreadable", False, gross, net)
-                    if t is None:
-                        log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                        continue
-                    self.positions.pop(tid, None)
-                    self.flush()
-                    if t:
-                        realized.append(t)
-                    log_pos.warning(
-                        f"{p['ticker']}: statut '{status}' mais result illisible "
-                        f"(raw={repr(pick(m, 'result', default=None))}) -- "
-                        f"traite comme void_unreadable (gross={gross:+.2f}$)")
+                    # AIR-001 W7: UNKNOWN stays UNKNOWN. The old code
+                    # CONVERTED an unreadable result into an invented
+                    # fee-loss settlement (double-counting the fees).
+                    # The position is now PARKED, loudly, with no PnL
+                    # fabricated; the RiskProof blocks new orders while
+                    # any settlement is unresolved.
+                    if p.get("state") != "settlement_unknown":
+                        p["state"] = "settlement_unknown"
+                        p["settlement_unknown_since"] = now_iso()
+                        p["settlement_raw_result"] = repr(
+                            pick(m, "result", default=None))
+                        self.flush()
+                    log_pos.error(
+                        f"[SETTLEMENT_UNKNOWN] {p['ticker']}: statut "
+                        f"'{status}' mais result illisible (raw="
+                        f"{repr(pick(m, 'result', default=None))}) -- "
+                        "position PARQUEE, PnL NON fabrique, resolution "
+                        "operateur requise")
                     continue
                 else:
                     # market still open or unknown → keep position
                     continue
 
             # ── happy path: yes / no ──────────────────────────────────
-            won  = (result == p["side"])
-            cost = p["count"] * p["avg_price"] / 100.0
-            gross = (p["count"] * 1.0 - cost) if won else -cost
-            net   = gross - p["fees"]
+            acct = accounting.settle_yes_no(
+                side=p["side"], result=result, count=p["count"],
+                avg_price_cents=p["avg_price"], fees_dollars=p["fees"])
+            won, gross, net = acct["won"], acct["gross"], acct["net"]
             t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
             if t is None:
                 log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")

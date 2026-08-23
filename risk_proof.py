@@ -127,6 +127,16 @@ def build_risk_proof(*, ticker: str, category: str, side: str,
         detail="in-flight intents unresolved against broker"
         if orders_blocked_reconciling else "")
 
+    # 3b. unresolved settlements (Wave 7): parked settlement_unknown
+    # positions mean the realized-PnL aggregates below are unreliable.
+    unresolved = int(getattr(posmgr, "unresolved_settlement_count",
+                             lambda: 0)())
+    add("settlements_resolved",
+        UNKNOWN_FAIL_CLOSED if unresolved else PASS,
+        observed=unresolved, limit=0,
+        detail="settlement_unknown position(s) parked — realized PnL "
+               "incomplete" if unresolved else "")
+
     # 4. balance freshness — unknown balance never sizes an order
     add("balance_known",
         PASS if (balance_known and capital > 0) else UNKNOWN_FAIL_CLOSED,

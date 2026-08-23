@@ -180,8 +180,13 @@ class TestSettlements(unittest.TestCase):
 
     # ── 4. test_settles_on_unreadable_settled ───────────────────────────
 
-    def test_settles_on_unreadable_settled(self):
-        """status 'settled', result empty → popped as void_unreadable."""
+    def test_unreadable_settled_parks_position_no_invented_pnl(self):
+        """AIR-001 W7 (PRODUCT DEFECT fixed): status 'settled' with an
+        unreadable result used to be CONVERTED into an invented
+        'void_unreadable' settlement whose net double-counted the fees
+        (gross=-fees, net=gross-fees). UNKNOWN now stays UNKNOWN: the
+        position is parked as settlement_unknown, no PnL is fabricated,
+        and the unresolved count blocks the RiskProof."""
         pos = _make_position(trade_id="t-unread")
         self.pm.positions["t-unread"] = pos
 
@@ -192,12 +197,12 @@ class TestSettlements(unittest.TestCase):
         }
         realized = self.pm.check_settlements()
 
-        self.assertNotIn("t-unread", self.pm.positions)
-        self.mock_tlog.settle_trade.assert_called_once()
-        call_args = self.mock_tlog.settle_trade.call_args
-        self.assertEqual(call_args[0][0], "t-unread")
-        self.assertEqual(call_args[0][1], "void_unreadable")
-        self.assertFalse(call_args[0][2])
+        self.assertEqual(realized, [])
+        self.mock_tlog.settle_trade.assert_not_called()
+        self.assertIn("t-unread", self.pm.positions)   # parked, visible
+        self.assertEqual(self.pm.positions["t-unread"]["state"],
+                         "settlement_unknown")
+        self.assertEqual(self.pm.unresolved_settlement_count(), 1)
 
     # ── 5. test_skips_open_market ───────────────────────────────────────
 
