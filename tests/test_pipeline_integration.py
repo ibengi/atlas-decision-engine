@@ -153,6 +153,13 @@ def make_engine(client):
     bot.CFG.MAX_PORTFOLIO_RISK_PCT = 10.0
     bot.CFG.MAX_CORRELATION_GROUP_PCT = 10.0
     bot.CFG.PORTFOLIO_DRAWDOWN_THROTTLE_PCT = 10.0
+    # AIR-001 W8 (DE-P0-002): live submission now requires a
+    # content-bound certification manifest. TEST FIXTURE ONLY — binds
+    # this rig's measured state so the order-flow mechanism can run; no
+    # production GO exists (the standing ATR-001 verdict is NO_GO) and
+    # the refusal paths are pinned in tests/test_live_certification.py.
+    from live_certification import write_manifest
+    write_manifest(atr_verdict="GO", operator="test-fixture")
     eng = bot.ExecutionEngine(client, capital=500.0)
     eng.router = build_default_registry(btc_context_provider=fake_ctx)
     cfg = ScannerConfig()

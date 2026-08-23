@@ -781,6 +781,20 @@ class ExecutionEngine:
                 report["rejections"].get("shadow_mode", 0) + 1
             return 0
 
+        # AIR-001 Wave 8 (DE-P0-002): la porte LIVE la plus externe. La
+        # soumission reelle exige un manifeste de certification lie au
+        # CONTENU (commit, hashes de config, identites modele/calib,
+        # lock des dependances, rapport de tests) recalcule par CE
+        # processus; toute derive ou absence refuse l'ordre.
+        from live_certification import live_certification_check
+        cert_ok, cert_reason = live_certification_check()
+        if not cert_ok:
+            log_trd.error(f"[LIVE_CERTIFICATION] {ticker}: ordre refuse "
+                          f"— {cert_reason}")
+            report["rejections"]["live_certification"] = \
+                report["rejections"].get("live_certification", 0) + 1
+            return 0
+
         # AIR-001 Wave 5 (DE-P0-006): un strike PROXY (spot courant au
         # lieu du prix de reference authentique) n'est JAMAIS eligible
         # au chemin LIVE — recherche/shadow uniquement. Ce point est

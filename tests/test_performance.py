@@ -483,6 +483,16 @@ def _make_engine(client, parallel):
     bot.CFG.SHADOW_MODE = False
     bot.CFG.KILL_SWITCH = False
     bot.CFG.ORDER_TTL_SECONDS = 0
+    # AIR-001 W6/W8: live submission requires operator-enabled aggregate
+    # limits and a content-bound certification manifest. TEST FIXTURE —
+    # refusal paths pinned in tests/test_risk_proof.py and
+    # tests/test_live_certification.py; no production GO exists
+    # (ATR-001 = NO_GO).
+    bot.CFG.MAX_PORTFOLIO_RISK_PCT = 10.0
+    bot.CFG.MAX_CORRELATION_GROUP_PCT = 10.0
+    bot.CFG.PORTFOLIO_DRAWDOWN_THROTTLE_PCT = 10.0
+    from live_certification import write_manifest
+    write_manifest(atr_verdict="GO", operator="test-fixture")
     old = getattr(bot.CFG, "API_PARALLEL_ENABLED", False)
     bot.CFG.API_PARALLEL_ENABLED = bool(parallel)
     try:
