@@ -79,9 +79,12 @@ class PositionSizer:
             pct *= 0.5
         budget_left = capital * CFG.RISK_BUDGET_PCT / 100.0 - open_risk
         alloc = min(capital * pct / 100.0, max(0.0, budget_left))
-        # A floor applies only to a genuine positive-edge wager and never
-        # overrides either the portfolio/risk budget or affordability.
+        # AIR-001 Wave 6 (DE-P0-008): a minimum bet must never RAISE an
+        # allocation above what the percentage caps computed (the old
+        # code lifted a capped allocation up to KELLY_MIN_BET, silently
+        # overriding MAX_POS_PCT/KELLY_MAX_POS_PCT). Below the minimum
+        # tradable size: NO TRADE.
         minimum = max(0.0, float(getattr(CFG, "KELLY_MIN_BET", 1.0)))
         if alloc < minimum:
-            alloc = minimum if budget_left >= minimum else 0.0
+            return 0
         return max(0, int(alloc / (price_cents / 100.0)))

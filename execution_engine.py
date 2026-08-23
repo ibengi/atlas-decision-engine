@@ -794,6 +794,36 @@ class ExecutionEngine:
                     "strike_proxy_not_live_eligible", 0) + 1
             return 0
 
+        # AIR-001 Wave 6 (DE-P0-008): preuve de risque unifiee et
+        # PROJETEE pour le chemin LIVE. Chaque controle est evalue et
+        # enregistre; un agregat laisse a son defaut desactive
+        # (DISABLED_BY_DEFAULT) ou un etat financier inconnu
+        # (UNKNOWN_FAIL_CLOSED) refuse l'ordre. Le hash de la preuve est
+        # lie a l'intent d'ordre (write-ahead, Wave 4).
+        from risk_proof import build_risk_proof, persist_proof
+        proof = build_risk_proof(
+            ticker=ticker, category=cat, side=dec.side, count=count,
+            entry_cents=entry, risk=self.risk, posmgr=self.posmgr,
+            capital=self.capital,
+            balance_known=getattr(self, "last_balance", None) is not None,
+            orders_blocked_reconciling=getattr(
+                self.orders, "blocked_reconciling", False))
+        self._last_risk_proof = proof
+        try:
+            persist_proof(proof)
+        except OSError as e:
+            log_rsk.error(f"[RISK_PROOF] persistence failed: {e} — "
+                          "ordre refuse (preuve non durable)")
+            report["rejections"]["risk_proof_rejected"] = \
+                report["rejections"].get("risk_proof_rejected", 0) + 1
+            return 0
+        if not proof.approved:
+            log_rsk.error(f"[RISK_PROOF_REJECTED] {ticker}: "
+                          f"{', '.join(proof.failing)}")
+            report["rejections"]["risk_proof_rejected"] = \
+                report["rejections"].get("risk_proof_rejected", 0) + 1
+            return 0
+
         # Circuit breaker demi-ouvert : la reservation se fait au dernier
         # moment, apres toutes les autres portes, juste avant la soumission.
         # Ainsi un cycle sans candidat ne consomme jamais l'unique essai.
@@ -815,7 +845,8 @@ class ExecutionEngine:
                 ticker, dec.side, count, entry,
                 decision_id=getattr(dec, "decision_id", None),
                 execution_intent_hash=(_intent.content_hash()
-                                       if _intent is not None else None))
+                                       if _intent is not None else None),
+                risk_proof_hash=proof.content_hash())
         from decision_tracer import current_tracer
         tracer = current_tracer()
         if tracer:

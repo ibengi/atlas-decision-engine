@@ -145,6 +145,14 @@ def make_engine(client):
     bot.CFG.SHADOW_MODE = False
     bot.CFG.KILL_SWITCH = False
     bot.CFG.ORDER_TTL_SECONDS = 0          # pas d'attente en test
+    # AIR-001 W6 (DE-P0-008): the LIVE path now REFUSES orders while the
+    # aggregate risk limits sit at their disabled defaults
+    # (DISABLED_BY_DEFAULT in the RiskProof). This rig models an
+    # operator who explicitly enabled them — the disabled-default
+    # refusal itself is pinned in tests/test_risk_proof.py.
+    bot.CFG.MAX_PORTFOLIO_RISK_PCT = 10.0
+    bot.CFG.MAX_CORRELATION_GROUP_PCT = 10.0
+    bot.CFG.PORTFOLIO_DRAWDOWN_THROTTLE_PCT = 10.0
     eng = bot.ExecutionEngine(client, capital=500.0)
     eng.router = build_default_registry(btc_context_provider=fake_ctx)
     cfg = ScannerConfig()

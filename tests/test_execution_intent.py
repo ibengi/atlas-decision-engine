@@ -42,6 +42,10 @@ def accepted_decision(gates):
 def engine_and_decision(order_scenario="fill"):
     client = FakeClient(btcd_market(), order_scenario=order_scenario)
     eng, tmp = make_engine(client)
+    # AIR-001 W6: _execute_decision is entered directly here (no cycle,
+    # so _balance_gate never ran). The RiskProof requires a fetched
+    # balance (balance_known) — provide the one the rig's capital uses.
+    eng.last_balance = 500.0
     return client, eng, accepted_decision(eng.gates)
 
 
