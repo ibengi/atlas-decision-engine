@@ -323,7 +323,11 @@ class _BtcAboveStrikeBase(Strategy):
             if not spot or spot <= 0:
                 return ModelOutput(False,
                                    "no_model_probability:spot_indisponible")
-            strike, strike_source = spot, "spot_proxy"
+            # AIR-001 Wave 5 (DE-P0-006): the current spot is a PROXY —
+            # the authentic KXBTC15M strike is the reference price at
+            # window OPEN, which the current spot has already drifted
+            # from. Research/shadow only: LIVE_ELIGIBLE=false below.
+            strike, strike_source = spot, "PROXY_CURRENT_SPOT"
         if strike is None:
             return ModelOutput(False, "no_model_probability:strike_absent")
         if ctx is None:
@@ -335,7 +339,7 @@ class _BtcAboveStrikeBase(Strategy):
         if conf <= 0:
             return ModelOutput(False, "insufficient_data_quality:"
                                f"score={ctx.data_quality_score}")
-        if strike_source == "spot_proxy":
+        if strike_source == "PROXY_CURRENT_SPOT":
             # strike estime (spot au lieu du prix de reference exact) :
             # confiance plafonnee, le flag strike_source l'expose.
             conf = min(conf, self.EXTENDED_HORIZON_CONFIDENCE)
@@ -348,6 +352,10 @@ class _BtcAboveStrikeBase(Strategy):
                     "data_quality": ctx.data_quality_score}
         if strike_source != "field":
             features["strike_source"] = strike_source
+        if strike_source == "PROXY_CURRENT_SPOT":
+            # DE-P0-006: a proxy strike may inform research/shadow but
+            # can NEVER qualify a decision for live capital.
+            features["live_eligible"] = False
         if extended:
             # MEME formule, vol ancree : les horizons multi-jours ne doivent
             # pas extrapoler une vol 1m calmee sur plusieurs jours.

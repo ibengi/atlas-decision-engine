@@ -124,7 +124,12 @@ class TestModelStrikeProxy(unittest.TestCase):
         m = {"ticker": "KXBTC15M-26JUL311245-45"}
         out = self.s.evaluate(m, {}, 12.0)
         self.assertTrue(out.valid, out.reason)
-        self.assertEqual(out.features["strike_source"], "spot_proxy")
+        # AIR-001 W5 (stale label): 'spot_proxy' renamed to the audit's
+        # canonical STRIKE_SOURCE=PROXY_CURRENT_SPOT; same mechanism,
+        # now additionally marked live_eligible=False (DE-P0-006).
+        self.assertEqual(out.features["strike_source"],
+                         "PROXY_CURRENT_SPOT")
+        self.assertIs(out.features["live_eligible"], False)
         self.assertEqual(out.features["strike"], 65200.0)
         self.assertLessEqual(out.confidence, 6)
         self.assertAlmostEqual(

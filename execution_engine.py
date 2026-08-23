@@ -85,6 +85,20 @@ def assert_real_demo_integrity(client, shadow_mode: bool):
         raise SystemExit(3)
 
 
+def live_eligibility_gate(dec):
+    """AIR-001 Wave 5 (DE-P0-006): (ok, reason). A decision whose model
+    features declare live_eligible=False (e.g. strike_source=
+    PROXY_CURRENT_SPOT — the strike was estimated from the CURRENT spot
+    instead of the market's authentic reference price) must never reach
+    the live order path. Shadow/research observation is unaffected."""
+    feats = (getattr(dec, "model_output", None) or {}).get("features",
+                                                           {}) or {}
+    if feats.get("live_eligible", True) is False:
+        return False, ("strike_proxy_not_live_eligible:"
+                       f"{feats.get('strike_source', 'UNKNOWN')}")
+    return True, ""
+
+
 def log_execution_banner(client):
     """Exigence 2 : etat d'execution explicite au demarrage. Les fonds sont
     des fonds DEMO — jamais annonce comme argent reel."""
@@ -765,6 +779,19 @@ class ExecutionEngine:
             log_trd.info("[SHADOW] ordre NON envoye (mode shadow).")
             report["rejections"]["shadow_mode"] = \
                 report["rejections"].get("shadow_mode", 0) + 1
+            return 0
+
+        # AIR-001 Wave 5 (DE-P0-006): un strike PROXY (spot courant au
+        # lieu du prix de reference authentique) n'est JAMAIS eligible
+        # au chemin LIVE — recherche/shadow uniquement. Ce point est
+        # APRES le retour SHADOW: l'observation continue, l'ordre non.
+        live_ok, live_reason = live_eligibility_gate(dec)
+        if not live_ok:
+            log_trd.error(f"[LIVE_INELIGIBLE] {ticker}: {live_reason} "
+                          "— ordre refuse")
+            report["rejections"]["strike_proxy_not_live_eligible"] = \
+                report["rejections"].get(
+                    "strike_proxy_not_live_eligible", 0) + 1
             return 0
 
         # Circuit breaker demi-ouvert : la reservation se fait au dernier
