@@ -38,7 +38,12 @@ class TestReconciliationRetries(unittest.TestCase):
 
         self.assertEqual(get_positions.call_count, 3)
         self.assertEqual(sleep.call_count, 2)
-        self.assertEqual(report, {"rebuilt": [], "ghost": [], "matched": []})
+        # AIR-001 W3 (justified correction): the report gained additive
+        # observability keys (classification/unknown_schema/blocked);
+        # the original assertion — an empty reconciliation — is intact.
+        self.assertEqual((report["rebuilt"], report["ghost"],
+                          report["matched"]), ([], [], []))
+        self.assertFalse(report["trading_blocked"])
         self.assertTrue(any("failed after 3 attempts" in message for message in logs.output))
         self.assertEqual(self.pm.positions, {})
 
@@ -50,7 +55,12 @@ class TestReconciliationRetries(unittest.TestCase):
 
         get_positions.assert_called_once_with()
         sleep.assert_not_called()
-        self.assertEqual(report, {"rebuilt": [], "ghost": [], "matched": []})
+        # AIR-001 W3 (justified correction): the report gained additive
+        # observability keys (classification/unknown_schema/blocked);
+        # the original assertion — an empty reconciliation — is intact.
+        self.assertEqual((report["rebuilt"], report["ghost"],
+                          report["matched"]), ([], [], []))
+        self.assertFalse(report["trading_blocked"])
 
 
 class TestGhostCleanup(unittest.TestCase):

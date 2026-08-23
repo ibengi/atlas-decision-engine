@@ -27,6 +27,10 @@ class PositionManager:
         self.positions = self._migrate(raw)          # trade_id -> pos
         self.seen_fill_ids = set(
             JsonStore.load(_p("seen_fill_ids.json"), []))
+        # AIR-001 W3: set on any reconcile pass that meets broker rows the
+        # typed contract cannot interpret — consumed by the risk validator
+        # as a fail-closed trading block (EXCHANGE_SCHEMA_INCOMPATIBLE).
+        self.exchange_schema_incompatible = False
 
     @staticmethod
     def _migrate(raw: dict) -> dict:
@@ -239,7 +243,15 @@ class PositionManager:
         """Broker = source de verite. Reconstruit les positions presentes
         chez Kalshi mais absentes localement (id stable => idempotent),
         marque 'ghost' les positions locales absentes du broker."""
-        report = {"rebuilt": [], "ghost": [], "matched": []}
+        # Every exit path (including broker-unreachable) carries the full
+        # observability shape. NOTE (residual risk, AIR-001 Wave 3):
+        # broker-unreachable currently reports trading_blocked=False for
+        # backward compatibility; the fail-closed broker-freshness block
+        # belongs to the Wave 6 RiskProof validator.
+        report = {"rebuilt": [], "ghost": [], "matched": [],
+                  "contradicted": [], "classification": {},
+                  "unknown_schema": 0, "trading_blocked": False,
+                  "blocked_reason": None}
         MAX_RETRIES = 3
         RETRY_BACKOFF_SECONDS = 2.0
         broker = None
@@ -259,43 +271,84 @@ class PositionManager:
                 f"get_positions() failed after {MAX_RETRIES} attempts — reconciliation skipped"
             )
             return report
+        # AIR-001 Wave 3 (DE-P0-004): broker rows go through the ONE typed
+        # Kalshi contract boundary. Reproduced defect: a current
+        # fixed-point row ({"position_fp": "3", ...}) parsed to qty 0 via
+        # the tolerant fallbacks, was silently skipped, and the matching
+        # LOCAL position was ghosted AND DELETED — broker exposure made
+        # invisible (open_risk 0). Now: no-guess parsing; UNKNOWN_SCHEMA
+        # rows BLOCK trading (EXCHANGE_SCHEMA_INCOMPATIBLE) and disable
+        # every ghost/delete authority for the pass; no invented cost
+        # basis (the old code defaulted to 50c and misread dollar
+        # exposure as a cent price).
+        from decimal import Decimal
+        from exchange.kalshi_contracts import classify_positions
+        classification = classify_positions(
+            broker, list(self.positions.values()))
+        report["classification"] = classification["counts"]
+        report["unknown_schema"] = classification["unknown_schema"]
+        report["trading_blocked"] = classification["trading_blocked"]
+        report["blocked_reason"] = classification["blocked_reason"]
+        self.exchange_schema_incompatible = \
+            classification["trading_blocked"]
+        if classification["trading_blocked"]:
+            log_pos.error(classification["blocked_reason"])
+
         seen_tickers = set()
-        for bp in broker:
-            tk = bp.get("ticker")
-            if not tk:
-                continue
-            qty = pick_int(bp, "position", "quantity", "count", default=0)
-            if qty == 0:
-                continue
-            side = "yes" if qty > 0 else "no"
-            seen_tickers.add(tk)
-            local = [p for p in self._active_positions() if p["ticker"] == tk]
-            if local:
+        for entry in classification["entries"]:
+            kind = entry["classification"]
+            if kind == "UNKNOWN_SCHEMA":
+                continue                 # blocked above; nothing touched
+            tk, side = entry.get("ticker"), entry.get("side")
+            if kind in ("MATCHED", "CONTRADICTED", "BROKER_ONLY"):
+                seen_tickers.add(tk)
+            if kind == "MATCHED":
                 report["matched"].append(tk)
                 continue
-            tid = f"brk-{tk}-{side}"                 # ID STABLE = idempotent
-            if tid in self.positions:
+            if kind == "CONTRADICTED":
+                # Broker is authoritative on QUANTITY, but silently
+                # overwriting the local count would hide the disagreement:
+                # record it loudly; resolution belongs to the startup
+                # reconciliation drill, never to a quiet mutation.
+                report.setdefault("contradicted", []).append(entry)
+                log_pos.error(f"[RECON_CONTRADICTED] {tk} {side}: "
+                              f"broker={entry['broker_count']} "
+                              f"local={entry['local_count']}")
                 continue
-            avg = pick_int(bp, "avg_price", "market_exposure", default=50) or 50
-            self.positions[tid] = {
-                "trade_id": tid, "ticker": tk, "side": side,
-                "count_initial": abs(qty), "count": abs(qty),
-                "avg_price": avg, "fees": 0.0, "opened_at": now_iso(),
-                "order_ids": [], "fill_ids": [], "state": "open",
-                "strategy": "reconciled", "market_score": None,
-                "entry_edge": None, "entry_ev": None,
-            }
-            report["rebuilt"].append(tk)
-        for tid, p in list(self.positions.items()):
-            if p["ticker"] not in seen_tickers and not tid.startswith("mig-"):
-                p["state"] = "ghost_local_only"
-                report["ghost"].append(p["ticker"])
-        # Clean up ghost positions that the broker doesn't know about
+            if kind == "BROKER_ONLY":
+                tid = f"brk-{tk}-{side}"         # ID STABLE = idempotent
+                if tid in self.positions:
+                    continue
+                count = int(Decimal(entry["count"]))
+                exposure = Decimal(entry["exposure_dollars"])
+                # Cost basis from the broker's own exposure figure when
+                # present; else the labeled conservative 99c bound —
+                # exposure is never understated, never invented at 50c.
+                avg = int(min(Decimal(99), max(Decimal(1), (
+                    exposure * 100 / count).to_integral_value())))
+                self.positions[tid] = {
+                    "trade_id": tid, "ticker": tk, "side": side,
+                    "count_initial": count, "count": count,
+                    "avg_price": avg, "fees": 0.0, "opened_at": now_iso(),
+                    "order_ids": [], "fill_ids": [], "state": "open",
+                    "strategy": "reconciled", "market_score": None,
+                    "entry_edge": None, "entry_ev": None,
+                    "cost_basis_source": entry["exposure_basis"],
+                }
+                report["rebuilt"].append(tk)
+
         ghost_removed = []
-        for tid in list(self.positions.keys()):
-            if self.positions[tid].get("state") == "ghost_local_only":
-                self.positions.pop(tid, None)
-                ghost_removed.append(tid)
+        if not classification["trading_blocked"]:
+            for tid, p in list(self.positions.items()):
+                if p["ticker"] not in seen_tickers \
+                        and not tid.startswith("mig-"):
+                    p["state"] = "ghost_local_only"
+                    report["ghost"].append(p["ticker"])
+            # Clean up ghost positions that the broker doesn't know about
+            for tid in list(self.positions.keys()):
+                if self.positions[tid].get("state") == "ghost_local_only":
+                    self.positions.pop(tid, None)
+                    ghost_removed.append(tid)
         if ghost_removed:
             self.flush()
             log_pos.info(f"Ghost cleanup: removed {len(ghost_removed)} stale position(s): {ghost_removed}")
