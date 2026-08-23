@@ -229,13 +229,20 @@ class TestProbabilityEngineAudit(unittest.TestCase):
             def __enter__(sf):
                 sf.buf = io.StringIO()
                 sf.h = logging.StreamHandler(sf.buf)
+                # AIR-001 W1: pin captured logger levels
+                sf.levels = {}
                 for n in ("PIPELINE", "BOT"):
-                    logging.getLogger(n).addHandler(sf.h)
+                    logger = logging.getLogger(n)
+                    sf.levels[n] = logger.level
+                    logger.setLevel(logging.DEBUG)
+                    logger.addHandler(sf.h)
                 return sf
 
             def __exit__(sf, *a):
                 for n in ("PIPELINE", "BOT"):
-                    logging.getLogger(n).removeHandler(sf.h)
+                    logger = logging.getLogger(n)
+                    logger.removeHandler(sf.h)
+                    logger.setLevel(sf.levels[n])
 
             @property
             def text(sf):

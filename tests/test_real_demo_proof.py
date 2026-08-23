@@ -23,22 +23,34 @@ import kalshi_alpha_bot as bot
 from test_pipeline_integration import FakeClient, make_engine, BTCD
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPT = os.path.join(ROOT, "scripts", "kalshi_demo_execution_check.py")
+# AIR-001 W1 (stale test): the script has always lived at the repo root.
+SCRIPT = os.path.join(ROOT, "kalshi_demo_execution_check.py")
 
 
 class _Cap:
-    """Capture les logs des canaux API/POSITION/BOT."""
+    """Capture les logs des canaux API/POSITION/BOT.
+
+    AIR-001 W1: the capture sets (and restores) the captured loggers'
+    levels — without this the assertions silently depend on which test
+    runner configured the root logger first (unittest passed, pytest
+    dropped INFO records before any handler)."""
     def __enter__(self):
         self.buf = io.StringIO()
         self.h = logging.StreamHandler(self.buf)
         self.h.setLevel(logging.DEBUG)
+        self._levels = {}
         for name in ("API", "POSITION", "BOT"):
-            logging.getLogger(name).addHandler(self.h)
+            logger = logging.getLogger(name)
+            self._levels[name] = logger.level
+            logger.setLevel(logging.DEBUG)
+            logger.addHandler(self.h)
         return self
 
     def __exit__(self, *a):
         for name in ("API", "POSITION", "BOT"):
-            logging.getLogger(name).removeHandler(self.h)
+            logger = logging.getLogger(name)
+            logger.removeHandler(self.h)
+            logger.setLevel(self._levels[name])
 
     @property
     def text(self):
@@ -115,7 +127,10 @@ class TestProofProtocolLogs(unittest.TestCase):
         t = cap.text
         self.assertEqual(placed, 0)
         self.assertIn("[ORDER_SUBMIT_RESPONSE]", t)      # accepte...
-        self.assertIn("[ORDER_CANCELED_UNFILLED]", t)    # ...mais pas rempli
+        # AIR-001 W1 (stale marker): the monolith's ORDER_CANCELED_UNFILLED
+        # became ORDER_CANCEL_CONFIRMED in the OrderManager extraction; the
+        # asserted behavior (cancel proven, zero fills, no trade) unchanged.
+        self.assertIn("[ORDER_CANCEL_CONFIRMED]", t)     # ...mais pas rempli
         self.assertNotIn("[ORDER_FILLED]", t)
         self.assertNotIn("[POSITION_OPENED]", t)
         self.assertIn("accepted != filled", t.replace("\n", " ")

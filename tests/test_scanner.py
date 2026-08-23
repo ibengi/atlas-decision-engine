@@ -231,14 +231,19 @@ class TestLiquidityRejectLogging(unittest.TestCase):
         cli = FakeClient(by_series={"KXBTCD": markets})
         buf = io.StringIO()
         h = logging.StreamHandler(buf)
-        logging.getLogger("SCANNER").addHandler(h)
+        # AIR-001 W1: pin the captured logger level (runner-independent)
+        _scanner_logger = logging.getLogger("SCANNER")
+        _prior_level = _scanner_logger.level
+        _scanner_logger.setLevel(logging.DEBUG)
+        _scanner_logger.addHandler(h)
         try:
             with tempfile.TemporaryDirectory() as d:
                 sc = MarketScanner(cli, router=FakeRouter(), cfg=_cfg(),
                                    data_dir=d)
                 res = sc.scan_cycle()
         finally:
-            logging.getLogger("SCANNER").removeHandler(h)
+            _scanner_logger.removeHandler(h)
+            _scanner_logger.setLevel(_prior_level)
         t = buf.getvalue()
         # format exact demande
         self.assertIn("rejected_reason=no_liquidity", t)

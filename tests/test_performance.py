@@ -466,7 +466,7 @@ class _EngClient:
         self.cancelled.append(oid)
         return dict(self._orders.get(oid, {}))
 
-    def get_fills(self, order_id):
+    def get_fills(self, order_id, *, strict=False):
         o = self._orders.get(order_id) or {}
         n = int(o.get("taker_fill_count") or 0)
         if n <= 0:

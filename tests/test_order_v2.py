@@ -91,15 +91,22 @@ class TestCreateOrderV2Payload(unittest.TestCase):
 
 class TestNoV1OrderEndpointLeft(unittest.TestCase):
     def test_no_post_to_legacy_portfolio_orders(self):
-        src = inspect.getsource(bot)
+        # AIR-001 W1 (stale test): the HTTP layer and the V1-obsolete
+        # migration marker moved to kalshi_client.py in 91e82fd; the
+        # assertions must bind to the module that issues HTTP.
+        import kalshi_client as _kc
+        src = inspect.getsource(bot) + inspect.getsource(_kc)
         self.assertNotIn('"POST", "/portfolio/orders"', src)
         # GET/DELETE /portfolio/orders/{id} restent V2-compatibles ; tout
         # 410 'deprecated' futur leve un message de migration explicite
         self.assertIn("ENDPOINT V1 OBSOLETE", src)
 
     def test_demo_script_uses_client_hence_v2(self):
+        # AIR-001 W1 (stale test): the demo integration script has
+        # lived at the repo ROOT for its entire history (git log --all
+        # -- scripts is empty).
         p = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), "scripts",
+            os.path.abspath(__file__))),
             "kalshi_demo_execution_check.py")
         src = open(p, encoding="utf-8").read()
         self.assertIn("client.create_order", src)

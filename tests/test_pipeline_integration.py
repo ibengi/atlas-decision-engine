@@ -104,7 +104,7 @@ class FakeClient:
               "partial": ("canceled", max(0, count - 1)),
               "none": ("resting", 0)}[self.scenario]
         self._orders[oid] = {"order_id": oid, "status": st[0],
-                             "taker_fill_count": st[1],
+                             "taker_fill_count": st[1], "requested": count,
                              "side": side, "price": price_cents}
         return dict(self._orders[oid])
 
@@ -112,13 +112,23 @@ class FakeClient:
         return dict(self._orders.get(oid, {}))
 
     def cancel_order(self, oid):
+        # AIR-001 W1 (stale fixture): the real V2 cancel response carries
+        # reduced_by, which order_manager requires as cancellation PROOF
+        # (fail-closed by design). Mirror the real contract.
         self.cancelled.append(oid)
         o = self._orders.get(oid)
-        if o and o["status"] not in ("executed",):
+        if not o:
+            return {}
+        reduced = 0
+        if o["status"] not in ("executed",):
+            reduced = max(0, o.get("requested", o.get("count", 1))
+                          - int(o.get("taker_fill_count") or 0))
             o["status"] = "canceled"
-        return dict(o or {})
+        out = dict(o)
+        out["reduced_by"] = reduced
+        return out
 
-    def get_fills(self, order_id):
+    def get_fills(self, order_id, *, strict=False):
         o = self._orders.get(order_id) or {}
         n = int(o.get("taker_fill_count") or 0)
         if n <= 0:

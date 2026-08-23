@@ -43,7 +43,7 @@ class ProdLikeClient:
     def get_order(self, order_id):
         raise bot.KalshiAPIError(404, f"GET /portfolio/orders/{order_id}", "")
 
-    def get_fills(self, order_id):
+    def get_fills(self, order_id, *, strict=False):
         return [{"count": 1, "price": 74, "fees": "0.0135"}]
 
     def get_positions(self):
@@ -54,6 +54,12 @@ class ProdLikeClient:
 
 
 def make_om(tmp, client=None):
+    # AIR-001 W1 (stale test): the persisted submission guard
+    # (order_manager 2026-07-25 double-fill fix) is intentional product
+    # safety; each test now gets an ISOLATED data dir so guard state can
+    # never leak between runs — the guard behavior itself stays tested.
+    import tempfile as _tempfile
+    tmp = _tempfile.mkdtemp(prefix=os.path.basename(tmp) + "_")
     bot.CFG.DATA_DIR = tmp
     os.makedirs(tmp, exist_ok=True)
     om = bot.OrderManager(client or ProdLikeClient())
@@ -87,7 +93,7 @@ class TestVerifyFallbackOnV2Get404(unittest.TestCase):
         """La garde s'arme des le 201, meme si aucune verification
         n'aboutit : c'est le point qui manquait en prod."""
         class NoFills(ProdLikeClient):
-            def get_fills(self, order_id):
+            def get_fills(self, order_id, *, strict=False):
                 raise bot.KalshiAPIError(404, "GET /portfolio/fills", "")
         om = make_om("/tmp/t_v2fix_c", NoFills())
         om.place_and_track("KXBTCD-X", "yes", 1, 74)

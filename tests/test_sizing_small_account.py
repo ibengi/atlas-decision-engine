@@ -49,15 +49,21 @@ def _rm(settled=None, open_risk=0.0, capital=BAL):
     rm.tlog = _T(settled)
     rm.posmgr = _P(open_risk)
     rm.capital = capital
+    # AIR-001 W1 (stale fixture): __new__ bypasses __init__, which
+    # always sets the half-open breaker state — restore the invariant.
+    rm.state = {}
     return rm
 
 
 def _loss(n):
-    from datetime import date
-    today = date.today().isoformat()
+    # AIR-001 W1 (stale fixture): a fixed 10:00Z settled_at made the
+    # consecutive-loss halt time-of-day dependent (cooldown elapsed
+    # after 11:00 UTC enters the half-open branch). A current timestamp
+    # keeps the cooldown active — the asserted halt is deterministic.
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
     return {"net_pnl": -0.5 * n, "won": False, "gross_pnl": -0.5 * n,
-            "fees": 0.05, "settled_at": today + "T10:00:00+00:00",
-            "timestamp": today + "T09:00:00+00:00"}
+            "fees": 0.05, "settled_at": now, "timestamp": now}
 
 
 class TestEffectiveCapital(unittest.TestCase):
