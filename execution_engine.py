@@ -681,12 +681,26 @@ class ExecutionEngine:
                 report["rejections"].get("stale_book", 0) + 1
             return 0
         with timed("signal_check"):
-            ask = book.get("yes_ask") if dec.side == "yes" else book.get("no_ask")
-            if ask is None or not (1 <= int(ask) <= 99):
-                report["rejections"]["no_executable_ask"] = \
-                    report["rejections"].get("no_executable_ask", 0) + 1
+            # AIR-001 Wave 2 (DE-P0-003): the fresh book is ECONOMICALLY
+            # re-gated with the SAME shared gate the pipeline used — same
+            # model probability, current executable prices. An accepted
+            # decision whose economics no longer hold (adverse move, wide
+            # spread, MAX_ENTRY breach, edge/EV collapse, side reversal,
+            # stale book) places NO order, and the block is counted.
+            from execution_intent import validate_fresh_execution
+            import time as _time
+            intent, gate_reason = validate_fresh_execution(
+                dec, m, book, self.gates, fetched_at=_time.time())
+            if intent is None:
+                log_trd.info(
+                    f"[FRESH_GATE] {ticker}: ordre BLOQUE — {gate_reason}",
+                    extra={"ticker": ticker, "side": dec.side,
+                           "fresh_gate_reason": gate_reason})
+                report["rejections"]["fresh_economic_gate"] = \
+                    report["rejections"].get("fresh_economic_gate", 0) + 1
                 return 0
-            entry = int(ask)
+            entry = intent.fresh_requested_price
+            self._last_execution_intent = intent
 
         # 5b) budgets risque categorie / marche + taille (sur capital effectif)
         with timed("risk_check"):
