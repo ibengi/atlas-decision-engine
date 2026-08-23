@@ -783,8 +783,12 @@ class ExecutionEngine:
                      extra={"ticker": ticker, "side": dec.side, "size": count,
                             "price": entry, "edge": dec.net_edge})
         with timed("order_placement"):
-            exec_res = self.orders.place_and_track(ticker, dec.side, count,
-                                                   entry)
+            _intent = getattr(self, "_last_execution_intent", None)
+            exec_res = self.orders.place_and_track(
+                ticker, dec.side, count, entry,
+                decision_id=getattr(dec, "decision_id", None),
+                execution_intent_hash=(_intent.content_hash()
+                                       if _intent is not None else None))
         from decision_tracer import current_tracer
         tracer = current_tracer()
         if tracer:
@@ -794,7 +798,9 @@ class ExecutionEngine:
             # Ne pas consumer l'unique essai si aucune soumission n'a ete
             # acceptee, ou si l'annulation sans fill est explicitement confirmee.
             # Un order_id avec etat incertain reste verrouille par prudence.
-            if exec_res.order_id is None:
+            if exec_res.order_id is None and exec_res.state != "unknown":
+                # state == "unknown" (soumission ambigue) : un ordre peut
+                # exister chez le broker — l'essai reste verrouille.
                 self.risk.release_half_open_attempt(ticker,
                     f"soumission non acceptee: {exec_res.status}")
             elif exec_res.state == "cancelled" and exec_res.status not in ("unverified", "unknown"):

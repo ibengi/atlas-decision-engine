@@ -346,6 +346,16 @@ class KalshiClient:
                 raise
             return []
 
+    def get_orders(self, ticker: str = None) -> list:
+        """Liste les ordres du portefeuille (source de verite pour la
+        resolution des intents ambigus par client_order_id). Les erreurs
+        REMONTENT: l'appelant (recovery) doit rester fail-closed, jamais
+        conclure 'aucun ordre' sur un echec reseau."""
+        params = {"ticker": ticker} if ticker else {}
+        r = self._req("GET", "/portfolio/orders", params=params)
+        self._log_raw_once("orders", r)
+        return r.get("orders", []) or []
+
     def get_positions(self) -> list:
         """Positions cote broker (source de verite pour la reconciliation)."""
         try:

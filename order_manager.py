@@ -8,6 +8,9 @@ from config import CFG, _p
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
+from order_lifecycle import (DuplicateProcessError, OrderIntentJournal,
+                             acquire_order_submission_lock,
+                             resolve_unresolved_intents)
 from persistence import JsonStore
 from position_manager import PositionManager
 from trade_logger import TradeLogger, now_iso
@@ -61,6 +64,17 @@ class OrderManager:
         # Cooldown apres 503 exchange (demo en pause/maintenance) : inutile
         # et bruyant de marteler l'API a chaque cycle.
         self.exchange_pause_until = 0.0
+        # AIR-001 Wave 4 (DE-P0-005): write-ahead intent journal. Any
+        # in-flight intent from a previous run blocks NEW submissions
+        # (TRADING_BLOCKED_RECONCILING) until resolved against the
+        # broker in reconcile_startup — fail-closed.
+        self.intents = OrderIntentJournal()
+        self.blocked_reconciling = bool(self.intents.unresolved())
+        if self.blocked_reconciling:
+            log_api.error("[TRADING_BLOCKED_RECONCILING] unresolved "
+                          f"order intent(s): "
+                          f"{[s['intent_id'] for s in self.intents.unresolved()]} "
+                          "— order submission blocked until reconciled")
         log_api.info(f"[SUBMISSION_GUARD_LOADED] active_tickers={len(self.session_submitted)} "
                      f"ttl_seconds={CFG.SUBMIT_DEDUP_TTL_S:.0f}")
 
@@ -135,7 +149,9 @@ class OrderManager:
 
     # -- cycle de vie complet d'un ordre --------------------------------------
     def place_and_track(self, ticker: str, side: str, count: int,
-                        limit_cents: int) -> ExecutionResult:
+                        limit_cents: int, *, decision_id: str = None,
+                        execution_intent_hash: str = None,
+                        risk_proof_hash: str = None) -> ExecutionResult:
         # INVARIANT DUR : aucun create_order sans prix executable valide.
         # Derniere ligne de defense contre un carnet vide qui aurait
         # traverse scanner, ranker et validateur.
@@ -172,6 +188,21 @@ class OrderManager:
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:duplicate_submission_guard",
                                    "rejected")
+        # AIR-001 Wave 4 (DE-P0-005): fail-closed pre-submission gates.
+        if self.blocked_reconciling:
+            log_api.error("[ORDER_SUBMIT_ATTEMPT] bloque: "
+                          "TRADING_BLOCKED_RECONCILING (intents non "
+                          "resolus d'un run precedent)")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:unresolved_order_intents",
+                                   "rejected")
+        try:
+            acquire_order_submission_lock()
+        except DuplicateProcessError as e:
+            log_api.critical(f"[ORDER_SUBMIT_ATTEMPT] bloque: {e}")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:duplicate_process",
+                                   "rejected")
         client_order_id = self._client_order_id(ticker, side, count, limit_cents)
         env_name = "DEMO" if getattr(self.client, "env", "demo") == "demo" \
             else "PROD"
@@ -188,10 +219,45 @@ class OrderManager:
                      f"environment={env_name} "
                      f"endpoint="
                      f"{getattr(self.client, 'ORDERS_V2_PATH', '/portfolio/events/orders')}")
+        # Write-ahead intent, fsynced BEFORE the POST (DE-P0-005): a
+        # crash from here on can never leave a broker order without a
+        # durable local trace.
+        try:
+            from execution_intent import _identities
+            engine_commit = _identities()[0]
+        except Exception:                  # noqa: BLE001
+            engine_commit = "UNKNOWN"
+        intent_id = self.intents.prepare(
+            ticker=ticker, side=side, count=count,
+            limit_cents=limit_cents, client_order_id=client_order_id,
+            decision_id=decision_id,
+            validated_execution_intent_hash=execution_intent_hash,
+            risk_proof_hash=risk_proof_hash,
+            engine_commit=engine_commit)
         try:
             order = self.client.create_order(ticker, side, count, limit_cents,
                                              client_order_id=client_order_id)
         except KalshiAPIError as e:
+            if getattr(e, "status", None) == 0:
+                # Network failure: the POST may or may not have reached
+                # the exchange. AMBIGUOUS — never re-POST. The ticker
+                # guard is engaged and persisted, submission stays
+                # blocked until broker-side resolution at next startup.
+                self.intents.ambiguous(intent_id, str(e))
+                self.session_submitted[ticker] = time.time()
+                self._flush_submission_guard()
+                self.blocked_reconciling = True
+                log_api.error("[ORDER_SUBMIT_AMBIGUOUS] "
+                              f"ticker={ticker} intent_id={intent_id} "
+                              f"client_order_id={client_order_id} "
+                              f"error={e} — resultat INCONNU, aucune "
+                              "re-soumission; resolution par "
+                              "interrogation broker uniquement")
+                return ExecutionResult(None, count, 0, limit_cents,
+                                       "ambiguous:network_result_unknown",
+                                       "unknown")
+            self.intents.rejected(intent_id, getattr(e, "status", None),
+                                  str(e))
             log_api.error("[ORDER_SUBMIT_FAILED] "
                           f"http_status={e.status} error_code={e.status} "
                           f"error_message={e} "
@@ -210,6 +276,17 @@ class OrderManager:
         self._flush_submission_guard()
         http_status = getattr(self.client, "last_http_status", None)
         order_id = str(pick(order, "order_id", "id", default="") or "")
+        if order_id:
+            # Acknowledged: durable tracking starts NOW, before any
+            # verification can fail — an acknowledged order must never
+            # be untracked (the old code lost 'unverified' orders).
+            self.intents.acknowledged(intent_id, order_id, http_status)
+            self.open_orders[order_id] = {
+                "ticker": ticker, "side": side, "count": count,
+                "price": limit_cents, "placed_at": now_iso(),
+                "intent_id": intent_id,
+                "client_order_id": client_order_id}
+            self.flush()
         log_api.info("[ORDER_SUBMIT_RESPONSE] "
                      f"http_status={http_status} "
                      f"request_id={order.get('request_id', '-')} "
@@ -256,17 +333,23 @@ class OrderManager:
             else:
                 log_api.error("[ORDER_VERIFY_FAILED] "
                               "reason=order_not_found_after_submission")
+                # Acknowledged but unverifiable: the order STAYS in
+                # open_orders for startup reconciliation (it used to be
+                # silently dropped here — an untracked live order).
+                self.intents.closed(intent_id,
+                                    "unverified_tracked_for_recovery",
+                                    order_id=order_id)
                 return ExecutionResult(order_id, count, 0, limit_cents,
                                        "unverified", "rejected")
         if not order_id:
+            # A 2xx response without an order identifier is AMBIGUOUS:
+            # an order may exist broker-side under client_order_id.
+            self.intents.ambiguous(intent_id,
+                                   "2xx response without order_id")
+            self.blocked_reconciling = True
             log_api.error(f"Reponse d'ordre sans identifiant -- trade NON enregistre. "
                           f"Reponse: {json.dumps(order)[:300]}")
             return ExecutionResult(None, count, 0, limit_cents, "no_id", "rejected")
-
-        self.open_orders[order_id] = {"ticker": ticker, "side": side,
-                                      "count": count, "price": limit_cents,
-                                      "placed_at": now_iso()}
-        self.flush()
 
         start = time.time()
         deadline = start + CFG.ORDER_TTL_SECONDS
@@ -305,6 +388,8 @@ class OrderManager:
             if not CFG.CANCEL_UNFILLED_ORDERS:
                 log_api.info(f"[ORDER_STILL_RESTING] {order_id} "
                              f"(CANCEL_UNFILLED_ORDERS=false)")
+                self.intents.closed(intent_id, "resting_tracked",
+                                    order_id=order_id, filled=filled)
                 return ExecutionResult(order_id, count, filled, limit_cents,
                                        status or "resting", "resting")
 
@@ -348,6 +433,9 @@ class OrderManager:
                 log_api.error("[ORDER_CANCEL_FAILED] "
                               f"kalshi_order_id={order_id} error={e} "
                               "state=UNKNOWN trading_for_ticker_halted=true")
+                self.intents.closed(intent_id,
+                                    "unknown_cancel_failed_tracked",
+                                    order_id=order_id, filled=filled)
                 return ExecutionResult(order_id, count, filled, limit_cents,
                                        "unknown_cancel_failed", "unknown")
 
@@ -374,6 +462,8 @@ class OrderManager:
                          f"filled_contracts=0 average_fill_price=- fees=- "
                          f"(ordre accepte par l'API mais AUCUN fill — "
                          f"accepted != filled)")
+            self.intents.closed(intent_id, "cancelled_unfilled",
+                                order_id=order_id)
             return ExecutionResult(order_id, count, 0, limit_cents,
                                    status or "unfilled", "cancelled")
         try:
@@ -399,6 +489,8 @@ class OrderManager:
         state = "filled" if filled >= count else "partial"
         log_api.info(f"[ORDER_FILLED] kalshi_order_id={order_id} "
                      f"state={state} {filled}/{count} @ {avg}c")
+        self.intents.closed(intent_id, state, order_id=order_id,
+                            filled=filled, avg_price=avg)
         return ExecutionResult(order_id, count, filled, avg, status or "executed", state)
 
     def reconcile_startup(self, tlog: TradeLogger, posmgr: PositionManager):
@@ -409,6 +501,32 @@ class OrderManager:
         sources alternatives. Un ordre encore incertain reste persiste pour
         le prochain cycle au lieu d'etre oublie.
         """
+        # AIR-001 Wave 4 (DE-P0-005): resolve write-ahead intents FIRST.
+        # An intent found at the broker is adopted into open_orders so
+        # the normal recovery below cancels/records it. Submission stays
+        # blocked (fail-closed) until the journal is fully resolved.
+        if self.intents.unresolved():
+            recovery = resolve_unresolved_intents(self.intents,
+                                                  self.client)
+            for adopted in recovery["adopted"]:
+                oid = adopted.get("order_id")
+                if oid and oid not in self.open_orders \
+                        and adopted.get("ticker"):
+                    self.open_orders[oid] = {
+                        "ticker": adopted["ticker"],
+                        "side": adopted.get("side"),
+                        "count": adopted.get("count"),
+                        "price": adopted.get("limit_cents"),
+                        "placed_at": now_iso(),
+                        "intent_id": adopted.get("intent_id"),
+                        "recovered_from_intent": True}
+            if self.open_orders:
+                self.flush()
+        self.blocked_reconciling = bool(self.intents.unresolved())
+        if self.blocked_reconciling:
+            log_api.error("[TRADING_BLOCKED_RECONCILING] intents still "
+                          "unresolved after broker query — order "
+                          "submission remains blocked")
         if not self.open_orders:
             return
         log_api.warning(f"Recovery: {len(self.open_orders)} ordre(s) non conclu(s) "
