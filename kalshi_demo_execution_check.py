@@ -100,9 +100,12 @@ def main():
 
     # ── 3. soumission REELLE d'un ordre minimal (1 contrat, au ask) ───────
     coid = f"democheck_{uuid.uuid4().hex}"
+    # AUD-OBS-003: l'endpoint affiche etait /portfolio/orders (V1,
+    # deprecie) alors que create_order POSTe sur ORDERS_V2_PATH — un
+    # diagnostic 404 mene sur le mauvais chemin. Afficher le chemin REEL.
     print(f"[ORDER_SUBMIT_ATTEMPT] ticker={ticker} side=yes action=buy "
           f"count=1 price_cents={ask} client_order_id={coid} "
-          f"environment=DEMO endpoint=/portfolio/orders")
+          f"environment=DEMO endpoint={client.ORDERS_V2_PATH}")
     proof.update({"order_submission_attempted": True,
                   "client_order_id": coid})
     try:

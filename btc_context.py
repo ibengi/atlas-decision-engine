@@ -24,6 +24,12 @@ from typing import Optional, Callable
 
 log = logging.getLogger("BTCCTX")
 
+#: Module version, exported for the startup banner. AUD-OBS-001: the
+#: banner printed "btc_context=inconnue" because this attribute did not
+#: exist — the label read like a health state while it only meant "no
+#: VERSION exported". The module was present and working.
+VERSION = "v2.1-fallback-observability"
+
 # ── Parametres (env-surchargables cote appelant si besoin) ───────────────────
 HTTP_TIMEOUT_S      = 5.0
 MAX_RETRIES         = 1            # retry LIMITE par source
@@ -221,6 +227,24 @@ KLINES_STALE_MAX_S = 600.0         # au-dela : donnees refusees
 _last_good_klines = {"kl": None, "ts": 0.0, "provider": None}
 
 
+def _report_klines_state(state: str, used: str, failures: list,
+                         klines, now: float) -> None:
+    """AUD-OBS-002: ONE INFO line per klines resolution naming the
+    audit states (PRIMARY_OK / FALLBACK_OK / DEGRADED_PARTIAL /
+    DEGRADED_STALE_CACHE / ALL_PROVIDERS_FAILED), the provider that
+    actually feeds the model features, every failed provider with its
+    HTTP status, and a freshness proof (last-candle age). Before this,
+    successful fetches logged only at DEBUG: production logs showed the
+    Binance 451 but never which provider took over."""
+    last_age = (f"{now - klines[-1]['ts']:.0f}"
+                if klines else "n/a")
+    log.info(f"[DATA_PROVIDER_STATE] kind=klines state={state} "
+             f"used={used or 'none'} "
+             f"failed={','.join(failures) if failures else 'none'} "
+             f"last_candle_age_s={last_age} "
+             f"count={len(klines or [])}")
+
+
 def fetch_klines_with_fallback(limit: int = 30, providers=None, now=None):
     """Essaie chaque fournisseur dans l'ordre ; journalise chacun ;
     retourne (klines, source_info). source_info distingue :
@@ -235,6 +259,8 @@ def fetch_klines_with_fallback(limit: int = 30, providers=None, now=None):
             "KLINES_PROVIDER_ORDER", "binance,kraken,coinbase").split(",")]
         by_name = dict(DEFAULT_KLINES_PROVIDERS)
         providers = [(n, by_name[n]) for n in order if n in by_name]
+    primary_name = providers[0][0] if providers else None
+    failures: list[str] = []
     best_partial, best_name = None, None
     for name, fn in providers:
         try:
@@ -244,16 +270,21 @@ def fetch_klines_with_fallback(limit: int = 30, providers=None, now=None):
                              {"http_status": None, "elapsed_ms": None,
                               "error": f"{type(e).__name__}: {e}"[:160]},
                              False, "exception")
+            failures.append(f"{name}(exception)")
             continue
         kl, meta = res if isinstance(res, tuple) else (res, {})
         n = len(kl or [])
         if kl and n >= MIN_KLINES:
             _report_provider(name, "klines", meta, True, f"ok({n})")
             _last_good_klines.update(kl=kl, ts=now, provider=name)
+            _report_klines_state(
+                "PRIMARY_OK" if name == primary_name else "FALLBACK_OK",
+                name, failures, kl, now)
             return kl, f"fresh:{name}"
         _report_provider(name, "klines", meta, False,
                          f"insuffisant({n}/{MIN_KLINES})" if kl
                          else "aucune_donnee")
+        failures.append(f"{name}({meta.get('http_status') or 'no_data'})")
         if kl and (best_partial is None or n > len(best_partial)):
             best_partial, best_name = kl, name
     stale = _last_good_klines["kl"]
@@ -262,10 +293,17 @@ def fetch_klines_with_fallback(limit: int = 30, providers=None, now=None):
         log.warning(f"[DATA_PROVIDER] klines: TOUS les fournisseurs "
                     f"indisponibles -- secours cache "
                     f"({_last_good_klines['provider']}, age {age:.0f}s)")
+        _report_klines_state("DEGRADED_STALE_CACHE",
+                             _last_good_klines["provider"], failures,
+                             stale, now)
         return stale, (f"stale_cache:{_last_good_klines['provider']}"
                        f"({age:.0f}s)")
     if best_partial:
+        _report_klines_state("DEGRADED_PARTIAL", best_name, failures,
+                             best_partial, now)
         return best_partial, f"partial:{best_name}({len(best_partial)})"
+    _report_klines_state("ALL_PROVIDERS_FAILED", None, failures, None,
+                         now)
     return None, "none"
 
 
