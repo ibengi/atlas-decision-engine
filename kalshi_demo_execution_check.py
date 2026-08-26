@@ -13,7 +13,13 @@ Garde-fous :
   - refuse de demarrer si l'URL n'est pas demo-api.kalshi.co ;
   - refuse tout environnement de production ;
   - 1 contrat maximum, sur le marche liquide le moins cher trouve ;
-  - aucune cle ni signature n'est journalisee ni ecrite dans le rapport.
+  - aucune cle ni signature n'est journalisee ni ecrite dans le rapport ;
+  - AUD-PROBE-001 : attente BORNEE d'un marche conforme (intervalle
+    DEMO_PROBE_POLL_INTERVAL_SECONDS, plafond DEMO_PROBE_MAX_WAIT_SECONDS)
+    au lieu d'une sortie immediate ; timeout = NO_ELIGIBLE_MARKET (exit 0,
+    pas un echec) ; criteres ask<=30c / spread<=5c INCHANGES ; UN SEUL
+    ordre de test par execution ; reponse POST ambigue -> interrogation
+    broker par client_order_id UNIQUEMENT, jamais de re-POST.
 
 Usage (Railway one-off ou local) :
   ENABLE_DEMO_INTEGRATION_TEST=true python scripts/kalshi_demo_execution_check.py
@@ -33,10 +39,129 @@ from config import CFG
 
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
 MAX_ASK_CENTS = 30          # cout maximal accepte pour 1 contrat (fonds DEMO)
+MAX_SPREAD_CENTS = 5        # spread maximal accepte — INCHANGE (audit 26/08)
 FILL_TIMEOUT_S = float(os.getenv("ORDER_FILL_TIMEOUT_SECONDS", "45"))
 VERIFY_EVERY_S = max(2.0, min(5.0, float(
     os.getenv("ORDER_VERIFY_INTERVAL_SECONDS", "3"))))
 CANDIDATE_SERIES = ("KXBTCD", "KXBTC15M", "KXETHD")
+
+# AUD-PROBE-001 (2026-08-26) : attente BORNEE d'un marche naturellement
+# conforme, au lieu d'une sortie immediate + relances externes toutes les
+# quelques secondes. Les criteres (ask <= 30c, spread <= 5c) sont
+# STRICTEMENT inchanges ; seul le "quand re-regarder" change. Chaque
+# tentative coute len(CANDIDATE_SERIES) GET /markets ; l'intervalle est
+# borne pour ne jamais marteler l'API.
+POLL_INTERVAL_MIN_S = 15.0
+POLL_INTERVAL_MAX_S = 300.0
+MAX_WAIT_CAP_S = 24 * 3600.0
+
+
+def _env_f(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+def poll_bounds():
+    """(intervalle, attente_max) en secondes, bornes garanties.
+    DEMO_PROBE_POLL_INTERVAL_SECONDS (defaut 60, borne [15, 300]) ;
+    DEMO_PROBE_MAX_WAIT_SECONDS (defaut 21600 = 6 h, borne
+    [0, 86400] — 0 = un seul scan, comportement historique)."""
+    interval = max(POLL_INTERVAL_MIN_S,
+                   min(POLL_INTERVAL_MAX_S,
+                       _env_f("DEMO_PROBE_POLL_INTERVAL_SECONDS", 60.0)))
+    max_wait = max(0.0, min(MAX_WAIT_CAP_S,
+                            _env_f("DEMO_PROBE_MAX_WAIT_SECONDS", 21600.0)))
+    return interval, max_wait
+
+
+def market_is_eligible(m):
+    """Criteres EXACTS et inchanges : 1 <= yes_ask <= 30c, 1 <= yes_bid
+    <= 99, spread (ask-bid) <= 5c. Retourne (ask, bid) ou None."""
+    try:
+        ask, bid = int(m.get("yes_ask")), int(m.get("yes_bid"))
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= ask <= MAX_ASK_CENTS and 1 <= bid <= 99):
+        return None
+    if ask - bid > MAX_SPREAD_CENTS:
+        return None
+    return ask, bid
+
+
+def find_eligible_market(client, series_list=CANDIDATE_SERIES):
+    """Un passage de scan (logique historique inchangee) : premier series
+    avec candidat, ask le plus bas. Retourne (ticker, ask) ou None,
+    plus (marches_vus, meilleur_ask_vu) pour le log de polling."""
+    candidate, scanned, best_ask_seen = None, 0, None
+    for series in series_list:
+        for m in client.get_markets(series, status="open", limit=100):
+            scanned += 1
+            try:
+                a = int(m.get("yes_ask"))
+                if 1 <= a <= 99:
+                    best_ask_seen = a if best_ask_seen is None \
+                        else min(best_ask_seen, a)
+            except (TypeError, ValueError):
+                pass
+            elig = market_is_eligible(m)
+            if elig is None:
+                continue
+            ask, _bid = elig
+            if candidate is None or ask < candidate[1]:
+                candidate = (m["ticker"], ask)
+        if candidate:
+            break
+    return candidate, scanned, best_ask_seen
+
+
+def wait_for_eligible_market(client, interval_s, max_wait_s,
+                             sleep_fn=time.sleep,
+                             monotonic_fn=time.monotonic):
+    """Polling BORNE : scanne, journalise une ligne concise par tentative,
+    attend interval_s entre les tentatives, s'arrete a max_wait_s.
+    Retourne (ticker, ask) ou None (timeout = NO_ELIGIBLE_MARKET, pas un
+    echec). Une erreur API pendant un scan (get_markets -> []) ne casse
+    rien : on continue d'attendre en securite."""
+    t0 = monotonic_fn()
+    attempt = 0
+    while True:
+        attempt += 1
+        candidate, scanned, best_ask = find_eligible_market(client)
+        elapsed = monotonic_fn() - t0
+        if candidate:
+            print(f"[PROBE_ELIGIBLE] ticker={candidate[0]} "
+                  f"yes_ask={candidate[1]}c attempt={attempt} "
+                  f"elapsed_s={elapsed:.0f}")
+            return candidate
+        remaining = max_wait_s - elapsed
+        if remaining <= 0:
+            print(f"[NO_ELIGIBLE_MARKET] attempts={attempt} "
+                  f"elapsed_s={elapsed:.0f} max_wait_s={max_wait_s:.0f} "
+                  f"criteria=ask<={MAX_ASK_CENTS}c,"
+                  f"spread<={MAX_SPREAD_CENTS}c (INCHANGES)")
+            return None
+        wait = min(interval_s, remaining)
+        print(f"[PROBE_POLL] attempt={attempt} elapsed_s={elapsed:.0f} "
+              f"eligible=false markets_scanned={scanned} "
+              f"best_ask_seen={best_ask if best_ask is not None else 'n/a'} "
+              f"next_poll_in_s={wait:.0f}")
+        sleep_fn(wait)
+
+
+def resolve_ambiguous_submission(client, ticker, coid):
+    """Reponse POST AMBIGUE (erreur reseau, statut inconnu) : la SEULE
+    action autorisee est d'interroger le broker par client_order_id —
+    JAMAIS de re-POST (un doublon d'ordre est irrecuperable, un ordre
+    manque ne l'est pas). Retourne l'ordre broker (dict) ou None si le
+    broker confirme qu'aucun ordre ne porte ce coid ; propage
+    KalshiAPIError si la resolution elle-meme echoue (on ne conclut
+    JAMAIS 'aucun ordre' sur un echec reseau)."""
+    for o in client.get_orders(ticker):
+        if str(o.get("client_order_id") or "") == coid:
+            return o
+    return None
 
 
 def fatal(msg):
@@ -71,28 +196,22 @@ def main():
     if bal < 1.0:
         fatal("Solde DEMO insuffisant (< 1$).")
 
-    # ── 2. marche ouvert, liquide, bon marche ─────────────────────────────
-    candidate = None
-    for series in CANDIDATE_SERIES:
-        for m in client.get_markets(series, status="open", limit=100):
-            ask = m.get("yes_ask")
-            bid = m.get("yes_bid")
-            try:
-                ask, bid = int(ask), int(bid)
-            except (TypeError, ValueError):
-                continue
-            if not (1 <= ask <= MAX_ASK_CENTS and 1 <= bid <= 99):
-                continue
-            if ask - bid > 5:
-                continue
-            if candidate is None or ask < candidate[1]:
-                candidate = (m["ticker"], ask)
-        if candidate:
-            break
+    # ── 2. attente BORNEE d'un marche naturellement conforme ──────────────
+    # AUD-PROBE-001 : criteres INCHANGES ; seule l'attente est nouvelle.
+    interval_s, max_wait_s = poll_bounds()
+    print(f"[PROBE_CONFIG] poll_interval_s={interval_s:.0f} "
+          f"max_wait_s={max_wait_s:.0f} series={','.join(CANDIDATE_SERIES)} "
+          f"criteria=ask<={MAX_ASK_CENTS}c,spread<={MAX_SPREAD_CENTS}c")
+    candidate = wait_for_eligible_market(client, interval_s, max_wait_s)
     if not candidate:
-        fatal(f"Aucun marche ouvert avec ask ≤ {MAX_ASK_CENTS}c et spread "
-              f"≤ 5c dans {CANDIDATE_SERIES}. Relancer plus tard ou "
-              f"elargir CANDIDATE_SERIES.")
+        # Timeout SANS marche conforme : sortie PROPRE, pas un echec
+        # d'execution — les bornes n'ont pas ete elargies pour forcer
+        # un ordre. Relancer la sonde plus tard (heures liquides US).
+        proof.update({"outcome": "NO_ELIGIBLE_MARKET",
+                      "poll_interval_s": interval_s,
+                      "max_wait_s": max_wait_s})
+        _write(proof)
+        sys.exit(0)
     ticker, ask = candidate
     print(f"[CHECK] market={ticker} yes_ask={ask}c (cout max "
           f"{ask / 100:.2f}$ pour 1 contrat)")
@@ -112,12 +231,50 @@ def main():
         order = client.create_order(ticker, "yes", 1, ask,
                                     client_order_id=coid)
     except KalshiAPIError as e:
-        print(f"[ORDER_SUBMIT_FAILED] http_status={e.status} "
-              f"error_message={e} response_body_sanitized={str(e.body)[:300]}")
-        proof.update({"http_status": e.status, "order_verified_from_api":
-                      False, "error": str(e.body)[:300]})
-        _write(proof)
-        sys.exit(1)
+        if e.status == 0:
+            # AMBIGU (erreur reseau : le POST a PU atteindre le broker).
+            # SEULE action autorisee : interroger le broker par
+            # client_order_id. JAMAIS de re-POST. NB : les retries
+            # internes de _req reutilisent le MEME client_order_id
+            # (idempotence preservee cote broker).
+            print(f"[ORDER_SUBMIT_AMBIGUOUS] client_order_id={coid} "
+                  f"error={e} action=broker_query_only never_repost=true")
+            try:
+                resolved = resolve_ambiguous_submission(client, ticker, coid)
+            except KalshiAPIError as e2:
+                print(f"[ORDER_SUBMIT_AMBIGUOUS_UNRESOLVED] "
+                      f"client_order_id={coid} lookup_error={e2} — statut "
+                      f"INDETERMINE, aucun re-POST. Resolution operateur "
+                      f"requise (GET /portfolio/orders).")
+                proof.update({"outcome": "AMBIGUOUS_UNRESOLVED",
+                              "order_verified_from_api": False,
+                              "error": str(e)[:300]})
+                _write(proof)
+                sys.exit(3)
+            if resolved is None:
+                print(f"[ORDER_SUBMIT_AMBIGUOUS_RESOLVED] "
+                      f"client_order_id={coid} broker_has_order=false — "
+                      f"aucun ordre place (confirme par le broker), "
+                      f"aucun re-POST (une seule tentative par execution).")
+                proof.update({"outcome": "AMBIGUOUS_RESOLVED_NOT_PLACED",
+                              "order_verified_from_api": False,
+                              "error": str(e)[:300]})
+                _write(proof)
+                sys.exit(1)
+            print(f"[ORDER_SUBMIT_AMBIGUOUS_RESOLVED] "
+                  f"client_order_id={coid} broker_has_order=true "
+                  f"kalshi_order_id={resolved.get('order_id')} — reprise "
+                  f"du cycle de vie sur l'ordre retrouve, aucun re-POST.")
+            order = resolved
+        else:
+            print(f"[ORDER_SUBMIT_FAILED] http_status={e.status} "
+                  f"error_message={e} "
+                  f"response_body_sanitized={str(e.body)[:300]}")
+            proof.update({"http_status": e.status,
+                          "order_verified_from_api": False,
+                          "error": str(e.body)[:300]})
+            _write(proof)
+            sys.exit(1)
     http_status = getattr(client, "last_http_status", None)
     oid = str(pick(order, "order_id", "id", default="") or "")
     print(f"[ORDER_SUBMIT_RESPONSE] http_status={http_status} "
