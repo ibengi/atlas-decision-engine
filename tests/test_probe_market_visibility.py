@@ -261,6 +261,7 @@ class TestFunnelCounts(unittest.TestCase):
         self.assertEqual(s["reason"], "ask_too_high")
         # uniquement les champs de cotation/identite declares
         allowed = {"ticker", "event", "series", "status", "yes_bid",
+                   "exchange_index",
                    "yes_ask", "no_bid", "no_ask", "yes_ask_dollars",
                    "parsed_ask", "parsed_bid", "parsed_spread", "reason"}
         self.assertTrue(set(s) <= allowed, set(s) - allowed)

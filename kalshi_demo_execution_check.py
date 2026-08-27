@@ -169,6 +169,7 @@ def _sanitized_sample(m, series):
     reason, ask, bid = classify_market(m, series)
     return {"ticker": m.get("ticker"), "event": m.get("event_ticker"),
             "series": series, "status": m.get("status"),
+            "exchange_index": m.get("exchange_index"),
             "yes_bid": m.get("yes_bid"), "yes_ask": m.get("yes_ask"),
             "no_bid": m.get("no_bid"), "no_ask": m.get("no_ask"),
             "yes_ask_dollars": m.get("yes_ask_dollars"),
@@ -188,7 +189,8 @@ def find_eligible_market(client, series_list=CANDIDATE_SERIES):
               "status_unknown": 0, "open": 0, "ask_available": 0,
               "quote_available": 0, "spread_available": 0, "ask_pass": 0,
               "spread_pass": 0, "eligible": 0, "rejections": {},
-              "best_ask_seen": None, "sample": []}
+              "best_ask_seen": None, "sample": [],
+              "candidate_exchange_index": None}
     candidate = None
     for series in series_list:
         for m in client.get_markets(series, status="open", limit=100):
@@ -223,6 +225,10 @@ def find_eligible_market(client, series_list=CANDIDATE_SERIES):
             funnel["eligible"] += 1
             if candidate is None or ask < candidate[1]:
                 candidate = (m["ticker"], ask)
+                # AUD-DEMO-TRADING-IDENTITY-003 : instance d'echange du
+                # marche retenu (contrat sharding 2026-08 — le Create
+                # Order route vers l'instance du marche).
+                funnel["candidate_exchange_index"] = m.get("exchange_index")
         if candidate:
             break
     return candidate, funnel
@@ -266,9 +272,10 @@ def wait_for_eligible_market(client, interval_s, max_wait_s,
         print(_funnel_line(funnel))
         if candidate:
             print(f"[PROBE_ELIGIBLE] ticker={candidate[0]} "
-                  f"yes_ask={candidate[1]}c attempt={attempt} "
-                  f"elapsed_s={elapsed:.0f}")
-            return candidate
+                  f"yes_ask={candidate[1]}c "
+                  f"exchange_index={funnel.get('candidate_exchange_index')} "
+                  f"attempt={attempt} elapsed_s={elapsed:.0f}")
+            return candidate, funnel
         remaining = max_wait_s - elapsed
         best_ask = funnel["best_ask_seen"]
         if remaining <= 0:
@@ -276,13 +283,62 @@ def wait_for_eligible_market(client, interval_s, max_wait_s,
                   f"elapsed_s={elapsed:.0f} max_wait_s={max_wait_s:.0f} "
                   f"criteria=ask<={MAX_ASK_CENTS}c,"
                   f"spread<={MAX_SPREAD_CENTS}c (INCHANGES)")
-            return None
+            return None, funnel
         wait = min(interval_s, remaining)
         print(f"[PROBE_POLL] attempt={attempt} elapsed_s={elapsed:.0f} "
               f"eligible=false markets_scanned={funnel['markets_total']} "
               f"best_ask_seen={best_ask if best_ask is not None else 'n/a'} "
               f"next_poll_in_s={wait:.0f}")
         sleep_fn(wait)
+
+
+def shard_preflight(client, market_exchange_index):
+    """AUD-DEMO-TRADING-IDENTITY-003 — pre-vol LECTURE SEULE (sharding).
+    Contrat 2026-08 : les soldes sont LOCAUX a une instance d'echange et
+    le Create Order route vers l'instance du marche vise. Un compte
+    jamais provisionne sur cette instance ne peut pas y resoudre son
+    utilisateur (404 user_not_found observe). Retourne (state, funds) :
+      PROVISIONED                     fonds presents sur l'instance ;
+      NOT_PROVISIONED_ON_MARKET_SHARD 0 sur l'instance du marche ;
+      UNAVAILABLE                     diagnostic impossible (marche sans
+                                      exchange_index, endpoint absent,
+                                      erreur) -> comportement historique
+                                      INCHANGE, la sonde continue."""
+    if market_exchange_index is None:
+        return "UNAVAILABLE", None
+    try:
+        idx = int(market_exchange_index)
+    except (TypeError, ValueError):
+        return "UNAVAILABLE", None
+    try:
+        rows = client.get_subaccounts_balances()
+    except Exception as e:                    # noqa: BLE001 — diagnostic
+        print(f"[SHARD_DIAG] state=UNAVAILABLE "
+              f"reason={type(e).__name__}:{str(e)[:120]}")
+        return "UNAVAILABLE", None
+    funds = {}
+    for row in rows or []:
+        try:
+            i = int(row.get("exchange_index"))
+        except (TypeError, ValueError):
+            continue
+        raw = row.get("balance_dollars", row.get("balance", 0))
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            v = 0.0
+        if "balance_dollars" not in row:
+            v = v / 100.0                     # champ legacy en cents
+        funds[i] = funds.get(i, 0.0) + v
+    if not funds:
+        print("[SHARD_DIAG] state=UNAVAILABLE reason=aucune_entree")
+        return "UNAVAILABLE", None
+    state = ("PROVISIONED" if funds.get(idx, 0.0) > 0.0
+             else "NOT_PROVISIONED_ON_MARKET_SHARD")
+    print(f"[SHARD_DIAG] state={state} market_exchange_index={idx} "
+          f"funds_by_index="
+          + ",".join(f"{i}:{funds[i]:.2f}" for i in sorted(funds)))
+    return state, funds
 
 
 def resolve_ambiguous_submission(client, ticker, coid):
@@ -370,7 +426,8 @@ def main():
     if discovery_only:
         print("[PROBE_MODE] discovery_only=true — AUCUNE soumission "
               "d'ordre dans cette execution, quel que soit le resultat.")
-    candidate = wait_for_eligible_market(client, interval_s, max_wait_s)
+    candidate, funnel = wait_for_eligible_market(client, interval_s,
+                                                 max_wait_s)
     if not candidate:
         # Timeout SANS marche conforme : sortie PROPRE, pas un echec
         # d'execution — les bornes n'ont pas ete elargies pour forcer
@@ -388,6 +445,26 @@ def main():
               f"sans POST.")
         proof.update({"outcome": "DISCOVERY_ONLY_ELIGIBLE_SEEN",
                       "ticker": ticker, "discovery_only": True})
+        _write(proof)
+        sys.exit(0)
+
+    # ── 2bis. pre-vol sharding (LECTURE SEULE, AUD-DEMO-TRADING-003) ──────
+    mkt_idx = funnel.get("candidate_exchange_index")
+    shard_state, shard_funds = shard_preflight(client, mkt_idx)
+    if shard_state == "NOT_PROVISIONED_ON_MARKET_SHARD":
+        print(f"[SHARD_NOT_PROVISIONED] le compte demo n'a AUCUN solde "
+              f"sur l'instance d'echange {mkt_idx} du marche {ticker} — "
+              f"le contrat 2026-08 (exchange sharding) route le Create "
+              f"Order vers cette instance ; un POST y echoue "
+              f"(user_not_found observe). AUCUN ordre envoye. Remede "
+              f"operateur : transferer des fonds demo vers l'instance "
+              f"{mkt_idx} (UI demo, ou POST "
+              f"/portfolio/intra_exchange_instance_transfer), puis "
+              f"relancer la sonde.")
+        proof.update({"outcome": "SHARD_NOT_PROVISIONED",
+                      "ticker": ticker,
+                      "market_exchange_index": mkt_idx,
+                      "funds_by_index": shard_funds})
         _write(proof)
         sys.exit(0)
     print(f"[CHECK] market={ticker} yes_ask={ask}c (cout max "

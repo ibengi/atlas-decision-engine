@@ -356,6 +356,17 @@ class KalshiClient:
         self._log_raw_once("orders", r)
         return r.get("orders", []) or []
 
+    def get_subaccounts_balances(self) -> list:
+        """AUD-DEMO-TRADING-IDENTITY-003 : LECTURE SEULE — soldes par
+        exchange_index (sharding des instances d'echange, contrat 2026-08).
+        Une entree par (subaccount, exchange_index). Les erreurs REMONTENT :
+        l'appelant decide (le diagnostic de shard de la sonde retombe sur
+        le comportement historique si l'endpoint est indisponible)."""
+        r = self._req("GET", "/portfolio/subaccounts/balances")
+        self._log_raw_once("subaccounts_balances", r)
+        return (r.get("balances") or r.get("subaccounts_balances")
+                or r.get("subaccounts") or []) or []
+
     def get_positions(self) -> list:
         """Positions cote broker (source de verite pour la reconciliation)."""
         try:

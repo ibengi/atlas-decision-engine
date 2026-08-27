@@ -142,7 +142,7 @@ class TestBoundedPolling(unittest.TestCase):
                           [mkt("KXBTCD-OK", ask=22, bid=19)]])
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            cand = kdc.wait_for_eligible_market(
+            cand, funnel = kdc.wait_for_eligible_market(
                 cli, 60.0, 3600.0,
                 sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
         self.assertEqual(cand, ("KXBTCD-OK", 22))
@@ -159,7 +159,7 @@ class TestBoundedPolling(unittest.TestCase):
         cli = PollClient([[]])                          # jamais conforme
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            cand = kdc.wait_for_eligible_market(
+            cand, funnel = kdc.wait_for_eligible_market(
                 cli, 60.0, 150.0,
                 sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
         self.assertIsNone(cand)
@@ -178,7 +178,7 @@ class TestBoundedPolling(unittest.TestCase):
         clock = FakeClock()
         cli = PollClient([[]])
         with contextlib.redirect_stdout(io.StringIO()):
-            cand = kdc.wait_for_eligible_market(
+            cand, funnel = kdc.wait_for_eligible_market(
                 cli, 60.0, 60.0,
                 sleep_fn=clock.sleep, monotonic_fn=clock.monotonic)
         self.assertIsNone(cand)
