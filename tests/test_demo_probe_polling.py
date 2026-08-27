@@ -127,10 +127,12 @@ class TestEligibility(unittest.TestCase):
     def test_find_picks_cheapest_in_first_series(self):
         cli = PollClient([[mkt("A", ask=28, bid=25), mkt("B", ask=12, bid=9),
                            mkt("C", ask=31, bid=28)]])
-        cand, scanned, best = kdc.find_eligible_market(cli)
+        cand, funnel = kdc.find_eligible_market(cli)
         self.assertEqual(cand, ("B", 12))
-        self.assertEqual(scanned, 3)
-        self.assertEqual(best, 12)
+        self.assertEqual(funnel["markets_total"], 3)
+        self.assertEqual(funnel["best_ask_seen"], 12)
+        self.assertEqual(funnel["eligible"], 2)
+        self.assertEqual(funnel["rejections"], {"ask_too_high": 1})
 
 
 class TestBoundedPolling(unittest.TestCase):
@@ -339,6 +341,22 @@ class TestMainOneShot(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(cli.create_calls, 1)            # pas de 2e POST
         self.assertIn("broker_has_order=false", t)
+
+    def test_discovery_only_never_posts_even_when_eligible(self):
+        """AUD-PROBE-002 : mode visibilite — marche ELIGIBLE observe,
+        AUCUN POST, sortie propre (sonde courte de diagnostic)."""
+        os.environ["DEMO_PROBE_DISCOVERY_ONLY"] = "true"
+        try:
+            cli = OneShotClient("fill")
+            code, t = self._run_main(cli)
+        finally:
+            os.environ.pop("DEMO_PROBE_DISCOVERY_ONLY", None)
+        self.assertEqual(code, 0)
+        self.assertEqual(cli.create_calls, 0)            # JAMAIS de POST
+        self.assertIn("[PROBE_MODE] discovery_only=true", t)
+        self.assertIn("[PROBE_ELIGIBLE]", t)             # cote observee
+        self.assertIn("[DISCOVERY_ONLY]", t)
+        self.assertNotIn("[ORDER_SUBMIT_ATTEMPT]", t)
 
     def test_ambiguous_unresolved_fail_closed_exit_3(self):
         class AmbLookupFails(OneShotClient):

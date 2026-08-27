@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 
 from kalshi_client import (KalshiClient, KalshiAPIError, pick, pick_int)  # noqa: E402
 from kalshi_alpha_bot import _client_is_genuine
+from market_scanner import read_price          # parseur PROUVE du moteur
 from config import CFG
 
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
@@ -76,44 +77,167 @@ def poll_bounds():
     return interval, max_wait
 
 
-def market_is_eligible(m):
-    """Criteres EXACTS et inchanges : 1 <= yes_ask <= 30c, 1 <= yes_bid
-    <= 99, spread (ask-bid) <= 5c. Retourne (ask, bid) ou None."""
-    try:
-        ask, bid = int(m.get("yes_ask")), int(m.get("yes_bid"))
-    except (TypeError, ValueError):
-        return None
-    if not (1 <= ask <= MAX_ASK_CENTS and 1 <= bid <= 99):
-        return None
+# AUD-PROBE-002 (2026-08-27) : la decouverte lisait les cotes par
+# int(m["yes_ask"]) brut — invisible des que l'API sert les variantes
+# reelles du schema V2 (chaines decimales "48.00", champs fixed-point
+# *_dollars "0.4800", cote vide encodee 0 ou "1.0000", cote YES derivable
+# du carnet NO). Le MOTEUR gere ces formats depuis la regression corrigee
+# du 2026-07-25 (market_scanner.read_price) ; la sonde ne les heritait
+# pas — d'ou best_ask_seen=n/a sur 361 tentatives x ~202 marches alors
+# que le moteur burn-in mesure des prix sur la MEME API. La sonde utilise
+# desormais le MEME parseur, plus un entonnoir de rejets TYPES.
+# Criteres ask<=30c / spread<=5c STRICTEMENT inchanges.
+
+#: statuts explicitement NON ouverts -> rejet type not_open (renforce la
+#: validation, ne l'affaiblit pas) ; statut absent/inconnu = tolere (la
+#: requete filtre deja status=open) mais COMPTE (status_unknown).
+NOT_OPEN_STATUSES = ("closed", "settled", "finalized", "determined",
+                     "inactive", "unopened", "paused")
+OPEN_STATUSES = ("open", "active")
+
+
+def _raw_quote_reason(m, names, side):
+    """Cote non parsable : invalid_price si une valeur presente est
+    illisible (garbage) ; sinon missing_<side> (champ absent, ou cote
+    VIDE encodee 0 / "1.0000" — semantique 'aucune cote')."""
+    for k in names:
+        v = m.get(k)
+        if v is None:
+            continue
+        try:
+            float(v)
+        except (TypeError, ValueError):
+            return "invalid_price"
+    return f"missing_{side}"
+
+
+def parse_quote(m):
+    """Cote YES NORMALISEE en cents entiers 1..99 via le parseur du
+    moteur : cents legacy, chaines decimales, variantes *_dollars, et
+    derivation depuis le carnet NO (acheter YES a p == croiser un bid NO
+    a 100-p ; meme regle que market_scanner.liquidity_diag).
+    Retourne (ask, bid, reason) — reason None si les deux cotes existent."""
+    ya, yb = read_price(m, "yes_ask"), read_price(m, "yes_bid")
+    na, nb = read_price(m, "no_ask"), read_price(m, "no_bid")
+    ask = ya if ya is not None else (100 - nb if nb is not None else None)
+    bid = yb if yb is not None else (100 - na if na is not None else None)
+    if ask is None:
+        return None, bid, _raw_quote_reason(
+            m, ("yes_ask", "yes_ask_dollars", "no_bid", "no_bid_dollars"),
+            "ask")
+    if bid is None:
+        return ask, None, _raw_quote_reason(
+            m, ("yes_bid", "yes_bid_dollars", "no_ask", "no_ask_dollars"),
+            "bid")
+    return ask, bid, None
+
+
+def classify_market(m, series=None):
+    """Classement TYPE d'un marche. Retourne (reason, ask, bid) ;
+    reason None => ELIGIBLE (ask <= 30c ET spread <= 5c, INCHANGES).
+    NB : un prefixe de ticker inattendu est COMPTE (series_mismatch, via
+    l'entonnoir) mais n'exclut PAS — le filtre series_ticker de l'API est
+    la reference ; une heuristique de prefixe pourrait elle-meme casser
+    silencieusement la decouverte (risque Q8 de l'audit)."""
+    status = str(m.get("status") or "").lower()
+    if status in NOT_OPEN_STATUSES:
+        return "not_open", None, None
+    ask, bid, reason = parse_quote(m)
+    if reason:
+        return reason, ask, bid
+    if ask > MAX_ASK_CENTS:
+        return "ask_too_high", ask, bid
     if ask - bid > MAX_SPREAD_CENTS:
-        return None
-    return ask, bid
+        return "spread_too_wide", ask, bid
+    return None, ask, bid
+
+
+def market_is_eligible(m):
+    """Compat : (ask, bid) si eligible, sinon None. Criteres EXACTS
+    inchanges (ask <= 30c, spread <= 5c)."""
+    reason, ask, bid = classify_market(m)
+    return (ask, bid) if reason is None else None
+
+
+def _sanitized_sample(m, series):
+    """Echantillon de debug : UNIQUEMENT les champs de cotation et
+    d'identite (jamais de payload brut complet, jamais de secret)."""
+    reason, ask, bid = classify_market(m, series)
+    return {"ticker": m.get("ticker"), "event": m.get("event_ticker"),
+            "series": series, "status": m.get("status"),
+            "yes_bid": m.get("yes_bid"), "yes_ask": m.get("yes_ask"),
+            "no_bid": m.get("no_bid"), "no_ask": m.get("no_ask"),
+            "yes_ask_dollars": m.get("yes_ask_dollars"),
+            "parsed_ask": ask, "parsed_bid": bid,
+            "parsed_spread": (ask - bid) if ask is not None
+            and bid is not None else None,
+            "reason": reason or "eligible"}
 
 
 def find_eligible_market(client, series_list=CANDIDATE_SERIES):
-    """Un passage de scan (logique historique inchangee) : premier series
-    avec candidat, ask le plus bas. Retourne (ticker, ask) ou None,
-    plus (marches_vus, meilleur_ask_vu) pour le log de polling."""
-    candidate, scanned, best_ask_seen = None, 0, None
+    """Un passage de scan : premier series avec candidat, ask le plus
+    bas. Retourne (candidate|None, funnel) ; funnel expose les comptes
+    d'entonnoir, les raisons de rejet typees, best_ask_seen (numerique
+    des qu'UN ask est parsable, meme sans marche eligible) et un
+    echantillon sanitise de 1-3 marches."""
+    funnel = {"markets_total": 0, "series_mismatch": 0,
+              "status_unknown": 0, "open": 0, "ask_available": 0,
+              "quote_available": 0, "spread_available": 0, "ask_pass": 0,
+              "spread_pass": 0, "eligible": 0, "rejections": {},
+              "best_ask_seen": None, "sample": []}
+    candidate = None
     for series in series_list:
         for m in client.get_markets(series, status="open", limit=100):
-            scanned += 1
-            try:
-                a = int(m.get("yes_ask"))
-                if 1 <= a <= 99:
-                    best_ask_seen = a if best_ask_seen is None \
-                        else min(best_ask_seen, a)
-            except (TypeError, ValueError):
-                pass
-            elig = market_is_eligible(m)
-            if elig is None:
+            funnel["markets_total"] += 1
+            if len(funnel["sample"]) < 3:
+                funnel["sample"].append(_sanitized_sample(m, series))
+            if series and not str(m.get("ticker") or "").startswith(series):
+                funnel["series_mismatch"] += 1
+            status = str(m.get("status") or "").lower()
+            if status not in OPEN_STATUSES:
+                if status not in NOT_OPEN_STATUSES:
+                    funnel["status_unknown"] += 1
+            reason, ask, bid = classify_market(m, series)
+            if reason != "not_open":
+                funnel["open"] += 1
+            if ask is not None:
+                funnel["ask_available"] += 1
+                funnel["best_ask_seen"] = ask \
+                    if funnel["best_ask_seen"] is None \
+                    else min(funnel["best_ask_seen"], ask)
+            if ask is not None and bid is not None:
+                funnel["quote_available"] += 1
+                funnel["spread_available"] += 1
+                if ask <= MAX_ASK_CENTS:
+                    funnel["ask_pass"] += 1
+                if ask - bid <= MAX_SPREAD_CENTS:
+                    funnel["spread_pass"] += 1
+            if reason is not None:
+                funnel["rejections"][reason] = \
+                    funnel["rejections"].get(reason, 0) + 1
                 continue
-            ask, _bid = elig
+            funnel["eligible"] += 1
             if candidate is None or ask < candidate[1]:
                 candidate = (m["ticker"], ask)
         if candidate:
             break
-    return candidate, scanned, best_ask_seen
+    return candidate, funnel
+
+
+def _funnel_line(funnel):
+    rej = ",".join(f"{k}:{v}" for k, v in
+                   sorted(funnel["rejections"].items())) or "none"
+    return (f"[PROBE_FUNNEL] markets_total={funnel['markets_total']} "
+            f"open={funnel['open']} "
+            f"quote_available={funnel['quote_available']} "
+            f"ask_available={funnel['ask_available']} "
+            f"spread_available={funnel['spread_available']} "
+            f"ask_pass={funnel['ask_pass']} "
+            f"spread_pass={funnel['spread_pass']} "
+            f"eligible={funnel['eligible']} "
+            f"series_mismatch={funnel['series_mismatch']} "
+            f"status_unknown={funnel['status_unknown']} "
+            f"rejections={rej}")
 
 
 def wait_for_eligible_market(client, interval_s, max_wait_s,
@@ -128,14 +252,21 @@ def wait_for_eligible_market(client, interval_s, max_wait_s,
     attempt = 0
     while True:
         attempt += 1
-        candidate, scanned, best_ask = find_eligible_market(client)
+        candidate, funnel = find_eligible_market(client)
         elapsed = monotonic_fn() - t0
+        if attempt == 1:
+            # AUD-PROBE-002 : echantillon sanitise (1-3 marches, champs
+            # de cotation/identite uniquement) UNE FOIS par execution.
+            for s in funnel["sample"]:
+                print(f"[PROBE_SAMPLE] {json.dumps(s, default=str)}")
+        print(_funnel_line(funnel))
         if candidate:
             print(f"[PROBE_ELIGIBLE] ticker={candidate[0]} "
                   f"yes_ask={candidate[1]}c attempt={attempt} "
                   f"elapsed_s={elapsed:.0f}")
             return candidate
         remaining = max_wait_s - elapsed
+        best_ask = funnel["best_ask_seen"]
         if remaining <= 0:
             print(f"[NO_ELIGIBLE_MARKET] attempts={attempt} "
                   f"elapsed_s={elapsed:.0f} max_wait_s={max_wait_s:.0f} "
@@ -144,7 +275,7 @@ def wait_for_eligible_market(client, interval_s, max_wait_s,
             return None
         wait = min(interval_s, remaining)
         print(f"[PROBE_POLL] attempt={attempt} elapsed_s={elapsed:.0f} "
-              f"eligible=false markets_scanned={scanned} "
+              f"eligible=false markets_scanned={funnel['markets_total']} "
               f"best_ask_seen={best_ask if best_ask is not None else 'n/a'} "
               f"next_poll_in_s={wait:.0f}")
         sleep_fn(wait)
@@ -202,17 +333,33 @@ def main():
     print(f"[PROBE_CONFIG] poll_interval_s={interval_s:.0f} "
           f"max_wait_s={max_wait_s:.0f} series={','.join(CANDIDATE_SERIES)} "
           f"criteria=ask<={MAX_ASK_CENTS}c,spread<={MAX_SPREAD_CENTS}c")
+    # AUD-PROBE-002 : mode DECOUVERTE SEULE — observe les cotes reelles et
+    # l'entonnoir, N'EMET JAMAIS d'ordre (sonde courte de visibilite).
+    discovery_only = os.getenv(
+        "DEMO_PROBE_DISCOVERY_ONLY", "").lower() == "true"
+    if discovery_only:
+        print("[PROBE_MODE] discovery_only=true — AUCUNE soumission "
+              "d'ordre dans cette execution, quel que soit le resultat.")
     candidate = wait_for_eligible_market(client, interval_s, max_wait_s)
     if not candidate:
         # Timeout SANS marche conforme : sortie PROPRE, pas un echec
         # d'execution — les bornes n'ont pas ete elargies pour forcer
         # un ordre. Relancer la sonde plus tard (heures liquides US).
         proof.update({"outcome": "NO_ELIGIBLE_MARKET",
+                      "discovery_only": discovery_only,
                       "poll_interval_s": interval_s,
                       "max_wait_s": max_wait_s})
         _write(proof)
         sys.exit(0)
     ticker, ask = candidate
+    if discovery_only:
+        print(f"[DISCOVERY_ONLY] marche eligible OBSERVE ticker={ticker} "
+              f"yes_ask={ask}c — soumission DESACTIVEE, arret propre "
+              f"sans POST.")
+        proof.update({"outcome": "DISCOVERY_ONLY_ELIGIBLE_SEEN",
+                      "ticker": ticker, "discovery_only": True})
+        _write(proof)
+        sys.exit(0)
     print(f"[CHECK] market={ticker} yes_ask={ask}c (cout max "
           f"{ask / 100:.2f}$ pour 1 contrat)")
     proof["ticker"] = ticker
