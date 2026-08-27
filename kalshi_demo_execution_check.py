@@ -36,9 +36,13 @@ from datetime import datetime, timezone
 from kalshi_client import (KalshiClient, KalshiAPIError, pick, pick_int)  # noqa: E402
 from kalshi_alpha_bot import _client_is_genuine
 from market_scanner import read_price          # parseur PROUVE du moteur
-from config import CFG
+from config import CFG, DEMO_URLS_ALLOWED
 
 DEMO_BASE = "https://demo-api.kalshi.co/trade-api/v2"
+# AUD-DEMO-ORDER-IDENTITY-002 : deux racines DEMO officielles connues
+# (hote partage historique + hote Trade API dedie recommande par la doc).
+# La sonde n'accepte QUE ces deux racines — jamais prod/LIVE.
+DEMO_ALLOWED_BASES = DEMO_URLS_ALLOWED
 MAX_ASK_CENTS = 30          # cout maximal accepte pour 1 contrat (fonds DEMO)
 MAX_SPREAD_CENTS = 5        # spread maximal accepte — INCHANGE (audit 26/08)
 FILL_TIMEOUT_S = float(os.getenv("ORDER_FILL_TIMEOUT_SECONDS", "45"))
@@ -300,6 +304,26 @@ def fatal(msg):
     sys.exit(2)
 
 
+def identity_fingerprint(client):
+    """AUD-DEMO-ORDER-IDENTITY-002 : empreinte SANS SECRET de l'identite
+    API effectivement utilisee — permet de comparer la cle Railway avec
+    la cle visible dans l'UI demo (sha256/suffixe du key id, sha256 de
+    la cle PUBLIQUE derivee). Aucun materiau prive n'est expose."""
+    import hashlib
+    kid = str(getattr(client, "key_id", "") or "")
+    fp = {"key_id_sha256_12": hashlib.sha256(kid.encode()).hexdigest()[:12],
+          "key_id_suffix4": kid[-4:] if len(kid) >= 4 else "?",
+          "pubkey_sha256_12": None}
+    pk = getattr(client, "_pk", None)
+    if pk is not None:
+        from cryptography.hazmat.primitives import serialization
+        der = pk.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)
+        fp["pubkey_sha256_12"] = hashlib.sha256(der).hexdigest()[:12]
+    return fp
+
+
 def main():
     # ── garde-fous stricts ────────────────────────────────────────────────
     if os.getenv("ENABLE_DEMO_INTEGRATION_TEST", "").lower() != "true":
@@ -309,11 +333,17 @@ def main():
             fatal(f"{var} indique un contexte LIVE — ce script est "
                   f"DEMO uniquement, arret.")
     client = KalshiClient("demo")
-    if client.base_url.rstrip("/") != DEMO_BASE:
-        fatal(f"URL inattendue: {client.base_url} — seul {DEMO_BASE} "
-              f"est autorise. Arret sans aucun appel d'ordre.")
+    if client.base_url.rstrip("/") not in DEMO_ALLOWED_BASES:
+        fatal(f"URL inattendue: {client.base_url} — seules les racines "
+              f"DEMO {DEMO_ALLOWED_BASES} sont autorisees. Arret sans "
+              f"aucun appel d'ordre.")
     if not _client_is_genuine(client):
         fatal("Client non authentique (mock/patch detecte).")
+    fp = identity_fingerprint(client)
+    print(f"[IDENTITY_FINGERPRINT] key_id_sha256_12={fp['key_id_sha256_12']} "
+          f"key_id_suffix4={fp['key_id_suffix4']} "
+          f"pubkey_sha256_12={fp['pubkey_sha256_12']} "
+          f"base={client.base_url}")
 
     proof = {"environment": "DEMO", "mock_enabled": False, "dry_run": False,
              "api_base_url": client.base_url,

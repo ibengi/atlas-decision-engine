@@ -11,10 +11,29 @@ def _env_i(name, default):
 def _env_b(name, *, default):
     return os.getenv(name, "1" if default else "0").strip().lower() not in ("0","false","no","non")
 
+# AUD-DEMO-ORDER-IDENTITY-002 (2026-08-27) : la documentation officielle
+# recommande desormais external-api.demo.kalshi.co comme racine Trade API
+# demo ; l'hote partage historique demo-api.kalshi.co reste "supporte pour
+# compatibilite". L'hote demo est surchargeable via KALSHI_DEMO_BASE_URL
+# mais UNIQUEMENT vers un hote demo CONNU de cette allowlist — toute autre
+# valeur (prod, LIVE, faute de frappe) retombe sur l'hote historique.
+# Aucune variable d'environnement ne peut pointer le mode demo vers un
+# environnement reel.
+DEMO_URL_LEGACY  = "https://demo-api.kalshi.co/trade-api/v2"
+DEMO_URL_CURRENT = "https://external-api.demo.kalshi.co/trade-api/v2"
+DEMO_URLS_ALLOWED = (DEMO_URL_LEGACY, DEMO_URL_CURRENT)
+
+
+def resolve_demo_url():
+    req = os.getenv("KALSHI_DEMO_BASE_URL",
+                    DEMO_URL_LEGACY).strip().rstrip("/")
+    return req if req in DEMO_URLS_ALLOWED else DEMO_URL_LEGACY
+
+
 class Config:
     # Environnements
     PROD_URL  = "https://api.elections.kalshi.com/trade-api/v2"
-    DEMO_URL  = "https://demo-api.kalshi.co/trade-api/v2"
+    DEMO_URL  = resolve_demo_url()
     # Identifiants (prod) et identifiants demo distincts si fournis
     KEY_ID        = os.getenv("KALSHI_KEY_ID", "")
     PRIV_KEY      = os.getenv("KALSHI_PRIVATE_KEY", "").replace("\\n", "\n")
