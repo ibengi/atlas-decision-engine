@@ -285,9 +285,11 @@ class TestProbeSurfacesUserNotFound(unittest.TestCase):
     avec l'absence de marche eligible (NO_ELIGIBLE_MARKET, exit 0)."""
 
     def setUp(self):
+        import tempfile
         self._env = {k: os.environ.get(k) for k in (
             "ENABLE_DEMO_INTEGRATION_TEST", "DEMO_PROBE_MAX_WAIT_SECONDS",
-            "DEMO_PROBE_DISCOVERY_ONLY")}
+            "DEMO_PROBE_DISCOVERY_ONLY", "DATA_DIR")}
+        os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="probe_guard_")
         os.environ["ENABLE_DEMO_INTEGRATION_TEST"] = "true"
         os.environ["DEMO_PROBE_MAX_WAIT_SECONDS"] = "0"
         os.environ.pop("DEMO_PROBE_DISCOVERY_ONLY", None)
@@ -312,6 +314,9 @@ class TestProbeSurfacesUserNotFound(unittest.TestCase):
 
             def get_balance(self):
                 return 136.56
+
+            def get_orders(self, ticker=None):
+                return []
 
             def get_markets(self, series, status="open", limit=100):
                 if series == kdc.CANDIDATE_SERIES[0]:

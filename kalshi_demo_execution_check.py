@@ -29,7 +29,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from datetime import datetime, timezone
 
 
@@ -360,6 +359,113 @@ def fatal(msg):
     sys.exit(2)
 
 
+# ── AUD-DEMO-LIFECYCLE-005 : garde de soumission PERSISTANTE ────────────────
+# Cause mesuree des fills repetes (11 contrats YES) : chaque redemarrage
+# Railway relancait la sonde avec un client_order_id ALEATOIRE neuf —
+# l'idempotence en memoire ne survit pas au restart. Desormais :
+#   1. client_order_id DETERMINISTE par run-id (defaut : date UTC) ;
+#   2. journal d'intention PERSISTANT (DATA_DIR) ecrit AVANT le POST ;
+#   3. pre-verification cote BROKER par client_order_id (survit meme a
+#      un systeme de fichiers neuf) ;
+#   4. toute trace de soumission anterieure non explicitement echouee
+#      -> AUCUN nouveau POST, reconciliation LECTURE SEULE.
+
+GUARD_FILE = "demo_probe_submission_guard.json"
+
+
+def probe_run_id():
+    """Identifiant logique de la sonde : DEMO_PROBE_RUN_ID, sinon la
+    date UTC — un seul ordre de test logique par run-id, quel que soit
+    le nombre de redemarrages du conteneur."""
+    rid = os.getenv("DEMO_PROBE_RUN_ID", "").strip()
+    if not rid:
+        rid = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return "".join(c for c in rid if c.isalnum() or c in "-_")[:40]
+
+
+def _guard_path():
+    return os.path.join(os.getenv("DATA_DIR", "."), GUARD_FILE)
+
+
+def load_guard():
+    """(records, lisible). Un fichier CORROMPU rend lisible=False : la
+    sonde doit alors rester fail-closed (on ne conclut jamais 'aucune
+    soumission anterieure' sur un journal illisible)."""
+    try:
+        with open(_guard_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return (data, True) if isinstance(data, list) else ([], False)
+    except FileNotFoundError:
+        return [], True
+    except Exception:                      # noqa: BLE001 — corrompu
+        return [], False
+
+
+def save_guard(records):
+    tmp = _guard_path() + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, _guard_path())
+
+
+def guard_record_for(records, run_id):
+    for r in reversed(records):
+        if r.get("run_id") == run_id:
+            return r
+    return None
+
+
+def update_guard(records, run_id, **fields):
+    rec = guard_record_for(records, run_id)
+    if rec is not None:
+        rec.update(fields)
+        save_guard(records)
+
+
+def find_order_by_coid(client, coid):
+    """LECTURE SEULE : retrouve un ordre broker par client_order_id.
+    Les erreurs REMONTENT (jamais 'aucun ordre' sur un echec reseau)."""
+    for o in client.get_orders():
+        if str(o.get("client_order_id") or "") == coid:
+            return o
+    return None
+
+
+def reconcile_prior_submission(client, coid, proof, why):
+    """Une soumission anterieure existe (journal local ou broker) :
+    AUCUN nouveau POST. Etat reconstitue par lectures uniquement."""
+    print(f"[SUBMISSION_GUARD] blocked=true reason={why} "
+          f"client_order_id={coid} — aucun nouveau POST ; "
+          f"reconciliation lecture seule.")
+    order, fills = None, []
+    try:
+        order = find_order_by_coid(client, coid)
+    except KalshiAPIError as e:
+        print(f"[GUARD_RECONCILE] lookup_error={e} — statut broker "
+              f"INDETERMINE, resolution operateur requise.")
+    oid = str((order or {}).get("order_id") or "")
+    if oid:
+        try:
+            fills = client.get_fills(oid)
+        except KalshiAPIError:
+            fills = []
+    filled = sum(pick_int(f, "count", "quantity", default=0)
+                 for f in fills)
+    print(f"[GUARD_RECONCILE] broker_has_order={bool(order)} "
+          f"kalshi_order_id={oid or 'n/a'} "
+          f"status={(order or {}).get('status', 'n/a')} "
+          f"filled_contracts={filled} "
+          f"outcome=ALREADY_SUBMITTED_RECONCILED")
+    proof.update({"outcome": "ALREADY_SUBMITTED_RECONCILED",
+                  "client_order_id": coid,
+                  "kalshi_order_id": oid or None,
+                  "filled_contracts": filled})
+    _write(proof)
+    sys.exit(0)
+
+
 def identity_fingerprint(client):
     """AUD-DEMO-ORDER-IDENTITY-002 : empreinte SANS SECRET de l'identite
     API effectivement utilisee — permet de comparer la cle Railway avec
@@ -471,8 +577,46 @@ def main():
           f"{ask / 100:.2f}$ pour 1 contrat)")
     proof["ticker"] = ticker
 
-    # ── 3. soumission REELLE d'un ordre minimal (1 contrat, au ask) ───────
-    coid = f"democheck_{uuid.uuid4().hex}"
+    # ── 3. garde PERSISTANTE puis soumission (1 contrat, au ask) ──────────
+    # AUD-DEMO-LIFECYCLE-005 : client_order_id DETERMINISTE (run-id) +
+    # journal d'intention persistant + pre-verification broker — un
+    # redemarrage Railway ne peut plus produire un ordre duplique.
+    run_id = probe_run_id()
+    coid = f"democheck_{run_id}"
+    records, readable = load_guard()
+    if not readable:
+        print(f"[SUBMISSION_GUARD] outcome=GUARD_UNREADABLE_FAIL_CLOSED "
+              f"journal ILLISIBLE ({_guard_path()}) — fail-closed, AUCUN "
+              f"POST. Verifier l'etat broker puis restaurer/supprimer le "
+              f"fichier manuellement.")
+        proof.update({"outcome": "GUARD_UNREADABLE_FAIL_CLOSED"})
+        _write(proof)
+        sys.exit(3)
+    prior = guard_record_for(records, run_id)
+    if prior and not str(prior.get("outcome", "")).startswith("failed"):
+        reconcile_prior_submission(
+            client, coid, proof,
+            f"journal_local(outcome={prior.get('outcome')})")
+    try:
+        existing = find_order_by_coid(client, coid)
+    except KalshiAPIError as e:
+        print(f"[SUBMISSION_GUARD] outcome=GUARD_UNVERIFIABLE_FAIL_CLOSED "
+              f"pre-verification broker IMPOSSIBLE ({e}) — fail-closed, "
+              f"AUCUN POST (on ne conclut jamais 'aucune soumission "
+              f"anterieure' sur un echec de lecture).")
+        proof.update({"outcome": "GUARD_UNVERIFIABLE_FAIL_CLOSED"})
+        _write(proof)
+        sys.exit(3)
+    if existing:
+        reconcile_prior_submission(client, coid, proof, "ordre_broker")
+    # intention persistee AVANT le POST (semantique journal d'intention :
+    # un crash pendant le POST laisse 'attempting' -> le prochain run
+    # BLOQUE et reconcilie au lieu de re-POSTer)
+    records.append({"run_id": run_id, "client_order_id": coid,
+                    "ticker": ticker,
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "order_id": None, "outcome": "attempting"})
+    save_guard(records)
     # AUD-OBS-003: l'endpoint affiche etait /portfolio/orders (V1,
     # deprecie) alors que create_order POSTe sur ORDERS_V2_PATH — un
     # diagnostic 404 mene sur le mauvais chemin. Afficher le chemin REEL.
@@ -500,6 +644,7 @@ def main():
                       f"client_order_id={coid} lookup_error={e2} — statut "
                       f"INDETERMINE, aucun re-POST. Resolution operateur "
                       f"requise (GET /portfolio/orders).")
+                update_guard(records, run_id, outcome="ambiguous")
                 proof.update({"outcome": "AMBIGUOUS_UNRESOLVED",
                               "order_verified_from_api": False,
                               "error": str(e)[:300]})
@@ -510,6 +655,8 @@ def main():
                       f"client_order_id={coid} broker_has_order=false — "
                       f"aucun ordre place (confirme par le broker), "
                       f"aucun re-POST (une seule tentative par execution).")
+                update_guard(records, run_id,
+                             outcome="failed:ambiguous_not_placed")
                 proof.update({"outcome": "AMBIGUOUS_RESOLVED_NOT_PLACED",
                               "order_verified_from_api": False,
                               "error": str(e)[:300]})
@@ -521,6 +668,11 @@ def main():
                   f"du cycle de vie sur l'ordre retrouve, aucun re-POST.")
             order = resolved
         else:
+            # echec DETERMINISTE (le broker a refuse : aucun ordre créé)
+            # -> la garde enregistre 'failed:<status>' ; une relance
+            # deliberee du MEME run-id reste possible, mais jamais de
+            # retry automatique dans cette execution.
+            update_guard(records, run_id, outcome=f"failed:{e.status}")
             print(f"[ORDER_SUBMIT_FAILED] http_status={e.status} "
                   f"error_message={e} "
                   f"response_body_sanitized={str(e.body)[:300]}")
@@ -537,22 +689,45 @@ def main():
           f"raw_response_sanitized={json.dumps(order, default=str)[:400]}")
     proof.update({"http_status": http_status, "kalshi_order_id": oid})
     if not oid:
-        fatal("Reponse sans order_id — soumission NON prouvee.")
+        # 201 sans order_id lisible : l'ordre a PU etre cree — etat
+        # AMBIGU persiste, jamais de re-POST, resolution operateur.
+        update_guard(records, run_id, outcome="ambiguous")
+        print("[AMBIGUOUS_POST_CREATED_STATE] reponse 201 sans order_id "
+              "lisible — aucun re-POST, reconciliation au prochain run.")
+        proof.update({"outcome": "AMBIGUOUS_POST_CREATED_STATE"})
+        _write(proof)
+        sys.exit(3)
+    # AUD-DEMO-LIFECYCLE-005 : un HTTP 201 avec order_id est la preuve
+    # AUTORITAIRE que l'ordre existe. Etat ORDER_CREATED_CONFIRMED,
+    # persiste AVANT toute relecture faillible.
+    update_guard(records, run_id, outcome="created", order_id=oid)
+    print(f"[ORDER_CREATED_CONFIRMED] kalshi_order_id={oid} "
+          f"client_order_id={coid} http_status={http_status}")
 
     # ── 4. relecture de l'ordre (2e requete API, meme id) ─────────────────
+    # Moteur 12.5.0 (2026-07-26, logs reels) : GET /portfolio/orders/{id}
+    # peut repondre 404 pour un ordre V2 REEL et REMPLI. Apres un 201,
+    # un 404 de relecture est ORDER_LOOKUP_UNAVAILABLE — JAMAIS
+    # 'ordre inexistant', JAMAIS un echec, JAMAIS un re-POST : la
+    # reponse de creation sert de verification
+    # (source=create_response_v2), comme dans le moteur.
     try:
         verified = client.get_order(oid)
+        verify_source = "get_order"
     except KalshiAPIError as e:
-        print(f"[ORDER_VERIFY_FAILED] reason=order_not_found_after_"
-              f"submission ({e})")
-        proof["order_verified_from_api"] = False
-        _write(proof)
-        sys.exit(1)
+        print(f"[ORDER_LOOKUP_UNAVAILABLE] kalshi_order_id={oid} "
+              f"http_status={e.status} — l'ordre reste CONFIRME CREE "
+              f"(201) ; verification par la reponse de creation "
+              f"(source=create_response_v2).")
+        verified = order
+        verify_source = "create_response_v2"
     status = str(pick(verified, "status", "order_status", default="?"))
     print(f"[ORDER_VERIFY] kalshi_order_id={oid} status={status} "
           f"remaining_count={pick_int(verified, 'remaining_count', default=-1)} "
-          f"filled_count={pick_int(verified, 'taker_fill_count', 'fill_count', default=-1)}")
+          f"filled_count={pick_int(verified, 'taker_fill_count', 'fill_count', default=-1)} "
+          f"source={verify_source}")
     proof["order_verified_from_api"] = True
+    proof["order_verify_source"] = verify_source
     proof["order_status"] = status
 
     # ── 5. attente de fill (accepted != filled), annulation sinon ─────────
@@ -579,12 +754,17 @@ def main():
             pass
     proof["fills_verified_from_api"] = filled >= 1
     proof["filled_contracts"] = filled
+    if filled >= 1:
+        update_guard(records, run_id, outcome="filled")
     if filled < 1:
         print(f"[ORDER_CANCELED_UNFILLED] kalshi_order_id={oid} "
               f"timeout_seconds={FILL_TIMEOUT_S:.0f}")
         try:
             client.cancel_order(oid)
+            update_guard(records, run_id, outcome="canceled_unfilled")
         except KalshiAPIError as e:
+            # annulation NON prouvee : l'ordre peut rester au carnet —
+            # etat conserve 'created' (bloquant), jamais efface.
             print(f"[WARN] annulation: {e}")
         proof["position_verified_from_api"] = False
         _write(proof)

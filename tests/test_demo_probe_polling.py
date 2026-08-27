@@ -257,10 +257,12 @@ class TestMainOneShot(unittest.TestCase):
     restent dans test_real_demo_proof.py (subprocess, non patches)."""
 
     def setUp(self):
+        import tempfile
         self._env = {k: os.environ.get(k) for k in (
             "ENABLE_DEMO_INTEGRATION_TEST", "DEMO_PROBE_MAX_WAIT_SECONDS",
             "DEMO_PROBE_POLL_INTERVAL_SECONDS", "LIVE_TRADING",
-            "KALSHI_ENV_CONFIRM")}
+            "KALSHI_ENV_CONFIRM", "DATA_DIR")}
+        os.environ["DATA_DIR"] = tempfile.mkdtemp(prefix="probe_guard_")
         os.environ["ENABLE_DEMO_INTEGRATION_TEST"] = "true"
         os.environ.pop("LIVE_TRADING", None)
         os.environ.pop("KALSHI_ENV_CONFIRM", None)
@@ -361,6 +363,10 @@ class TestMainOneShot(unittest.TestCase):
     def test_ambiguous_unresolved_fail_closed_exit_3(self):
         class AmbLookupFails(OneShotClient):
             def get_orders(self, ticker=None):
+                # la pre-verification (avant POST) doit passer ; seule la
+                # resolution APRES le POST ambigu echoue
+                if self.create_calls == 0:
+                    return []
                 raise KalshiAPIError(0, "reseau: lookup impossible")
         cli = AmbLookupFails("ambiguous")
         code, t = self._run_main(cli)
