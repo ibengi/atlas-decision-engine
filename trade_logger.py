@@ -70,6 +70,52 @@ class TradeLogger:
                      f"@ {avg_price}c (frais {fees:.2f}$) ordre={order_id}")
         return rec
 
+    def adopt_reconstructed(self, position: dict) -> dict:
+        """ATLAS-TOTAL-AUDIT-001 : adopte une position RECONSTRUITE du
+        broker (trade_id brk-*) comme ligne de registre a PROVENANCE
+        EXPLICITE broker_reconstructed. VERITE BROKER > CACHE LOCAL :
+        sans cette ligne, son reglement echouait 'introuvable' en boucle
+        et, une fois la ligne broker retiree, le nettoyage fantome la
+        supprimait SANS AUCUNE trace comptable (mouvement de cash broker
+        invisible du registre). RIEN n'est fabrique : timestamp = heure
+        de RECONCILIATION (opened_at), decision_id None (honnetement non
+        joignable), cost basis = celle derivee du broker, provenance
+        marquee — EXCLUE des metriques investisseur par la politique
+        d'inclusion. Idempotent par trade_id stable."""
+        for t in self.trades:
+            if t["trade_id"] == position["trade_id"]:
+                return t
+        rec = {
+            "schema": self.SCHEMA, "trade_id": position["trade_id"],
+            "decision_id": None,
+            "provenance": "broker_reconstructed",
+            "cost_basis_source": position.get("cost_basis_source"),
+            "timestamp": position.get("opened_at") or now_iso(),
+            "ticker": position["ticker"], "market": None,
+            "side": position["side"],
+            "requested_price": None,
+            "avg_fill_price": position["avg_price"],
+            "requested_count": position["count"],
+            "filled_count": position["count"],
+            "spread": None,
+            "fees": round(float(position.get("fees") or 0.0), 2),
+            "edge": None, "ev": None, "confidence": None, "grade": None,
+            "reason": "broker_reconstructed", "analysis": None,
+            "order_id": None, "order_status": "reconciled",
+            "state": "open", "result": None, "won": None,
+            "gross_pnl": None, "net_pnl": None, "roi": None,
+            "holding_seconds": None, "settled_at": None,
+        }
+        self.trades.append(rec)
+        self.flush()
+        log_trd.warning(
+            f"[LEDGER_ADOPTED] {position['ticker']} "
+            f"{position['side'].upper()} x{position['count']} "
+            f"trade_id={position['trade_id']} "
+            f"provenance=broker_reconstructed (exclue des metriques "
+            f"investisseur) — reglement desormais comptabilisable.")
+        return rec
+
     def settle_trade(self, trade_id: str, result: str, won: bool,
                      gross_pnl: float, net_pnl: float):
         for t in self.trades:

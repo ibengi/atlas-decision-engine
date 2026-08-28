@@ -150,6 +150,16 @@ class PositionManager:
         for tid, p in list(self.positions.items()):
             if p.get("state", "open") != "open":
                 continue
+            # ATLAS-TOTAL-AUDIT-001 : une position reconstruite (brk-*)
+            # n'a pas de ligne de registre — son reglement echouait
+            # 'settle_trade introuvable' en boucle infinie. VERITE
+            # BROKER > CACHE LOCAL : adoption d'une ligne a provenance
+            # explicite AVANT tout reglement (idempotent). Un orphelin
+            # NON brk-* reste une erreur bruyante (bug distinct).
+            if str(p.get("trade_id", "")).startswith("brk-") and \
+                    not any(t["trade_id"] == p["trade_id"]
+                            for t in self.tlog.trades):
+                self.tlog.adopt_reconstructed(p)
             m = self.client.get_market(p["ticker"])
 
             # ── max-age escape hatch ──────────────────────────────────
