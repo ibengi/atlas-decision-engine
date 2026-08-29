@@ -1,0 +1,85 @@
+{
+  "_schema": "atlas.pre_migration_evidence.v1",
+  "_purpose": [
+    "Baseline captured immediately BEFORE the first restart of the state",
+    "persistence migration. The disk this describes is destroyed by that",
+    "restart, so this record is committed to git — the only place the",
+    "migration cannot reach."
+  ],
+  "_law": [
+    "Any field that cannot actually be read is the string UNAVAILABLE.",
+    "Never 0, never an estimate, never a plausible-looking default. A false",
+    "baseline is worse than no baseline: the post-restart comparison would",
+    "'confirm' it."
+  ],
+
+  "timestamp": "UNAVAILABLE",
+  "deployed_commit": "UNAVAILABLE",
+
+  "gate_a_confirmation": {
+    "_rule": "Two consecutive observations, >= 60s apart, all four fields true in BOTH. Any disagreement aborts the migration.",
+    "observation_1": {
+      "at": "UNAVAILABLE",
+      "open_count": "UNAVAILABLE",
+      "guard_state": "UNAVAILABLE",
+      "guard_reason": "UNAVAILABLE",
+      "unresolved_broker_positions": "UNAVAILABLE",
+      "evidence_trustworthy": "UNAVAILABLE",
+      "engine_cycle": "UNAVAILABLE"
+    },
+    "observation_2": {
+      "at": "UNAVAILABLE",
+      "open_count": "UNAVAILABLE",
+      "guard_state": "UNAVAILABLE",
+      "guard_reason": "UNAVAILABLE",
+      "unresolved_broker_positions": "UNAVAILABLE",
+      "evidence_trustworthy": "UNAVAILABLE",
+      "engine_cycle": "UNAVAILABLE"
+    },
+    "separation_seconds": "UNAVAILABLE",
+    "observations_agree": "UNAVAILABLE"
+  },
+
+  "open_count": "UNAVAILABLE",
+  "guard_state": "UNAVAILABLE",
+  "guard_reason": "UNAVAILABLE",
+
+  "broker_position_summary": {
+    "_source": "engine reconciliation log: matched / rebuilt / ghost",
+    "matched": "UNAVAILABLE",
+    "rebuilt": "UNAVAILABLE",
+    "ghost": "UNAVAILABLE"
+  },
+
+  "risk_state_summary": {
+    "_source": "engine [CAPITAL] and pnl_jour / frais_cumules lines",
+    "solde": "UNAVAILABLE",
+    "capital_effectif": "UNAVAILABLE",
+    "pnl_jour": "UNAVAILABLE",
+    "frais_cumules": "UNAVAILABLE",
+    "risque_ouvert": "UNAVAILABLE",
+    "_note": "consecutive_losses and rolling_drawdown are derived from the trade journal and are not logged; they are UNAVAILABLE by construction and WILL reset at migration."
+  },
+
+  "submission_guard_state": {
+    "_source": "[SUBMISSION_GUARD_LOADED] active_tickers=N — emitted at STARTUP ONLY",
+    "active_tickers": "UNAVAILABLE",
+    "ttl_seconds": "UNAVAILABLE",
+    "_note": "Pre-migration value is whatever the LAST startup reported, or UNAVAILABLE if that line has aged out of log retention."
+  },
+
+  "trade_journal_count": {
+    "_source": "research /api/research/v1/capabilities settled-trade count, via evidence capture",
+    "settled_trades": "UNAVAILABLE",
+    "_note": "Open (unsettled) trade rows are exported by nothing and are not counted here."
+  },
+
+  "expected_loss_at_migration": [
+    "cumulative rolling_drawdown history",
+    "consecutive_losses streak",
+    "trades_today counter",
+    "submission_guard entries still inside their TTL",
+    "any in-flight order in orders_state.json",
+    "entry price / fees / strategy of any position still open (must be zero at migration)"
+  ]
+}
