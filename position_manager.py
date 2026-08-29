@@ -284,7 +284,21 @@ class PositionManager:
             tid = f"brk-{tk}-{side}"                 # ID STABLE = idempotent
             if tid in self.positions:
                 continue
-            avg = pick_int(bp, "avg_price", "market_exposure", default=50) or 50
+            # Le broker connait l'EXISTENCE, le sens et la quantite. Il ne
+            # rend pas le prix d'entree reellement paye : ni les frais, ni la
+            # strategie, ni l'horodatage d'ouverture. `default=50` n'est donc
+            # pas une mesure mais un remplissage — 50c au hasard sur une
+            # position reellement entree a 3c fausse open_risk, le PnL au
+            # reglement et toute statistique qui les agrege.
+            #
+            # Le chiffre est conserve (le retirer casserait l'arithmetique en
+            # aval) mais il est desormais ETIQUETE : `avg_price_estimated`
+            # dit qu'aucun fill ne l'atteste, et `opened_at_estimated` dit
+            # que l'horodatage est celui de la reconstruction, pas de
+            # l'ouverture — ce qui compte pour l'echappatoire d'age.
+            measured_avg = pick_int(bp, "avg_price", default=0)
+            avg = measured_avg or (pick_int(bp, "market_exposure", default=50) or 50)
+            estimated = measured_avg <= 0
             self.positions[tid] = {
                 "trade_id": tid, "ticker": tk, "side": side,
                 "count_initial": abs(qty), "count": abs(qty),
@@ -292,7 +306,16 @@ class PositionManager:
                 "order_ids": [], "fill_ids": [], "state": "open",
                 "strategy": "reconciled", "market_score": None,
                 "entry_edge": None, "entry_ev": None,
+                "avg_price_estimated": estimated,
+                "fees_estimated": True,
+                "opened_at_estimated": True,
             }
+            if estimated:
+                log_pos.warning(
+                    f"{tk}: position reconstruite depuis le broker sans prix "
+                    f"d'entree atteste -- avg_price={avg}c ESTIME, frais "
+                    f"inconnus (0.0$), strategie perdue. Le PnL de reglement "
+                    f"de cette position sera approximatif.")
             report["rebuilt"].append(tk)
         for tid, p in list(self.positions.items()):
             if p["ticker"] not in seen_tickers and not tid.startswith("mig-"):
@@ -320,4 +343,25 @@ class PositionManager:
         if self.positions:
             log_pos.info(f"Recovery: {len(self.positions)} position(s) ouverte(s) "
                          f"rechargee(s): {', '.join(self.tickers_open())}")
+        else:
+            # Un demarrage sans AUCUNE position locale est normal apres un
+            # arret propre a plat — et c'est aussi exactement ce que l'on
+            # observe quand le disque a disparu. Les deux se distinguent en
+            # regardant le journal des trades : un moteur qui a deja
+            # travaille en a forcement un. Vide + un broker qui detient des
+            # positions = l'etat local a ete PERDU, pas simplement absent.
+            #
+            # Le dire fort au demarrage est la seule occasion de le voir :
+            # au cycle suivant, reconcile_with_broker aura reconstruit les
+            # positions et tout aura l'air normal, avec des prix d'entree
+            # inventes et un historique de risque remis a zero.
+            if not self.tlog.trades:
+                log_pos.warning(
+                    "[STATE_EMPTY] aucune position locale ET journal de "
+                    "trades vide au demarrage. Si le broker detient des "
+                    "positions, l'etat local a ete perdu (disque ephemere ?) "
+                    ": les prix d'entree seront estimes et l'historique de "
+                    "risque (drawdown, pertes consecutives, PnL du jour) "
+                    "repart de zero.",
+                    extra={"event": "state_empty_at_startup"})
 
