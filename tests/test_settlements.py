@@ -80,24 +80,38 @@ class TestSettlements(unittest.TestCase):
         self.assertEqual(call_args[0][1], "yes")
         self.assertTrue(call_args[0][2])  # won=True
 
-    def test_settle_trade_failure_keeps_position(self):
-        """A missing trade-log entry must leave the position for retry."""
-        pos = _make_position(trade_id="t-settle-failure")
-        self.pm.positions["t-settle-failure"] = pos
+    def test_missing_trade_log_entry_releases_slot_as_orphan(self):
+        """A missing trade-log entry settles as an orphan and frees the slot.
+
+        The previous contract kept the position "for retry" — but settle_trade
+        returns None for exactly one reason, an id absent from the journal,
+        and an absent id never becomes present. The retry could never succeed,
+        so a broker-rebuilt (brk-) position after a restart held its
+        MAX_OPEN_POSITIONS slot until the 30-day escape hatch even once the
+        broker had published a result.
+        """
+        pos = _make_position(trade_id="t-settle-orphan")
+        self.pm.positions["t-settle-orphan"] = pos
         self.mock_client.get_market.return_value = {
             "ticker": pos["ticker"],
             "status": "settled",
             "result": "yes",
         }
+        orphan_row = {"trade_id": "t-settle-orphan", "orphan": True,
+                      "state": "settled", "result": "yes"}
 
         with patch.object(self.mock_tlog, "settle_trade", return_value=None) as settle, \
-             self.assertLogs("POSITION", level="ERROR") as log_ctx:
+             patch.object(self.mock_tlog, "settle_orphan",
+                          return_value=orphan_row) as orphan, \
+             self.assertLogs("POSITION", level="WARNING") as log_ctx:
             realized = self.pm.check_settlements()
 
-        self.assertEqual(realized, [])
-        self.assertIn("t-settle-failure", self.pm.positions)
+        self.assertEqual(realized, [orphan_row])
+        self.assertNotIn("t-settle-orphan", self.pm.positions)
         settle.assert_called_once()
-        self.assertTrue(any("position kept for retry" in msg for msg in log_ctx.output))
+        orphan.assert_called_once()
+        self.assertTrue(any("reglement" in msg and "orphelin" in msg
+                            for msg in log_ctx.output))
 
     def test_settle_trade_success_pops_position(self):
         """A successful trade-log settlement permits removing the position."""

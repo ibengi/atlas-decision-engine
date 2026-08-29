@@ -120,6 +120,34 @@ class PositionManager:
             total += p["count"] * (mid - p["avg_price"]) / 100.0
         return total
 
+    def _settle_and_release(self, tid: str, p: dict, result: str,
+                            won: bool, gross: float, net: float):
+        """Regle le trade et libere le slot ; retourne la ligne reglee.
+
+        settle_trade ne retourne None que dans UN cas : le trade_id est absent
+        du journal (« introuvable »). Ce n'est pas une erreur transitoire — un
+        id inconnu du journal ne le deviendra jamais — donc « garder la
+        position pour reessayer » garantissait un slot occupe a vie. Le cas
+        concret est une position ``brk-...`` reconstruite depuis le broker
+        apres un redemarrage : le journal des trades vivait sur le disque
+        ephemere du conteneur precedent.
+
+        Pour ces positions, le reglement est ecrit comme ligne orpheline
+        (auditee, marquee ``orphan``) et le slot est libere quand meme : le
+        broker a publie un resultat, la position n'existe plus chez lui, la
+        garder localement ne protege rien et bloque MAX_OPEN_POSITIONS.
+        """
+        t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
+        if t is None:
+            log_pos.warning(
+                f"{p['ticker']}: trade {p['trade_id']} absent du journal "
+                f"(position reconstruite apres redemarrage ?) — reglement "
+                f"orphelin, slot libere quand meme.")
+            t = self.tlog.settle_orphan(p, result, won, gross, net)
+        self.positions.pop(tid, None)
+        self.flush()
+        return t
+
     def check_settlements(self) -> list:
         """Interroge l'API pour les marches regles ; realise le PnL.
         Ecriture du reglement AVANT retrait de la position : un crash entre
@@ -155,12 +183,7 @@ class PositionManager:
                 if not m or str(pick(m, "status", default="") or "").lower() != "open":
                     gross = -p["fees"]   # conservative: lose fees on stale position
                     net = gross - p["fees"]
-                    t = self.tlog.settle_trade(p["trade_id"], "expired_stale", False, gross, net)
-                    if t is None:
-                        log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                        continue
-                    self.positions.pop(tid, None)
-                    self.flush()
+                    t = self._settle_and_release(tid, p, "expired_stale", False, gross, net)
                     if t:
                         realized.append(t)
                     log_pos.warning(
@@ -187,12 +210,7 @@ class PositionManager:
             if result == "void":
                 gross = 0.0   # return of premium, net loss = fees only
                 net = gross - p["fees"]
-                t = self.tlog.settle_trade(p["trade_id"], "void", False, gross, net)
-                if t is None:
-                    log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                    continue
-                self.positions.pop(tid, None)
-                self.flush()
+                t = self._settle_and_release(tid, p, "void", False, gross, net)
                 if t:
                     realized.append(t)
                 log_pos.info(f"{p['ticker']}: reglement VOID (remboursement premium, "
@@ -204,12 +222,7 @@ class PositionManager:
                 if status in ("settled", "finalized"):
                     gross = -p["fees"]   # conservative: assume loss
                     net = gross - p["fees"]
-                    t = self.tlog.settle_trade(p["trade_id"], "void_unreadable", False, gross, net)
-                    if t is None:
-                        log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                        continue
-                    self.positions.pop(tid, None)
-                    self.flush()
+                    t = self._settle_and_release(tid, p, "void_unreadable", False, gross, net)
                     if t:
                         realized.append(t)
                     log_pos.warning(
@@ -226,12 +239,7 @@ class PositionManager:
             cost = p["count"] * p["avg_price"] / 100.0
             gross = (p["count"] * 1.0 - cost) if won else -cost
             net   = gross - p["fees"]
-            t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
-            if t is None:
-                log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                continue
-            self.positions.pop(tid, None)
-            self.flush()
+            t = self._settle_and_release(tid, p, result, won, gross, net)
             if t: realized.append(t)
         return realized
 
