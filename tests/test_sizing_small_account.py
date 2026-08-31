@@ -44,19 +44,30 @@ class _P:
         return 0.0
 
 
-def _rm(settled=None, open_risk=0.0, capital=BAL):
+def _rm(settled=None, open_risk=0.0, capital=BAL, state=None):
     rm = bot.RiskManager.__new__(bot.RiskManager)
     rm.tlog = _T(settled)
     rm.posmgr = _P(open_risk)
     rm.capital = capital
+    # __new__ contourne __init__ : self.state doit etre fourni ici, comme
+    # __init__ le garantit toujours en production (l'oubli faisait planter
+    # can_trade() des que la branche post-cooldown etait atteinte, donc
+    # cette branche n'etait jamais testee).
+    rm.state = dict(state or {})
+    rm.flush = lambda: None
     return rm
 
 
-def _loss(n):
-    from datetime import date
-    today = date.today().isoformat()
+def _loss(n, minutes_ago=5.0):
+    # Horodatage RELATIF a maintenant : l'ancien "T10:00:00" fixe rendait
+    # ces tests dependants de l'heure d'execution (cooldown des pertes
+    # consecutives ecoule ou non selon l'heure UTC du run).
+    from datetime import datetime, timedelta, timezone
+    ts = (datetime.now(timezone.utc)
+          - timedelta(minutes=minutes_ago)).isoformat()
+    today = ts[:10]
     return {"net_pnl": -0.5 * n, "won": False, "gross_pnl": -0.5 * n,
-            "fees": 0.05, "settled_at": today + "T10:00:00+00:00",
+            "fees": 0.05, "settled_at": ts,
             "timestamp": today + "T09:00:00+00:00"}
 
 
@@ -147,6 +158,41 @@ class TestSizer(unittest.TestCase):
 
     def test_max_open_positions_is_3(self):
         self.assertEqual(bot.CFG.MAX_OPEN_POSITIONS, 3)
+
+
+
+class TestPostCooldownHalfOpen(unittest.TestCase):
+    """Branche post-cooldown du circuit-breaker demi-ouvert (jamais testee
+    auparavant : le double _rm plantait avant de l'atteindre)."""
+
+    def _old_losses(self):
+        # 3 pertes reglees il y a longtemps : cooldown certainement ecoule.
+        hours = bot.CFG.CONSECUTIVE_LOSS_COOLDOWN_S / 3600.0 + 2.0
+        return [_loss(1, minutes_ago=hours * 60 + i) for i in (2, 1, 0)]
+
+    def test_cooldown_elapsed_grants_one_retry(self):
+        rm = _rm(settled=self._old_losses(), capital=BAL, state={})
+        ok, why = rm.can_trade(0)
+        self.assertTrue(ok, f"un essai doit etre autorise apres cooldown: {why}")
+
+    def test_claimed_half_open_blocks_until_settlement(self):
+        settled = self._old_losses()
+        anchor = settled[-1]["settled_at"]
+        rm = _rm(settled=settled, capital=BAL,
+                 state={"half_open_anchor": anchor,
+                        "half_open_claimed": True})
+        ok, why = rm.can_trade(0)
+        self.assertFalse(ok)
+        self.assertIn("demi-ouvert", why)
+
+    def test_stale_claim_from_older_settlement_does_not_block(self):
+        settled = self._old_losses()
+        rm = _rm(settled=settled, capital=BAL,
+                 state={"half_open_anchor": "2020-01-01T00:00:00+00:00",
+                        "half_open_claimed": True})
+        ok, why = rm.can_trade(0)
+        self.assertTrue(ok, why)
+
 
 
 if __name__ == "__main__":

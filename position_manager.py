@@ -27,6 +27,11 @@ class PositionManager:
         self.positions = self._migrate(raw)          # trade_id -> pos
         self.seen_fill_ids = set(
             JsonStore.load(_p("seen_fill_ids.json"), []))
+        # Verrou de reconciliation periodique (voir verify_against_broker) :
+        # None = pas de divergence connue ; sinon dict {status, detail, at}.
+        # Volontairement NON persiste : chaque redemarrage re-verifie contre
+        # le broker au lieu d'heriter d'un verdict peut-etre perime.
+        self.reconcile_halt = None
 
     @staticmethod
     def _migrate(raw: dict) -> dict:
@@ -120,6 +125,34 @@ class PositionManager:
             total += p["count"] * (mid - p["avg_price"]) / 100.0
         return total
 
+    def _settle_and_release(self, tid: str, p: dict, result: str,
+                            won: bool, gross: float, net: float):
+        """Regle le trade et libere le slot ; retourne la ligne reglee.
+
+        settle_trade ne retourne None que dans UN cas : le trade_id est absent
+        du journal (« introuvable »). Ce n'est pas une erreur transitoire — un
+        id inconnu du journal ne le deviendra jamais — donc « garder la
+        position pour reessayer » garantissait un slot occupe a vie. Le cas
+        concret est une position ``brk-...`` reconstruite depuis le broker
+        apres un redemarrage : le journal des trades vivait sur le disque
+        ephemere du conteneur precedent.
+
+        Pour ces positions, le reglement est ecrit comme ligne orpheline
+        (auditee, marquee ``orphan``) et le slot est libere quand meme : le
+        broker a publie un resultat, la position n'existe plus chez lui, la
+        garder localement ne protege rien et bloque MAX_OPEN_POSITIONS.
+        """
+        t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
+        if t is None:
+            log_pos.warning(
+                f"{p['ticker']}: trade {p['trade_id']} absent du journal "
+                f"(position reconstruite apres redemarrage ?) — reglement "
+                f"orphelin, slot libere quand meme.")
+            t = self.tlog.settle_orphan(p, result, won, gross, net)
+        self.positions.pop(tid, None)
+        self.flush()
+        return t
+
     def check_settlements(self) -> list:
         """Interroge l'API pour les marches regles ; realise le PnL.
         Ecriture du reglement AVANT retrait de la position : un crash entre
@@ -155,12 +188,7 @@ class PositionManager:
                 if not m or str(pick(m, "status", default="") or "").lower() != "open":
                     gross = -p["fees"]   # conservative: lose fees on stale position
                     net = gross - p["fees"]
-                    t = self.tlog.settle_trade(p["trade_id"], "expired_stale", False, gross, net)
-                    if t is None:
-                        log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                        continue
-                    self.positions.pop(tid, None)
-                    self.flush()
+                    t = self._settle_and_release(tid, p, "expired_stale", False, gross, net)
                     if t:
                         realized.append(t)
                     log_pos.warning(
@@ -187,12 +215,7 @@ class PositionManager:
             if result == "void":
                 gross = 0.0   # return of premium, net loss = fees only
                 net = gross - p["fees"]
-                t = self.tlog.settle_trade(p["trade_id"], "void", False, gross, net)
-                if t is None:
-                    log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                    continue
-                self.positions.pop(tid, None)
-                self.flush()
+                t = self._settle_and_release(tid, p, "void", False, gross, net)
                 if t:
                     realized.append(t)
                 log_pos.info(f"{p['ticker']}: reglement VOID (remboursement premium, "
@@ -204,12 +227,7 @@ class PositionManager:
                 if status in ("settled", "finalized"):
                     gross = -p["fees"]   # conservative: assume loss
                     net = gross - p["fees"]
-                    t = self.tlog.settle_trade(p["trade_id"], "void_unreadable", False, gross, net)
-                    if t is None:
-                        log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                        continue
-                    self.positions.pop(tid, None)
-                    self.flush()
+                    t = self._settle_and_release(tid, p, "void_unreadable", False, gross, net)
                     if t:
                         realized.append(t)
                     log_pos.warning(
@@ -226,14 +244,119 @@ class PositionManager:
             cost = p["count"] * p["avg_price"] / 100.0
             gross = (p["count"] * 1.0 - cost) if won else -cost
             net   = gross - p["fees"]
-            t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
-            if t is None:
-                log_pos.error(f"settle_trade failed for {p['trade_id']} — position kept for retry")
-                continue
-            self.positions.pop(tid, None)
-            self.flush()
+            t = self._settle_and_release(tid, p, result, won, gross, net)
             if t: realized.append(t)
         return realized
+
+    def verify_against_broker(self) -> dict:
+        """Verification broker PERIODIQUE, strictement NON destructrice.
+
+        A la difference de reconcile_with_broker (demarrage), ce passage ne
+        reconstruit rien, ne supprime rien et ne cree evidemment aucun
+        trade : le broker reste la source de verite, mais un etat financier
+        incertain n'est jamais « corrige » automatiquement en cours de vol.
+        Une divergence arme self.reconcile_halt, que les portes du moteur
+        lisent pour bloquer toute NOUVELLE soumission fail-closed ; un
+        passage ulterieur entierement MATCH le desarme (retablissement).
+
+        Statuts retournes :
+          MATCH               broker et local concordent ticker par ticker
+                              -> SEUL statut qui leve le verrou
+          MISMATCH            au moins une divergence (manquant d'un cote,
+                              ou quantite/sens differents) -> verrou
+          BROKER_UNAVAILABLE  la reconciliation etait DUE et la verite n'a
+                              pas pu etre etablie -> verrou (fail-closed) ;
+                              un verrou anterieur plus specifique
+                              (MISMATCH/UNKNOWN) est conserve tel quel
+          UNKNOWN             reponse broker inexploitable -> verrou
+
+        Les positions financieres existantes ne sont JAMAIS detruites ni
+        modifiees parce que le broker est indisponible ; les reglements et
+        la recuperation en lecture seule continuent par ailleurs.
+        """
+        report = {"status": "MATCH", "mismatches": [], "detail": ""}
+        def _unavailable(detail):
+            report["status"] = "BROKER_UNAVAILABLE"
+            report["detail"] = detail
+            # Fail-closed : la reconciliation etait due et la verite n'a
+            # pas pu etre etablie -> les NOUVELLES soumissions sont
+            # bloquees. Un verrou anterieur plus specifique (MISMATCH/
+            # UNKNOWN) est conserve : seul un MATCH digne de confiance
+            # leve un verrou, jamais un echec de verification.
+            if self.reconcile_halt is None:
+                self.reconcile_halt = {"status": "BROKER_UNAVAILABLE",
+                                       "detail": detail, "at": now_iso()}
+            log_pos.error(f"[RECONCILE_VERIFY] broker indisponible "
+                          f"({detail}) -- verite non etablie, soumissions "
+                          f"bloquees fail-closed jusqu'a un MATCH.")
+            return report
+
+        try:
+            broker = self.client.get_positions()
+        except Exception as e:                                # noqa: BLE001
+            return _unavailable(str(e))
+        if broker is None:
+            return _unavailable("get_positions() -> None")
+
+        # Broker : quantite nette signee par ticker (yes>0, no<0).
+        broker_net = {}
+        try:
+            for bp in broker:
+                tk = bp.get("ticker")
+                if not tk:
+                    continue
+                qty = pick_int(bp, "position", "quantity", "count", default=0)
+                broker_net[tk] = broker_net.get(tk, 0) + qty
+        except (TypeError, AttributeError) as e:
+            report["status"] = "UNKNOWN"
+            report["detail"] = f"reponse broker inexploitable: {e}"
+            self.reconcile_halt = {"status": "UNKNOWN",
+                                   "detail": report["detail"],
+                                   "at": now_iso()}
+            log_pos.error("[RECONCILE_VERIFY] reponse broker inexploitable "
+                          f"({e}) -- soumissions bloquees fail-closed.")
+            return report
+        broker_net = {tk: q for tk, q in broker_net.items() if q != 0}
+
+        local_net = {}
+        for p in self._active_positions():
+            sign = 1 if p.get("side") == "yes" else -1
+            local_net[p["ticker"]] = (local_net.get(p["ticker"], 0)
+                                      + sign * int(p.get("count", 0)))
+        local_net = {tk: q for tk, q in local_net.items() if q != 0}
+
+        for tk in sorted(set(broker_net) | set(local_net)):
+            b, l = broker_net.get(tk), local_net.get(tk)
+            if b == l:
+                continue
+            if l is None:
+                kind = "broker_only"
+            elif b is None:
+                kind = "local_only"
+            else:
+                kind = "quantity_mismatch"
+            report["mismatches"].append(
+                {"ticker": tk, "kind": kind, "broker": b, "local": l})
+
+        if report["mismatches"]:
+            report["status"] = "MISMATCH"
+            self.reconcile_halt = {"status": "MISMATCH",
+                                   "detail": report["mismatches"],
+                                   "at": now_iso()}
+            log_pos.error(f"[RECONCILE_VERIFY] MISMATCH -- soumissions "
+                          f"bloquees fail-closed, etat local INTACT "
+                          f"(aucune correction automatique): "
+                          f"{report['mismatches']}")
+        else:
+            if self.reconcile_halt is not None:
+                log_pos.warning("[RECONCILE_VERIFY] retablissement: broker "
+                                "et local de nouveau concordants -- verrou "
+                                "de reconciliation leve.")
+            self.reconcile_halt = None
+            log_pos.info(f"[RECONCILE_VERIFY] MATCH "
+                         f"(tickers broker={len(broker_net)} "
+                         f"local={len(local_net)})")
+        return report
 
     def reconcile_with_broker(self) -> dict:
         """Broker = source de verite. Reconstruit les positions presentes
@@ -276,7 +399,21 @@ class PositionManager:
             tid = f"brk-{tk}-{side}"                 # ID STABLE = idempotent
             if tid in self.positions:
                 continue
-            avg = pick_int(bp, "avg_price", "market_exposure", default=50) or 50
+            # Le broker connait l'EXISTENCE, le sens et la quantite. Il ne
+            # rend pas le prix d'entree reellement paye : ni les frais, ni la
+            # strategie, ni l'horodatage d'ouverture. `default=50` n'est donc
+            # pas une mesure mais un remplissage — 50c au hasard sur une
+            # position reellement entree a 3c fausse open_risk, le PnL au
+            # reglement et toute statistique qui les agrege.
+            #
+            # Le chiffre est conserve (le retirer casserait l'arithmetique en
+            # aval) mais il est desormais ETIQUETE : `avg_price_estimated`
+            # dit qu'aucun fill ne l'atteste, et `opened_at_estimated` dit
+            # que l'horodatage est celui de la reconstruction, pas de
+            # l'ouverture — ce qui compte pour l'echappatoire d'age.
+            measured_avg = pick_int(bp, "avg_price", default=0)
+            avg = measured_avg or (pick_int(bp, "market_exposure", default=50) or 50)
+            estimated = measured_avg <= 0
             self.positions[tid] = {
                 "trade_id": tid, "ticker": tk, "side": side,
                 "count_initial": abs(qty), "count": abs(qty),
@@ -284,7 +421,16 @@ class PositionManager:
                 "order_ids": [], "fill_ids": [], "state": "open",
                 "strategy": "reconciled", "market_score": None,
                 "entry_edge": None, "entry_ev": None,
+                "avg_price_estimated": estimated,
+                "fees_estimated": True,
+                "opened_at_estimated": True,
             }
+            if estimated:
+                log_pos.warning(
+                    f"{tk}: position reconstruite depuis le broker sans prix "
+                    f"d'entree atteste -- avg_price={avg}c ESTIME, frais "
+                    f"inconnus (0.0$), strategie perdue. Le PnL de reglement "
+                    f"de cette position sera approximatif.")
             report["rebuilt"].append(tk)
         for tid, p in list(self.positions.items()):
             if p["ticker"] not in seen_tickers and not tid.startswith("mig-"):
@@ -312,4 +458,25 @@ class PositionManager:
         if self.positions:
             log_pos.info(f"Recovery: {len(self.positions)} position(s) ouverte(s) "
                          f"rechargee(s): {', '.join(self.tickers_open())}")
+        else:
+            # Un demarrage sans AUCUNE position locale est normal apres un
+            # arret propre a plat — et c'est aussi exactement ce que l'on
+            # observe quand le disque a disparu. Les deux se distinguent en
+            # regardant le journal des trades : un moteur qui a deja
+            # travaille en a forcement un. Vide + un broker qui detient des
+            # positions = l'etat local a ete PERDU, pas simplement absent.
+            #
+            # Le dire fort au demarrage est la seule occasion de le voir :
+            # au cycle suivant, reconcile_with_broker aura reconstruit les
+            # positions et tout aura l'air normal, avec des prix d'entree
+            # inventes et un historique de risque remis a zero.
+            if not self.tlog.trades:
+                log_pos.warning(
+                    "[STATE_EMPTY] aucune position locale ET journal de "
+                    "trades vide au demarrage. Si le broker detient des "
+                    "positions, l'etat local a ete perdu (disque ephemere ?) "
+                    ": les prix d'entree seront estimes et l'historique de "
+                    "risque (drawdown, pertes consecutives, PnL du jour) "
+                    "repart de zero.",
+                    extra={"event": "state_empty_at_startup"})
 

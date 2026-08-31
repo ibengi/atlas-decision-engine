@@ -91,7 +91,10 @@ class TestCreateOrderV2Payload(unittest.TestCase):
 
 class TestNoV1OrderEndpointLeft(unittest.TestCase):
     def test_no_post_to_legacy_portfolio_orders(self):
-        src = inspect.getsource(bot)
+        # Depuis l'extraction en modules, les requetes partent de
+        # kalshi_client : l'assertion couvre les deux sources.
+        import kalshi_client
+        src = inspect.getsource(bot) + inspect.getsource(kalshi_client)
         self.assertNotIn('"POST", "/portfolio/orders"', src)
         # GET/DELETE /portfolio/orders/{id} restent V2-compatibles ; tout
         # 410 'deprecated' futur leve un message de migration explicite
@@ -99,7 +102,7 @@ class TestNoV1OrderEndpointLeft(unittest.TestCase):
 
     def test_demo_script_uses_client_hence_v2(self):
         p = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), "scripts",
+            os.path.abspath(__file__))),
             "kalshi_demo_execution_check.py")
         src = open(p, encoding="utf-8").read()
         self.assertIn("client.create_order", src)

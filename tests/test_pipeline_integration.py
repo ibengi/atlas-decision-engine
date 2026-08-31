@@ -114,11 +114,19 @@ class FakeClient:
     def cancel_order(self, oid):
         self.cancelled.append(oid)
         o = self._orders.get(oid)
+        reduced = 0
         if o and o["status"] not in ("executed",):
             o["status"] = "canceled"
-        return dict(o or {})
+            # L'API reelle renvoie reduced_by = quantite retiree du carnet ;
+            # l'OrderManager EXIGE cette preuve (sinon etat 'unknown',
+            # fail-closed). Le double doit modeliser la semantique documentee
+            # du broker, pas une reponse vide.
+            req = next((c["count"] for c in self.created_orders
+                        if c["order_id"] == oid), 0)
+            reduced = max(0, req - int(o.get("taker_fill_count") or 0))
+        return dict(o or {}, reduced_by=reduced)
 
-    def get_fills(self, order_id):
+    def get_fills(self, order_id, *, strict=False):
         o = self._orders.get(order_id) or {}
         n = int(o.get("taker_fill_count") or 0)
         if n <= 0:

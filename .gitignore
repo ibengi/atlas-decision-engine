@@ -15,3 +15,12 @@ raw_samples/
 backups/
 *.log
 .DS_Store
+
+# Etat d'execution du moteur (ecrit dans DATA_DIR, "." par defaut) — jamais
+# des sources. Les suites de tests instancient PositionManager/TradeLogger
+# avec les vrais JsonStore et deposent ces fichiers a la racine du depot ;
+# en production ils contiennent l'etat de trading vivant et ne doivent
+# jamais etre commites.
+positions_state.json*
+seen_fill_ids.json*
+reconciliation_report.json*

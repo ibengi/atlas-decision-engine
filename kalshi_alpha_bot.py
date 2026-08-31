@@ -214,6 +214,13 @@ def main():
     if args.shadow:
         CFG.SHADOW_MODE = True
 
+    # Restauration zero-perte AVANT toute lecture d'etat (Phase 2B): si le
+    # volume est vierge et que l'operateur fournit le backup golden en env,
+    # les cinq fichiers critiques sont recrees octet pour octet; tout echec
+    # declenche la sentinelle et bloque les soumissions fail-closed.
+    from state_restore import maybe_restore_state
+    maybe_restore_state()
+
     env = "demo" if (args.demo or os.getenv("DEMO_TRADING", "") == "1") \
         else "prod"
     if env == "prod" and not (args.scan_only or args.rank_only):

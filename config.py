@@ -53,6 +53,28 @@ class Config:
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
     MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
     MAX_POSITION_AGE_DAYS   = _env_i("MAX_POSITION_AGE_DAYS", 30)
+    # Plafond DUR de contrats par ordre, independant de tout sizing en % :
+    # clampe apres PositionSizer ET re-verifie juste avant le POST broker
+    # (defense en profondeur). Validation stricte via contract_cap_config():
+    # une valeur invalide, nulle, negative ou deraisonnable DESACTIVE les
+    # soumissions fail-closed — une erreur de configuration operateur n'est
+    # JAMAIS reinterpretee silencieusement. Valeur absente : defaut sur
+    # documente (CONTRACT_CAP_DEFAULT) hors config LIVE-capable ; une config
+    # LIVE-capable (REQUIRE_PERSISTENT_STATE=true) EXIGE une valeur
+    # explicite. Canary LIVE prevu: MAX_CONTRACTS_PER_ORDER=1.
+    MAX_CONTRACTS_PER_ORDER = os.getenv("MAX_CONTRACTS_PER_ORDER")
+    # Reconciliation broker PERIODIQUE (l'appel au demarrage ne suffit pas :
+    # 15 jours d'uptime = 15 jours sans verification). 0 desactive le
+    # passage periodique (comportement historique, tests uniquement).
+    RECONCILE_INTERVAL_S    = _env_f("RECONCILE_INTERVAL_SECONDS", 900.0)
+    # Deploiement LIVE-capable : exiger la continuite de l'etat persistant.
+    # Un marqueur state_epoch.json absent (disque neuf ou EFFACE) bloque
+    # les soumissions fail-closed au lieu de reprendre comme si de rien
+    # n'etait. ALLOW_FRESH_STATE=true est l'acquittement operateur explicite
+    # d'un repertoire d'etat volontairement vide (premier montage du
+    # volume). Les DEUX sont off par defaut: zero changement en DEMO.
+    REQUIRE_PERSISTENT_STATE = _env_b("REQUIRE_PERSISTENT_STATE", default=False)
+    ALLOW_FRESH_STATE        = _env_b("ALLOW_FRESH_STATE", default=False)
     # Portfolio controls are opt-in (0 disables each percentage cap).
     MAX_CORRELATION_GROUP_PCT = _env_f("MAX_CORRELATION_GROUP_PCT", 0.0)
     MAX_PORTFOLIO_RISK_PCT = _env_f("MAX_PORTFOLIO_RISK_PCT", 0.0)
@@ -126,3 +148,47 @@ CFG = Config()
 def _p(name: str) -> str:
     return os.path.join(CFG.DATA_DIR, name)
 
+
+#: Defaut documente du plafond de contrats, valable UNIQUEMENT hors
+#: configuration LIVE-capable (une config LIVE-capable exige une valeur
+#: explicite).
+CONTRACT_CAP_DEFAULT = 100
+#: Au-dela, la valeur est jugee deraisonnable et REJETEE par la validation
+#: (protection contre une faute de frappe type "10000").
+CONTRACT_CAP_MAX = 1000
+
+
+def contract_cap_config(live_capable=None):
+    """Validate MAX_CONTRACTS_PER_ORDER. Returns (cap, error).
+
+    cap is a positive int when the configuration is usable; cap is None
+    when order submission must be DISABLED fail-closed, with `error`
+    naming the operator-visible reason. An invalid operator configuration
+    is never silently reinterpreted (never collapsed to 1, never to a
+    default).
+
+      valid positive int            -> (int, None)
+      missing, non-LIVE-capable     -> (CONTRACT_CAP_DEFAULT, None)
+      missing, LIVE-capable         -> (None, "...explicit value required")
+      invalid string                -> (None, "...")
+      zero / negative               -> (None, "...")
+      > CONTRACT_CAP_MAX            -> (None, "...")
+    """
+    if live_capable is None:
+        live_capable = bool(CFG.REQUIRE_PERSISTENT_STATE)
+    raw = CFG.MAX_CONTRACTS_PER_ORDER
+    if raw is None or str(raw).strip() == "":
+        if live_capable:
+            return None, ("MAX_CONTRACTS_PER_ORDER absent: une configuration "
+                          "LIVE-capable exige une valeur explicite")
+        return CONTRACT_CAP_DEFAULT, None
+    try:
+        v = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, f"MAX_CONTRACTS_PER_ORDER invalide: {raw!r}"
+    if v <= 0:
+        return None, f"MAX_CONTRACTS_PER_ORDER <= 0 ({v}): soumissions desactivees"
+    if v > CONTRACT_CAP_MAX:
+        return None, (f"MAX_CONTRACTS_PER_ORDER deraisonnable ({v} > "
+                      f"{CONTRACT_CAP_MAX}): rejete par validation")
+    return v, None

@@ -23,7 +23,10 @@ import kalshi_alpha_bot as bot
 from test_pipeline_integration import FakeClient, make_engine, BTCD
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPT = os.path.join(ROOT, "scripts", "kalshi_demo_execution_check.py")
+# Le script vit a la racine du depot depuis l'extraction en modules
+# (l'ancien chemin scripts/ faisait echouer ces gardes en silence :
+# subprocess FileNotFoundError => stdout vide => assertions fausses).
+SCRIPT = os.path.join(ROOT, "kalshi_demo_execution_check.py")
 
 
 class _Cap:
@@ -115,7 +118,12 @@ class TestProofProtocolLogs(unittest.TestCase):
         t = cap.text
         self.assertEqual(placed, 0)
         self.assertIn("[ORDER_SUBMIT_RESPONSE]", t)      # accepte...
-        self.assertIn("[ORDER_CANCELED_UNFILLED]", t)    # ...mais pas rempli
+        # ...mais pas rempli : l'annulation est PROUVEE (reduced_by) puis la
+        # verification des fills confirme 0 contrat. L'ancien marqueur
+        # [ORDER_CANCELED_UNFILLED] a ete remplace par cette paire.
+        self.assertIn("[ORDER_CANCEL_CONFIRMED]", t)
+        self.assertIn("[FILL_VERIFY]", t)
+        self.assertIn("filled_contracts=0", t)
         self.assertNotIn("[ORDER_FILLED]", t)
         self.assertNotIn("[POSITION_OPENED]", t)
         self.assertIn("accepted != filled", t.replace("\n", " ")

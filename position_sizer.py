@@ -2,7 +2,7 @@
 import logging
 import math
 
-from config import CFG
+from config import CFG, contract_cap_config
 
 log_rsk = logging.getLogger("RISK")
 
@@ -55,7 +55,15 @@ class PositionSizer:
                          f"{CFG.DD_THROTTLE_PCT:g}% du capital -- taille reduite.")
         budget_left = capital * CFG.RISK_BUDGET_PCT / 100.0 - open_risk
         alloc = min(capital * pct / 100.0, max(0.0, budget_left))
-        return max(0, int(alloc / (price_cents / 100.0)))
+        # Plafond DUR final : aucun chemin de sizing (legacy ou Kelly,
+        # quel que soit MAX_POSITION_PCT) ne peut depasser le cap. Une
+        # configuration de cap invalide dimensionne 0 (fail-closed) — elle
+        # n'est jamais reinterpretee.
+        cap, cap_err = contract_cap_config()
+        if cap is None:
+            log_rsk.error(f"Sizer: {cap_err} -- taille forcee a 0.")
+            return 0
+        return min(cap, max(0, int(alloc / (price_cents / 100.0))))
 
     @staticmethod
     def contracts(capital: float, price_cents: int, taille_str: str,
@@ -84,4 +92,8 @@ class PositionSizer:
         minimum = max(0.0, float(getattr(CFG, "KELLY_MIN_BET", 1.0)))
         if alloc < minimum:
             alloc = minimum if budget_left >= minimum else 0.0
-        return max(0, int(alloc / (price_cents / 100.0)))
+        cap, cap_err = contract_cap_config()
+        if cap is None:
+            log_rsk.error(f"Sizer: {cap_err} -- taille forcee a 0.")
+            return 0
+        return min(cap, max(0, int(alloc / (price_cents / 100.0))))

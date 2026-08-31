@@ -91,6 +91,55 @@ class TradeLogger:
         log_trd.error(f"settle_trade: trade_id {trade_id} introuvable.")
         return None
 
+    def settle_orphan(self, position: dict, result: str, won: bool,
+                      gross_pnl: float, net_pnl: float) -> dict:
+        """Regle une position dont le trade d'origine est absent du journal.
+
+        Cas reel : une position reconstruite par reconcile_with_broker apres
+        un redemarrage (id ``brk-...``) n'a jamais eu de ligne de trade — le
+        journal vivait sur le disque ephemere du conteneur precedent. Pour
+        elle, settle_trade echoue a CHAQUE cycle et echouera toujours :
+        « position kept for retry » etait un mensonge, le retry ne pouvait
+        jamais aboutir et le slot restait occupe jusqu'a l'echappatoire
+        MAX_POSITION_AGE_DAYS (30 j).
+
+        On ecrit donc une ligne de reglement synthetisee depuis la position
+        elle-meme, marquee ``orphan`` pour que les statistiques puissent
+        l'exclure ou l'auditer : ses champs d'entree (prix moyen, frais)
+        viennent de la reconstruction broker, pas d'un fill observe.
+        """
+        rec = {
+            "schema": self.SCHEMA,
+            "trade_id": position.get("trade_id") or f"orphan-{uuid.uuid4().hex[:8]}",
+            "decision_id": None,
+            "timestamp": position.get("opened_at") or now_iso(),
+            "ticker": position.get("ticker"), "market": None,
+            "side": position.get("side"),
+            "requested_price": None,
+            "avg_fill_price": position.get("avg_price"),
+            "requested_count": position.get("count_initial"),
+            "filled_count": position.get("count"),
+            "spread": None, "fees": round(position.get("fees", 0.0), 2),
+            "edge": None, "ev": None, "confidence": None, "grade": None,
+            "reason": "orphan_settlement",
+            "analysis": ("reglement orphelin : position reconstruite depuis "
+                         "le broker apres redemarrage, trade d'origine absent "
+                         "du journal (disque ephemere)"),
+            "order_id": None, "order_status": None,
+            "state": "settled", "result": result, "won": won,
+            "gross_pnl": round(gross_pnl, 2), "net_pnl": round(net_pnl, 2),
+            "roi": None, "holding_seconds": None, "settled_at": now_iso(),
+            "orphan": True,
+        }
+        self.trades.append(rec)
+        self.flush()
+        log_trd.warning(
+            f"REGLE (orphelin) {rec['ticker']} -> {str(result).upper()} | "
+            f"{'GAGNE' if won else 'PERDU'} | net {net_pnl:+.2f}$ | "
+            f"trade d'origine absent du journal — reglement synthetise "
+            f"depuis la position reconstruite")
+        return rec
+
     def has_open_on(self, ticker: str) -> bool:
         return any(t["ticker"] == ticker and t["state"] == "open" for t in self.trades)
 

@@ -1,0 +1,111 @@
+{
+ "_schema": "atlas.pre_migration_evidence.v1",
+ "_purpose": [
+  "Baseline captured immediately BEFORE the first restart of the state",
+  "persistence migration. The disk this describes is destroyed by that",
+  "restart, so this record is committed to git — the only place the",
+  "migration cannot reach."
+ ],
+ "_law": [
+  "Any field that cannot actually be read is the string UNAVAILABLE.",
+  "Never 0, never an estimate, never a plausible-looking default. A false",
+  "baseline is worse than no baseline: the post-restart comparison would",
+  "'confirm' it."
+ ],
+ "timestamp": "UNAVAILABLE",
+ "deployed_commit": "UNAVAILABLE",
+ "gate_a_confirmation": {
+  "_rule": "Two consecutive observations, >= 60s apart, all four fields true in BOTH. Any disagreement aborts the migration.",
+  "observation_1": {
+   "at": "UNAVAILABLE",
+   "open_count": "UNAVAILABLE",
+   "guard_state": "UNAVAILABLE",
+   "guard_reason": "UNAVAILABLE",
+   "unresolved_broker_positions": "UNAVAILABLE",
+   "evidence_trustworthy": "UNAVAILABLE",
+   "engine_cycle": "UNAVAILABLE"
+  },
+  "observation_2": {
+   "at": "UNAVAILABLE",
+   "open_count": "UNAVAILABLE",
+   "guard_state": "UNAVAILABLE",
+   "guard_reason": "UNAVAILABLE",
+   "unresolved_broker_positions": "UNAVAILABLE",
+   "evidence_trustworthy": "UNAVAILABLE",
+   "engine_cycle": "UNAVAILABLE"
+  },
+  "separation_seconds": "UNAVAILABLE",
+  "observations_agree": "UNAVAILABLE"
+ },
+ "open_count": "UNAVAILABLE",
+ "guard_state": "UNAVAILABLE",
+ "guard_reason": "UNAVAILABLE",
+ "broker_position_summary": {
+  "_source": "engine reconciliation log: matched / rebuilt / ghost",
+  "matched": "UNAVAILABLE",
+  "rebuilt": "UNAVAILABLE",
+  "ghost": "UNAVAILABLE"
+ },
+ "risk_state_summary": {
+  "_source": "engine [CAPITAL] and pnl_jour / frais_cumules lines",
+  "solde": "UNAVAILABLE",
+  "capital_effectif": "UNAVAILABLE",
+  "pnl_jour": "UNAVAILABLE",
+  "frais_cumules": "UNAVAILABLE",
+  "risque_ouvert": "UNAVAILABLE",
+  "_note": "consecutive_losses and rolling_drawdown are derived from the trade journal and are not logged; they are UNAVAILABLE by construction and WILL reset at migration."
+ },
+ "submission_guard_state": {
+  "_source": "[SUBMISSION_GUARD_LOADED] active_tickers=N — emitted at STARTUP ONLY",
+  "active_tickers": "UNAVAILABLE",
+  "ttl_seconds": "UNAVAILABLE",
+  "_note": "Pre-migration value is whatever the LAST startup reported, or UNAVAILABLE if that line has aged out of log retention."
+ },
+ "trade_journal_count": {
+  "_source": "research /api/research/v1/capabilities settled-trade count, via evidence capture",
+  "settled_trades": "UNAVAILABLE",
+  "_note": "Open (unsettled) trade rows are exported by nothing and are not counted here."
+ },
+ "expected_loss_at_migration": [
+  "cumulative rolling_drawdown history",
+  "consecutive_losses streak",
+  "trades_today counter",
+  "submission_guard entries still inside their TTL",
+  "any in-flight order in orders_state.json",
+  "entry price / fees / strategy of any position still open (must be zero at migration)"
+ ],
+ "phase_2a_source_backup": {
+  "_rule": "Actual hex digests REQUIRED. A record carrying placeholders ('...', 'MATCH=YES' without values) cannot gate the cutover: step 12 compares destination hashes against THESE values, and an elided baseline is a false baseline. UNAVAILABLE stays the only honest substitute for a value that could not be read.",
+  "captured_at": "UNAVAILABLE",
+  "capture_method": "UNAVAILABLE (railway ssh | http_semantic)",
+  "source_deployment_id": "UNAVAILABLE",
+  "artifacts": {
+   "submission_guard.json": {
+    "source_sha256": "UNAVAILABLE",
+    "bytes": "UNAVAILABLE"
+   },
+   "orders_state.json": {
+    "source_sha256": "UNAVAILABLE",
+    "bytes": "UNAVAILABLE"
+   },
+   "kalshi_trades.json": {
+    "source_sha256": "UNAVAILABLE",
+    "bytes": "UNAVAILABLE"
+   },
+   "risk_state.json": {
+    "source_sha256": "UNAVAILABLE",
+    "bytes": "UNAVAILABLE"
+   },
+   "positions_state.json": {
+    "source_sha256": "UNAVAILABLE",
+    "bytes": "UNAVAILABLE"
+   }
+  },
+  "research_artifacts_included": "UNAVAILABLE (btc_daily_*.jsonl, shadow_predictions.json, decisions.jsonl*, cycles.jsonl)",
+  "freshness_anchor": {
+   "_rule": "Hashes are valid only while the source stays frozen: any settlement or [ORDER_SUBMIT_ATTEMPT] after captured_at invalidates journal/positions/guard digests -> re-export.",
+   "engine_cycle_at_capture": "UNAVAILABLE",
+   "settled_count_at_capture": "UNAVAILABLE"
+  }
+ }
+}
