@@ -6,9 +6,17 @@ write path into the running container is the deployment itself, so the
 backup rides in as operator-controlled environment variables:
 
   RESTORE_STATE_TGZ_B64  base64 of a tar.gz holding the five critical
-                         state files at the archive root
+                         state files at the archive root; may be split
+                         into RESTORE_STATE_TGZ_B64 + _2, _3, ... chunks
+                         (concatenated in suffix order) because some
+                         provisioning paths mangle long values
   RESTORE_STATE_SHA256   JSON object {filename: 64-hex sha256} for the
                          exact bytes of each file
+
+Whitespace inside the base64 and missing trailing padding are repaired
+before decoding: neither carries data, and the per-file SHA-256 manifest
+-- not base64 well-formedness -- is the integrity authority. Any real
+corruption still fails the hash check and writes nothing.
 
 No runtime state lives in git; code only. Semantics are fail-closed:
 
@@ -65,10 +73,23 @@ def _atomic_write(path: str, payload: bytes) -> None:
     os.replace(tmp, path)
 
 
+def _read_b64_env() -> str:
+    parts = [os.getenv("RESTORE_STATE_TGZ_B64", "")]
+    i = 2
+    while True:
+        part = os.getenv(f"RESTORE_STATE_TGZ_B64_{i}")
+        if part is None:
+            break
+        parts.append(part)
+        i += 1
+    b64 = "".join("".join(p.split()) for p in parts)
+    return b64 + "=" * (-len(b64) % 4) if b64 else ""
+
+
 def maybe_restore_state() -> bool:
     """Runs before any manager touches state. True = state usable
     (restored, already present, or restore not requested)."""
-    b64 = os.getenv("RESTORE_STATE_TGZ_B64", "").strip()
+    b64 = _read_b64_env()
     if not b64:
         return True
 

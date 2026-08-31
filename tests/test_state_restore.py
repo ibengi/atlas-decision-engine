@@ -152,6 +152,30 @@ class RestoreTest(unittest.TestCase):
         self.assertFalse(maybe_restore_state())
         self.assertFalse(PersistenceSentinel.healthy())
 
+    def test_chunked_b64_with_whitespace_and_lost_padding_restores(self):
+        b64 = _tgz_b64()
+        third = len(b64) // 3
+        os.environ["RESTORE_STATE_TGZ_B64"] = b64[:third] + "\n"
+        os.environ["RESTORE_STATE_TGZ_B64_2"] = " " + b64[third:2 * third]
+        os.environ["RESTORE_STATE_TGZ_B64_3"] = \
+            b64[2 * third:].rstrip("=") + "\n"
+        os.environ["RESTORE_STATE_SHA256"] = _manifest()
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in
+                                 ("RESTORE_STATE_TGZ_B64_2",
+                                  "RESTORE_STATE_TGZ_B64_3")])
+        self.assertTrue(maybe_restore_state())
+        self.assertTrue(PersistenceSentinel.healthy())
+        for name, payload in FILES.items():
+            self.assertEqual(
+                open(os.path.join(self.tmp, name), "rb").read(), payload)
+
+    def test_truncated_chunk_fails_closed(self):
+        b64 = _tgz_b64()
+        os.environ["RESTORE_STATE_TGZ_B64"] = b64[:len(b64) - 200]
+        os.environ["RESTORE_STATE_SHA256"] = _manifest()
+        self.assertFalse(maybe_restore_state())
+        self.assertFalse(PersistenceSentinel.healthy())
+
 
 if __name__ == "__main__":
     unittest.main()
