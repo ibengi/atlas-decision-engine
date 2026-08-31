@@ -91,27 +91,40 @@ class TestClassification(VerifyTestCase):
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "MISMATCH")
 
-    def test_api_exception_is_broker_unavailable(self):
+    def test_api_exception_halts_fail_closed(self):
+        """Reconciliation was due and truth could not be established:
+        new submissions are blocked until a trustworthy MATCH."""
         self.cli.get_positions.side_effect = RuntimeError("timeout")
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "BROKER_UNAVAILABLE")
-        # Absence of proof: no halt is set...
-        self.assertIsNone(self.pm.reconcile_halt)
+        self.assertEqual(self.pm.reconcile_halt["status"],
+                         "BROKER_UNAVAILABLE")
+        # ...but existing financial state is never touched by an outage.
+        self.assertEqual(self.pm.positions, {})
 
-    def test_api_none_is_broker_unavailable(self):
+    def test_api_none_halts_fail_closed(self):
         self.cli.get_positions.return_value = None
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "BROKER_UNAVAILABLE")
+        self.assertIsNotNone(self.pm.reconcile_halt)
 
-    def test_broker_unavailable_does_not_lift_an_existing_halt(self):
-        """...and an existing halt is NOT cleared by an unreachable broker:
-        recovery requires a positive MATCH, not a failed check."""
-        self.pm.reconcile_halt = {"status": "MISMATCH", "detail": [],
+    def test_outage_does_not_modify_existing_positions(self):
+        self.pm.positions["t1"] = _pos("t1", "KXOUT", "yes", 2)
+        self.cli.get_positions.side_effect = RuntimeError("down")
+        self.pm.verify_against_broker()
+        self.assertIn("t1", self.pm.positions)
+        self.assertEqual(self.pm.positions["t1"]["state"], "open")
+        self.assertEqual(self.pm.positions["t1"]["count"], 2)
+
+    def test_broker_unavailable_preserves_a_more_specific_halt(self):
+        """An existing MISMATCH halt is kept as-is (not overwritten, never
+        lifted) by an unreachable broker: recovery requires MATCH."""
+        self.pm.reconcile_halt = {"status": "MISMATCH", "detail": ["x"],
                                   "at": "t0"}
         self.cli.get_positions.side_effect = RuntimeError("down")
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "BROKER_UNAVAILABLE")
-        self.assertIsNotNone(self.pm.reconcile_halt)
+        self.assertEqual(self.pm.reconcile_halt["status"], "MISMATCH")
 
     def test_unparsable_broker_rows_are_unknown_and_halt(self):
         self.cli.get_positions.return_value = ["not-a-dict"]
@@ -158,6 +171,105 @@ class TestEngineGate(VerifyTestCase):
         self.assertFalse(ok)
         self.assertNotEqual(guard, "reconciliation_mismatch")
         eng.risk.can_trade.assert_called_once()
+
+
+
+class TestHaltStateMachine(VerifyTestCase):
+    """The approved transition matrix: only MATCH clears the halt; every
+    non-MATCH outcome blocks new submissions."""
+
+    def _gate(self):
+        eng = bot.ExecutionEngine.__new__(bot.ExecutionEngine)
+        eng.posmgr = self.pm
+        eng.risk = MagicMock()
+        eng.risk.can_trade.return_value = (True, "")
+        eng.risk.rolling_drawdown_pct.return_value = 0.0
+        eng.risk.rolling_drawdown.return_value = 0.0
+        return eng
+
+    def _set_broker(self, rows=None, exc=None):
+        self.cli.get_positions.side_effect = exc
+        if exc is None:
+            self.cli.get_positions.return_value = rows
+
+    def test_match_then_submissions_eligible(self):
+        self._set_broker(rows=[])
+        self.assertEqual(self.pm.verify_against_broker()["status"], "MATCH")
+        self.assertIsNone(self.pm.reconcile_halt)
+
+    def test_match_then_broker_unavailable_blocks(self):
+        self._set_broker(rows=[])
+        self.pm.verify_against_broker()
+        self._set_broker(exc=TimeoutError("api timeout"))
+        self.pm.verify_against_broker()
+        self.assertIsNotNone(self.pm.reconcile_halt)
+        ok, guard = self._gate()._post_balance_gates()
+        self.assertFalse(ok)
+        self.assertEqual(guard, "reconciliation_broker_unavailable")
+
+    def test_match_then_unknown_blocks(self):
+        self._set_broker(rows=[])
+        self.pm.verify_against_broker()
+        self._set_broker(rows=[42])                 # malformed payload
+        self.pm.verify_against_broker()
+        ok, guard = self._gate()._post_balance_gates()
+        self.assertFalse(ok)
+        self.assertEqual(guard, "reconciliation_unknown")
+
+    def test_match_then_mismatch_blocks(self):
+        self._set_broker(rows=[])
+        self.pm.verify_against_broker()
+        self._set_broker(rows=[{"ticker": "KXSM", "position": 1}])
+        self.pm.verify_against_broker()
+        ok, guard = self._gate()._post_balance_gates()
+        self.assertFalse(ok)
+        self.assertEqual(guard, "reconciliation_mismatch")
+
+    def test_mismatch_then_broker_unavailable_remains_blocked(self):
+        self._set_broker(rows=[{"ticker": "KXSM", "position": 1}])
+        self.pm.verify_against_broker()
+        self._set_broker(exc=RuntimeError("down"))
+        self.pm.verify_against_broker()
+        ok, guard = self._gate()._post_balance_gates()
+        self.assertFalse(ok)
+        self.assertEqual(guard, "reconciliation_mismatch")   # kept, not lifted
+
+    def test_broker_unavailable_then_match_clears(self):
+        self._set_broker(exc=RuntimeError("down"))
+        self.pm.verify_against_broker()
+        self.assertIsNotNone(self.pm.reconcile_halt)
+        self._set_broker(rows=[])
+        self.assertEqual(self.pm.verify_against_broker()["status"], "MATCH")
+        self.assertIsNone(self.pm.reconcile_halt)
+        ok, _ = self._gate()._post_balance_gates()
+        # gates continue past reconciliation into ordinary risk gates
+        self.assertNotIn(_, ("reconciliation_mismatch",
+                             "reconciliation_unknown",
+                             "reconciliation_broker_unavailable"))
+
+    def test_unknown_then_match_clears(self):
+        self._set_broker(rows=["garbage"])
+        self.pm.verify_against_broker()
+        self.assertEqual(self.pm.reconcile_halt["status"], "UNKNOWN")
+        self._set_broker(rows=[])
+        self.pm.verify_against_broker()
+        self.assertIsNone(self.pm.reconcile_halt)
+
+    def test_api_timeout_means_no_broker_post(self):
+        self._set_broker(exc=TimeoutError("api timeout"))
+        self.pm.verify_against_broker()
+        ok, guard = self._gate()._post_balance_gates()
+        self.assertFalse(ok, "gate must block: no broker POST can follow")
+        self.cli.create_order.assert_not_called()
+        self.cli.cancel_order.assert_not_called()
+
+    def test_malformed_payload_means_no_broker_post(self):
+        self._set_broker(rows=[{"no_ticker": True}, 3.14])
+        self.pm.verify_against_broker()
+        ok, guard = self._gate()._post_balance_gates()
+        self.assertFalse(ok)
+        self.cli.create_order.assert_not_called()
+        self.cli.cancel_order.assert_not_called()
 
 
 if __name__ == "__main__":

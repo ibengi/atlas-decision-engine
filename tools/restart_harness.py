@@ -102,6 +102,9 @@ print("=" * 72)
 shutil.rmtree(DATA, ignore_errors=True)
 bot.CFG.REQUIRE_PERSISTENT_STATE = True
 bot.CFG.ALLOW_FRESH_STATE = True         # one-time operator ack
+# Une configuration LIVE-capable EXIGE un plafond de contrats explicite
+# (contract_cap_config: valeur absente => soumissions desactivees).
+bot.CFG.MAX_CONTRACTS_PER_ORDER = "1"
 cli, tlog, pm, om, rm = build_managers()
 bot.CFG.ALLOW_FRESH_STATE = False        # never implied afterwards
 seed_history(tlog)

@@ -261,28 +261,42 @@ class PositionManager:
 
         Statuts retournes :
           MATCH               broker et local concordent ticker par ticker
+                              -> SEUL statut qui leve le verrou
           MISMATCH            au moins une divergence (manquant d'un cote,
-                              ou quantite/sens differents)
-          BROKER_UNAVAILABLE  API indisponible — AUCUNE conclusion, le
-                              verrou existant n'est ni pose ni leve
-          UNKNOWN             reponse broker inexploitable — traite comme
-                              une divergence (fail-closed)
+                              ou quantite/sens differents) -> verrou
+          BROKER_UNAVAILABLE  la reconciliation etait DUE et la verite n'a
+                              pas pu etre etablie -> verrou (fail-closed) ;
+                              un verrou anterieur plus specifique
+                              (MISMATCH/UNKNOWN) est conserve tel quel
+          UNKNOWN             reponse broker inexploitable -> verrou
+
+        Les positions financieres existantes ne sont JAMAIS detruites ni
+        modifiees parce que le broker est indisponible ; les reglements et
+        la recuperation en lecture seule continuent par ailleurs.
         """
         report = {"status": "MATCH", "mismatches": [], "detail": ""}
+        def _unavailable(detail):
+            report["status"] = "BROKER_UNAVAILABLE"
+            report["detail"] = detail
+            # Fail-closed : la reconciliation etait due et la verite n'a
+            # pas pu etre etablie -> les NOUVELLES soumissions sont
+            # bloquees. Un verrou anterieur plus specifique (MISMATCH/
+            # UNKNOWN) est conserve : seul un MATCH digne de confiance
+            # leve un verrou, jamais un echec de verification.
+            if self.reconcile_halt is None:
+                self.reconcile_halt = {"status": "BROKER_UNAVAILABLE",
+                                       "detail": detail, "at": now_iso()}
+            log_pos.error(f"[RECONCILE_VERIFY] broker indisponible "
+                          f"({detail}) -- verite non etablie, soumissions "
+                          f"bloquees fail-closed jusqu'a un MATCH.")
+            return report
+
         try:
             broker = self.client.get_positions()
         except Exception as e:                                # noqa: BLE001
-            report["status"] = "BROKER_UNAVAILABLE"
-            report["detail"] = str(e)
-            log_pos.warning(f"[RECONCILE_VERIFY] broker indisponible ({e}) "
-                            "-- verdict inchange (absence de preuve).")
-            return report
+            return _unavailable(str(e))
         if broker is None:
-            report["status"] = "BROKER_UNAVAILABLE"
-            report["detail"] = "get_positions() -> None"
-            log_pos.warning("[RECONCILE_VERIFY] get_positions() -> None "
-                            "-- verdict inchange (absence de preuve).")
-            return report
+            return _unavailable("get_positions() -> None")
 
         # Broker : quantite nette signee par ticker (yes>0, no<0).
         broker_net = {}

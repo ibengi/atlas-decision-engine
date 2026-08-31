@@ -4,7 +4,7 @@ import json
 import logging
 import time
 
-from config import CFG, _p, hard_contract_cap
+from config import CFG, _p, contract_cap_config
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
@@ -153,12 +153,24 @@ class OrderManager:
                           f"{f.get('reason')}) -- create_order NON appele.")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:persistence_failure", "rejected")
-        # INVARIANT DUR : plafond de contrats independant du sizing. Un
-        # count superieur ici signifie un bug de dimensionnement en amont ;
-        # on BLOQUE (pas de clamp silencieux) pour le rendre visible.
-        if count > hard_contract_cap():
+        # INVARIANT DUR : plafond de contrats independant du sizing.
+        # 1) Configuration du cap invalide/absente (LIVE-capable) : erreur
+        #    operateur VISIBLE et soumissions desactivees fail-closed —
+        #    jamais de reinterpretation silencieuse.
+        live_capable = (CFG.REQUIRE_PERSISTENT_STATE
+                        or getattr(self.client, "env", "demo") == "prod")
+        cap, cap_err = contract_cap_config(live_capable=live_capable)
+        if cap is None:
+            log_api.error(f"[CONFIG_INVALID] {cap_err} -- create_order NON "
+                          f"appele (fail-closed).")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:contract_cap_invalid", "rejected")
+        # 2) Un count superieur au cap signifie un bug de dimensionnement en
+        #    amont ; on BLOQUE (pas de clamp silencieux) pour le rendre
+        #    visible.
+        if count > cap:
             log_api.error(f"ORDRE BLOQUE (invariant): {ticker} count={count} "
-                          f"> MAX_CONTRACTS_PER_ORDER={hard_contract_cap()} "
+                          f"> MAX_CONTRACTS_PER_ORDER={cap} "
                           f"-- create_order NON appele.")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:contract_cap_exceeded", "rejected")

@@ -55,10 +55,14 @@ class Config:
     MAX_POSITION_AGE_DAYS   = _env_i("MAX_POSITION_AGE_DAYS", 30)
     # Plafond DUR de contrats par ordre, independant de tout sizing en % :
     # clampe apres PositionSizer ET re-verifie juste avant le POST broker
-    # (defense en profondeur). Une valeur invalide/<=0 retombe sur 1 via
-    # hard_contract_cap() — un plafond ne peut jamais devenir illimite par
-    # erreur de configuration. Canary LIVE prevu: MAX_CONTRACTS_PER_ORDER=1.
-    MAX_CONTRACTS_PER_ORDER = os.getenv("MAX_CONTRACTS_PER_ORDER", "100")
+    # (defense en profondeur). Validation stricte via contract_cap_config():
+    # une valeur invalide, nulle, negative ou deraisonnable DESACTIVE les
+    # soumissions fail-closed — une erreur de configuration operateur n'est
+    # JAMAIS reinterpretee silencieusement. Valeur absente : defaut sur
+    # documente (CONTRACT_CAP_DEFAULT) hors config LIVE-capable ; une config
+    # LIVE-capable (REQUIRE_PERSISTENT_STATE=true) EXIGE une valeur
+    # explicite. Canary LIVE prevu: MAX_CONTRACTS_PER_ORDER=1.
+    MAX_CONTRACTS_PER_ORDER = os.getenv("MAX_CONTRACTS_PER_ORDER")
     # Reconciliation broker PERIODIQUE (l'appel au demarrage ne suffit pas :
     # 15 jours d'uptime = 15 jours sans verification). 0 desactive le
     # passage periodique (comportement historique, tests uniquement).
@@ -145,15 +149,46 @@ def _p(name: str) -> str:
     return os.path.join(CFG.DATA_DIR, name)
 
 
-def hard_contract_cap() -> int:
-    """Effective MAX_CONTRACTS_PER_ORDER, fail-safe.
+#: Defaut documente du plafond de contrats, valable UNIQUEMENT hors
+#: configuration LIVE-capable (une config LIVE-capable exige une valeur
+#: explicite).
+CONTRACT_CAP_DEFAULT = 100
+#: Au-dela, la valeur est jugee deraisonnable et REJETEE par la validation
+#: (protection contre une faute de frappe type "10000").
+CONTRACT_CAP_MAX = 1000
 
-    A cap must never become unlimited through misconfiguration: anything
-    unparseable, zero or negative collapses to the most conservative
-    positive cap (1 contract) rather than to "no cap".
+
+def contract_cap_config(live_capable=None):
+    """Validate MAX_CONTRACTS_PER_ORDER. Returns (cap, error).
+
+    cap is a positive int when the configuration is usable; cap is None
+    when order submission must be DISABLED fail-closed, with `error`
+    naming the operator-visible reason. An invalid operator configuration
+    is never silently reinterpreted (never collapsed to 1, never to a
+    default).
+
+      valid positive int            -> (int, None)
+      missing, non-LIVE-capable     -> (CONTRACT_CAP_DEFAULT, None)
+      missing, LIVE-capable         -> (None, "...explicit value required")
+      invalid string                -> (None, "...")
+      zero / negative               -> (None, "...")
+      > CONTRACT_CAP_MAX            -> (None, "...")
     """
+    if live_capable is None:
+        live_capable = bool(CFG.REQUIRE_PERSISTENT_STATE)
+    raw = CFG.MAX_CONTRACTS_PER_ORDER
+    if raw is None or str(raw).strip() == "":
+        if live_capable:
+            return None, ("MAX_CONTRACTS_PER_ORDER absent: une configuration "
+                          "LIVE-capable exige une valeur explicite")
+        return CONTRACT_CAP_DEFAULT, None
     try:
-        v = int(str(CFG.MAX_CONTRACTS_PER_ORDER).strip())
+        v = int(str(raw).strip())
     except (TypeError, ValueError):
-        return 1
-    return v if v >= 1 else 1
+        return None, f"MAX_CONTRACTS_PER_ORDER invalide: {raw!r}"
+    if v <= 0:
+        return None, f"MAX_CONTRACTS_PER_ORDER <= 0 ({v}): soumissions desactivees"
+    if v > CONTRACT_CAP_MAX:
+        return None, (f"MAX_CONTRACTS_PER_ORDER deraisonnable ({v} > "
+                      f"{CONTRACT_CAP_MAX}): rejete par validation")
+    return v, None

@@ -8,7 +8,7 @@ import time
 from typing import Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
-from config import CFG, _env_b, _p
+from config import CFG, _env_b, _p, contract_cap_config
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
 from market_validator import MarketValidator
@@ -309,14 +309,25 @@ class ExecutionEngine:
                           extra={"event": "trading_blocked",
                                  "reason": "persistence_failure"})
             return False, "persistence_failure"
+        cap, cap_err = contract_cap_config()
+        if cap is None:
+            log_rsk.error(f"Trading bloque: {cap_err}",
+                          extra={"event": "trading_blocked",
+                                 "reason": "contract_cap_invalid"})
+            return False, "contract_cap_invalid"
         halt = getattr(self.posmgr, "reconcile_halt", None)
         if halt:
-            log_rsk.error(f"Trading bloque: reconciliation broker en "
-                          f"divergence ({halt.get('status')}) depuis "
+            # Le nom de la porte reflete la NATURE du verrou (mismatch /
+            # broker_unavailable / unknown) : chacun bloque fail-closed,
+            # seul un MATCH ulterieur leve le verrou.
+            guard = ("reconciliation_"
+                     + str(halt.get("status", "mismatch")).lower())
+            log_rsk.error(f"Trading bloque: reconciliation broker non "
+                          f"concluante ({halt.get('status')}) depuis "
                           f"{halt.get('at')}",
                           extra={"event": "trading_blocked",
-                                 "reason": "reconciliation_mismatch"})
-            return False, "reconciliation_mismatch"
+                                 "reason": guard})
+            return False, guard
         ok, why = self.risk.can_trade(cycle_trades=0)
         if not ok:
             log_rsk.warning(f"Trading bloque: {why}",
