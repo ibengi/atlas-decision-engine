@@ -27,6 +27,11 @@ class PositionManager:
         self.positions = self._migrate(raw)          # trade_id -> pos
         self.seen_fill_ids = set(
             JsonStore.load(_p("seen_fill_ids.json"), []))
+        # Verrou de reconciliation periodique (voir verify_against_broker) :
+        # None = pas de divergence connue ; sinon dict {status, detail, at}.
+        # Volontairement NON persiste : chaque redemarrage re-verifie contre
+        # le broker au lieu d'heriter d'un verdict peut-etre perime.
+        self.reconcile_halt = None
 
     @staticmethod
     def _migrate(raw: dict) -> dict:
@@ -242,6 +247,102 @@ class PositionManager:
             t = self._settle_and_release(tid, p, result, won, gross, net)
             if t: realized.append(t)
         return realized
+
+    def verify_against_broker(self) -> dict:
+        """Verification broker PERIODIQUE, strictement NON destructrice.
+
+        A la difference de reconcile_with_broker (demarrage), ce passage ne
+        reconstruit rien, ne supprime rien et ne cree evidemment aucun
+        trade : le broker reste la source de verite, mais un etat financier
+        incertain n'est jamais « corrige » automatiquement en cours de vol.
+        Une divergence arme self.reconcile_halt, que les portes du moteur
+        lisent pour bloquer toute NOUVELLE soumission fail-closed ; un
+        passage ulterieur entierement MATCH le desarme (retablissement).
+
+        Statuts retournes :
+          MATCH               broker et local concordent ticker par ticker
+          MISMATCH            au moins une divergence (manquant d'un cote,
+                              ou quantite/sens differents)
+          BROKER_UNAVAILABLE  API indisponible — AUCUNE conclusion, le
+                              verrou existant n'est ni pose ni leve
+          UNKNOWN             reponse broker inexploitable — traite comme
+                              une divergence (fail-closed)
+        """
+        report = {"status": "MATCH", "mismatches": [], "detail": ""}
+        try:
+            broker = self.client.get_positions()
+        except Exception as e:                                # noqa: BLE001
+            report["status"] = "BROKER_UNAVAILABLE"
+            report["detail"] = str(e)
+            log_pos.warning(f"[RECONCILE_VERIFY] broker indisponible ({e}) "
+                            "-- verdict inchange (absence de preuve).")
+            return report
+        if broker is None:
+            report["status"] = "BROKER_UNAVAILABLE"
+            report["detail"] = "get_positions() -> None"
+            log_pos.warning("[RECONCILE_VERIFY] get_positions() -> None "
+                            "-- verdict inchange (absence de preuve).")
+            return report
+
+        # Broker : quantite nette signee par ticker (yes>0, no<0).
+        broker_net = {}
+        try:
+            for bp in broker:
+                tk = bp.get("ticker")
+                if not tk:
+                    continue
+                qty = pick_int(bp, "position", "quantity", "count", default=0)
+                broker_net[tk] = broker_net.get(tk, 0) + qty
+        except (TypeError, AttributeError) as e:
+            report["status"] = "UNKNOWN"
+            report["detail"] = f"reponse broker inexploitable: {e}"
+            self.reconcile_halt = {"status": "UNKNOWN",
+                                   "detail": report["detail"],
+                                   "at": now_iso()}
+            log_pos.error("[RECONCILE_VERIFY] reponse broker inexploitable "
+                          f"({e}) -- soumissions bloquees fail-closed.")
+            return report
+        broker_net = {tk: q for tk, q in broker_net.items() if q != 0}
+
+        local_net = {}
+        for p in self._active_positions():
+            sign = 1 if p.get("side") == "yes" else -1
+            local_net[p["ticker"]] = (local_net.get(p["ticker"], 0)
+                                      + sign * int(p.get("count", 0)))
+        local_net = {tk: q for tk, q in local_net.items() if q != 0}
+
+        for tk in sorted(set(broker_net) | set(local_net)):
+            b, l = broker_net.get(tk), local_net.get(tk)
+            if b == l:
+                continue
+            if l is None:
+                kind = "broker_only"
+            elif b is None:
+                kind = "local_only"
+            else:
+                kind = "quantity_mismatch"
+            report["mismatches"].append(
+                {"ticker": tk, "kind": kind, "broker": b, "local": l})
+
+        if report["mismatches"]:
+            report["status"] = "MISMATCH"
+            self.reconcile_halt = {"status": "MISMATCH",
+                                   "detail": report["mismatches"],
+                                   "at": now_iso()}
+            log_pos.error(f"[RECONCILE_VERIFY] MISMATCH -- soumissions "
+                          f"bloquees fail-closed, etat local INTACT "
+                          f"(aucune correction automatique): "
+                          f"{report['mismatches']}")
+        else:
+            if self.reconcile_halt is not None:
+                log_pos.warning("[RECONCILE_VERIFY] retablissement: broker "
+                                "et local de nouveau concordants -- verrou "
+                                "de reconciliation leve.")
+            self.reconcile_halt = None
+            log_pos.info(f"[RECONCILE_VERIFY] MATCH "
+                         f"(tickers broker={len(broker_net)} "
+                         f"local={len(local_net)})")
+        return report
 
     def reconcile_with_broker(self) -> dict:
         """Broker = source de verite. Reconstruit les positions presentes
