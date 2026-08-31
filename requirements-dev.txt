@@ -1,0 +1,11 @@
+# Dependances de TEST uniquement (jamais deployees).
+#
+# Invocation reproductible de la suite, depuis la racine du depot :
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m pytest tests/          # ou: python -m unittest discover -s tests
+#
+# NB: 'cryptography' est deja une dependance d'execution (requirements.txt).
+# Les tests qui construisent un vrai KalshiClient en dependent aussi : un
+# paquet systeme casse (cffi/_cffi_backend absent) produit des
+# PanicException pyo3 trompeuses — installer via pip regle le probleme.
+pytest>=8

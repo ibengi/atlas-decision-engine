@@ -7,6 +7,8 @@
 3. spam de retries sur 503 exchange -> cooldown global."""
 import unittest
 import os
+import shutil
+import tempfile
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
@@ -43,7 +45,7 @@ class ProdLikeClient:
     def get_order(self, order_id):
         raise bot.KalshiAPIError(404, f"GET /portfolio/orders/{order_id}", "")
 
-    def get_fills(self, order_id):
+    def get_fills(self, order_id, *, strict=False):
         return [{"count": 1, "price": 74, "fees": "0.0135"}]
 
     def get_positions(self):
@@ -61,18 +63,37 @@ def make_om(tmp, client=None):
     return om
 
 
-class TestVerifyFallbackOnV2Get404(unittest.TestCase):
+class _IsolatedDirTestCase(unittest.TestCase):
+    """Chaque test recoit un DATA_DIR neuf et jetable.
+
+    Les anciens chemins fixes /tmp/t_v2fix_* n'etaient jamais nettoyes :
+    la garde anti-doublon PERSISTAIT d'une execution de suite a l'autre et
+    faisait echouer ces tests selon l'ordre/l'historique des runs. L'etat
+    d'un test ne doit jamais survivre au test.
+    """
+
+    def setUp(self):
+        self._old_dir = bot.CFG.DATA_DIR
+        self.tmp = tempfile.mkdtemp(prefix="t_v2fix_")
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        bot.CFG.DATA_DIR = self._old_dir
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class TestVerifyFallbackOnV2Get404(_IsolatedDirTestCase):
     def test_filled_order_confirmed_via_create_response_and_fills(self):
         """Le scenario de prod exact : plus jamais 'unverified' quand la
         reponse de creation certifie le fill."""
-        om = make_om("/tmp/t_v2fix_a")
+        om = make_om(self.tmp)
         res = om.place_and_track("KXBTCD-26JUL2617-T63749.99", "yes", 1, 74)
         self.assertNotEqual(res.status, "unverified")
         self.assertEqual(res.filled, 1)            # fill reel comptabilise
         self.assertEqual(res.state, "filled")
 
     def test_dedup_guard_blocks_resubmission_same_ticker(self):
-        om = make_om("/tmp/t_v2fix_b")
+        om = make_om(self.tmp)
         cli = om.client
         om.place_and_track("KXBTCD-26JUL2617-T63749.99", "yes", 1, 74)
         n = cli.create_calls
@@ -87,18 +108,18 @@ class TestVerifyFallbackOnV2Get404(unittest.TestCase):
         """La garde s'arme des le 201, meme si aucune verification
         n'aboutit : c'est le point qui manquait en prod."""
         class NoFills(ProdLikeClient):
-            def get_fills(self, order_id):
+            def get_fills(self, order_id, *, strict=False):
                 raise bot.KalshiAPIError(404, "GET /portfolio/fills", "")
-        om = make_om("/tmp/t_v2fix_c", NoFills())
+        om = make_om(self.tmp, NoFills())
         om.place_and_track("KXBTCD-X", "yes", 1, 74)
         res2 = om.place_and_track("KXBTCD-X", "yes", 1, 74)
         self.assertEqual(res2.status, "blocked:duplicate_submission_guard")
 
 
-class TestExchange503Cooldown(unittest.TestCase):
+class TestExchange503Cooldown(_IsolatedDirTestCase):
     def test_cooldown_after_503_blocks_without_api_call(self):
         cli = ProdLikeClient(fail_503=True)
-        om = make_om("/tmp/t_v2fix_d", cli)
+        om = make_om(self.tmp, cli)
         res = om.place_and_track("KXBTCD-X", "yes", 1, 74)
         self.assertEqual(res.status, "rejected:503")
         n = cli.create_calls
