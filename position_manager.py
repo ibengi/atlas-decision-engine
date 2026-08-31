@@ -305,7 +305,8 @@ class PositionManager:
                 tk = bp.get("ticker")
                 if not tk:
                     continue
-                qty = pick_int(bp, "position", "quantity", "count", default=0)
+                qty = pick_int(bp, "position", "position_fp", "quantity",
+                               "count", default=0)
                 broker_net[tk] = broker_net.get(tk, 0) + qty
         except (TypeError, AttributeError) as e:
             report["status"] = "UNKNOWN"
@@ -387,7 +388,8 @@ class PositionManager:
             tk = bp.get("ticker")
             if not tk:
                 continue
-            qty = pick_int(bp, "position", "quantity", "count", default=0)
+            qty = pick_int(bp, "position", "position_fp", "quantity",
+                           "count", default=0)
             if qty == 0:
                 continue
             side = "yes" if qty > 0 else "no"
