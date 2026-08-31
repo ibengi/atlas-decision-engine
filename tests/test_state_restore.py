@@ -23,7 +23,8 @@ import _bootstrap  # noqa: F401,E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from persistence import PersistenceSentinel, verify_state_root  # noqa: E402
-from state_restore import RESTORE_BASENAMES, maybe_restore_state  # noqa: E402
+from state_restore import (RESTORE_BASENAMES, maybe_restore_state,  # noqa: E402
+                           restore_or_die)
 
 FILES = {
     "submission_guard.json": b'{\n "KX-T1": 1787915905.081206\n}',
@@ -49,7 +50,7 @@ def _manifest(files=FILES):
                        for n, p in files.items()})
 
 
-class RestoreTest(unittest.TestCase):
+class _RestoreBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="atlas_restore_")
         self._saved_dir = bot.CFG.DATA_DIR
@@ -74,6 +75,9 @@ class RestoreTest(unittest.TestCase):
         os.environ["RESTORE_STATE_TGZ_B64"] = _tgz_b64() if b64 is None else b64
         os.environ["RESTORE_STATE_SHA256"] = (_manifest() if manifest is None
                                               else manifest)
+
+
+class RestoreTest(_RestoreBase):
 
     def test_no_env_is_noop(self):
         self.assertTrue(maybe_restore_state())
@@ -175,6 +179,76 @@ class RestoreTest(unittest.TestCase):
         os.environ["RESTORE_STATE_SHA256"] = _manifest()
         self.assertFalse(maybe_restore_state())
         self.assertFalse(PersistenceSentinel.healthy())
+
+
+class RestoreOrDieTest(_RestoreBase):
+    """Boot-hook semantics: a REQUESTED restore that cannot complete must
+    stop the process with the destination untouched (incident 2026-08-31:
+    falling through to startup let RiskManager contaminate the virgin
+    destination and permanently block the never-overwrite restore)."""
+
+    def _die(self):
+        with self.assertRaises(SystemExit) as cm:
+            restore_or_die()
+        self.assertEqual(cm.exception.code, 78)
+        self.assertFalse(PersistenceSentinel.healthy())
+        self.assertEqual(
+            [f for f in os.listdir(self.tmp) if not f.endswith(".tmp")], [],
+            "a dead restore must leave the destination with ZERO writes")
+
+    def test_no_restore_vars_boots_normally(self):
+        restore_or_die()          # must not raise
+        self.assertEqual(os.listdir(self.tmp), [])
+        self.assertTrue(PersistenceSentinel.healthy())
+
+    def test_manifest_without_payload_exits_without_writes(self):
+        # The 2026-08-31 production incident: payload variable deleted,
+        # manifest left behind -> restore silently no-opped and startup
+        # contaminated the destination. Now: process exit, zero writes.
+        os.environ["RESTORE_STATE_SHA256"] = _manifest()
+        self._die()
+
+    def test_corrupt_payload_exits_without_writes(self):
+        self._arm(b64=base64.b64encode(b"garbage").decode())
+        self._die()
+
+    def test_wrong_hash_exits_without_writes(self):
+        bad = dict(FILES)
+        bad["kalshi_trades.json"] = b"[]"
+        self._arm(b64=_tgz_b64(bad))
+        self._die()
+
+    def test_successful_restore_boots_with_require_persistent_state(self):
+        # Full virgin-destination boot: REQUIRE_PERSISTENT_STATE=true and
+        # ALLOW_FRESH_STATE unset from the start, valid payload.
+        saved = (bot.CFG.REQUIRE_PERSISTENT_STATE, bot.CFG.ALLOW_FRESH_STATE)
+        bot.CFG.REQUIRE_PERSISTENT_STATE = True
+        bot.CFG.ALLOW_FRESH_STATE = False
+        self.addCleanup(lambda: (setattr(bot.CFG, "REQUIRE_PERSISTENT_STATE",
+                                         saved[0]),
+                                 setattr(bot.CFG, "ALLOW_FRESH_STATE",
+                                         saved[1])))
+        self._arm()
+        restore_or_die()          # must not raise
+        self.assertTrue(verify_state_root())
+        self.assertTrue(PersistenceSentinel.healthy())
+        for name, payload in FILES.items():
+            raw = open(os.path.join(self.tmp, name), "rb").read()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                             hashlib.sha256(payload).hexdigest())
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmp, "state_epoch.json")))
+
+    def test_partial_destination_exits_and_never_overwrites(self):
+        keep = os.path.join(self.tmp, "risk_state.json")
+        with open(keep, "wb") as f:
+            f.write(b"EXISTING")
+        self._arm()
+        with self.assertRaises(SystemExit):
+            restore_or_die()
+        self.assertEqual(open(keep, "rb").read(), b"EXISTING")
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, "orders_state.json")))
 
 
 if __name__ == "__main__":

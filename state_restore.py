@@ -40,6 +40,7 @@ import io
 import json
 import logging
 import os
+import sys
 import tarfile
 
 from config import _p
@@ -155,3 +156,32 @@ def maybe_restore_state() -> bool:
     log.info("[STATE_RESTORE] restauration COMPLETE: 5/5 fichiers + "
              "state_epoch.json crees.")
     return True
+
+
+def restore_or_die() -> None:
+    """Boot hook: when a restore is REQUESTED but cannot complete, stop
+    the process before ANY engine component initializes.
+
+    Rationale (incident 2026-08-31): a failed or impossible restore used
+    to fall through to normal startup, which -- although fail-closed for
+    order submissions -- still let RiskManager write a fresh
+    risk_state.json into the virgin destination, permanently blocking the
+    never-overwrite restore on every later attempt. A requested restore
+    that cannot be completed must therefore leave the destination with
+    ZERO writes: exit before managers exist. A boot with no restore
+    variables at all keeps today's behavior (verify_state_root decides).
+    """
+    b64 = _read_b64_env()
+    manifest = os.getenv("RESTORE_STATE_SHA256", "").strip()
+    if manifest and not b64:
+        _fail("restauration demandee (RESTORE_STATE_SHA256 present) mais "
+              "RESTORE_STATE_TGZ_B64 absent/vide")
+        log.critical("[STATE_RESTORE] ARRET du processus avant toute "
+                     "initialisation: destination laissee sans AUCUNE "
+                     "ecriture.")
+        sys.exit(78)
+    if not maybe_restore_state():
+        log.critical("[STATE_RESTORE] ARRET du processus avant toute "
+                     "initialisation: destination laissee sans AUCUNE "
+                     "ecriture.")
+        sys.exit(78)
