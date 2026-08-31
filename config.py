@@ -53,6 +53,24 @@ class Config:
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
     MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 3)
     MAX_POSITION_AGE_DAYS   = _env_i("MAX_POSITION_AGE_DAYS", 30)
+    # Plafond DUR de contrats par ordre, independant de tout sizing en % :
+    # clampe apres PositionSizer ET re-verifie juste avant le POST broker
+    # (defense en profondeur). Une valeur invalide/<=0 retombe sur 1 via
+    # hard_contract_cap() — un plafond ne peut jamais devenir illimite par
+    # erreur de configuration. Canary LIVE prevu: MAX_CONTRACTS_PER_ORDER=1.
+    MAX_CONTRACTS_PER_ORDER = os.getenv("MAX_CONTRACTS_PER_ORDER", "100")
+    # Reconciliation broker PERIODIQUE (l'appel au demarrage ne suffit pas :
+    # 15 jours d'uptime = 15 jours sans verification). 0 desactive le
+    # passage periodique (comportement historique, tests uniquement).
+    RECONCILE_INTERVAL_S    = _env_f("RECONCILE_INTERVAL_SECONDS", 900.0)
+    # Deploiement LIVE-capable : exiger la continuite de l'etat persistant.
+    # Un marqueur state_epoch.json absent (disque neuf ou EFFACE) bloque
+    # les soumissions fail-closed au lieu de reprendre comme si de rien
+    # n'etait. ALLOW_FRESH_STATE=true est l'acquittement operateur explicite
+    # d'un repertoire d'etat volontairement vide (premier montage du
+    # volume). Les DEUX sont off par defaut: zero changement en DEMO.
+    REQUIRE_PERSISTENT_STATE = _env_b("REQUIRE_PERSISTENT_STATE", default=False)
+    ALLOW_FRESH_STATE        = _env_b("ALLOW_FRESH_STATE", default=False)
     # Portfolio controls are opt-in (0 disables each percentage cap).
     MAX_CORRELATION_GROUP_PCT = _env_f("MAX_CORRELATION_GROUP_PCT", 0.0)
     MAX_PORTFOLIO_RISK_PCT = _env_f("MAX_PORTFOLIO_RISK_PCT", 0.0)
@@ -126,3 +144,16 @@ CFG = Config()
 def _p(name: str) -> str:
     return os.path.join(CFG.DATA_DIR, name)
 
+
+def hard_contract_cap() -> int:
+    """Effective MAX_CONTRACTS_PER_ORDER, fail-safe.
+
+    A cap must never become unlimited through misconfiguration: anything
+    unparseable, zero or negative collapses to the most conservative
+    positive cap (1 contract) rather than to "no cap".
+    """
+    try:
+        v = int(str(CFG.MAX_CONTRACTS_PER_ORDER).strip())
+    except (TypeError, ValueError):
+        return 1
+    return v if v >= 1 else 1

@@ -13,7 +13,7 @@ from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
 from market_validator import MarketValidator
 from order_manager import OrderManager
-from persistence import JsonStore
+from persistence import JsonStore, PersistenceSentinel
 from position_manager import PositionManager
 from position_sizer import PositionSizer
 from risk_manager import RiskManager
@@ -185,6 +185,9 @@ class ExecutionEngine:
         self.orders.reconcile_startup(self.tlog, self.posmgr)
         self.posmgr.reconcile_startup()
         self.posmgr.reconcile_with_broker()
+        # Reconciliation periodique : le passage de demarrage vient d'avoir
+        # lieu, le premier passage periodique attend un intervalle complet.
+        self._last_broker_verify = time.monotonic()
         # ── P8 : parallelisme solde+sante vs scan (desactive par defaut).
         # Executor paresseux a l'usage : aucun thread tant qu'un cycle
         # parallele n'est execute.
@@ -296,6 +299,24 @@ class ExecutionEngine:
         VALEURS DE RETOUR SONT INCHANGES — seul le nom du bloqueur, jusqu'ici
         perdu, est desormais rendu au cycle pour etre journalise.
         """
+        # Portes fail-closed structurelles AVANT les portes de risque :
+        # une panne de persistance critique ou une divergence broker/local
+        # non resolue interdit toute nouvelle soumission.
+        if not PersistenceSentinel.healthy():
+            f = PersistenceSentinel.failure() or {}
+            log_rsk.error(f"Trading bloque: panne de persistance critique "
+                          f"({f.get('path')}: {f.get('reason')})",
+                          extra={"event": "trading_blocked",
+                                 "reason": "persistence_failure"})
+            return False, "persistence_failure"
+        halt = getattr(self.posmgr, "reconcile_halt", None)
+        if halt:
+            log_rsk.error(f"Trading bloque: reconciliation broker en "
+                          f"divergence ({halt.get('status')}) depuis "
+                          f"{halt.get('at')}",
+                          extra={"event": "trading_blocked",
+                                 "reason": "reconciliation_mismatch"})
+            return False, "reconciliation_mismatch"
         ok, why = self.risk.can_trade(cycle_trades=0)
         if not ok:
             log_rsk.warning(f"Trading bloque: {why}",
@@ -476,6 +497,20 @@ class ExecutionEngine:
                          f"settled={cov['settled']})")
         except Exception as e:                            # noqa: BLE001
             log.warning(f"[BTC_DAILY_EVIDENCE] reglement: {e}")
+
+        # 0b) Verification broker periodique (non destructrice) : le
+        # broker reste la source de verite pendant toute la vie du
+        # processus, pas seulement au demarrage. Une divergence arme
+        # posmgr.reconcile_halt, lu par les portes ci-dessous ; l'etat
+        # local n'est jamais « corrige » automatiquement en vol.
+        if (CFG.RECONCILE_INTERVAL_S > 0 and
+                time.monotonic() - self._last_broker_verify
+                >= CFG.RECONCILE_INTERVAL_S):
+            self._last_broker_verify = time.monotonic()
+            try:
+                self.posmgr.verify_against_broker()
+            except Exception as e:                        # noqa: BLE001
+                log_pos.warning(f"[RECONCILE_VERIFY] echec du passage: {e}")
 
         # 1) Reglements d'abord : le PnL realise conditionne les portes
         for _t in self.posmgr.check_settlements():

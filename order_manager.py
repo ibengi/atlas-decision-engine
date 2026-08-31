@@ -4,11 +4,11 @@ import json
 import logging
 import time
 
-from config import CFG, _p
+from config import CFG, _p, hard_contract_cap
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
-from persistence import JsonStore
+from persistence import JsonStore, PersistenceSentinel, verify_state_root
 from position_manager import PositionManager
 from trade_logger import TradeLogger, now_iso
 
@@ -44,6 +44,11 @@ class OrderManager:
 
     def __init__(self, client: KalshiClient):
         self.client = client
+        # Continuite d'etat (LIVE-capable) : sous REQUIRE_PERSISTENT_STATE,
+        # un repertoire d'etat neuf/efface arme la sentinelle AVANT toute
+        # possibilite de soumission — le moteur ne reprend jamais le
+        # trading comme sain sur un disque qui a perdu ses garanties.
+        verify_state_root()
         self.open_orders = JsonStore.load(_p(CFG.ORDERS_FILE), {})  # id -> meta
         # Garde anti-doublon de SESSION, independante de l'enregistrement des
         # trades : un ordre soumis (201) sur un ticker verrouille ce ticker
@@ -136,6 +141,27 @@ class OrderManager:
     # -- cycle de vie complet d'un ordre --------------------------------------
     def place_and_track(self, ticker: str, side: str, count: int,
                         limit_cents: int) -> ExecutionResult:
+        # INVARIANT DUR : aucune ecriture broker apres une panne de
+        # persistance critique. Si le verrou anti-doublon, le journal ou
+        # l'etat des ordres ne peut plus etre ecrit, chaque garantie de
+        # redemarrage est deja morte — soumettre serait s'exposer au
+        # doublon 2026-07-25 en sachant que la protection n'existe plus.
+        if not PersistenceSentinel.healthy():
+            f = PersistenceSentinel.failure() or {}
+            log_api.error("[ORDER_SUBMIT_ATTEMPT] bloque fail-closed: panne "
+                          f"de persistance critique ({f.get('path')}: "
+                          f"{f.get('reason')}) -- create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:persistence_failure", "rejected")
+        # INVARIANT DUR : plafond de contrats independant du sizing. Un
+        # count superieur ici signifie un bug de dimensionnement en amont ;
+        # on BLOQUE (pas de clamp silencieux) pour le rendre visible.
+        if count > hard_contract_cap():
+            log_api.error(f"ORDRE BLOQUE (invariant): {ticker} count={count} "
+                          f"> MAX_CONTRACTS_PER_ORDER={hard_contract_cap()} "
+                          f"-- create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:contract_cap_exceeded", "rejected")
         # INVARIANT DUR : aucun create_order sans prix executable valide.
         # Derniere ligne de defense contre un carnet vide qui aurait
         # traverse scanner, ranker et validateur.
