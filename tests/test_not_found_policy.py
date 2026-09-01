@@ -189,10 +189,13 @@ class PaginationCompletenessTest(_PolicyBase):
         return c, pages
 
     def test_truncated_listing_raises_instead_of_reporting_absence(self):
-        c, pages = self._client_with_pages(None)
-        # every page still advertises a next cursor: the listing never ends
-        endless = {"orders": [], "cursor": "more"}
-        with patch.object(KalshiClient, "_req", return_value=endless) as req:
+        c, _pages = self._client_with_pages(None)
+        # Every page advertises a NEW next cursor: the listing genuinely
+        # progresses and simply never ends, so only the page cap can stop
+        # it. (A page repeating the SAME cursor is a different fault, and
+        # is caught earlier -- see test_orders_envelope_schema.)
+        endless = [{"orders": [], "cursor": f"p{i}"} for i in range(1, 40)]
+        with patch.object(KalshiClient, "_req", side_effect=endless) as req:
             with self.assertRaises(KalshiAPIError) as ctx:
                 c.find_orders_by_client_order_id(CID, ticker=TICKER)
 

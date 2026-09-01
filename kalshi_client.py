@@ -353,6 +353,11 @@ class KalshiClient:
     #: ordre. C'est la seule facon documentee de retrouver un ordre dont on
     #: n'a jamais recu l'order_id (POST ambigu).
     ORDERS_LIST_PATH = "/portfolio/orders"
+    #: Enveloppes de listing ACCEPTEES, en dur. Toute autre forme est une
+    #: reponse que ce client ne sait pas lire -- jamais une liste vide.
+    #: "data" a ete retire: c'etait une supposition, pas une forme
+    #: documentee par Kalshi, et elle elargissait la surface acceptee.
+    ORDERS_ENVELOPE_KEYS = ("orders",)
 
     def list_orders(self, *, ticker: str = None, status: str = None,
                     limit: int = 200, max_pages: int = 10) -> list:
@@ -378,19 +383,52 @@ class KalshiClient:
                 raise KalshiAPIError(
                     0, f"listing d'ordres incoherent: reponse "
                        f"{type(r).__name__}, objet attendu")
-            orders = r.get("orders", r.get("data", []))
+            # ENVELOPPE: uniquement les cles explicitement connues. Le code
+            # precedent faisait r.get("orders", r.get("data", [])) -- un
+            # defaut [] SILENCIEUX: si l'enveloppe reelle portait un autre
+            # nom, une reponse pleine se lisait comme un listing VIDE et
+            # COMPLET, donc comme une absence. Or l'absence est exactement
+            # ce qu'il ne faut jamais fabriquer: elle finit par cloturer une
+            # intention ambigue. Le precedent get_positions montre que
+            # Kalshi ne pluralise pas toujours l'evidence ("market_positions"
+            # et non "positions"): une enveloppe non reconnue est donc une
+            # reponse INCOMPREHENSIBLE, pas une reponse vide.
+            present = [k for k in self.ORDERS_ENVELOPE_KEYS if k in r]
+            if not present:
+                raise KalshiAPIError(
+                    0, f"listing d'ordres incoherent: aucune enveloppe "
+                       f"connue {list(self.ORDERS_ENVELOPE_KEYS)} dans la "
+                       f"reponse (cles vues: {sorted(r)[:8]})")
+            if len(present) > 1:
+                raise KalshiAPIError(
+                    0, f"listing d'ordres incoherent: enveloppes multiples "
+                       f"{present}, impossible de choisir")
+            orders = r[present[0]]
             if not isinstance(orders, list):
                 raise KalshiAPIError(
-                    0, "listing d'ordres incoherent: 'orders' n'est pas une "
-                       f"liste ({type(orders).__name__})")
+                    0, f"listing d'ordres incoherent: '{present[0]}' n'est "
+                       f"pas une liste ({type(orders).__name__})")
             if any(not isinstance(o, dict) for o in orders):
                 raise KalshiAPIError(
-                    0, "listing d'ordres incoherent: entree non-objet dans "
-                       "'orders'")
+                    0, f"listing d'ordres incoherent: entree non-objet dans "
+                       f"'{present[0]}'")
             if pages == 1:
                 self._log_raw_once("list_orders", r)
             out.extend(orders)
-            cursor = str(r.get("cursor") or "")
+            # CURSEUR: absent = fin de pagination (terminal legitime). Present
+            # mais d'un type inattendu = pagination inexploitable, donc on
+            # leve plutot que de la traiter comme une fin de listing.
+            raw_cursor = r.get("cursor", "")
+            if raw_cursor is not None and not isinstance(raw_cursor, str):
+                raise KalshiAPIError(
+                    0, f"listing d'ordres incoherent: 'cursor' de type "
+                       f"{type(raw_cursor).__name__}, chaine attendue")
+            next_cursor = str(raw_cursor or "")
+            if next_cursor and next_cursor == cursor:
+                raise KalshiAPIError(
+                    0, "listing d'ordres incoherent: 'cursor' ne progresse "
+                       "pas (meme valeur renvoyee), pagination sans fin")
+            cursor = next_cursor
             if not cursor:
                 return out
         # Sortie par epuisement de max_pages AVEC un cursor encore actif :
