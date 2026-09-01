@@ -9,6 +9,9 @@ from config import CFG, _p, contract_cap_config
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
+from alert_notifier import (FAILED, SENT, SKIPPED_NO_CHANNEL,
+                            SKIPPED_SEVERITY, NotifierError,
+                            build_notifier, build_payload)
 from persistence import JsonStore, PersistenceSentinel, verify_state_root
 from position_manager import PositionManager
 from trade_logger import TradeLogger, now_iso
@@ -50,8 +53,12 @@ class OrderManager:
     #: chaque reboot ne declenche jamais de seuil.
     ALERTS_FILE = "intent_alerts.json"
 
-    def __init__(self, client: KalshiClient):
+    def __init__(self, client: KalshiClient, notifier=None):
         self.client = client
+        # Transport d'alerte: injectable, et volontairement IGNORANT du
+        # broker. Il ne recoit qu'un payload plat; il ne peut donc ni
+        # soumettre, ni annuler, ni toucher au verrou ou aux intentions.
+        self.notifier = notifier if notifier is not None else build_notifier()
         # Continuite d'etat (LIVE-capable) : sous REQUIRE_PERSISTENT_STATE,
         # un repertoire d'etat neuf/efface arme la sentinelle AVANT toute
         # possibilite de soumission — le moteur ne reprend jamais le
@@ -348,7 +355,8 @@ class OrderManager:
         }
 
     def _raise_alert(self, key: str, kind: str, severity: str, ticker: str,
-                     detail: str, now: float) -> dict:
+                     detail: str, now: float, client_order_id: str = None,
+                     status: str = None, attempts: int = 0) -> dict:
         """Arme (ou rafraichit) une alerte. first_raised_at n'est ecrit
         qu'UNE fois: c'est lui qui porte l'age reel a travers les
         redemarrages."""
@@ -366,6 +374,9 @@ class OrderManager:
             new = not alert.get("_seen_this_pass")
         alert["detail"] = detail
         alert["severity"] = severity
+        alert["client_order_id"] = client_order_id
+        alert["status"] = status
+        alert["attempts"] = attempts
         alert["last_raised_at"] = stamp
         alert["occurrences"] = int(alert.get("occurrences") or 0) + 1
         alert["age_seconds"] = round(
@@ -397,7 +408,9 @@ class OrderManager:
                     key, f"AMBIGUOUS_RESOLUTION_{status}", "CRITICAL", ticker,
                     f"resolution non tranchable (client_order_id="
                     f"{row['client_order_id']}): un ordre en double peut "
-                    f"exister; toute soumission est bloquee", now)
+                    f"exister; toute soumission est bloquee", now,
+                    client_order_id=row["client_order_id"], status=status,
+                    attempts=row["not_found_count"])
             if row["unavailable_streak"] >= streak_limit:
                 key = f"UNAVAILABLE_STREAK:{ticker}"
                 active.add(key)
@@ -405,7 +418,9 @@ class OrderManager:
                     key, "AMBIGUOUS_LOOKUP_UNAVAILABLE_STREAK", "CRITICAL",
                     ticker,
                     f"{row['unavailable_streak']} lectures consecutives "
-                    f"impossibles: l'existence de l'ordre reste INCONNUE", now)
+                    f"impossibles: l'existence de l'ordre reste INCONNUE", now,
+                    client_order_id=row["client_order_id"], status=status,
+                    attempts=row["unavailable_streak"])
             if stale_after > 0 and row["age_seconds"] >= stale_after:
                 key = f"STALE:{ticker}"
                 active.add(key)
@@ -414,7 +429,9 @@ class OrderManager:
                     f"intention ouverte depuis {row['age_seconds']:.0f}s "
                     f"(seuil {stale_after:.0f}s, statut {status}, "
                     f"not_found={row['not_found_count']}): ticker bloque "
-                    f"tant qu'elle n'est pas tranchee", now)
+                    f"tant qu'elle n'est pas tranchee", now,
+                    client_order_id=row["client_order_id"], status=status,
+                    attempts=row["not_found_count"])
 
         # Une alerte dont la cause a disparu est retiree (l'acquittement
         # n'est donc jamais un moyen de masquer une cause encore vivante).
@@ -425,8 +442,62 @@ class OrderManager:
         for key in active:
             self.intent_alerts[key].pop("_seen_this_pass", None)
             self.intent_alerts[key]["_seen_this_pass"] = True
+        self._notify_alerts()
         JsonStore.save(_p(self.ALERTS_FILE), self.intent_alerts)
         return [dict(a, key=k) for k, a in sorted(self.intent_alerts.items())]
+
+    def _notify_alerts(self) -> None:
+        """Livre les alertes non encore notifiees au canal externe.
+
+        INVARIANT: cette methode ne peut RIEN casser du trading. Elle
+        n'appelle jamais le broker, ne touche ni aux intentions ni au
+        verrou anti-doublon, et toute exception -- y compris inattendue --
+        est absorbee ici. Une panne du canal se solde par un etat
+        `notify_state=FAILED` et une trace, jamais par un ordre, une
+        annulation, une cloture d'intention ou un deverrouillage.
+        """
+        max_attempts = max(1, int(CFG.ALERT_NOTIFY_MAX_ATTEMPTS))
+        warn_enabled = bool(CFG.ALERT_NOTIFY_WARNINGS)
+        for key, alert in self.intent_alerts.items():
+            state = alert.get("notify_state")
+            if state == SENT:
+                continue                       # idempotence: une seule fois
+            if alert.get("severity") != "CRITICAL" and not warn_enabled:
+                alert["notify_state"] = SKIPPED_SEVERITY
+                continue
+            if not getattr(self.notifier, "configured", False):
+                alert["notify_state"] = SKIPPED_NO_CHANNEL
+                continue
+            if int(alert.get("notify_attempts") or 0) >= max_attempts:
+                continue                       # retries epuises: on n'insiste plus
+            alert["notify_attempts"] = int(alert.get("notify_attempts") or 0) + 1
+            try:
+                self.notifier.send(build_payload(alert, key))
+            except NotifierError as e:
+                alert["notify_state"] = FAILED
+                alert["notify_last_error"] = str(e)[:200]
+                log_api.error(
+                    f"[ALERT_NOTIFY_FAILED] {alert.get('kind')} "
+                    f"ticker={alert.get('ticker')} tentative="
+                    f"{alert['notify_attempts']}/{max_attempts}: {e} -- "
+                    "AUCUN effet sur le trading (intention et verrou "
+                    "inchanges, aucun appel broker).")
+            except Exception as e:                          # noqa: BLE001
+                alert["notify_state"] = FAILED
+                alert["notify_last_error"] = f"{type(e).__name__}"[:200]
+                log_api.error(
+                    f"[ALERT_NOTIFY_FAILED] {alert.get('kind')} "
+                    f"ticker={alert.get('ticker')}: erreur inattendue "
+                    f"{type(e).__name__} -- absorbee, aucun effet trading.")
+            else:
+                alert["notify_state"] = SENT
+                alert["notify_last_error"] = None
+                alert["notified_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds")
+                log_api.warning(
+                    f"[ALERT_NOTIFY_SENT] {alert.get('kind')} "
+                    f"ticker={alert.get('ticker')} via "
+                    f"{getattr(self.notifier, 'name', '?')}")
 
     def ack_intent_alert(self, ticker: str, operator: str,
                          note: str = "") -> list:

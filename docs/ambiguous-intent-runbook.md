@@ -35,6 +35,44 @@ age. No credential, key, signature or token appears in any of it — the
 `client_order_id` is a deterministic hash of the order parameters, which
 is precisely what you need to query the broker yourself.
 
+## Notification externe
+
+Un CRITICAL peut sortir du processus par un canal externe
+(`alert_notifier.py`). Le transport est une abstraction: webhook HTTPS
+aujourd'hui, e-mail ou Slack en implementant une seule methode, sans
+toucher au moteur.
+
+| Variable | Effet |
+|---|---|
+| `ALERT_WEBHOOK_URL` | active le canal (HTTPS obligatoire). Vide = livraison `SKIPPED`, jamais `FAILED` |
+| `ALERT_WEBHOOK_TOKEN` | jeton du canal, transmis en en-tete `Authorization`, jamais dans le payload ni dans un log |
+| `ALERT_NOTIFY_WARNINGS` | `true` pour notifier aussi les `STALE` (WARNING). Defaut: CRITICAL seulement |
+| `ALERT_NOTIFY_MAX_ATTEMPTS` | plafond de reessais par alerte (defaut 5), compte cumule a travers les redemarrages |
+
+Le payload contient ticker, `client_order_id`, statut, age, nombre de
+tentatives, horodatage et detail — rien d'autre. Il est construit champ
+par champ, donc un champ ajoute plus tard a une alerte ne part pas tout
+seul sur le reseau.
+
+Garanties, dans l'ordre d'importance:
+
+* **Le canal ne peut pas trader.** Un notifier ne recoit qu'un
+  dictionnaire plat; il ne voit ni le broker, ni le verrou, ni les
+  intentions. Toute panne — timeout, 500, jeton manquant, bug interne —
+  est absorbee: `notify_state=FAILED`, une trace, et rien d'autre. Aucune
+  panne de notification ne peut provoquer `create_order`, `cancel_order`,
+  une cloture d'intention ni un deverrouillage.
+* **Une alerte est livree une fois**, pas a chaque cycle, et le
+  dedoublonnage survit au redemarrage.
+* **Les reessais de notification ne rejouent jamais rien cote broker.**
+* `notify_state` (`SENT` / `FAILED` / `SKIPPED_NO_CHANNEL` /
+  `SKIPPED_SEVERITY`), `notify_attempts`, `notified_at` et
+  `notify_last_error` sont persistes avec l'alerte.
+
+Une notification non livree n'est donc jamais une raison d'agir dans
+l'urgence sur le moteur: le ticker est deja bloque fail-closed, et c'est
+la procedure ci-dessous qui le debloque.
+
 ## Procedure
 
 1. **Read the snapshot.** Note the ticker, the `client_order_id` and the
