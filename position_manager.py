@@ -4,6 +4,7 @@ Extrait de kalshi_alpha_bot.py (P3.6).
 """
 
 import logging
+import math
 import time
 from datetime import datetime, timezone
 
@@ -248,6 +249,77 @@ class PositionManager:
             if t: realized.append(t)
         return realized
 
+    #: Champs de quantite acceptes d'une ligne /portfolio/positions. L'API
+    #: DEMO reelle n'expose que position_fp (chaine a virgule fixe, signee).
+    QTY_FIELDS = ("position", "position_fp", "quantity", "count")
+
+    @staticmethod
+    def parse_broker_qty(bp: dict):
+        """Quantite nette signee d'une ligne broker -> (int, None) ou
+        (None, raison).
+
+        Un echec de lecture n'est JAMAIS converti en 0 : le 2026-08-31,
+        position_fp="-6.00" lu comme 0 a fait juger le broker "a plat" et le
+        demarrage a detruit les trois positions restaurees. Les champs
+        multiples doivent CONCORDER (aucune precedence documentee par l'API)
+        et les quantites fractionnaires sont refusees tant que la
+        specification broker ne les atteste pas.
+        """
+        seen = []
+        for f in PositionManager.QTY_FIELDS:
+            v = bp.get(f)
+            if v is None:
+                continue
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                return None, f"{f}={v!r} illisible"
+            if not math.isfinite(fv):
+                return None, f"{f}={v!r} non fini (NaN/inf)"
+            if fv != int(fv):
+                return None, (f"{f}={v!r} non entier -- contrats "
+                              f"fractionnaires non attestes par l'API")
+            seen.append((f, int(fv)))
+        if not seen:
+            return None, ("aucun champ de quantite reconnu (attendus: "
+                          + ", ".join(PositionManager.QTY_FIELDS) + ")")
+        if len({q for _, q in seen}) > 1:
+            return None, f"champs de quantite contradictoires: {seen}"
+        return seen[0][1], None
+
+    def _broker_net_positions(self, broker):
+        """(dict ticker->net signe, None) ou (None, raison UNKNOWN)."""
+        net = {}
+        for bp in broker:
+            if not isinstance(bp, dict):
+                return None, f"ligne broker inexploitable: {bp!r}"
+            tk = bp.get("ticker")
+            if not tk:
+                return None, f"ligne broker sans ticker: {bp!r}"
+            qty, err = self.parse_broker_qty(bp)
+            if err:
+                return None, f"{tk}: {err}"
+            net[tk] = net.get(tk, 0) + qty
+        return {tk: q for tk, q in net.items() if q != 0}, None
+
+    def _local_net_positions(self):
+        net = {}
+        for p in self._active_positions():
+            sign = 1 if p.get("side") == "yes" else -1
+            net[p["ticker"]] = net.get(p["ticker"], 0) \
+                + sign * int(p.get("count", 0))
+        return {tk: q for tk, q in net.items() if q != 0}
+
+    @staticmethod
+    def _classify_mismatch(b, l) -> str:
+        if l is None:
+            return "broker_only"
+        if b is None:
+            return "local_only"
+        if (b > 0) != (l > 0):
+            return "side_mismatch"
+        return "quantity_mismatch"
+
     def verify_against_broker(self) -> dict:
         """Verification broker PERIODIQUE, strictement NON destructrice.
 
@@ -298,44 +370,29 @@ class PositionManager:
         if broker is None:
             return _unavailable("get_positions() -> None")
 
-        # Broker : quantite nette signee par ticker (yes>0, no<0).
-        broker_net = {}
+        # Broker : quantite nette signee par ticker (yes>0, no<0) via le
+        # parseur PARTAGE avec la reconciliation de demarrage.
         try:
-            for bp in broker:
-                tk = bp.get("ticker")
-                if not tk:
-                    continue
-                qty = pick_int(bp, "position", "position_fp", "quantity",
-                               "count", default=0)
-                broker_net[tk] = broker_net.get(tk, 0) + qty
+            broker_net, err = self._broker_net_positions(broker)
         except (TypeError, AttributeError) as e:
+            broker_net, err = None, str(e)
+        if err is not None:
             report["status"] = "UNKNOWN"
-            report["detail"] = f"reponse broker inexploitable: {e}"
+            report["detail"] = f"reponse broker inexploitable: {err}"
             self.reconcile_halt = {"status": "UNKNOWN",
                                    "detail": report["detail"],
                                    "at": now_iso()}
             log_pos.error("[RECONCILE_VERIFY] reponse broker inexploitable "
-                          f"({e}) -- soumissions bloquees fail-closed.")
+                          f"({err}) -- soumissions bloquees fail-closed.")
             return report
-        broker_net = {tk: q for tk, q in broker_net.items() if q != 0}
 
-        local_net = {}
-        for p in self._active_positions():
-            sign = 1 if p.get("side") == "yes" else -1
-            local_net[p["ticker"]] = (local_net.get(p["ticker"], 0)
-                                      + sign * int(p.get("count", 0)))
-        local_net = {tk: q for tk, q in local_net.items() if q != 0}
+        local_net = self._local_net_positions()
 
         for tk in sorted(set(broker_net) | set(local_net)):
             b, l = broker_net.get(tk), local_net.get(tk)
             if b == l:
                 continue
-            if l is None:
-                kind = "broker_only"
-            elif b is None:
-                kind = "local_only"
-            else:
-                kind = "quantity_mismatch"
+            kind = self._classify_mismatch(b, l)
             report["mismatches"].append(
                 {"ticker": tk, "kind": kind, "broker": b, "local": l})
 
@@ -360,98 +417,87 @@ class PositionManager:
         return report
 
     def reconcile_with_broker(self) -> dict:
-        """Broker = source de verite. Reconstruit les positions presentes
-        chez Kalshi mais absentes localement (id stable => idempotent),
-        marque 'ghost' les positions locales absentes du broker."""
-        report = {"rebuilt": [], "ghost": [], "matched": []}
+        """Verification broker de DEMARRAGE, meme loi que le verificateur
+        periodique : strictement NON destructrice.
+
+        Ce passage a longtemps ete l'inverse : il RECONSTRUISAIT les
+        positions broker absentes localement (prix d'entree inventes) et
+        SUPPRIMAIT comme « fantomes » les positions locales qu'il ne
+        retrouvait pas chez le broker. Le 2026-08-31, un simple changement
+        de champ dans la reponse /portfolio/positions (position_fp) a fait
+        lire chaque quantite comme 0 : le broker a ete juge a plat et les
+        trois positions tout juste restaurees de la migration ont ete
+        detruites localement -- sans reglement, sans trace journal --
+        pendant que la meme reponse broker les listait.
+
+        Aucune divergence broker/local ne justifie une correction
+        automatique d'etat financier. Toute divergence (ou impossibilite
+        d'etablir la verite) arme self.reconcile_halt, que les portes du
+        moteur lisent pour bloquer les soumissions fail-closed ; seul un
+        MATCH digne de confiance laisse le demarrage sans verrou.
+        """
+        report = {"status": "MATCH", "mismatches": [], "matched": [],
+                  "detail": ""}
+
+        def _halt(status, detail):
+            report["status"] = status
+            report["detail"] = detail
+            self.reconcile_halt = {"status": status, "detail": detail,
+                                   "at": now_iso()}
+            if report["mismatches"]:
+                self.reconcile_halt["mismatches"] = report["mismatches"]
+            log_pos.error(
+                f"[RECONCILE_STARTUP] {status} ({detail}) -- soumissions "
+                f"bloquees fail-closed ; AUCUNE position locale supprimee, "
+                f"AUCUNE position broker adoptee, journal INTACT.")
+            JsonStore.save(_p("reconciliation_report.json"), report)
+            return report
+
         MAX_RETRIES = 3
         RETRY_BACKOFF_SECONDS = 2.0
         broker = None
         for attempt in range(1, MAX_RETRIES + 1):
-            broker = self.client.get_positions()
+            try:
+                broker = self.client.get_positions()
+            except Exception as e:                            # noqa: BLE001
+                return _halt("BROKER_UNAVAILABLE", str(e))
             if broker is not None:
                 break
             if attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 log_pos.warning(
-                    f"get_positions() returned None (attempt {attempt}/{MAX_RETRIES}), "
-                    f"retrying in {wait:.0f}s..."
-                )
+                    f"get_positions() returned None (attempt "
+                    f"{attempt}/{MAX_RETRIES}), retrying in {wait:.0f}s...")
                 time.sleep(wait)
         if broker is None:
-            log_pos.error(
-                f"get_positions() failed after {MAX_RETRIES} attempts — reconciliation skipped"
-            )
-            return report
-        seen_tickers = set()
-        for bp in broker:
-            tk = bp.get("ticker")
-            if not tk:
-                continue
-            qty = pick_int(bp, "position", "position_fp", "quantity",
-                           "count", default=0)
-            if qty == 0:
-                continue
-            side = "yes" if qty > 0 else "no"
-            seen_tickers.add(tk)
-            local = [p for p in self._active_positions() if p["ticker"] == tk]
-            if local:
+            return _halt("BROKER_UNAVAILABLE",
+                         f"get_positions() -> None apres {MAX_RETRIES} "
+                         f"tentatives")
+
+        try:
+            broker_net, err = self._broker_net_positions(broker)
+        except (TypeError, AttributeError) as e:
+            broker_net, err = None, str(e)
+        if err is not None:
+            return _halt("UNKNOWN", f"reponse broker inexploitable: {err}")
+
+        local_net = self._local_net_positions()
+        for tk in sorted(set(broker_net) | set(local_net)):
+            b, l = broker_net.get(tk), local_net.get(tk)
+            if b == l:
                 report["matched"].append(tk)
                 continue
-            tid = f"brk-{tk}-{side}"                 # ID STABLE = idempotent
-            if tid in self.positions:
-                continue
-            # Le broker connait l'EXISTENCE, le sens et la quantite. Il ne
-            # rend pas le prix d'entree reellement paye : ni les frais, ni la
-            # strategie, ni l'horodatage d'ouverture. `default=50` n'est donc
-            # pas une mesure mais un remplissage — 50c au hasard sur une
-            # position reellement entree a 3c fausse open_risk, le PnL au
-            # reglement et toute statistique qui les agrege.
-            #
-            # Le chiffre est conserve (le retirer casserait l'arithmetique en
-            # aval) mais il est desormais ETIQUETE : `avg_price_estimated`
-            # dit qu'aucun fill ne l'atteste, et `opened_at_estimated` dit
-            # que l'horodatage est celui de la reconstruction, pas de
-            # l'ouverture — ce qui compte pour l'echappatoire d'age.
-            measured_avg = pick_int(bp, "avg_price", default=0)
-            avg = measured_avg or (pick_int(bp, "market_exposure", default=50) or 50)
-            estimated = measured_avg <= 0
-            self.positions[tid] = {
-                "trade_id": tid, "ticker": tk, "side": side,
-                "count_initial": abs(qty), "count": abs(qty),
-                "avg_price": avg, "fees": 0.0, "opened_at": now_iso(),
-                "order_ids": [], "fill_ids": [], "state": "open",
-                "strategy": "reconciled", "market_score": None,
-                "entry_edge": None, "entry_ev": None,
-                "avg_price_estimated": estimated,
-                "fees_estimated": True,
-                "opened_at_estimated": True,
-            }
-            if estimated:
-                log_pos.warning(
-                    f"{tk}: position reconstruite depuis le broker sans prix "
-                    f"d'entree atteste -- avg_price={avg}c ESTIME, frais "
-                    f"inconnus (0.0$), strategie perdue. Le PnL de reglement "
-                    f"de cette position sera approximatif.")
-            report["rebuilt"].append(tk)
-        for tid, p in list(self.positions.items()):
-            if p["ticker"] not in seen_tickers and not tid.startswith("mig-"):
-                p["state"] = "ghost_local_only"
-                report["ghost"].append(p["ticker"])
-        # Clean up ghost positions that the broker doesn't know about
-        ghost_removed = []
-        for tid in list(self.positions.keys()):
-            if self.positions[tid].get("state") == "ghost_local_only":
-                self.positions.pop(tid, None)
-                ghost_removed.append(tid)
-        if ghost_removed:
-            self.flush()
-            log_pos.info(f"Ghost cleanup: removed {len(ghost_removed)} stale position(s): {ghost_removed}")
-        if report["rebuilt"] or report["ghost"]:
-            self.flush()
-            JsonStore.save(_p("reconciliation_report.json"), report)
-            log_pos.warning(f"Reconciliation broker: reconstruites="
-                            f"{report['rebuilt']} fantomes={report['ghost']}")
+            report["mismatches"].append(
+                {"ticker": tk, "kind": self._classify_mismatch(b, l),
+                 "broker": b, "local": l})
+        if report["mismatches"]:
+            return _halt("MISMATCH",
+                         f"{len(report['mismatches'])} divergence(s) "
+                         f"broker/local: {report['mismatches']}")
+
+        JsonStore.save(_p("reconciliation_report.json"), report)
+        log_pos.info(f"[RECONCILE_STARTUP] MATCH (tickers "
+                     f"broker={len(broker_net)} local={len(local_net)})")
         return report
 
     def reconcile_startup(self):
@@ -466,19 +512,16 @@ class PositionManager:
             # observe quand le disque a disparu. Les deux se distinguent en
             # regardant le journal des trades : un moteur qui a deja
             # travaille en a forcement un. Vide + un broker qui detient des
-            # positions = l'etat local a ete PERDU, pas simplement absent.
-            #
-            # Le dire fort au demarrage est la seule occasion de le voir :
-            # au cycle suivant, reconcile_with_broker aura reconstruit les
-            # positions et tout aura l'air normal, avec des prix d'entree
-            # inventes et un historique de risque remis a zero.
+            # positions = l'etat local a ete PERDU, pas simplement absent —
+            # et reconcile_with_broker armera alors un verrou MISMATCH
+            # (broker_only) qui bloque toute soumission jusqu'a decision
+            # de l'operateur : plus aucune reconstruction automatique.
             if not self.tlog.trades:
                 log_pos.warning(
                     "[STATE_EMPTY] aucune position locale ET journal de "
                     "trades vide au demarrage. Si le broker detient des "
                     "positions, l'etat local a ete perdu (disque ephemere ?) "
-                    ": les prix d'entree seront estimes et l'historique de "
-                    "risque (drawdown, pertes consecutives, PnL du jour) "
-                    "repart de zero.",
+                    ": la reconciliation de demarrage bloquera les "
+                    "soumissions (broker_only) au lieu de reconstruire.",
                     extra={"event": "state_empty_at_startup"})
 

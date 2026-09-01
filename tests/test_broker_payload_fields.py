@@ -96,22 +96,38 @@ class _Base(unittest.TestCase):
 
 class StartupReconcileRealPayloadTest(_Base):
 
-    def test_real_payload_positions_are_matched_not_ghosted(self):
+    def test_real_payload_classifies_the_documented_quantity_mismatch(self):
+        """Mission C: -6 broker vs -5 local on T79599.99, everything else
+        matched, nothing deleted, nothing adopted, halt armed."""
         report = self.pm.reconcile_with_broker()
-        self.assertEqual(report["ghost"], [],
-                         "broker-held positions must never be ghosted")
+        self.assertEqual(report["status"], "MISMATCH")
+        self.assertEqual(report["mismatches"],
+                         [{"ticker": "KXBTCD-26AUG2808-T79599.99",
+                           "kind": "quantity_mismatch",
+                           "broker": -6, "local": -5}])
         self.assertEqual(sorted(report["matched"]),
-                         sorted(p["ticker"]
-                                for p in LOCAL_POSITIONS.values()))
+                         ["KXBTCD-26AUG2808-T79799.99",
+                          "KXBTCD-26AUG2817-T84999.99"])
+        self.assertIsNotNone(self.pm.reconcile_halt)
         self.assertEqual(self.pm.open_count(), 3,
                          "the 2026-08-31 incident: all three restored "
                          "positions were destroyed on a parseable payload")
 
+    def test_false_flat_regression_broker_count_is_three_not_zero(self):
+        net, err = self.pm._broker_net_positions(
+            [dict(e) for e in REAL_BROKER_PAYLOAD])
+        self.assertIsNone(err)
+        self.assertEqual(len(net), 3,
+                         "position_fp rows must parse: broker_count=3, "
+                         "never the incident's broker_count=0")
+        self.assertEqual(net["KXBTCD-26AUG2808-T79599.99"], -6)
+
     def test_incident_regression_nothing_removed_nothing_rebuilt(self):
-        before = set(self.pm.positions)
-        report = self.pm.reconcile_with_broker()
-        self.assertEqual(set(self.pm.positions), before)
-        self.assertEqual(report["rebuilt"], [])
+        before = {k: dict(v) for k, v in self.pm.positions.items()}
+        self.pm.reconcile_with_broker()
+        self.assertEqual(self.pm.positions, before)
+        self.assertEqual(self.client.create_order.call_count, 0)
+        self.assertEqual(self.client.cancel_order.call_count, 0)
 
 
 class PeriodicVerifyRealPayloadTest(_Base):

@@ -198,15 +198,20 @@ def restart(label, wipe):
     rep = pm2.reconcile_with_broker()
     check(f"{tag} unresolved broker position stays counted",
           pm2.open_count() >= 1,
-          f"open_count={pm2.open_count()} rebuilt={rep.get('rebuilt')} "
-          f"ghost={rep.get('ghost')}")
+          f"open_count={pm2.open_count()} status={rep.get('status')}")
 
-    # No resurrection: broker flat -> local must go flat
+    # 2026-08-31 hardening: a flat broker read must NEVER delete local
+    # positions (the old 'ghost cleanup' destroyed restored state). It
+    # halts submissions instead and preserves everything.
+    pm2.reconcile_halt = None
     cli2.get_positions.return_value = []
-    pm2.reconcile_with_broker()
-    check(f"{tag} closed broker position is not resurrected",
-          pm2.open_count() == 0,
-          f"open_count={pm2.open_count()}")
+    rep_flat = pm2.reconcile_with_broker()
+    check(f"{tag} flat broker read preserves local positions and halts",
+          pm2.open_count() >= 1
+          and rep_flat.get("status") == "MISMATCH"
+          and pm2.reconcile_halt is not None,
+          f"open_count={pm2.open_count()} status={rep_flat.get('status')} "
+          f"halt={pm2.reconcile_halt}")
     return post
 
 
