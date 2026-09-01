@@ -91,7 +91,10 @@ def load_report(data_dir: str, capital: float = None) -> dict:
                 return json.load(f)
         except (OSError, ValueError):
             return default
-    trades = _load("kalshi_trades.json", [])
+    # Vue effective : les corrections de ledger ne sont pas des trades,
+    # leur economie est repliee dans le trade d'origine.
+    from trade_logger import fold_corrections
+    trades = fold_corrections(_load("kalshi_trades.json", []))
     settled = [t for t in trades if t.get("state") == "settled"
                or t.get("settled_at")]
     rep = _load("cycle_report.json", {})

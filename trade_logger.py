@@ -1,6 +1,25 @@
 """
 TradeLogger — Journal des trades reels Kalshi.
 Extrait de kalshi_alpha_bot.py (PR #16, P3.5+).
+
+Le journal contient DEUX types d'evenements, distingues par ``event_type``:
+
+  ``trade``             un trade independant (defaut ; les lignes ecrites
+                        avant l'introduction du champ n'en portent pas et
+                        sont donc des trades)
+  ``ledger_correction`` une correction broker-authoritative portant sur UN
+                        trade existant (``corrects_trade_id``). Ce n'est PAS
+                        un trade : c'est le delta economique d'un fill que
+                        le moteur n'avait pas observe.
+
+REGLE DE COMPTAGE (unique et explicite) : une correction n'est JAMAIS une
+ligne des surfaces qui comptent des trades ; son economie est REPLIEE dans
+le trade d'origine par ``fold_corrections``. Le nombre de trades, le
+win/loss, la serie de pertes et la recence de reglement restent donc ceux
+du trading reel, tandis que PnL, frais et quantite refletent la verite
+broker. ``settled_trades``/``open_trades`` servent cette vue repliee ;
+``trades`` reste le journal brut (audit), ``trade_rows``/``correction_rows``
+en donnent les deux moities.
 """
 
 import logging
@@ -13,10 +32,65 @@ from persistence import JsonStore
 # Module-level logger (meme format que dans kalshi_alpha_bot.py)
 log_trd = logging.getLogger("TRADE")
 
+#: Valeurs de ``event_type``. L'absence du champ signifie EVENT_TRADE
+#: (compatibilite avec tout le journal historique).
+EVENT_TRADE = "trade"
+EVENT_LEDGER_CORRECTION = "ledger_correction"
+
+#: Champs economiques additifs replies d'une correction vers sa cible.
+_FOLDED_FIELDS = ("gross_pnl", "net_pnl", "fees", "filled_count")
+
 
 def now_iso() -> str:
     """Horodatage UTC ISO 8601 a la seconde pres."""
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def is_correction(row: dict) -> bool:
+    return row.get("event_type") == EVENT_LEDGER_CORRECTION
+
+
+def fold_corrections(rows: list) -> list:
+    """Vue ECONOMIQUE du journal: les trades independants seuls, chacun
+    portant la somme de ses corrections broker-authoritative.
+
+    Entree = journal brut (liste de dicts, corrections comprises).
+    Sortie = liste des seuls trades, meme ordre, valeurs corrigees. Une
+    ligne corrigee est une COPIE marquee ``corrected``/``correction_ids``;
+    une ligne sans correction est renvoyee telle quelle (identite
+    preservee). Une correction orpheline (cible absente) n'est repliee
+    nulle part et ne peut donc pas creer de PnL fantome.
+    """
+    by_target = {}
+    for row in rows:
+        if is_correction(row):
+            by_target.setdefault(row.get("corrects_trade_id"), []).append(row)
+    out = []
+    for t in rows:
+        if is_correction(t):
+            continue
+        corrs = by_target.get(t.get("trade_id"))
+        if not corrs:
+            out.append(t)
+            continue
+        eff = dict(t)
+        for c in corrs:
+            for field in _FOLDED_FIELDS:
+                delta = c.get(field)
+                if delta is None:
+                    continue
+                base = eff.get(field)
+                if base is None:
+                    # Cible sans valeur (trade encore ouvert): on ne
+                    # fabrique pas une economie a partir de rien.
+                    continue
+                eff[field] = (base + delta if isinstance(base, int)
+                              and isinstance(delta, int)
+                              else round(float(base) + float(delta), 6))
+        eff["corrected"] = True
+        eff["correction_ids"] = [c.get("correction_id") for c in corrs]
+        out.append(eff)
+    return out
 
 
 class TradeLogger:
@@ -140,14 +214,34 @@ class TradeLogger:
             f"depuis la position reconstruite")
         return rec
 
+    # -- vues du journal -------------------------------------------------
+    # trades              : journal BRUT (audit, ecriture) -- corrections
+    #                       comprises, jamais filtre
+    # trade_rows          : trades independants, valeurs D'ORIGINE
+    # correction_rows     : evenements correctifs seuls
+    # effective_trades    : trades independants, economie CORRIGEE
+    # settled/open_trades : la vue effective, filtree par etat
+
+    def trade_rows(self) -> list:
+        """Trades independants (les corrections n'en sont pas)."""
+        return [t for t in self.trades if not is_correction(t)]
+
+    def correction_rows(self) -> list:
+        return [t for t in self.trades if is_correction(t)]
+
+    def effective_trades(self) -> list:
+        """Trades independants, corrections broker repliees dedans."""
+        return fold_corrections(self.trades)
+
     def has_open_on(self, ticker: str) -> bool:
-        return any(t["ticker"] == ticker and t["state"] == "open" for t in self.trades)
+        return any(t["ticker"] == ticker and t["state"] == "open"
+                   for t in self.trade_rows())
 
     def open_trades(self) -> list:
-        return [t for t in self.trades if t["state"] == "open"]
+        return [t for t in self.effective_trades() if t["state"] == "open"]
 
     def settled_trades(self) -> list:
-        return [t for t in self.trades if t["state"] == "settled"]
+        return [t for t in self.effective_trades() if t["state"] == "settled"]
 
     def flush(self):
         JsonStore.save(self.path, self.trades)

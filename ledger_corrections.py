@@ -10,6 +10,9 @@ readable forever.
 
 Every correction is declarative and surgical:
 
+  - explicitly ACTIVATED by the operator: deploying this code corrects
+    nothing until ``LEDGER_CORRECTION_APPLY_IDS`` names the correction. A
+    financial mutation never rides in silently on a code deploy.
   - keyed to ONE historical trade row (trade_id + order_id + ticker), with
     strict preconditions on quantity/side/result -- any other ledger, any
     already-corrected ledger, and any not-yet-settled target gets ZERO
@@ -21,6 +24,17 @@ Every correction is declarative and surgical:
   - purely local: this module never touches a broker client, never opens a
     position, and risk history follows automatically because every risk
     metric is recomputed from the journal (single source of truth)
+
+NOT A TRADE. The corrective row carries ``event_type="ledger_correction"``
+and holds DELTAS, not totals. ``trade_logger.fold_corrections`` -- through
+which every counting and economic surface reads the journal -- folds those
+deltas into the corrected trade and never yields the correction as a row of
+its own. Trade counts, win/loss counts, the consecutive-loss streak,
+trades_today and settlement recency are therefore untouched by a
+correction, while PnL, fees and filled quantity become broker-true. The
+row's ``won`` is None (a correction has no independent outcome) and its
+``settled_at`` is the corrected trade's settlement time (economic day),
+with ``applied_at`` recording when the correction itself was written.
 
 Registered corrections
 ----------------------
@@ -40,10 +54,18 @@ broker's actuals (0.0539$ vs 0.06$ recorded -> -0.0061$), i.e. net
 """
 
 import logging
+import os
 
-from trade_logger import TradeLogger, now_iso
+from persistence import JsonStore, PersistenceSentinel
+from trade_logger import EVENT_LEDGER_CORRECTION, TradeLogger, now_iso
 
 log = logging.getLogger("LEDGER")
+
+#: Activation EXPLICITE et nominative. Deployer le code ne corrige RIEN:
+#: l'operateur doit nommer la correction a appliquer dans cette variable
+#: (liste separee par des virgules). Une fois la ligne correctrice ecrite,
+#: la variable peut etre retiree: le marqueur vit dans le journal.
+ACTIVATION_ENV = "LEDGER_CORRECTION_APPLY_IDS"
 
 SIXTH_CONTRACT_CORRECTION = {
     "correction_id": "corr-01a04823-sixth-fill-v1",
@@ -90,6 +112,11 @@ SIXTH_CONTRACT_CORRECTION = {
 CORRECTIONS = (SIXTH_CONTRACT_CORRECTION,)
 
 
+def _authorized_ids() -> set:
+    raw = os.getenv(ACTIVATION_ENV, "")
+    return {p.strip() for p in raw.split(",") if p.strip()}
+
+
 def _find_target(trades: list, corr: dict):
     for t in trades:
         if (t.get("trade_id") == corr["target_trade_id"]
@@ -121,15 +148,56 @@ def _preconditions_unmet(target: dict, corr: dict):
     return None
 
 
+def _marker_count_on_disk(tlog: TradeLogger, cid: str) -> int:
+    """Nombre de lignes correctrices ``cid`` reellement PRESENTES SUR LE
+    DISQUE (pas en memoire). Sert a detecter une application concurrente."""
+    rows = JsonStore.load(tlog.path, [])
+    if not isinstance(rows, list):
+        return 0
+    return sum(1 for t in rows
+               if isinstance(t, dict) and t.get("correction_id") == cid)
+
+
 def apply_ledger_corrections(tlog: TradeLogger) -> list:
-    """Applies every registered correction whose exact target ledger is
-    loaded. Returns the corrective rows appended (possibly empty). Pure
-    local bookkeeping: no broker client is ever seen here."""
+    """Applies every registered AND operator-activated correction whose
+    exact target ledger is loaded. Returns the corrective rows appended
+    (possibly empty). Pure local bookkeeping: no broker client is ever
+    seen here.
+
+    SINGLE_REPLICA_REQUIRED: the journal is a JSON file with atomic
+    replace but no cross-process lock, so two replicas booting at once
+    could each append the same correction (and, worse, each overwrite the
+    other's journal -- a hazard this file shares with every other engine
+    write). Mutual exclusion is therefore enforced OUTSIDE: the service
+    runs with exactly one replica. This function additionally VERIFIES the
+    invariant it cannot lock: it re-reads the journal from disk before
+    appending and again after flushing, and trips the persistence sentinel
+    (which blocks every order submission) if the marker count is anything
+    but exactly one.
+    """
     applied = []
+    authorized = _authorized_ids()
     for corr in CORRECTIONS:
         cid = corr["correction_id"]
         if any(t.get("correction_id") == cid for t in tlog.trades):
             continue                       # already applied: marker row found
+        if cid not in authorized:
+            log.info(f"[LEDGER_CORRECTION] {cid} disponible mais NON activee "
+                     f"({ACTIVATION_ENV} ne la nomme pas): aucune ecriture.")
+            continue
+        if _marker_count_on_disk(tlog, cid):
+            # Un autre processus vient de l'appliquer: notre journal en
+            # memoire est perime et le flusher ecraserait son travail.
+            PersistenceSentinel.record_failure(
+                "ledger_corrections",
+                f"{cid} deja presente sur le disque mais absente en "
+                f"memoire: application concurrente (replicas multiples ?)")
+            log.critical(
+                f"[LEDGER_CORRECTION] {cid} presente sur le DISQUE et absente "
+                f"en memoire -- un autre processus l'a appliquee. Abandon "
+                f"(aucune ecriture) et soumissions bloquees: "
+                f"SINGLE_REPLICA_REQUIRED viole.")
+            continue
         target = _find_target(tlog.trades, corr)
         reason = _preconditions_unmet(target, corr)
         if reason:
@@ -140,6 +208,9 @@ def apply_ledger_corrections(tlog: TradeLogger) -> list:
 
         rec = {
             "schema": tlog.SCHEMA,
+            # PAS un trade: event_type l'exclut de toute surface qui COMPTE
+            # des trades; son economie est repliee dans corrects_trade_id.
+            "event_type": EVENT_LEDGER_CORRECTION,
             "trade_id": cid,
             "decision_id": None,
             "timestamp": corr["fill_time"],
@@ -149,6 +220,7 @@ def apply_ledger_corrections(tlog: TradeLogger) -> list:
             "requested_price": None,
             "avg_fill_price": corr["avg_fill_price"],
             "requested_count": corr["filled_delta"],
+            # DELTAS, pas des totaux: replies sur la ligne d'origine.
             "filled_count": corr["filled_delta"],
             "spread": None, "fees": corr["fees"],
             "edge": None, "ev": None, "confidence": None, "grade": None,
@@ -160,11 +232,17 @@ def apply_ledger_corrections(tlog: TradeLogger) -> list:
             "order_status": corr["broker_evidence"]["status"],
             "state": "settled",
             "result": corr["expected_result"],
-            "won": corr["net_pnl"] >= 0,
+            # AUCUNE issue independante: une correction ne gagne ni ne perd,
+            # elle corrige l'issue deja enregistree du trade d'origine.
+            "won": None,
             "gross_pnl": corr["gross_pnl"],
             "net_pnl": corr["net_pnl"],
             "roi": None, "holding_seconds": None,
-            "settled_at": now_iso(),
+            # Jour ECONOMIQUE = celui du reglement corrige (et non la date
+            # d'application), pour que le PnL quotidien et la recence de
+            # reglement restent attaches au fait reel.
+            "settled_at": target.get("settled_at"),
+            "applied_at": now_iso(),
             "correction": True,
             "correction_id": cid,
             "corrects_trade_id": corr["target_trade_id"],
@@ -173,6 +251,18 @@ def apply_ledger_corrections(tlog: TradeLogger) -> list:
         tlog.trades.append(rec)
         tlog.flush()
         applied.append(rec)
+
+        seen = _marker_count_on_disk(tlog, cid)
+        if seen != 1:
+            PersistenceSentinel.record_failure(
+                "ledger_corrections",
+                f"{cid}: {seen} ligne(s) correctrice(s) sur le disque apres "
+                f"ecriture (exactement 1 exigee)")
+            log.critical(
+                f"[LEDGER_CORRECTION] {cid}: {seen} exemplaire(s) sur le "
+                f"disque apres flush au lieu d'UN SEUL -- correction "
+                f"economique potentiellement dupliquee ou perdue. "
+                f"Soumissions bloquees, intervention operateur requise.")
         log.warning(
             f"[LEDGER_CORRECTION] {cid} APPLIQUEE: {corr['ticker']} "
             f"{corr['side'].upper()} +{corr['filled_delta']} @ "
