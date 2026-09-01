@@ -87,11 +87,41 @@ def _read_b64_env() -> str:
     return b64 + "=" * (-len(b64) % 4) if b64 else ""
 
 
+def _restore_from_dir(src_dir: str, manifest: dict):
+    """Byte source ON THE VOLUME: for each critical basename, scan the
+    candidates JsonStore's rotation may hold (name, .bak1..3) in src_dir
+    and select the one whose sha256 MATCHES the operator manifest. The
+    manifest -- not the filename -- picks the bytes, so a current file
+    overwritten after the fact (incident 2026-08-31) is skipped in favor
+    of its intact rotation copy. Fully mechanical: no payload ever
+    transits a lossy channel. -> (contents, None) or (None, raison)."""
+    contents = {}
+    for name in RESTORE_BASENAMES:
+        want = str(manifest.get(name, "")).strip().lower()
+        found = None
+        for cand in (name, name + ".bak1", name + ".bak2", name + ".bak3"):
+            path = os.path.join(src_dir, cand)
+            if not os.path.isfile(path):
+                continue
+            raw = open(path, "rb").read()
+            if hashlib.sha256(raw).hexdigest() == want:
+                found = raw
+                log.info(f"[STATE_RESTORE] {name}: source volume {cand} "
+                         f"({len(raw)} octets, sha256 conforme au manifest)")
+                break
+        if found is None:
+            return None, (f"aucun candidat de {name} dans {src_dir} ne "
+                          f"correspond au hash attendu du manifest")
+        contents[name] = found
+    return contents, None
+
+
 def maybe_restore_state() -> bool:
     """Runs before any manager touches state. True = state usable
     (restored, already present, or restore not requested)."""
     b64 = _read_b64_env()
-    if not b64:
+    src_dir = os.getenv("RESTORE_STATE_SRC_DIR", "").strip()
+    if not b64 and not src_dir:
         return True
 
     present = [n for n in RESTORE_BASENAMES if os.path.exists(_p(n))]
@@ -113,17 +143,22 @@ def maybe_restore_state() -> bool:
         return _fail(f"manifest de hash incomplet/inattendu: "
                      f"{sorted(manifest)}")
 
-    try:
-        raw = base64.b64decode(b64, validate=True)
-        contents = {}
-        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
-            for m in tar.getmembers():
-                name = os.path.basename(m.name)
-                if not m.isfile() or name not in RESTORE_BASENAMES:
-                    continue
-                contents[name] = tar.extractfile(m).read()
-    except Exception as e:
-        return _fail(f"archive RESTORE_STATE_TGZ_B64 illisible: {e}")
+    if src_dir:
+        contents, err = _restore_from_dir(src_dir, manifest)
+        if err:
+            return _fail(err)
+    else:
+        try:
+            raw = base64.b64decode(b64, validate=True)
+            contents = {}
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
+                for m in tar.getmembers():
+                    name = os.path.basename(m.name)
+                    if not m.isfile() or name not in RESTORE_BASENAMES:
+                        continue
+                    contents[name] = tar.extractfile(m).read()
+        except Exception as e:
+            return _fail(f"archive RESTORE_STATE_TGZ_B64 illisible: {e}")
 
     for name in RESTORE_BASENAMES:
         if name not in contents:
@@ -172,10 +207,12 @@ def restore_or_die() -> None:
     variables at all keeps today's behavior (verify_state_root decides).
     """
     b64 = _read_b64_env()
+    src_dir = os.getenv("RESTORE_STATE_SRC_DIR", "").strip()
     manifest = os.getenv("RESTORE_STATE_SHA256", "").strip()
-    if manifest and not b64:
+    if manifest and not b64 and not src_dir:
         _fail("restauration demandee (RESTORE_STATE_SHA256 present) mais "
-              "RESTORE_STATE_TGZ_B64 absent/vide")
+              "aucune source (RESTORE_STATE_TGZ_B64 et RESTORE_STATE_SRC_DIR "
+              "absents/vides)")
         log.critical("[STATE_RESTORE] ARRET du processus avant toute "
                      "initialisation: destination laissee sans AUCUNE "
                      "ecriture.")

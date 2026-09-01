@@ -181,6 +181,88 @@ class RestoreTest(_RestoreBase):
         self.assertFalse(PersistenceSentinel.healthy())
 
 
+class DirSourceRestoreTest(_RestoreBase):
+    """RESTORE_STATE_SRC_DIR: mechanical byte source on the volume itself.
+
+    The env-var payload transits lossy channels and was corrupted twice in
+    production; the JsonStore rotation copies on the volume never move.
+    The manifest hash -- not the filename -- selects the right candidate,
+    so a current file that was overwritten after the fact is skipped for
+    its intact .bak copy."""
+
+    def setUp(self):
+        super().setUp()
+        self.src = tempfile.mkdtemp(prefix="atlas_src_")
+        self._env["RESTORE_STATE_SRC_DIR"] = \
+            os.environ.pop("RESTORE_STATE_SRC_DIR", None)
+        self.addCleanup(lambda: shutil.rmtree(self.src, ignore_errors=True))
+
+    def _seed_src(self):
+        # The incident layout: current positions/orders/guard files were
+        # overwritten with empties, the golden bytes live in .bak copies;
+        # the journal's current file is still golden; risk golden in .bak2.
+        layout = {
+            "submission_guard.json": b"{}",
+            "submission_guard.json.bak1": FILES["submission_guard.json"],
+            "orders_state.json": b"{}",
+            "orders_state.json.bak1": FILES["orders_state.json"],
+            "kalshi_trades.json": FILES["kalshi_trades.json"],
+            "risk_state.json": b'{\n "date": "2026-08-31"\n}',
+            "risk_state.json.bak1": b'{\n "date": "2026-08-31"\n}',
+            "risk_state.json.bak2": FILES["risk_state.json"],
+            "positions_state.json": b"{}",
+            "positions_state.json.bak1": b"{}",
+            "positions_state.json.bak2": FILES["positions_state.json"],
+        }
+        for name, payload in layout.items():
+            with open(os.path.join(self.src, name), "wb") as f:
+                f.write(payload)
+
+    def test_dir_source_selects_candidates_by_manifest_hash(self):
+        self._seed_src()
+        os.environ["RESTORE_STATE_SRC_DIR"] = self.src
+        os.environ["RESTORE_STATE_SHA256"] = _manifest()
+        self.assertTrue(maybe_restore_state())
+        self.assertTrue(PersistenceSentinel.healthy())
+        for name, payload in FILES.items():
+            raw = open(os.path.join(self.tmp, name), "rb").read()
+            self.assertEqual(raw, payload,
+                             f"{name}: manifest hash must pick the golden "
+                             f"bytes, wherever the rotation put them")
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmp, "state_epoch.json")))
+
+    def test_dir_source_wins_over_corrupt_b64(self):
+        self._seed_src()
+        os.environ["RESTORE_STATE_SRC_DIR"] = self.src
+        os.environ["RESTORE_STATE_TGZ_B64"] = "corrupt-not-base64!!!"
+        os.environ["RESTORE_STATE_SHA256"] = _manifest()
+        restore_or_die()              # must not raise: dir source wins
+        for name, payload in FILES.items():
+            self.assertEqual(
+                open(os.path.join(self.tmp, name), "rb").read(), payload)
+
+    def test_dir_source_without_matching_candidate_dies_without_writes(self):
+        self._seed_src()
+        os.remove(os.path.join(self.src, "positions_state.json.bak2"))
+        os.environ["RESTORE_STATE_SRC_DIR"] = self.src
+        os.environ["RESTORE_STATE_SHA256"] = _manifest()
+        with self.assertRaises(SystemExit) as cm:
+            restore_or_die()
+        self.assertEqual(cm.exception.code, 78)
+        self.assertFalse(PersistenceSentinel.healthy())
+        self.assertEqual(
+            [f for f in os.listdir(self.tmp) if not f.endswith(".tmp")], [],
+            "no hash match -> destination stays virgin")
+
+    def test_manifest_with_src_dir_but_no_b64_is_a_valid_request(self):
+        self._seed_src()
+        os.environ["RESTORE_STATE_SRC_DIR"] = self.src
+        os.environ["RESTORE_STATE_SHA256"] = _manifest()
+        restore_or_die()              # not the manifest-without-source death
+        self.assertTrue(PersistenceSentinel.healthy())
+
+
 class RestoreOrDieTest(_RestoreBase):
     """Boot-hook semantics: a REQUESTED restore that cannot complete must
     stop the process with the destination untouched (incident 2026-08-31:
