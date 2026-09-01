@@ -537,6 +537,13 @@ class ExecutionEngine:
                 except Exception as e:                    # noqa: BLE001
                     log_pos.warning(
                         f"[AMBIGUOUS_RESOLUTION] passage periodique echoue: {e}")
+            # Supervision: une intention ambigue bloque un ticker
+            # fail-closed; elle ne doit jamais rester silencieuse. Purement
+            # observatoire (aucune soumission, aucune cloture).
+            try:
+                self.orders.evaluate_intent_alerts()
+            except Exception as e:                        # noqa: BLE001
+                log_pos.warning(f"[INTENT_ALERT] evaluation echouee: {e}")
 
         # 1) Reglements d'abord : le PnL realise conditionne les portes
         for _t in self.posmgr.check_settlements():

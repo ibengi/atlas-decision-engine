@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 from config import CFG, _p, contract_cap_config
 from execution_result import ExecutionResult
@@ -44,6 +45,10 @@ class OrderManager:
     #: Intentions d'envoi non resolues (voir __init__). Volontairement
     #: hors des cinq fichiers critiques figes par la migration.
     PENDING_FILE = "pending_intents.json"
+    #: Etat des alertes de supervision. Persiste pour que l'AGE d'une
+    #: alerte survive au redemarrage: une alerte qui repart a zero a
+    #: chaque reboot ne declenche jamais de seuil.
+    ALERTS_FILE = "intent_alerts.json"
 
     def __init__(self, client: KalshiClient):
         self.client = client
@@ -85,6 +90,10 @@ class OrderManager:
         # client_order_id, ou le broker repond n'importe quoi). Tant qu'il
         # est arme, AUCUNE soumission n'est autorisee, sur aucun ticker.
         self.resolution_halt = None
+        raw_alerts = JsonStore.load(_p(self.ALERTS_FILE), {})
+        self.intent_alerts = {str(k): dict(v)
+                              for k, v in (raw_alerts or {}).items()
+                              if isinstance(v, dict)}
         log_api.info(f"[SUBMISSION_GUARD_LOADED] active_tickers={len(self.session_submitted)} "
                      f"ttl_seconds={CFG.SUBMIT_DEDUP_TTL_S:.0f}")
         if self.pending_intents:
@@ -161,6 +170,8 @@ class OrderManager:
                 "-> UNAVAILABLE: le client ne sait pas rechercher par "
                 "client_order_id. Verrou MAINTENU, aucune re-soumission.")
             intent["resolution"] = "UNAVAILABLE"
+            intent["unavailable_streak"] = int(
+                intent.get("unavailable_streak") or 0) + 1
             self._flush_pending_intents()
             return "UNAVAILABLE"
         try:
@@ -172,6 +183,11 @@ class OrderManager:
                 f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
                 f"-> {outcome} ({e}). Verrou anti-doublon MAINTENU, aucune "
                 "re-soumission.")
+            if outcome == "UNAVAILABLE":
+                intent["unavailable_streak"] = int(
+                    intent.get("unavailable_streak") or 0) + 1
+            else:
+                intent["unavailable_streak"] = 0
             if outcome == "MALFORMED":
                 self._halt_resolution(
                     "MALFORMED_ORDER_LISTING",
@@ -185,6 +201,8 @@ class OrderManager:
                 f"-> UNAVAILABLE ({type(e).__name__}: {e}). Verrou MAINTENU, "
                 "aucune re-soumission.")
             intent["resolution"] = "UNAVAILABLE"
+            intent["unavailable_streak"] = int(
+                intent.get("unavailable_streak") or 0) + 1
             self._flush_pending_intents()
             return "UNAVAILABLE"
 
@@ -218,6 +236,7 @@ class OrderManager:
             need = max(1, int(CFG.AMBIGUOUS_NOT_FOUND_CONFIRMATIONS))
             gap = max(0.0, float(CFG.AMBIGUOUS_NOT_FOUND_INTERVAL_S))
             now = time.time()
+            intent["unavailable_streak"] = 0      # une lecture a abouti
             seen = int(intent.get("not_found_count") or 0)
             last = float(intent.get("last_not_found_at") or 0.0)
             if seen == 0 or (now - last) >= gap:
@@ -278,6 +297,163 @@ class OrderManager:
         # de cycle de vie): l'intention n'a plus lieu d'etre ouverte.
         self._clear_intent(ticker)
         return "FOUND"
+
+    # -- supervision des intentions ambigues ---------------------------------
+
+    @staticmethod
+    def _age_seconds(iso_ts: str, now: float) -> float:
+        """Age en secondes d'un horodatage ISO, 0.0 s'il est illisible."""
+        try:
+            born = datetime.fromisoformat(str(iso_ts)).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, now - born)
+
+    def intent_health(self, now: float = None) -> dict:
+        """Etat OBSERVABLE des intentions ambigues.
+
+        Aucune donnee sensible n'entre ici: ni cle, ni signature, ni jeton.
+        Le client_order_id EST publie -- c'est un hash deterministe des
+        parametres d'ordre (ticker|side|count|prix), pas un secret, et
+        c'est l'identifiant dont l'operateur a besoin pour interroger le
+        broker lui-meme.
+        """
+        now = time.time() if now is None else now
+        rows = []
+        for ticker, intent in sorted(self.pending_intents.items()):
+            age = self._age_seconds(intent.get("at"), now)
+            last_at = intent.get("last_not_found_at")
+            rows.append({
+                "ticker": ticker,
+                "client_order_id": intent.get("client_order_id"),
+                "status": intent.get("resolution") or "NEVER_CHECKED",
+                "not_found_count": int(intent.get("not_found_count") or 0),
+                "unavailable_streak": int(intent.get("unavailable_streak") or 0),
+                "last_attempt_at": (
+                    datetime.fromtimestamp(float(last_at), timezone.utc)
+                    .isoformat(timespec="seconds") if last_at else None),
+                "opened_at": intent.get("at"),
+                "age_seconds": round(age, 1),
+            })
+        oldest = max(rows, key=lambda r: r["age_seconds"], default=None)
+        return {
+            "open_intents": len(rows),
+            "oldest_age_seconds": oldest["age_seconds"] if oldest else 0.0,
+            "oldest_ticker": oldest["ticker"] if oldest else None,
+            "intents": rows,
+            "resolution_halt": dict(self.resolution_halt)
+                               if self.resolution_halt else None,
+            "alerts_open": sum(1 for a in self.intent_alerts.values()
+                               if not a.get("acknowledged_at")),
+        }
+
+    def _raise_alert(self, key: str, kind: str, severity: str, ticker: str,
+                     detail: str, now: float) -> dict:
+        """Arme (ou rafraichit) une alerte. first_raised_at n'est ecrit
+        qu'UNE fois: c'est lui qui porte l'age reel a travers les
+        redemarrages."""
+        alert = self.intent_alerts.get(key)
+        stamp = datetime.fromtimestamp(now, timezone.utc).isoformat(
+            timespec="seconds")
+        if alert is None:
+            alert = {"kind": kind, "severity": severity, "ticker": ticker,
+                     "first_raised_at": stamp, "occurrences": 0,
+                     "acknowledged_at": None, "acknowledged_by": None,
+                     "acknowledgement_note": None}
+            self.intent_alerts[key] = alert
+            new = True
+        else:
+            new = not alert.get("_seen_this_pass")
+        alert["detail"] = detail
+        alert["severity"] = severity
+        alert["last_raised_at"] = stamp
+        alert["occurrences"] = int(alert.get("occurrences") or 0) + 1
+        alert["age_seconds"] = round(
+            self._age_seconds(alert.get("first_raised_at"), now), 1)
+        if new and not alert.get("acknowledged_at"):
+            log = log_api.critical if severity == "CRITICAL" else log_api.warning
+            log(f"[INTENT_ALERT] {kind} severity={severity} ticker={ticker} "
+                f"depuis={alert['first_raised_at']} -- {detail}")
+        return alert
+
+    def evaluate_intent_alerts(self, now: float = None) -> list:
+        """Evalue les alertes de supervision et les persiste.
+
+        Purement OBSERVATOIRE: cette methode ne soumet rien, n'annule rien
+        et ne cloture aucune intention. Elle rend visible ce qui est deja
+        bloque fail-closed.
+        """
+        now = time.time() if now is None else now
+        stale_after = max(0.0, float(CFG.AMBIGUOUS_INTENT_STALE_S))
+        streak_limit = max(1, int(CFG.AMBIGUOUS_UNAVAILABLE_STREAK_ALERT))
+        active = set()
+
+        for row in self.intent_health(now)["intents"]:
+            ticker, status = row["ticker"], row["status"]
+            if status in ("MULTIPLE", "MALFORMED"):
+                key = f"{status}:{ticker}"
+                active.add(key)
+                self._raise_alert(
+                    key, f"AMBIGUOUS_RESOLUTION_{status}", "CRITICAL", ticker,
+                    f"resolution non tranchable (client_order_id="
+                    f"{row['client_order_id']}): un ordre en double peut "
+                    f"exister; toute soumission est bloquee", now)
+            if row["unavailable_streak"] >= streak_limit:
+                key = f"UNAVAILABLE_STREAK:{ticker}"
+                active.add(key)
+                self._raise_alert(
+                    key, "AMBIGUOUS_LOOKUP_UNAVAILABLE_STREAK", "CRITICAL",
+                    ticker,
+                    f"{row['unavailable_streak']} lectures consecutives "
+                    f"impossibles: l'existence de l'ordre reste INCONNUE", now)
+            if stale_after > 0 and row["age_seconds"] >= stale_after:
+                key = f"STALE:{ticker}"
+                active.add(key)
+                self._raise_alert(
+                    key, "AMBIGUOUS_INTENT_STALE", "WARNING", ticker,
+                    f"intention ouverte depuis {row['age_seconds']:.0f}s "
+                    f"(seuil {stale_after:.0f}s, statut {status}, "
+                    f"not_found={row['not_found_count']}): ticker bloque "
+                    f"tant qu'elle n'est pas tranchee", now)
+
+        # Une alerte dont la cause a disparu est retiree (l'acquittement
+        # n'est donc jamais un moyen de masquer une cause encore vivante).
+        for key in [k for k in self.intent_alerts if k not in active]:
+            resolved = self.intent_alerts.pop(key)
+            log_api.info(f"[INTENT_ALERT_CLEARED] {resolved.get('kind')} "
+                         f"ticker={resolved.get('ticker')}: cause disparue.")
+        for key in active:
+            self.intent_alerts[key].pop("_seen_this_pass", None)
+            self.intent_alerts[key]["_seen_this_pass"] = True
+        JsonStore.save(_p(self.ALERTS_FILE), self.intent_alerts)
+        return [dict(a, key=k) for k, a in sorted(self.intent_alerts.items())]
+
+    def ack_intent_alert(self, ticker: str, operator: str,
+                         note: str = "") -> list:
+        """Acquittement OPERATEUR: reconnait avoir vu l'alerte.
+
+        N'A AUCUN effet sur le trading. L'intention reste ouverte, le
+        ticker reste bloque, et rien ici ne peut declencher un
+        create_order: un acquittement dit « j'ai vu », jamais « rejoue ».
+        Seule une resolution broker (FOUND) ou la politique de cloture
+        (CLOSED_ABSENT) libere un ticker.
+        """
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        acked = []
+        for key, alert in self.intent_alerts.items():
+            if alert.get("ticker") != ticker:
+                continue
+            alert["acknowledged_at"] = stamp
+            alert["acknowledged_by"] = str(operator)[:64]
+            alert["acknowledgement_note"] = str(note)[:280]
+            acked.append(key)
+        if acked:
+            JsonStore.save(_p(self.ALERTS_FILE), self.intent_alerts)
+            log_api.warning(
+                f"[INTENT_ALERT_ACK] {ticker} acquittee par {operator} "
+                f"({len(acked)} alerte(s)) -- l'intention reste OUVERTE et le "
+                "ticker reste bloque: un acquittement ne resoumet jamais.")
+        return acked
 
     def resolve_pending_intents(self) -> dict:
         """Rejoue la resolution pour chaque intention non resolue. Appele au

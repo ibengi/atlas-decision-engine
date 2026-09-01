@@ -77,6 +77,12 @@ class Config:
         "AMBIGUOUS_NOT_FOUND_CONFIRMATIONS", 2)
     AMBIGUOUS_NOT_FOUND_INTERVAL_S = _env_f(
         "AMBIGUOUS_NOT_FOUND_INTERVAL_SECONDS", 60.0)
+    # Supervision des intentions ambigues: une intention ouverte bloque un
+    # ticker fail-closed, elle ne doit donc JAMAIS rester silencieuse.
+    AMBIGUOUS_INTENT_STALE_S = _env_f(
+        "AMBIGUOUS_INTENT_STALE_SECONDS", 900.0)          # 15 min
+    AMBIGUOUS_UNAVAILABLE_STREAK_ALERT = _env_i(
+        "AMBIGUOUS_UNAVAILABLE_STREAK_ALERT", 3)
     # Deploiement LIVE-capable : exiger la continuite de l'etat persistant.
     # Un marqueur state_epoch.json absent (disque neuf ou EFFACE) bloque
     # les soumissions fail-closed au lieu de reprendre comme si de rien
