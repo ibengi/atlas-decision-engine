@@ -61,7 +61,15 @@ class _CanaryBase(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="atlas_canary_")
-        self._saved = {k: getattr(CFG, k) for k in (
+        self._tmps = getattr(self, "_tmps", [])
+        self._tmps.append(self.tmp)
+        # Certains tests rappellent setUp() pour isoler un sous-cas: la
+        # sauvegarde de CFG ne doit etre prise QU'UNE FOIS, sinon on
+        # restaurerait des valeurs deja modifiees dans le CFG global et on
+        # polluerait toute la suite (bug observe: kelly/pipeline en echec
+        # uniquement quand ce fichier tourne avant eux).
+        self._saved = getattr(self, "_saved", None) or {
+            k: getattr(CFG, k) for k in (
             "DATA_DIR", "REQUIRE_PERSISTENT_STATE", "ALLOW_ORDER_SUBMISSION",
             "MAX_CONTRACTS_PER_ORDER", "ALLOW_FRESH_STATE",
             "SUBMIT_DEDUP_TTL_S", "ORDER_TTL_SECONDS")}
@@ -79,7 +87,8 @@ class _CanaryBase(unittest.TestCase):
         PersistenceSentinel.reset()
         for k, v in self._saved.items():
             setattr(CFG, k, v)
-        shutil.rmtree(self.tmp, ignore_errors=True)
+        for d in getattr(self, "_tmps", [self.tmp]):
+            shutil.rmtree(d, ignore_errors=True)
 
     @staticmethod
     def _client(order_id="ord-canary-1"):

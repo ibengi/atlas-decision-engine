@@ -126,7 +126,11 @@ class TestExchange503Cooldown(_IsolatedDirTestCase):
         # peut exister chez le broker, donc le verrou anti-doublon pose
         # AVANT l'appel reste en place et aucune re-soumission de ce
         # ticker n'est autorisee -- semantique single-shot du canary.
-        self.assertEqual(res.status, "ambiguous:503")
+        # Le suffixe nomme l'issue de la resolution par
+        # client_order_id (unavailable ici: le double de test ne sait
+        # pas rechercher). On epingle la famille, pas le detail.
+        self.assertTrue(res.status.startswith("ambiguous:503"),
+                        f"statut inattendu: {res.status}")
         self.assertEqual(res.state, "rejected")
         self.assertIn("KXBTCD-X", om.session_submitted,
                       "ticker laisse deverrouille apres un POST ambigu")

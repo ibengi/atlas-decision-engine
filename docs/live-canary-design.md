@@ -54,10 +54,19 @@ kept filling after the engine stopped watching it.
   survives restart (`submission_guard.json`, TTL 21600 s): after a restart
   the same ticker cannot be re-submitted, which
   `tools/restart_harness.py` verifies on every run.
-- **Ambiguous outcome ⇒ stop, never retry.** Any of: non-201 with an
-  unclear body, a timeout after send, a cancel failure, or a read-back the
-  engine cannot interpret, ends the canary and hands the decision to the
-  operator with the raw broker payload.
+- **Ambiguous outcome ⇒ resolve by asking, never retry.** On any of:
+  non-201 with an unclear body, a timeout after send, or a dropped
+  connection, the engine looks the order up by its deterministic
+  `client_order_id` via `GET /portfolio/orders` (listed server-side by
+  ticker, matched locally — Kalshi has no server-side filter on that
+  field). Exactly one match ⇒ its `order_id` and status are adopted, no
+  new order. No match ⇒ stay locked, no automatic repost. More than one
+  match, an unusable listing, or a lookup that fails ⇒ fail-closed: a
+  failed lookup is never read as "the order does not exist", and a
+  multiple match halts submissions on every ticker until the operator
+  decides. The intent (ticker + `client_order_id` + size + price) is
+  persisted in `pending_intents.json` before the POST, so the same
+  question is re-asked after a restart.
 
 ## 4. Automatic stop conditions
 

@@ -41,6 +41,9 @@ def assert_real_demo_integrity(client, shadow_mode: bool):
 
 class OrderManager:
     TERMINAL = {"executed", "canceled", "cancelled", "expired", "filled"}
+    #: Intentions d'envoi non resolues (voir __init__). Volontairement
+    #: hors des cinq fichiers critiques figes par la migration.
+    PENDING_FILE = "pending_intents.json"
 
     def __init__(self, client: KalshiClient):
         self.client = client
@@ -66,8 +69,29 @@ class OrderManager:
         # Cooldown apres 503 exchange (demo en pause/maintenance) : inutile
         # et bruyant de marteler l'API a chaque cycle.
         self.exchange_pause_until = 0.0
+        # INTENTIONS D'ENVOI NON RESOLUES. Ecrites AVANT le POST, elles
+        # survivent au redemarrage et portent le client_order_id
+        # deterministe : c'est ce qui permet, apres un POST ambigu, de
+        # demander au broker « cet ordre existe-t-il ? » au lieu de
+        # deviner. Fichier SEPARE de submission_guard.json, dont le schema
+        # (ticker -> epoch) est fige par la migration Phase 2A/2B.
+        raw_intents = JsonStore.load(_p(self.PENDING_FILE), {})
+        self.pending_intents = {
+            str(tk): dict(v) for tk, v in (raw_intents or {}).items()
+            if isinstance(v, dict) and v.get("client_order_id")
+        }
+        # Verrou GLOBAL fail-closed: arme quand une resolution est
+        # impossible a trancher (plusieurs ordres portent le meme
+        # client_order_id, ou le broker repond n'importe quoi). Tant qu'il
+        # est arme, AUCUNE soumission n'est autorisee, sur aucun ticker.
+        self.resolution_halt = None
         log_api.info(f"[SUBMISSION_GUARD_LOADED] active_tickers={len(self.session_submitted)} "
                      f"ttl_seconds={CFG.SUBMIT_DEDUP_TTL_S:.0f}")
+        if self.pending_intents:
+            log_api.warning(
+                f"[PENDING_INTENTS_LOADED] {len(self.pending_intents)} "
+                f"intention(s) d'envoi non resolue(s): "
+                f"{sorted(self.pending_intents)}")
 
     def flush(self):
         JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders)
@@ -88,6 +112,150 @@ class OrderManager:
             }
         return bool(JsonStore.save(_p("submission_guard.json"),
                                    self.session_submitted))
+
+    # -- resolution d'un POST ambigu par client_order_id ---------------------
+
+    def _flush_pending_intents(self) -> bool:
+        return bool(JsonStore.save(_p(self.PENDING_FILE), self.pending_intents))
+
+    def _record_intent(self, ticker: str, client_order_id: str, count: int,
+                       limit_cents: int) -> bool:
+        """Enregistre l'INTENTION d'envoyer, avant le POST. Persistee, elle
+        permet de rejouer la resolution apres un redemarrage."""
+        self.pending_intents[ticker] = {
+            "client_order_id": client_order_id, "count": int(count),
+            "price": int(limit_cents), "at": now_iso(), "resolution": None,
+        }
+        return self._flush_pending_intents()
+
+    def _clear_intent(self, ticker: str) -> None:
+        if self.pending_intents.pop(ticker, None) is not None:
+            self._flush_pending_intents()
+
+    def _halt_resolution(self, reason: str, detail: str) -> None:
+        self.resolution_halt = {"status": reason, "detail": detail,
+                                "at": now_iso()}
+        log_api.critical(
+            f"[AMBIGUOUS_RESOLUTION_HALT] {reason}: {detail} -- AUCUNE "
+            "soumission autorisee sur AUCUN ticker jusqu'a decision "
+            "operateur.")
+
+    def resolve_intent(self, ticker: str, intent: dict) -> str:
+        """Demande au broker si l'ordre porte par ce client_order_id existe.
+
+        Retourne l'un de: FOUND (adopte), NOT_FOUND, MULTIPLE, UNAVAILABLE,
+        MALFORMED. AUCUN de ces chemins ne re-soumet quoi que ce soit : la
+        resolution est une LECTURE. Seul FOUND leve l'incertitude, en
+        adoptant l'order_id et le statut reels.
+        """
+        cid = str(intent.get("client_order_id") or "")
+        count = int(intent.get("count") or 0)
+        lookup = getattr(self.client, "find_orders_by_client_order_id", None)
+        if not callable(lookup):
+            # Client sans capacite de recherche (client ancien, double de
+            # test) : on ne peut pas trancher, donc on ne tranche pas. Ce
+            # chemin ne doit JAMAIS lever -- une exception ici ferait
+            # remonter une erreur au lieu de rester fail-closed.
+            log_api.error(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                "-> UNAVAILABLE: le client ne sait pas rechercher par "
+                "client_order_id. Verrou MAINTENU, aucune re-soumission.")
+            intent["resolution"] = "UNAVAILABLE"
+            self._flush_pending_intents()
+            return "UNAVAILABLE"
+        try:
+            matches = lookup(cid, ticker=ticker)
+        except KalshiAPIError as e:
+            # « Je n'ai pas pu regarder » n'est PAS « il n'existe pas ».
+            outcome = "MALFORMED" if "incoherent" in str(e) else "UNAVAILABLE"
+            log_api.error(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                f"-> {outcome} ({e}). Verrou anti-doublon MAINTENU, aucune "
+                "re-soumission.")
+            if outcome == "MALFORMED":
+                self._halt_resolution(
+                    "MALFORMED_ORDER_LISTING",
+                    f"{ticker}/{cid}: reponse de listing inexploitable ({e})")
+            intent["resolution"] = outcome
+            self._flush_pending_intents()
+            return outcome
+        except Exception as e:                                # noqa: BLE001
+            log_api.error(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                f"-> UNAVAILABLE ({type(e).__name__}: {e}). Verrou MAINTENU, "
+                "aucune re-soumission.")
+            intent["resolution"] = "UNAVAILABLE"
+            self._flush_pending_intents()
+            return "UNAVAILABLE"
+
+        if not isinstance(matches, list):
+            self._halt_resolution(
+                "MALFORMED_ORDER_LISTING",
+                f"{ticker}/{cid}: recherche renvoie "
+                f"{type(matches).__name__}, liste attendue")
+            intent["resolution"] = "MALFORMED"
+            self._flush_pending_intents()
+            return "MALFORMED"
+
+        if len(matches) > 1:
+            ids = [str(pick(m, "order_id", "id", default="?")) for m in matches]
+            self._halt_resolution(
+                "MULTIPLE_ORDERS_SAME_CLIENT_ID",
+                f"{ticker}/{cid}: {len(matches)} ordres portent le meme "
+                f"client_order_id ({ids}) -- doublon possible deja cree")
+            intent["resolution"] = "MULTIPLE"
+            self._flush_pending_intents()
+            return "MULTIPLE"
+
+        if not matches:
+            log_api.warning(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                "-> NOT_FOUND: le broker ne connait aucun ordre portant cet "
+                "identifiant. Aucune re-soumission automatique (le verrou "
+                "anti-doublon reste actif jusqu'a son TTL ou une decision "
+                "operateur).")
+            intent["resolution"] = "NOT_FOUND"
+            self._flush_pending_intents()
+            return "NOT_FOUND"
+
+        order = matches[0]
+        order_id = str(pick(order, "order_id", "id", default="") or "")
+        if not order_id:
+            self._halt_resolution(
+                "MALFORMED_ORDER_LISTING",
+                f"{ticker}/{cid}: ordre correspondant SANS order_id")
+            intent["resolution"] = "MALFORMED"
+            self._flush_pending_intents()
+            return "MALFORMED"
+        status, filled = self._extract(order, count or 1)
+        # ADOPTION: l'ordre existe, on le reprend en suivi local comme s'il
+        # venait d'etre place. Aucun ordre n'est cree ici.
+        self.open_orders[order_id] = {
+            "ticker": ticker, "side": order.get("side") or order.get("action"),
+            "count": count, "price": int(intent.get("price") or 0),
+            "placed_at": intent.get("at") or now_iso(),
+            "adopted_from_client_order_id": cid,
+        }
+        self.flush()
+        log_api.warning(
+            f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} -> FOUND: "
+            f"order_id={order_id} status={status} filled={filled}/{count} "
+            "-- ordre ADOPTE en suivi local, aucune re-soumission.")
+        intent["resolution"] = "FOUND"
+        intent["order_id"] = order_id
+        self._flush_pending_intents()
+        return "FOUND"
+
+    def resolve_pending_intents(self) -> dict:
+        """Rejoue la resolution pour chaque intention non resolue. Appele au
+        demarrage: apres un redemarrage, l'ambiguite se retranche a partir
+        de l'etat persiste, pas de la memoire perdue."""
+        outcomes = {}
+        for ticker, intent in list(self.pending_intents.items()):
+            if intent.get("resolution") == "FOUND":
+                continue          # deja adoptee, rien a redemander
+            outcomes[ticker] = self.resolve_intent(ticker, intent)
+        return outcomes
 
     # -- extraction tolerante de l'etat d'un ordre ---------------------------
     @staticmethod
@@ -158,6 +326,19 @@ class OrderManager:
                           f"{f.get('reason')}) -- create_order NON appele.")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:persistence_failure", "rejected")
+        # INVARIANT DUR : une ambiguite non tranchee (plusieurs ordres pour
+        # le meme client_order_id, ou listing inexploitable) bloque TOUTE
+        # soumission, pas seulement le ticker concerne : tant qu'on ignore
+        # si un doublon existe deja, on n'en cree pas un de plus.
+        if self.resolution_halt:
+            h = self.resolution_halt
+            log_api.error(
+                f"[ORDER_SUBMIT_ATTEMPT] bloque: resolution ambigue non "
+                f"tranchee ({h.get('status')}: {h.get('detail')}) -- "
+                "create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:ambiguous_resolution_halt",
+                                   "rejected")
         # INVARIANT DUR : plafond de contrats independant du sizing.
         # 1) Configuration du cap invalide/absente (LIVE-capable) : erreur
         #    operateur VISIBLE et soumissions desactivees fail-closed —
@@ -247,6 +428,10 @@ class OrderManager:
         # erreur : un echec de POST est un etat AMBIGU (l'ordre existe
         # peut-etre), et seul le TTL ou une decision operateur le lève.
         self.session_submitted[ticker] = time.time()
+        # L'intention porte le client_order_id deterministe: c'est elle qui
+        # rend la question « cet ordre existe-t-il ? » posable au broker,
+        # maintenant ou apres un redemarrage.
+        self._record_intent(ticker, client_order_id, count, limit_cents)
         if not self._flush_submission_guard():
             # Verrou non persistable = aucune garantie anti-doublon au
             # redemarrage : on n'appelle PAS le broker (fail-closed).
@@ -282,14 +467,29 @@ class OrderManager:
                 f"ticker={ticker} client_order_id={client_order_id} "
                 f"http_status={e.status} -- l'ordre peut exister chez le "
                 "broker. Verrou anti-doublon MAINTENU, aucune re-soumission "
-                "ne sera tentee; la reconciliation broker/local tranchera.")
+                "ne sera tentee; resolution par client_order_id en cours.")
+            # LECTURE, jamais une seconde ecriture: on demande au broker si
+            # l'ordre porte par notre client_order_id deterministe existe.
+            outcome = self.resolve_intent(ticker,
+                                          self.pending_intents.get(ticker, {
+                                              "client_order_id": client_order_id,
+                                              "count": count,
+                                              "price": limit_cents}))
+            if outcome == "FOUND":
+                intent = self.pending_intents.get(ticker, {})
+                return ExecutionResult(intent.get("order_id"), count, 0,
+                                       limit_cents, "adopted_after_ambiguous",
+                                       "resting")
             return ExecutionResult(None, count, 0, limit_cents,
-                                   f"ambiguous:{e.status}", "rejected")
+                                   f"ambiguous:{e.status}:{outcome.lower()}",
+                                   "rejected")
         self.exchange_pause_until = 0.0
         # Le verrou est deja pose et persiste avant l'appel ; on rafraichit
         # seulement l'horodatage sur le succes confirme.
         self.session_submitted[ticker] = time.time()
         self._flush_submission_guard()
+        # POST revenu: plus d'ambiguite a trancher pour cette intention.
+        self._clear_intent(ticker)
         http_status = getattr(self.client, "last_http_status", None)
         order_id = str(pick(order, "order_id", "id", default="") or "")
         log_api.info("[ORDER_SUBMIT_RESPONSE] "
@@ -491,6 +691,11 @@ class OrderManager:
         sources alternatives. Un ordre encore incertain reste persiste pour
         le prochain cycle au lieu d'etre oublie.
         """
+        # Un POST ambigu laisse une INTENTION persistee: apres redemarrage,
+        # on retranche la meme question au broker (lecture seule) avant
+        # toute autre action.
+        if self.pending_intents:
+            self.resolve_pending_intents()
         if not self.open_orders:
             return
         log_api.warning(f"Recovery: {len(self.open_orders)} ordre(s) non conclu(s) "
