@@ -50,7 +50,8 @@ load_dotenv()
 # S1. CONFIGURATION (centralisee, surchargeables par variables d'env)
 # ══════════════════════════════════════════════════════════════════════════
 
-from config import Config, CFG, _env_b, _env_i, _env_f, _p
+from config import (Config, CFG, _env_b, _env_i, _env_f, _p,
+                    prod_credentials_config)
 
 # ══════════════════════════════════════════════════════════════════════════
 # S2. LOGGING (canaux BOT / API / TRADE / RISK / POSITION / STATS)
@@ -248,6 +249,25 @@ def main():
             sys.exit(1)
         log.warning("PRODUCTION REAL MONEY ENABLED (double confirmation + "
                     "gatekeeper valides).")
+
+    # INVARIANT DUR : en PRODUCTION, des identifiants absents ou
+    # illisibles ARRETENT le processus AVANT toute construction de client,
+    # tout manager, toute reconciliation, tout scan et tout appel broker.
+    # Sans ce garde, _load_key se contentait d'un avertissement et
+    # _sign_headers omettait la signature : le moteur demarrait et
+    # interrogeait le broker en NON AUTHENTIFIE (401 silencieux a chaque
+    # cycle). Le mode DEMO refusait deja de demarrer sans ses cles ; la
+    # PRODUCTION, ou l'argent est reel, ne peut pas etre plus permissive.
+    if env == "prod":
+        creds_ok, creds_err = prod_credentials_config()
+        if not creds_ok:
+            log.critical(
+                f"[FATAL] PRODUCTION: identifiants invalides -- {creds_err}. "
+                f"ARRET avant toute initialisation: aucun client, aucun "
+                f"manager, aucune reconciliation, aucun scan, AUCUN appel "
+                f"broker. Remede: fournir KALSHI_KEY_ID et "
+                f"KALSHI_PRIVATE_KEY (PEM RSA complet) puis redemarrer.")
+            sys.exit(1)
 
     client = KalshiClient(env)
     banner(client, args.capital)

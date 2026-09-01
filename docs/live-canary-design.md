@@ -28,7 +28,12 @@ behaviour; every control it relies on already exists and is tested.
 6. LIVE credentials installed **and** the three LIVE confirmations set
    (`KALSHI_ENV_CONFIRM=LIVE`, `LIVE_TRADING_CONFIRMED=YES`,
    `LIVE_TRADING=1`) — the engine refuses production otherwise — plus the
-   model gatekeeper (`check_live_allowed`) passing.
+   model gatekeeper (`check_live_allowed`) passing. `KALSHI_KEY_ID` and
+   `KALSHI_PRIVATE_KEY` must be a real, loadable RSA pair:
+   `prod_credentials_config()` stops a prod boot before any client,
+   manager, reconciliation, scan or broker call when either is absent,
+   blank, non-PEM, unparseable or not RSA — previously such a boot came
+   up and called the broker unsigned.
 7. A fresh pre-canary state capture (five files + SHA-256s) taken and held
    off-box, as at each earlier migration gate.
 

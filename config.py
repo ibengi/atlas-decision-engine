@@ -192,3 +192,51 @@ def contract_cap_config(live_capable=None):
         return None, (f"MAX_CONTRACTS_PER_ORDER deraisonnable ({v} > "
                       f"{CONTRACT_CAP_MAX}): rejete par validation")
     return v, None
+
+
+def prod_credentials_config():
+    """Validate the PRODUCTION Kalshi credentials. Returns (ok, error).
+
+    ok is True only when KALSHI_KEY_ID and KALSHI_PRIVATE_KEY are both
+    present AND the private key actually loads as an RSA key usable for
+    the KALSHI-ACCESS-SIGNATURE header. `error` names the operator-visible
+    reason otherwise, and NEVER contains key material.
+
+    Rationale: DEMO already refuses to start without its dedicated keys
+    (KalshiClient.__init__), but PRODUCTION had no equivalent check.
+    KalshiClient._load_key merely WARNS and returns None on an absent or
+    malformed key, and _sign_headers then omits the signature entirely --
+    so a prod boot with broken credentials used to come up, reconcile,
+    scan and call the broker unauthenticated, collecting silent 401s
+    instead of stopping. Real money deserves the same fail-closed
+    treatment as the demo ledger: refuse the boot, before anything runs.
+    """
+    key_id = str(CFG.KEY_ID or "").strip()
+    key_pem = str(CFG.PRIV_KEY or "").strip()
+    if not key_id:
+        return False, "KALSHI_KEY_ID absent ou vide"
+    if not key_pem:
+        return False, "KALSHI_PRIVATE_KEY absente ou vide"
+    if not key_pem.startswith("-----"):
+        return False, ("KALSHI_PRIVATE_KEY n'est pas au format PEM "
+                       "(en-tete '-----BEGIN ...' manquant)")
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+    except ImportError:
+        return False, ("paquet 'cryptography' absent: aucune requete "
+                       "authentifiee ne peut etre signee")
+    try:
+        key = serialization.load_pem_private_key(key_pem.encode(),
+                                                 password=None)
+    except Exception as e:
+        # Type d'erreur seulement: le message d'une lib crypto ne doit
+        # jamais risquer de reproduire un fragment de la cle.
+        return False, (f"KALSHI_PRIVATE_KEY illisible "
+                       f"({type(e).__name__}): PEM invalide, tronque ou "
+                       f"protege par mot de passe")
+    if not isinstance(key, rsa.RSAPrivateKey):
+        return False, (f"KALSHI_PRIVATE_KEY n'est pas une cle RSA "
+                       f"({type(key).__name__}): la signature Kalshi "
+                       f"exige RSA-PSS")
+    return True, None
