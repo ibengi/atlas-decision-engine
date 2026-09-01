@@ -346,6 +346,74 @@ class KalshiClient:
                 raise
             return []
 
+    #: Listing officiel des ordres du portefeuille (Trade API v2). Kalshi
+    #: n'expose PAS de filtre serveur sur client_order_id : le listing est
+    #: donc restreint cote serveur par ticker/status (ce qui est supporte)
+    #: puis filtre localement sur le client_order_id rendu dans chaque
+    #: ordre. C'est la seule facon documentee de retrouver un ordre dont on
+    #: n'a jamais recu l'order_id (POST ambigu).
+    ORDERS_LIST_PATH = "/portfolio/orders"
+
+    def list_orders(self, *, ticker: str = None, status: str = None,
+                    limit: int = 200, max_pages: int = 10) -> list:
+        """Ordres du portefeuille, pagination cursor suivie jusqu'au bout.
+
+        Leve KalshiAPIError si le transport echoue OU si la reponse est
+        incoherente : l'appelant DOIT pouvoir distinguer « aucun ordre ne
+        correspond » de « je n'ai pas pu regarder ». Confondre les deux
+        apres un POST ambigu autoriserait un doublon.
+        """
+        out, cursor, pages = [], "", 0
+        while pages < max_pages:
+            pages += 1
+            params = {"limit": int(limit)}
+            if ticker:
+                params["ticker"] = ticker
+            if status:
+                params["status"] = status
+            if cursor:
+                params["cursor"] = cursor
+            r = self._req("GET", self.ORDERS_LIST_PATH, params=params)
+            if not isinstance(r, dict):
+                raise KalshiAPIError(
+                    0, f"listing d'ordres incoherent: reponse "
+                       f"{type(r).__name__}, objet attendu")
+            orders = r.get("orders", r.get("data", []))
+            if not isinstance(orders, list):
+                raise KalshiAPIError(
+                    0, "listing d'ordres incoherent: 'orders' n'est pas une "
+                       f"liste ({type(orders).__name__})")
+            if any(not isinstance(o, dict) for o in orders):
+                raise KalshiAPIError(
+                    0, "listing d'ordres incoherent: entree non-objet dans "
+                       "'orders'")
+            if pages == 1:
+                self._log_raw_once("list_orders", r)
+            out.extend(orders)
+            cursor = str(r.get("cursor") or "")
+            if not cursor:
+                return out
+        # Sortie par epuisement de max_pages AVEC un cursor encore actif :
+        # le listing est INCOMPLET. Conclure « aucun ordre ne correspond »
+        # ici serait une absence FABRIQUEE par la pagination. On leve.
+        raise KalshiAPIError(
+            0, f"listing d'ordres tronque: {max_pages} pages lues et le "
+               f"broker annonce encore une suite -- absence non concluante")
+
+    def find_orders_by_client_order_id(self, client_order_id: str, *,
+                                       ticker: str = None) -> list:
+        """TOUS les ordres portant ce client_order_id (0, 1 ou plusieurs).
+
+        Ne renvoie jamais « rien » sur une erreur : une panne de lecture
+        remonte en KalshiAPIError pour rester fail-closed cote appelant.
+        """
+        cid = str(client_order_id or "").strip()
+        if not cid:
+            raise KalshiAPIError(0, "recherche par client_order_id vide")
+        return [o for o in self.list_orders(ticker=ticker)
+                if str(pick(o, "client_order_id", "client_id",
+                            default="")).strip() == cid]
+
     def get_positions(self) -> list:
         """Positions cote broker (source de verite pour la reconciliation)."""
         try:

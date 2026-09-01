@@ -3,11 +3,15 @@ import hashlib
 import json
 import logging
 import time
+from datetime import datetime, timezone
 
 from config import CFG, _p, contract_cap_config
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
+from alert_notifier import (FAILED, SENT, SKIPPED_NO_CHANNEL,
+                            SKIPPED_SEVERITY, NotifierError,
+                            build_notifier, build_payload)
 from persistence import JsonStore, PersistenceSentinel, verify_state_root
 from position_manager import PositionManager
 from trade_logger import TradeLogger, now_iso
@@ -41,9 +45,20 @@ def assert_real_demo_integrity(client, shadow_mode: bool):
 
 class OrderManager:
     TERMINAL = {"executed", "canceled", "cancelled", "expired", "filled"}
+    #: Intentions d'envoi non resolues (voir __init__). Volontairement
+    #: hors des cinq fichiers critiques figes par la migration.
+    PENDING_FILE = "pending_intents.json"
+    #: Etat des alertes de supervision. Persiste pour que l'AGE d'une
+    #: alerte survive au redemarrage: une alerte qui repart a zero a
+    #: chaque reboot ne declenche jamais de seuil.
+    ALERTS_FILE = "intent_alerts.json"
 
-    def __init__(self, client: KalshiClient):
+    def __init__(self, client: KalshiClient, notifier=None):
         self.client = client
+        # Transport d'alerte: injectable, et volontairement IGNORANT du
+        # broker. Il ne recoit qu'un payload plat; il ne peut donc ni
+        # soumettre, ni annuler, ni toucher au verrou ou aux intentions.
+        self.notifier = notifier if notifier is not None else build_notifier()
         # Continuite d'etat (LIVE-capable) : sous REQUIRE_PERSISTENT_STATE,
         # un repertoire d'etat neuf/efface arme la sentinelle AVANT toute
         # possibilite de soumission — le moteur ne reprend jamais le
@@ -66,23 +81,461 @@ class OrderManager:
         # Cooldown apres 503 exchange (demo en pause/maintenance) : inutile
         # et bruyant de marteler l'API a chaque cycle.
         self.exchange_pause_until = 0.0
+        # INTENTIONS D'ENVOI NON RESOLUES. Ecrites AVANT le POST, elles
+        # survivent au redemarrage et portent le client_order_id
+        # deterministe : c'est ce qui permet, apres un POST ambigu, de
+        # demander au broker « cet ordre existe-t-il ? » au lieu de
+        # deviner. Fichier SEPARE de submission_guard.json, dont le schema
+        # (ticker -> epoch) est fige par la migration Phase 2A/2B.
+        raw_intents = JsonStore.load(_p(self.PENDING_FILE), {})
+        self.pending_intents = {
+            str(tk): dict(v) for tk, v in (raw_intents or {}).items()
+            if isinstance(v, dict) and v.get("client_order_id")
+        }
+        # Verrou GLOBAL fail-closed: arme quand une resolution est
+        # impossible a trancher (plusieurs ordres portent le meme
+        # client_order_id, ou le broker repond n'importe quoi). Tant qu'il
+        # est arme, AUCUNE soumission n'est autorisee, sur aucun ticker.
+        self.resolution_halt = None
+        raw_alerts = JsonStore.load(_p(self.ALERTS_FILE), {})
+        self.intent_alerts = {str(k): dict(v)
+                              for k, v in (raw_alerts or {}).items()
+                              if isinstance(v, dict)}
         log_api.info(f"[SUBMISSION_GUARD_LOADED] active_tickers={len(self.session_submitted)} "
                      f"ttl_seconds={CFG.SUBMIT_DEDUP_TTL_S:.0f}")
+        if self.pending_intents:
+            log_api.warning(
+                f"[PENDING_INTENTS_LOADED] {len(self.pending_intents)} "
+                f"intention(s) d'envoi non resolue(s): "
+                f"{sorted(self.pending_intents)}")
 
     def flush(self):
         JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders)
         self._flush_submission_guard()
 
-    def _flush_submission_guard(self):
+    def _flush_submission_guard(self) -> bool:
         """Persiste le verrou anti-doublon afin qu'un redemarrage Railway
-        ne permette pas de resoumettre le meme ticker pendant le TTL."""
+        ne permette pas de resoumettre le meme ticker pendant le TTL.
+
+        Retourne True seulement si l'ecriture a REELLEMENT abouti: l'appelant
+        s'en sert pour refuser l'appel broker quand la protection
+        anti-doublon ne survivrait pas a un redemarrage."""
         now = time.time()
         if CFG.SUBMIT_DEDUP_TTL_S > 0:
             self.session_submitted = {
                 tk: ts for tk, ts in self.session_submitted.items()
                 if now - ts < CFG.SUBMIT_DEDUP_TTL_S
             }
-        JsonStore.save(_p("submission_guard.json"), self.session_submitted)
+        return bool(JsonStore.save(_p("submission_guard.json"),
+                                   self.session_submitted))
+
+    # -- resolution d'un POST ambigu par client_order_id ---------------------
+
+    def _flush_pending_intents(self) -> bool:
+        return bool(JsonStore.save(_p(self.PENDING_FILE), self.pending_intents))
+
+    def _record_intent(self, ticker: str, client_order_id: str, count: int,
+                       limit_cents: int) -> bool:
+        """Enregistre l'INTENTION d'envoyer, avant le POST. Persistee, elle
+        permet de rejouer la resolution apres un redemarrage."""
+        self.pending_intents[ticker] = {
+            "client_order_id": client_order_id, "count": int(count),
+            "price": int(limit_cents), "at": now_iso(), "resolution": None,
+        }
+        return self._flush_pending_intents()
+
+    def _clear_intent(self, ticker: str) -> None:
+        if self.pending_intents.pop(ticker, None) is not None:
+            self._flush_pending_intents()
+
+    def _halt_resolution(self, reason: str, detail: str) -> None:
+        self.resolution_halt = {"status": reason, "detail": detail,
+                                "at": now_iso()}
+        log_api.critical(
+            f"[AMBIGUOUS_RESOLUTION_HALT] {reason}: {detail} -- AUCUNE "
+            "soumission autorisee sur AUCUN ticker jusqu'a decision "
+            "operateur.")
+
+    def resolve_intent(self, ticker: str, intent: dict) -> str:
+        """Demande au broker si l'ordre porte par ce client_order_id existe.
+
+        Retourne l'un de: FOUND (adopte), NOT_FOUND, MULTIPLE, UNAVAILABLE,
+        MALFORMED. AUCUN de ces chemins ne re-soumet quoi que ce soit : la
+        resolution est une LECTURE. Seul FOUND leve l'incertitude, en
+        adoptant l'order_id et le statut reels.
+        """
+        cid = str(intent.get("client_order_id") or "")
+        count = int(intent.get("count") or 0)
+        lookup = getattr(self.client, "find_orders_by_client_order_id", None)
+        if not callable(lookup):
+            # Client sans capacite de recherche (client ancien, double de
+            # test) : on ne peut pas trancher, donc on ne tranche pas. Ce
+            # chemin ne doit JAMAIS lever -- une exception ici ferait
+            # remonter une erreur au lieu de rester fail-closed.
+            log_api.error(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                "-> UNAVAILABLE: le client ne sait pas rechercher par "
+                "client_order_id. Verrou MAINTENU, aucune re-soumission.")
+            intent["resolution"] = "UNAVAILABLE"
+            intent["unavailable_streak"] = int(
+                intent.get("unavailable_streak") or 0) + 1
+            self._flush_pending_intents()
+            return "UNAVAILABLE"
+        try:
+            matches = lookup(cid, ticker=ticker)
+        except KalshiAPIError as e:
+            # « Je n'ai pas pu regarder » n'est PAS « il n'existe pas ».
+            outcome = "MALFORMED" if "incoherent" in str(e) else "UNAVAILABLE"
+            log_api.error(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                f"-> {outcome} ({e}). Verrou anti-doublon MAINTENU, aucune "
+                "re-soumission.")
+            if outcome == "UNAVAILABLE":
+                intent["unavailable_streak"] = int(
+                    intent.get("unavailable_streak") or 0) + 1
+            else:
+                intent["unavailable_streak"] = 0
+            if outcome == "MALFORMED":
+                self._halt_resolution(
+                    "MALFORMED_ORDER_LISTING",
+                    f"{ticker}/{cid}: reponse de listing inexploitable ({e})")
+            intent["resolution"] = outcome
+            self._flush_pending_intents()
+            return outcome
+        except Exception as e:                                # noqa: BLE001
+            log_api.error(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                f"-> UNAVAILABLE ({type(e).__name__}: {e}). Verrou MAINTENU, "
+                "aucune re-soumission.")
+            intent["resolution"] = "UNAVAILABLE"
+            intent["unavailable_streak"] = int(
+                intent.get("unavailable_streak") or 0) + 1
+            self._flush_pending_intents()
+            return "UNAVAILABLE"
+
+        if not isinstance(matches, list):
+            self._halt_resolution(
+                "MALFORMED_ORDER_LISTING",
+                f"{ticker}/{cid}: recherche renvoie "
+                f"{type(matches).__name__}, liste attendue")
+            intent["resolution"] = "MALFORMED"
+            self._flush_pending_intents()
+            return "MALFORMED"
+
+        if len(matches) > 1:
+            ids = [str(pick(m, "order_id", "id", default="?")) for m in matches]
+            self._halt_resolution(
+                "MULTIPLE_ORDERS_SAME_CLIENT_ID",
+                f"{ticker}/{cid}: {len(matches)} ordres portent le meme "
+                f"client_order_id ({ids}) -- doublon possible deja cree")
+            intent["resolution"] = "MULTIPLE"
+            self._flush_pending_intents()
+            return "MULTIPLE"
+
+        if not matches:
+            # UNE lecture vide n'est pas une preuve d'absence: elle est
+            # prise juste apres le POST, au pire moment (un ordre accepte
+            # peut n'etre pas encore visible dans le listing). On exige
+            # AMBIGUOUS_NOT_FOUND_CONFIRMATIONS observations completes,
+            # espacees d'au moins AMBIGUOUS_NOT_FOUND_INTERVAL_S, avant de
+            # cloturer. Une observation trop rapprochee n'apporte aucune
+            # information nouvelle et n'est PAS comptee.
+            need = max(1, int(CFG.AMBIGUOUS_NOT_FOUND_CONFIRMATIONS))
+            gap = max(0.0, float(CFG.AMBIGUOUS_NOT_FOUND_INTERVAL_S))
+            now = time.time()
+            intent["unavailable_streak"] = 0      # une lecture a abouti
+            seen = int(intent.get("not_found_count") or 0)
+            last = float(intent.get("last_not_found_at") or 0.0)
+            if seen == 0 or (now - last) >= gap:
+                seen += 1
+                intent["not_found_count"] = seen
+                intent["last_not_found_at"] = now
+            else:
+                log_api.info(
+                    f"[AMBIGUOUS_RESOLUTION] {ticker} lecture vide ignoree "
+                    f"({now - last:.0f}s < {gap:.0f}s depuis la precedente): "
+                    "trop rapprochee pour constituer une confirmation.")
+            self._flush_pending_intents()
+            if seen >= need:
+                log_api.warning(
+                    f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                    f"-> CLOSED_ABSENT: {seen} lecture(s) completes et "
+                    f"espacees confirment qu'aucun ordre ne porte cet "
+                    "identifiant. Intention CLOTUREE; le ticker repasse sous "
+                    "les regles normales du verrou anti-doublon.")
+                intent["resolution"] = "CLOSED_ABSENT"
+                self._clear_intent(ticker)
+                return "CLOSED_ABSENT"
+            log_api.warning(
+                f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                f"-> NOT_FOUND_PENDING ({seen}/{need} confirmation(s)): "
+                "absence NON concluante. Intention MAINTENUE ouverte, "
+                "aucune re-soumission possible sur ce ticker.")
+            intent["resolution"] = "NOT_FOUND_PENDING"
+            self._flush_pending_intents()
+            return "NOT_FOUND_PENDING"
+
+        order = matches[0]
+        order_id = str(pick(order, "order_id", "id", default="") or "")
+        if not order_id:
+            self._halt_resolution(
+                "MALFORMED_ORDER_LISTING",
+                f"{ticker}/{cid}: ordre correspondant SANS order_id")
+            intent["resolution"] = "MALFORMED"
+            self._flush_pending_intents()
+            return "MALFORMED"
+        status, filled = self._extract(order, count or 1)
+        # ADOPTION: l'ordre existe, on le reprend en suivi local comme s'il
+        # venait d'etre place. Aucun ordre n'est cree ici.
+        self.open_orders[order_id] = {
+            "ticker": ticker, "side": order.get("side") or order.get("action"),
+            "count": count, "price": int(intent.get("price") or 0),
+            "placed_at": intent.get("at") or now_iso(),
+            "adopted_from_client_order_id": cid,
+        }
+        self.flush()
+        log_api.warning(
+            f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} -> FOUND: "
+            f"order_id={order_id} status={status} filled={filled}/{count} "
+            "-- ordre ADOPTE en suivi local, aucune re-soumission.")
+        intent["resolution"] = "FOUND"
+        intent["order_id"] = order_id
+        # L'ordre est desormais suivi dans open_orders (machinerie normale
+        # de cycle de vie): l'intention n'a plus lieu d'etre ouverte.
+        self._clear_intent(ticker)
+        return "FOUND"
+
+    # -- supervision des intentions ambigues ---------------------------------
+
+    @staticmethod
+    def _age_seconds(iso_ts: str, now: float) -> float:
+        """Age en secondes d'un horodatage ISO, 0.0 s'il est illisible."""
+        try:
+            born = datetime.fromisoformat(str(iso_ts)).timestamp()
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, now - born)
+
+    def intent_health(self, now: float = None) -> dict:
+        """Etat OBSERVABLE des intentions ambigues.
+
+        Aucune donnee sensible n'entre ici: ni cle, ni signature, ni jeton.
+        Le client_order_id EST publie -- c'est un hash deterministe des
+        parametres d'ordre (ticker|side|count|prix), pas un secret, et
+        c'est l'identifiant dont l'operateur a besoin pour interroger le
+        broker lui-meme.
+        """
+        now = time.time() if now is None else now
+        rows = []
+        for ticker, intent in sorted(self.pending_intents.items()):
+            age = self._age_seconds(intent.get("at"), now)
+            last_at = intent.get("last_not_found_at")
+            rows.append({
+                "ticker": ticker,
+                "client_order_id": intent.get("client_order_id"),
+                "status": intent.get("resolution") or "NEVER_CHECKED",
+                "not_found_count": int(intent.get("not_found_count") or 0),
+                "unavailable_streak": int(intent.get("unavailable_streak") or 0),
+                "last_attempt_at": (
+                    datetime.fromtimestamp(float(last_at), timezone.utc)
+                    .isoformat(timespec="seconds") if last_at else None),
+                "opened_at": intent.get("at"),
+                "age_seconds": round(age, 1),
+            })
+        oldest = max(rows, key=lambda r: r["age_seconds"], default=None)
+        return {
+            "open_intents": len(rows),
+            "oldest_age_seconds": oldest["age_seconds"] if oldest else 0.0,
+            "oldest_ticker": oldest["ticker"] if oldest else None,
+            "intents": rows,
+            "resolution_halt": dict(self.resolution_halt)
+                               if self.resolution_halt else None,
+            "alerts_open": sum(1 for a in self.intent_alerts.values()
+                               if not a.get("acknowledged_at")),
+        }
+
+    def _raise_alert(self, key: str, kind: str, severity: str, ticker: str,
+                     detail: str, now: float, client_order_id: str = None,
+                     status: str = None, attempts: int = 0) -> dict:
+        """Arme (ou rafraichit) une alerte. first_raised_at n'est ecrit
+        qu'UNE fois: c'est lui qui porte l'age reel a travers les
+        redemarrages."""
+        alert = self.intent_alerts.get(key)
+        stamp = datetime.fromtimestamp(now, timezone.utc).isoformat(
+            timespec="seconds")
+        if alert is None:
+            alert = {"kind": kind, "severity": severity, "ticker": ticker,
+                     "first_raised_at": stamp, "occurrences": 0,
+                     "acknowledged_at": None, "acknowledged_by": None,
+                     "acknowledgement_note": None}
+            self.intent_alerts[key] = alert
+            new = True
+        else:
+            new = not alert.get("_seen_this_pass")
+        alert["detail"] = detail
+        alert["severity"] = severity
+        alert["client_order_id"] = client_order_id
+        alert["status"] = status
+        alert["attempts"] = attempts
+        alert["last_raised_at"] = stamp
+        alert["occurrences"] = int(alert.get("occurrences") or 0) + 1
+        alert["age_seconds"] = round(
+            self._age_seconds(alert.get("first_raised_at"), now), 1)
+        if new and not alert.get("acknowledged_at"):
+            log = log_api.critical if severity == "CRITICAL" else log_api.warning
+            log(f"[INTENT_ALERT] {kind} severity={severity} ticker={ticker} "
+                f"depuis={alert['first_raised_at']} -- {detail}")
+        return alert
+
+    def evaluate_intent_alerts(self, now: float = None) -> list:
+        """Evalue les alertes de supervision et les persiste.
+
+        Purement OBSERVATOIRE: cette methode ne soumet rien, n'annule rien
+        et ne cloture aucune intention. Elle rend visible ce qui est deja
+        bloque fail-closed.
+        """
+        now = time.time() if now is None else now
+        stale_after = max(0.0, float(CFG.AMBIGUOUS_INTENT_STALE_S))
+        streak_limit = max(1, int(CFG.AMBIGUOUS_UNAVAILABLE_STREAK_ALERT))
+        active = set()
+
+        for row in self.intent_health(now)["intents"]:
+            ticker, status = row["ticker"], row["status"]
+            if status in ("MULTIPLE", "MALFORMED"):
+                key = f"{status}:{ticker}"
+                active.add(key)
+                self._raise_alert(
+                    key, f"AMBIGUOUS_RESOLUTION_{status}", "CRITICAL", ticker,
+                    f"resolution non tranchable (client_order_id="
+                    f"{row['client_order_id']}): un ordre en double peut "
+                    f"exister; toute soumission est bloquee", now,
+                    client_order_id=row["client_order_id"], status=status,
+                    attempts=row["not_found_count"])
+            if row["unavailable_streak"] >= streak_limit:
+                key = f"UNAVAILABLE_STREAK:{ticker}"
+                active.add(key)
+                self._raise_alert(
+                    key, "AMBIGUOUS_LOOKUP_UNAVAILABLE_STREAK", "CRITICAL",
+                    ticker,
+                    f"{row['unavailable_streak']} lectures consecutives "
+                    f"impossibles: l'existence de l'ordre reste INCONNUE", now,
+                    client_order_id=row["client_order_id"], status=status,
+                    attempts=row["unavailable_streak"])
+            if stale_after > 0 and row["age_seconds"] >= stale_after:
+                key = f"STALE:{ticker}"
+                active.add(key)
+                self._raise_alert(
+                    key, "AMBIGUOUS_INTENT_STALE", "WARNING", ticker,
+                    f"intention ouverte depuis {row['age_seconds']:.0f}s "
+                    f"(seuil {stale_after:.0f}s, statut {status}, "
+                    f"not_found={row['not_found_count']}): ticker bloque "
+                    f"tant qu'elle n'est pas tranchee", now,
+                    client_order_id=row["client_order_id"], status=status,
+                    attempts=row["not_found_count"])
+
+        # Une alerte dont la cause a disparu est retiree (l'acquittement
+        # n'est donc jamais un moyen de masquer une cause encore vivante).
+        for key in [k for k in self.intent_alerts if k not in active]:
+            resolved = self.intent_alerts.pop(key)
+            log_api.info(f"[INTENT_ALERT_CLEARED] {resolved.get('kind')} "
+                         f"ticker={resolved.get('ticker')}: cause disparue.")
+        for key in active:
+            self.intent_alerts[key].pop("_seen_this_pass", None)
+            self.intent_alerts[key]["_seen_this_pass"] = True
+        self._notify_alerts()
+        JsonStore.save(_p(self.ALERTS_FILE), self.intent_alerts)
+        return [dict(a, key=k) for k, a in sorted(self.intent_alerts.items())]
+
+    def _notify_alerts(self) -> None:
+        """Livre les alertes non encore notifiees au canal externe.
+
+        INVARIANT: cette methode ne peut RIEN casser du trading. Elle
+        n'appelle jamais le broker, ne touche ni aux intentions ni au
+        verrou anti-doublon, et toute exception -- y compris inattendue --
+        est absorbee ici. Une panne du canal se solde par un etat
+        `notify_state=FAILED` et une trace, jamais par un ordre, une
+        annulation, une cloture d'intention ou un deverrouillage.
+        """
+        max_attempts = max(1, int(CFG.ALERT_NOTIFY_MAX_ATTEMPTS))
+        warn_enabled = bool(CFG.ALERT_NOTIFY_WARNINGS)
+        for key, alert in self.intent_alerts.items():
+            state = alert.get("notify_state")
+            if state == SENT:
+                continue                       # idempotence: une seule fois
+            if alert.get("severity") != "CRITICAL" and not warn_enabled:
+                alert["notify_state"] = SKIPPED_SEVERITY
+                continue
+            if not getattr(self.notifier, "configured", False):
+                alert["notify_state"] = SKIPPED_NO_CHANNEL
+                continue
+            if int(alert.get("notify_attempts") or 0) >= max_attempts:
+                continue                       # retries epuises: on n'insiste plus
+            alert["notify_attempts"] = int(alert.get("notify_attempts") or 0) + 1
+            try:
+                self.notifier.send(build_payload(alert, key))
+            except NotifierError as e:
+                alert["notify_state"] = FAILED
+                alert["notify_last_error"] = str(e)[:200]
+                log_api.error(
+                    f"[ALERT_NOTIFY_FAILED] {alert.get('kind')} "
+                    f"ticker={alert.get('ticker')} tentative="
+                    f"{alert['notify_attempts']}/{max_attempts}: {e} -- "
+                    "AUCUN effet sur le trading (intention et verrou "
+                    "inchanges, aucun appel broker).")
+            except Exception as e:                          # noqa: BLE001
+                alert["notify_state"] = FAILED
+                alert["notify_last_error"] = f"{type(e).__name__}"[:200]
+                log_api.error(
+                    f"[ALERT_NOTIFY_FAILED] {alert.get('kind')} "
+                    f"ticker={alert.get('ticker')}: erreur inattendue "
+                    f"{type(e).__name__} -- absorbee, aucun effet trading.")
+            else:
+                alert["notify_state"] = SENT
+                alert["notify_last_error"] = None
+                alert["notified_at"] = datetime.now(timezone.utc).isoformat(
+                    timespec="seconds")
+                log_api.warning(
+                    f"[ALERT_NOTIFY_SENT] {alert.get('kind')} "
+                    f"ticker={alert.get('ticker')} via "
+                    f"{getattr(self.notifier, 'name', '?')}")
+
+    def ack_intent_alert(self, ticker: str, operator: str,
+                         note: str = "") -> list:
+        """Acquittement OPERATEUR: reconnait avoir vu l'alerte.
+
+        N'A AUCUN effet sur le trading. L'intention reste ouverte, le
+        ticker reste bloque, et rien ici ne peut declencher un
+        create_order: un acquittement dit « j'ai vu », jamais « rejoue ».
+        Seule une resolution broker (FOUND) ou la politique de cloture
+        (CLOSED_ABSENT) libere un ticker.
+        """
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        acked = []
+        for key, alert in self.intent_alerts.items():
+            if alert.get("ticker") != ticker:
+                continue
+            alert["acknowledged_at"] = stamp
+            alert["acknowledged_by"] = str(operator)[:64]
+            alert["acknowledgement_note"] = str(note)[:280]
+            acked.append(key)
+        if acked:
+            JsonStore.save(_p(self.ALERTS_FILE), self.intent_alerts)
+            log_api.warning(
+                f"[INTENT_ALERT_ACK] {ticker} acquittee par {operator} "
+                f"({len(acked)} alerte(s)) -- l'intention reste OUVERTE et le "
+                "ticker reste bloque: un acquittement ne resoumet jamais.")
+        return acked
+
+    def resolve_pending_intents(self) -> dict:
+        """Rejoue la resolution pour chaque intention non resolue. Appele au
+        demarrage: apres un redemarrage, l'ambiguite se retranche a partir
+        de l'etat persiste, pas de la memoire perdue."""
+        outcomes = {}
+        for ticker, intent in list(self.pending_intents.items()):
+            if intent.get("resolution") in ("FOUND", "CLOSED_ABSENT"):
+                continue          # deja tranchee, rien a redemander
+            outcomes[ticker] = self.resolve_intent(ticker, intent)
+        return outcomes
 
     # -- extraction tolerante de l'etat d'un ordre ---------------------------
     @staticmethod
@@ -153,6 +606,19 @@ class OrderManager:
                           f"{f.get('reason')}) -- create_order NON appele.")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:persistence_failure", "rejected")
+        # INVARIANT DUR : une ambiguite non tranchee (plusieurs ordres pour
+        # le meme client_order_id, ou listing inexploitable) bloque TOUTE
+        # soumission, pas seulement le ticker concerne : tant qu'on ignore
+        # si un doublon existe deja, on n'en cree pas un de plus.
+        if self.resolution_halt:
+            h = self.resolution_halt
+            log_api.error(
+                f"[ORDER_SUBMIT_ATTEMPT] bloque: resolution ambigue non "
+                f"tranchee ({h.get('status')}: {h.get('detail')}) -- "
+                "create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:ambiguous_resolution_halt",
+                                   "rejected")
         # INVARIANT DUR : plafond de contrats independant du sizing.
         # 1) Configuration du cap invalide/absente (LIVE-capable) : erreur
         #    operateur VISIBLE et soumissions desactivees fail-closed —
@@ -200,6 +666,22 @@ class OrderManager:
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:exchange_unavailable_cooldown",
                                    "rejected")
+        # INVARIANT DUR : une intention d'envoi non resolue interdit toute
+        # nouvelle soumission sur ce ticker, INDEPENDAMMENT du TTL du
+        # verrou anti-doublon. Sans cela, l'expiration du TTL rouvrirait
+        # silencieusement un ticker dont on ignore toujours si un ordre
+        # existe chez le broker -- le TTL mesure le temps, pas la preuve.
+        pending = self.pending_intents.get(ticker)
+        if pending and pending.get("resolution") != "CLOSED_ABSENT":
+            log_api.error(
+                f"[ORDER_SUBMIT_SKIPPED] intention ambigue non resolue sur "
+                f"{ticker} (client_order_id={pending.get('client_order_id')}, "
+                f"etat={pending.get('resolution') or 'jamais relue'}) -- "
+                "create_order NON appele tant que la resolution n'a pas "
+                "conclu.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:ambiguous_intent_unresolved",
+                                   "rejected")
         last = self.session_submitted.get(ticker)
         if last is not None and now - last < CFG.SUBMIT_DEDUP_TTL_S:
             log_api.warning("[ORDER_SUBMIT_SKIPPED] garde anti-doublon: un "
@@ -226,6 +708,36 @@ class OrderManager:
                      f"environment={env_name} "
                      f"endpoint="
                      f"{getattr(self.client, 'ORDERS_V2_PATH', '/portfolio/events/orders')}")
+        # INVARIANT DUR (semantique single-shot) : le verrou anti-doublon est
+        # RESERVE ET PERSISTE **AVANT** l'appel broker, jamais apres.
+        #
+        # Un POST peut etre accepte par l'echange puis se perdre au retour
+        # (timeout, coupure reseau, crash du conteneur). Ecrire le verrou
+        # apres coup laissait alors le ticker LIBRE : le cycle suivant
+        # re-soumettait, et comme le prix du carnet avait bouge, le
+        # client_order_id deterministe changeait aussi -- l'idempotence
+        # broker ne protegeait plus rien et l'ordre etait double. C'est le
+        # scenario du doublon 2026-07-25.
+        #
+        # Le verrou est donc pose sur l'INTENTION d'envoyer, pas sur le
+        # succes de l'envoi. Il n'est JAMAIS relache automatiquement sur
+        # erreur : un echec de POST est un etat AMBIGU (l'ordre existe
+        # peut-etre), et seul le TTL ou une decision operateur le lève.
+        self.session_submitted[ticker] = time.time()
+        # L'intention porte le client_order_id deterministe: c'est elle qui
+        # rend la question « cet ordre existe-t-il ? » posable au broker,
+        # maintenant ou apres un redemarrage.
+        self._record_intent(ticker, client_order_id, count, limit_cents)
+        if not self._flush_submission_guard():
+            # Verrou non persistable = aucune garantie anti-doublon au
+            # redemarrage : on n'appelle PAS le broker (fail-closed).
+            log_api.critical(
+                "[ORDER_SUBMIT_ABORTED] verrou anti-doublon impossible a "
+                f"persister pour {ticker} -- create_order NON appele "
+                "(aucune protection contre le doublon au redemarrage).")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:submission_guard_unwritable",
+                                   "rejected")
         try:
             order = self.client.create_order(ticker, side, count, limit_cents,
                                              client_order_id=client_order_id)
@@ -239,13 +751,42 @@ class OrderManager:
                 log_api.warning("[EXCHANGE_COOLDOWN] 503 exchange -- pause "
                                 f"des soumissions {CFG.EXCHANGE_503_COOLDOWN_S:.0f}s "
                                 "(demo probablement en maintenance).")
-            return ExecutionResult(None, count, 0, limit_cents, f"rejected:{e.status}",
+            # AUCUN repost, ni maintenant ni au cycle suivant : le verrou
+            # pose plus haut reste en place. L'ordre a PEUT-ETRE ete cree
+            # (status=0 = timeout/reseau: la requete est partie sans reponse
+            # exploitable) ; la reconciliation periodique broker/local est
+            # ce qui tranchera, et elle bloque fail-closed en cas de
+            # divergence. Le client_order_id reste deterministe, donc meme
+            # le retry interne de _req est idempotent cote broker.
+            log_api.error(
+                "[ORDER_SUBMIT_AMBIGUOUS] "
+                f"ticker={ticker} client_order_id={client_order_id} "
+                f"http_status={e.status} -- l'ordre peut exister chez le "
+                "broker. Verrou anti-doublon MAINTENU, aucune re-soumission "
+                "ne sera tentee; resolution par client_order_id en cours.")
+            # LECTURE, jamais une seconde ecriture: on demande au broker si
+            # l'ordre porte par notre client_order_id deterministe existe.
+            # On garde une REFERENCE sur l'intention: resolve_intent la
+            # mute (order_id adopte) puis, sur FOUND, la retire du registre
+            # -- relire self.pending_intents ici renverrait du vide.
+            intent = self.pending_intents.get(ticker) or {
+                "client_order_id": client_order_id, "count": count,
+                "price": limit_cents}
+            outcome = self.resolve_intent(ticker, intent)
+            if outcome == "FOUND":
+                return ExecutionResult(intent.get("order_id"), count, 0,
+                                       limit_cents, "adopted_after_ambiguous",
+                                       "resting")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   f"ambiguous:{e.status}:{outcome.lower()}",
                                    "rejected")
         self.exchange_pause_until = 0.0
+        # Le verrou est deja pose et persiste avant l'appel ; on rafraichit
+        # seulement l'horodatage sur le succes confirme.
         self.session_submitted[ticker] = time.time()
-        # Persistance IMMEDIATE : meme un crash entre le HTTP 201 et
-        # l'enregistrement local ne peut plus autoriser un doublon.
         self._flush_submission_guard()
+        # POST revenu: plus d'ambiguite a trancher pour cette intention.
+        self._clear_intent(ticker)
         http_status = getattr(self.client, "last_http_status", None)
         order_id = str(pick(order, "order_id", "id", default="") or "")
         log_api.info("[ORDER_SUBMIT_RESPONSE] "
@@ -447,6 +988,11 @@ class OrderManager:
         sources alternatives. Un ordre encore incertain reste persiste pour
         le prochain cycle au lieu d'etre oublie.
         """
+        # Un POST ambigu laisse une INTENTION persistee: apres redemarrage,
+        # on retranche la meme question au broker (lecture seule) avant
+        # toute autre action.
+        if self.pending_intents:
+            self.resolve_pending_intents()
         if not self.open_orders:
             return
         log_api.warning(f"Recovery: {len(self.open_orders)} ordre(s) non conclu(s) "
