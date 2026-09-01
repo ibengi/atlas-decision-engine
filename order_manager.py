@@ -73,16 +73,21 @@ class OrderManager:
         JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders)
         self._flush_submission_guard()
 
-    def _flush_submission_guard(self):
+    def _flush_submission_guard(self) -> bool:
         """Persiste le verrou anti-doublon afin qu'un redemarrage Railway
-        ne permette pas de resoumettre le meme ticker pendant le TTL."""
+        ne permette pas de resoumettre le meme ticker pendant le TTL.
+
+        Retourne True seulement si l'ecriture a REELLEMENT abouti: l'appelant
+        s'en sert pour refuser l'appel broker quand la protection
+        anti-doublon ne survivrait pas a un redemarrage."""
         now = time.time()
         if CFG.SUBMIT_DEDUP_TTL_S > 0:
             self.session_submitted = {
                 tk: ts for tk, ts in self.session_submitted.items()
                 if now - ts < CFG.SUBMIT_DEDUP_TTL_S
             }
-        JsonStore.save(_p("submission_guard.json"), self.session_submitted)
+        return bool(JsonStore.save(_p("submission_guard.json"),
+                                   self.session_submitted))
 
     # -- extraction tolerante de l'etat d'un ordre ---------------------------
     @staticmethod
@@ -226,6 +231,32 @@ class OrderManager:
                      f"environment={env_name} "
                      f"endpoint="
                      f"{getattr(self.client, 'ORDERS_V2_PATH', '/portfolio/events/orders')}")
+        # INVARIANT DUR (semantique single-shot) : le verrou anti-doublon est
+        # RESERVE ET PERSISTE **AVANT** l'appel broker, jamais apres.
+        #
+        # Un POST peut etre accepte par l'echange puis se perdre au retour
+        # (timeout, coupure reseau, crash du conteneur). Ecrire le verrou
+        # apres coup laissait alors le ticker LIBRE : le cycle suivant
+        # re-soumettait, et comme le prix du carnet avait bouge, le
+        # client_order_id deterministe changeait aussi -- l'idempotence
+        # broker ne protegeait plus rien et l'ordre etait double. C'est le
+        # scenario du doublon 2026-07-25.
+        #
+        # Le verrou est donc pose sur l'INTENTION d'envoyer, pas sur le
+        # succes de l'envoi. Il n'est JAMAIS relache automatiquement sur
+        # erreur : un echec de POST est un etat AMBIGU (l'ordre existe
+        # peut-etre), et seul le TTL ou une decision operateur le lève.
+        self.session_submitted[ticker] = time.time()
+        if not self._flush_submission_guard():
+            # Verrou non persistable = aucune garantie anti-doublon au
+            # redemarrage : on n'appelle PAS le broker (fail-closed).
+            log_api.critical(
+                "[ORDER_SUBMIT_ABORTED] verrou anti-doublon impossible a "
+                f"persister pour {ticker} -- create_order NON appele "
+                "(aucune protection contre le doublon au redemarrage).")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:submission_guard_unwritable",
+                                   "rejected")
         try:
             order = self.client.create_order(ticker, side, count, limit_cents,
                                              client_order_id=client_order_id)
@@ -239,12 +270,25 @@ class OrderManager:
                 log_api.warning("[EXCHANGE_COOLDOWN] 503 exchange -- pause "
                                 f"des soumissions {CFG.EXCHANGE_503_COOLDOWN_S:.0f}s "
                                 "(demo probablement en maintenance).")
-            return ExecutionResult(None, count, 0, limit_cents, f"rejected:{e.status}",
-                                   "rejected")
+            # AUCUN repost, ni maintenant ni au cycle suivant : le verrou
+            # pose plus haut reste en place. L'ordre a PEUT-ETRE ete cree
+            # (status=0 = timeout/reseau: la requete est partie sans reponse
+            # exploitable) ; la reconciliation periodique broker/local est
+            # ce qui tranchera, et elle bloque fail-closed en cas de
+            # divergence. Le client_order_id reste deterministe, donc meme
+            # le retry interne de _req est idempotent cote broker.
+            log_api.error(
+                "[ORDER_SUBMIT_AMBIGUOUS] "
+                f"ticker={ticker} client_order_id={client_order_id} "
+                f"http_status={e.status} -- l'ordre peut exister chez le "
+                "broker. Verrou anti-doublon MAINTENU, aucune re-soumission "
+                "ne sera tentee; la reconciliation broker/local tranchera.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   f"ambiguous:{e.status}", "rejected")
         self.exchange_pause_until = 0.0
+        # Le verrou est deja pose et persiste avant l'appel ; on rafraichit
+        # seulement l'horodatage sur le succes confirme.
         self.session_submitted[ticker] = time.time()
-        # Persistance IMMEDIATE : meme un crash entre le HTTP 201 et
-        # l'enregistrement local ne peut plus autoriser un doublon.
         self._flush_submission_guard()
         http_status = getattr(self.client, "last_http_status", None)
         order_id = str(pick(order, "order_id", "id", default="") or "")

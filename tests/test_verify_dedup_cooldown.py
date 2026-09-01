@@ -121,7 +121,15 @@ class TestExchange503Cooldown(_IsolatedDirTestCase):
         cli = ProdLikeClient(fail_503=True)
         om = make_om(self.tmp, cli)
         res = om.place_and_track("KXBTCD-X", "yes", 1, 74)
-        self.assertEqual(res.status, "rejected:503")
+        # Un 503 est un echec AMBIGU: la requete est partie, la reponse
+        # utile n'est jamais revenue (et _req a deja retente). L'ordre
+        # peut exister chez le broker, donc le verrou anti-doublon pose
+        # AVANT l'appel reste en place et aucune re-soumission de ce
+        # ticker n'est autorisee -- semantique single-shot du canary.
+        self.assertEqual(res.status, "ambiguous:503")
+        self.assertEqual(res.state, "rejected")
+        self.assertIn("KXBTCD-X", om.session_submitted,
+                      "ticker laisse deverrouille apres un POST ambigu")
         n = cli.create_calls
         res2 = om.place_and_track("KXBTCD-Y", "yes", 1, 74)   # autre ticker
         self.assertEqual(res2.status,
