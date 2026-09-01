@@ -1,0 +1,73 @@
+# Prouve, sur l'image REELLEMENT construite, que les deux artefacts lus par
+# model_gatekeeper existent au chemin ou il les cherche -- et qu'une suite
+# rouge ne produit aucune image.
+#
+# Un test unitaire ne peut pas etablir ca : il verifie le depot, pas le
+# resultat du build. C'est la raison d'etre de ce workflow.
+name: Gatekeeper artifacts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  image-contains-artifacts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Le build execute run_tests.py : s'il echoue, cette etape echoue.
+      - name: Build the image (runs the suite inside)
+        run: docker build -t atlas-engine:ci .
+
+      - name: test_report.json exists at the runtime path
+        run: docker run --rm atlas-engine:ci test -f /app/test_report.json
+
+      - name: model_validation.json exists at the runtime path
+        run: docker run --rm atlas-engine:ci test -f /app/model_validation.json
+
+      - name: The shipped report is green and describes this commit's suite
+        run: |
+          docker run --rm atlas-engine:ci python -c "
+          import json, sys
+          r = json.load(open('/app/test_report.json'))
+          assert r['failures'] == 0 and r['errors'] == 0, r
+          assert r['ran'] > 0, r
+          print('report OK:', r['ran'], 'tests, 0 failure, 0 error')
+          "
+
+      # Le point le plus important : le gatekeeper doit rester REFUSANT.
+      # Rendre ses artefacts disponibles ne doit pas ouvrir le live.
+      - name: The gatekeeper still refuses live inside the image
+        run: |
+          docker run --rm \
+            -e NO_LIVE_PROMOTION=0 -e MODEL_APPROVED_FOR_LIVE=YES \
+            atlas-engine:ci python -c "
+          import model_gatekeeper as g
+          ok, failed = g.check_live_allowed()
+          assert ok is False, 'LIVE AUTORISE depuis l image CI'
+          assert any('model_validation' in f for f in failed), failed
+          assert not any('test_report' in f for f in failed), \
+              'le rapport de tests manque dans l image: %r' % (failed,)
+          print('refus attendu:', failed)
+          "
+
+  a-red-suite-blocks-the-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sans cette preuve, l'etape de tests du Dockerfile pourrait etre
+      # inoperante (mauvais chemin, code de sortie avale) sans que rien ne
+      # le signale : tous les builds passeraient, y compris les rouges.
+      - name: Injecting a failing test must fail the build
+        run: |
+          printf 'import unittest\n\n\nclass Canary(unittest.TestCase):\n    def test_deliberate_failure(self):\n        self.fail("canari CI: cet echec DOIT casser le build")\n' \
+            > tests/test_ci_red_canary.py
+          if docker build -t atlas-engine:red . ; then
+            echo "::error::le build a REUSSI avec un test rouge -- l'etape de tests du Dockerfile ne bloque rien"
+            exit 1
+          fi
+          echo "build correctement echoue sur une suite rouge"
+          rm -f tests/test_ci_red_canary.py

@@ -1,0 +1,23 @@
+# Contexte de build. Ce qui n'est pas ici finit dans l'image.
+.git
+.github
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+
+# Jamais d'etat d'execution ni de secret dans une image.
+.env
+*.log
+raw_samples/
+backups/
+data/
+
+# test_report.json est genere par l'etape `tests` du Dockerfile, a partir
+# de la suite du commit construit. L'exclure du contexte garantit qu'un
+# rapport traine sur la machine du developpeur ne puisse pas se faire
+# passer pour celui du build : le seul exemplaire dans l'image finale
+# vient du COPY --from=tests.
+test_report.json
