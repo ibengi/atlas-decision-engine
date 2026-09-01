@@ -68,6 +68,30 @@ kept filling after the engine stopped watching it.
   persisted in `pending_intents.json` before the POST, so the same
   question is re-asked after a restart.
 
+## 3b. Closing an ambiguous intent — the NOT_FOUND policy
+
+`NOT_FOUND` is the answer that looks like permission to try again, and it
+is exactly the answer a lagging read replica gives about an order that
+does exist. It is therefore the only outcome that is not decisive on its
+own. Policy: **`NOT_FOUND_CONFIRMED_2x_60s_FULL_PAGINATION`**.
+
+| Question | Answer |
+|---|---|
+| Readings before declaring absence | **2** (`AMBIGUOUS_NOT_FOUND_CONFIRMATIONS`) |
+| Minimum spacing between them | **60 s** (`AMBIGUOUS_NOT_FOUND_INTERVAL_S`); a closer reading carries no new information and is not counted |
+| Full pagination required | **Yes** — a listing truncated at `max_pages` with a cursor still open raises, because that absence is fabricated by pagination |
+| Late-appearing order | Adopted at the next reading (submission path, periodic reconciliation, or restart); never a second order |
+| Restart mid-window | The count and timestamps live in `pending_intents.json`, so the sequence continues rather than restarting |
+| While unresolved | The open intent blocks submission on that ticker **independently of the guard TTL** |
+| TTL expiry alone | Never authorises a repost — the TTL measures elapsed time, not proof |
+| Anything inconsistent | Fail-closed: `MULTIPLE` and `MALFORMED` halt submissions on every ticker; a failed lookup is `UNAVAILABLE` and does not count as evidence |
+
+Once closed (`CLOSED_ABSENT`), the intent is removed and the ticker
+returns to the ordinary duplicate-guard rules — closure is a decision,
+not a permanent trap. An intent that can never be resolved (broker
+unreadable indefinitely) stays open by design and needs an operator
+decision; that is the intended failure mode.
+
 ## 4. Automatic stop conditions
 
 The canary ends after **one order lifecycle** (fill or resolution), and

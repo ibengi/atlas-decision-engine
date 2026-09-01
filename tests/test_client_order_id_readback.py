@@ -192,6 +192,8 @@ class AmbiguousPostResolutionTest(_ResolverBase):
         self.assertIsNone(om.resolution_halt)
         # adoption is durable
         self.assertIn("ord-found-1", JsonStore.load(_p(CFG.ORDERS_FILE), {}))
+        # l'intention est close: l'ordre vit desormais dans open_orders
+        self.assertNotIn(TICKER, om.pending_intents)
 
     def test_not_found_stays_fail_closed_and_never_reposts(self):
         client = self._client()
@@ -202,10 +204,12 @@ class AmbiguousPostResolutionTest(_ResolverBase):
 
         self.assertEqual(client.create_order.call_count, 1)
         self.assertEqual(om.open_orders, {}, "nothing adopted on NOT_FOUND")
-        self.assertTrue(res.status.endswith("not_found"))
+        # Une seule lecture vide ne CLOTURE rien: l'absence reste non
+        # concluante tant que la politique n'a pas ses confirmations.
+        self.assertTrue(res.status.endswith("not_found_pending"))
         self.assertIn(TICKER, om.session_submitted, "guard released")
         self.assertEqual(self._intents_on_disk()[TICKER]["resolution"],
-                         "NOT_FOUND")
+                         "NOT_FOUND_PENDING")
 
         # a later cycle at a moved price must NOT create the order
         client2 = self._client()
@@ -213,7 +217,7 @@ class AmbiguousPostResolutionTest(_ResolverBase):
         client2.create_order.return_value = order_row(order_id="ord-new")
         res2 = self._submit(bot.OrderManager(client2), price=PRICE + 9)
         self.assertEqual(client2.create_order.call_count, 0)
-        self.assertEqual(res2.status, "blocked:duplicate_submission_guard")
+        self.assertEqual(res2.status, "blocked:ambiguous_intent_unresolved")
 
     def test_multiple_matches_halt_every_submission(self):
         client = self._client()
@@ -315,7 +319,7 @@ class RestartResolutionTest(_ResolverBase):
         om2.reconcile_startup(MagicMock(trades=[]), MagicMock())
 
         res = self._submit(om2, price=PRICE + 5)
-        self.assertEqual(res.status, "blocked:duplicate_submission_guard")
+        self.assertEqual(res.status, "blocked:ambiguous_intent_unresolved")
         self.assertEqual(client2.create_order.call_count, 0)
 
     def test_restart_after_multiple_match_keeps_the_global_halt(self):

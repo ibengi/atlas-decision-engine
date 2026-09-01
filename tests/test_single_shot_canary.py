@@ -255,8 +255,11 @@ class NoRepostOnAmbiguousPostTest(_CanaryBase):
 
                 self.assertEqual(client2.create_order.call_count, 0,
                                  f"{label}: repost with a NEW id")
+                # Le refus vient desormais de l'INTENTION non resolue, un
+                # verrou plus fort que le TTL du guard (voir la politique
+                # NOT_FOUND dans docs/live-canary-design.md).
                 self.assertEqual(res2.status,
-                                 "blocked:duplicate_submission_guard")
+                                 "blocked:ambiguous_intent_unresolved")
                 self._cleanup()
 
     def test_ambiguous_status_is_reported_not_silently_rejected(self):
@@ -349,7 +352,7 @@ class RestartDuplicateGuardTest(_CanaryBase):
 
         self.assertEqual(client2.create_order.call_count, 0,
                          "restart after an ambiguous POST allowed a duplicate")
-        self.assertEqual(res2.status, "blocked:duplicate_submission_guard")
+        self.assertEqual(res2.status, "blocked:ambiguous_intent_unresolved")
 
     def test_guard_survives_many_restarts_within_the_ttl(self):
         client = self._client()

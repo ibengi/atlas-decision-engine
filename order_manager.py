@@ -208,15 +208,46 @@ class OrderManager:
             return "MULTIPLE"
 
         if not matches:
+            # UNE lecture vide n'est pas une preuve d'absence: elle est
+            # prise juste apres le POST, au pire moment (un ordre accepte
+            # peut n'etre pas encore visible dans le listing). On exige
+            # AMBIGUOUS_NOT_FOUND_CONFIRMATIONS observations completes,
+            # espacees d'au moins AMBIGUOUS_NOT_FOUND_INTERVAL_S, avant de
+            # cloturer. Une observation trop rapprochee n'apporte aucune
+            # information nouvelle et n'est PAS comptee.
+            need = max(1, int(CFG.AMBIGUOUS_NOT_FOUND_CONFIRMATIONS))
+            gap = max(0.0, float(CFG.AMBIGUOUS_NOT_FOUND_INTERVAL_S))
+            now = time.time()
+            seen = int(intent.get("not_found_count") or 0)
+            last = float(intent.get("last_not_found_at") or 0.0)
+            if seen == 0 or (now - last) >= gap:
+                seen += 1
+                intent["not_found_count"] = seen
+                intent["last_not_found_at"] = now
+            else:
+                log_api.info(
+                    f"[AMBIGUOUS_RESOLUTION] {ticker} lecture vide ignoree "
+                    f"({now - last:.0f}s < {gap:.0f}s depuis la precedente): "
+                    "trop rapprochee pour constituer une confirmation.")
+            self._flush_pending_intents()
+            if seen >= need:
+                log_api.warning(
+                    f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
+                    f"-> CLOSED_ABSENT: {seen} lecture(s) completes et "
+                    f"espacees confirment qu'aucun ordre ne porte cet "
+                    "identifiant. Intention CLOTUREE; le ticker repasse sous "
+                    "les regles normales du verrou anti-doublon.")
+                intent["resolution"] = "CLOSED_ABSENT"
+                self._clear_intent(ticker)
+                return "CLOSED_ABSENT"
             log_api.warning(
                 f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
-                "-> NOT_FOUND: le broker ne connait aucun ordre portant cet "
-                "identifiant. Aucune re-soumission automatique (le verrou "
-                "anti-doublon reste actif jusqu'a son TTL ou une decision "
-                "operateur).")
-            intent["resolution"] = "NOT_FOUND"
+                f"-> NOT_FOUND_PENDING ({seen}/{need} confirmation(s)): "
+                "absence NON concluante. Intention MAINTENUE ouverte, "
+                "aucune re-soumission possible sur ce ticker.")
+            intent["resolution"] = "NOT_FOUND_PENDING"
             self._flush_pending_intents()
-            return "NOT_FOUND"
+            return "NOT_FOUND_PENDING"
 
         order = matches[0]
         order_id = str(pick(order, "order_id", "id", default="") or "")
@@ -243,7 +274,9 @@ class OrderManager:
             "-- ordre ADOPTE en suivi local, aucune re-soumission.")
         intent["resolution"] = "FOUND"
         intent["order_id"] = order_id
-        self._flush_pending_intents()
+        # L'ordre est desormais suivi dans open_orders (machinerie normale
+        # de cycle de vie): l'intention n'a plus lieu d'etre ouverte.
+        self._clear_intent(ticker)
         return "FOUND"
 
     def resolve_pending_intents(self) -> dict:
@@ -252,8 +285,8 @@ class OrderManager:
         de l'etat persiste, pas de la memoire perdue."""
         outcomes = {}
         for ticker, intent in list(self.pending_intents.items()):
-            if intent.get("resolution") == "FOUND":
-                continue          # deja adoptee, rien a redemander
+            if intent.get("resolution") in ("FOUND", "CLOSED_ABSENT"):
+                continue          # deja tranchee, rien a redemander
             outcomes[ticker] = self.resolve_intent(ticker, intent)
         return outcomes
 
@@ -386,6 +419,22 @@ class OrderManager:
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:exchange_unavailable_cooldown",
                                    "rejected")
+        # INVARIANT DUR : une intention d'envoi non resolue interdit toute
+        # nouvelle soumission sur ce ticker, INDEPENDAMMENT du TTL du
+        # verrou anti-doublon. Sans cela, l'expiration du TTL rouvrirait
+        # silencieusement un ticker dont on ignore toujours si un ordre
+        # existe chez le broker -- le TTL mesure le temps, pas la preuve.
+        pending = self.pending_intents.get(ticker)
+        if pending and pending.get("resolution") != "CLOSED_ABSENT":
+            log_api.error(
+                f"[ORDER_SUBMIT_SKIPPED] intention ambigue non resolue sur "
+                f"{ticker} (client_order_id={pending.get('client_order_id')}, "
+                f"etat={pending.get('resolution') or 'jamais relue'}) -- "
+                "create_order NON appele tant que la resolution n'a pas "
+                "conclu.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:ambiguous_intent_unresolved",
+                                   "rejected")
         last = self.session_submitted.get(ticker)
         if last is not None and now - last < CFG.SUBMIT_DEDUP_TTL_S:
             log_api.warning("[ORDER_SUBMIT_SKIPPED] garde anti-doublon: un "
@@ -470,13 +519,14 @@ class OrderManager:
                 "ne sera tentee; resolution par client_order_id en cours.")
             # LECTURE, jamais une seconde ecriture: on demande au broker si
             # l'ordre porte par notre client_order_id deterministe existe.
-            outcome = self.resolve_intent(ticker,
-                                          self.pending_intents.get(ticker, {
-                                              "client_order_id": client_order_id,
-                                              "count": count,
-                                              "price": limit_cents}))
+            # On garde une REFERENCE sur l'intention: resolve_intent la
+            # mute (order_id adopte) puis, sur FOUND, la retire du registre
+            # -- relire self.pending_intents ici renverrait du vide.
+            intent = self.pending_intents.get(ticker) or {
+                "client_order_id": client_order_id, "count": count,
+                "price": limit_cents}
+            outcome = self.resolve_intent(ticker, intent)
             if outcome == "FOUND":
-                intent = self.pending_intents.get(ticker, {})
                 return ExecutionResult(intent.get("order_id"), count, 0,
                                        limit_cents, "adopted_after_ambiguous",
                                        "resting")

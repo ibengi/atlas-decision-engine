@@ -67,6 +67,16 @@ class Config:
     # 15 jours d'uptime = 15 jours sans verification). 0 desactive le
     # passage periodique (comportement historique, tests uniquement).
     RECONCILE_INTERVAL_S    = _env_f("RECONCILE_INTERVAL_SECONDS", 900.0)
+    # Politique de cloture d'une intention d'envoi AMBIGUE dont le
+    # client_order_id est introuvable chez le broker. Une seule lecture
+    # vide, prise juste apres le POST, est une preuve faible: un ordre
+    # accepte peut n'etre pas encore visible dans le listing (replica en
+    # retard). On exige donc N observations NOT_FOUND *completes* et
+    # espacees, avant de declarer l'intention definitivement absente.
+    AMBIGUOUS_NOT_FOUND_CONFIRMATIONS = _env_i(
+        "AMBIGUOUS_NOT_FOUND_CONFIRMATIONS", 2)
+    AMBIGUOUS_NOT_FOUND_INTERVAL_S = _env_f(
+        "AMBIGUOUS_NOT_FOUND_INTERVAL_SECONDS", 60.0)
     # Deploiement LIVE-capable : exiger la continuite de l'etat persistant.
     # Un marqueur state_epoch.json absent (disque neuf ou EFFACE) bloque
     # les soumissions fail-closed au lieu de reprendre comme si de rien

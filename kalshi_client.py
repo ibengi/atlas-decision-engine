@@ -392,8 +392,13 @@ class KalshiClient:
             out.extend(orders)
             cursor = str(r.get("cursor") or "")
             if not cursor:
-                break
-        return out
+                return out
+        # Sortie par epuisement de max_pages AVEC un cursor encore actif :
+        # le listing est INCOMPLET. Conclure « aucun ordre ne correspond »
+        # ici serait une absence FABRIQUEE par la pagination. On leve.
+        raise KalshiAPIError(
+            0, f"listing d'ordres tronque: {max_pages} pages lues et le "
+               f"broker annonce encore une suite -- absence non concluante")
 
     def find_orders_by_client_order_id(self, client_order_id: str, *,
                                        ticker: str = None) -> list:

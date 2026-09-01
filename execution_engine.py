@@ -527,6 +527,16 @@ class ExecutionEngine:
                 self.posmgr.verify_against_broker()
             except Exception as e:                        # noqa: BLE001
                 log_pos.warning(f"[RECONCILE_VERIFY] echec du passage: {e}")
+            # Une intention d'envoi ambigue peut se resoudre TARD: un ordre
+            # accepte mais invisible au premier passage peut apparaitre
+            # ensuite. On rejoue donc la resolution tant qu'elle n'a pas
+            # conclu, sans attendre un redemarrage.
+            if getattr(self.orders, "pending_intents", None):
+                try:
+                    self.orders.resolve_pending_intents()
+                except Exception as e:                    # noqa: BLE001
+                    log_pos.warning(
+                        f"[AMBIGUOUS_RESOLUTION] passage periodique echoue: {e}")
 
         # 1) Reglements d'abord : le PnL realise conditionne les portes
         for _t in self.posmgr.check_settlements():
