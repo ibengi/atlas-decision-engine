@@ -3,9 +3,11 @@
 
 Scenario pinned end-to-end with REAL state files (no mocked stores):
 
-  1. restart on an empty disk while the broker still holds a position
-     -> reconcile_with_broker rebuilds it (brk- id, estimated entry data
-        honestly labelled, never presented as measured)
+  1. a brk- position (reconstructed by the PRE-hardening engine after an
+     earlier state loss; estimated entry data honestly labelled) is loaded
+     from disk, and startup reconciliation MATCHes it against the broker
+     without mutating anything (adoption of unknown broker positions is
+     gone since the 2026-08-31 hardening)
   2. the market stays merely CLOSED -> closed != settled, slot stays held
   3. the broker publishes a final result -> orphan settlement releases
      EXACTLY one slot and writes exactly one journal row
@@ -58,20 +60,29 @@ class OrphanLifecycleTest(unittest.TestCase):
         return tlog, pm
 
     def test_full_lifecycle(self):
-        # 1) Empty disk, broker holds 1 NO... position=+1 -> yes side.
+        # 1) A brk- position from a pre-hardening rebuild lives on disk;
+        #    the broker still holds it. Startup reconciliation must MATCH
+        #    it and leave it untouched (no adoption, no deletion).
         cli = self._client(position=1)
         tlog, pm = self._managers(cli)
         self.assertEqual(len(tlog.trades), 0)
-        rep = pm.reconcile_with_broker()
-        self.assertEqual(rep["rebuilt"], [TICKER])
-        self.assertEqual(pm.open_count(), 1)
         tid = f"brk-{TICKER}-yes"
+        pm.positions[tid] = {
+            "trade_id": tid, "ticker": TICKER, "side": "yes",
+            "count_initial": 1, "count": 1, "avg_price": 50, "fees": 0.0,
+            "opened_at": "2026-08-28T00:00:00+00:00", "order_ids": [],
+            "fill_ids": [], "state": "open", "strategy": "reconciled",
+            "market_score": None, "entry_edge": None, "entry_ev": None,
+            "avg_price_estimated": True, "fees_estimated": True,
+            "opened_at_estimated": True,
+        }
+        pm.flush()
+        rep = pm.reconcile_with_broker()
+        self.assertEqual(rep["status"], "MATCH")
+        self.assertEqual(pm.open_count(), 1)
         pos = pm.positions[tid]
         self.assertTrue(pos["avg_price_estimated"],
-                        "reconstructed entry price must be labelled "
-                        "estimated, never presented as measured")
-        self.assertTrue(pos["fees_estimated"])
-        self.assertTrue(pos["opened_at_estimated"])
+                        "estimated entry data stays labelled estimated")
 
         # 2) closed != settled: a merely closed market releases nothing.
         cli.get_market.return_value = {"ticker": TICKER, "status": "closed",

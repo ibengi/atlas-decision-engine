@@ -33,35 +33,25 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
         self.pm.positions = {}
         self.pm.flush = MagicMock()
 
-    def test_rebuilt_position_without_broker_price_is_flagged_estimated(self):
-        """The production case: broker gives no avg_price, so 50c is filler."""
+    def test_broker_only_position_is_never_adopted(self):
+        """The old production behavior rebuilt broker-only positions with an
+        invented 50c entry price. Since the 2026-08-31 hardening, a
+        broker-only position is a MISMATCH halt: no fabricated financial
+        history, the operator decides."""
         self.client.get_positions.return_value = [
-            {"ticker": "KXBTCD-26AUG2808-T79599.99", "position": -5}
+            {"ticker": "KXBTCD-26AUG2808-T79599.99", "position_fp": "-5.00"}
         ]
 
         report = self.pm.reconcile_with_broker()
 
-        self.assertEqual(report["rebuilt"], ["KXBTCD-26AUG2808-T79599.99"])
-        pos = self.pm.positions["brk-KXBTCD-26AUG2808-T79599.99-no"]
-        self.assertTrue(pos["avg_price_estimated"])
-        self.assertTrue(pos["fees_estimated"])
-        self.assertTrue(pos["opened_at_estimated"])
+        self.assertEqual(report["status"], "MISMATCH")
+        self.assertEqual(report["mismatches"][0]["kind"], "broker_only")
+        self.assertEqual(self.pm.positions, {},
+                         "no brk- reconstruction, no estimated entry price")
+        self.assertIsNotNone(self.pm.reconcile_halt)
 
-    def test_a_broker_supplied_price_is_not_flagged_estimated(self):
-        """When the broker does report an average, it is a measurement."""
-        self.client.get_positions.return_value = [
-            {"ticker": "KXTEST", "position": 4, "avg_price": 19}
-        ]
-
-        self.pm.reconcile_with_broker()
-
-        pos = self.pm.positions["brk-KXTEST-yes"]
-        self.assertEqual(pos["avg_price"], 19)
-        self.assertFalse(pos["avg_price_estimated"])
-
-    def test_rebuild_is_idempotent_across_repeated_reconciliations(self):
-        """CRITICAL: a restart must not duplicate positions. The brk- id is
-        stable, so reconciling twice yields one position, not two."""
+    def test_repeated_reconciliation_stays_halted_without_adoption(self):
+        """CRITICAL: repeated startup passes must not accumulate state."""
         self.client.get_positions.return_value = [
             {"ticker": "KXTEST", "position": 4}
         ]
@@ -70,11 +60,14 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
         self.pm.reconcile_with_broker()
         self.pm.reconcile_with_broker()
 
-        self.assertEqual(self.pm.open_count(), 1)
-        self.assertEqual(list(self.pm.positions), ["brk-KXTEST-yes"])
+        self.assertEqual(self.pm.open_count(), 0)
+        self.assertEqual(self.pm.positions, {})
+        self.assertEqual(self.pm.reconcile_halt["status"], "MISMATCH")
 
-    def test_a_closed_broker_position_is_not_resurrected(self):
-        """CRITICAL: broker says flat -> no local position survives."""
+    def test_a_flat_broker_never_deletes_local_positions(self):
+        """CRITICAL inversion of the pre-incident 'ghost cleanup': broker
+        reads flat -> local position is PRESERVED and submissions halt.
+        The 2026-08-31 incident deleted three real positions this way."""
         self.pm.positions["brk-KXOLD-yes"] = {
             "trade_id": "brk-KXOLD-yes", "ticker": "KXOLD", "side": "yes",
             "count_initial": 2, "count": 2, "avg_price": 50, "fees": 0.0,
@@ -83,10 +76,13 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
         }
         self.client.get_positions.return_value = []
 
-        self.pm.reconcile_with_broker()
+        report = self.pm.reconcile_with_broker()
 
-        self.assertEqual(self.pm.open_count(), 0)
-        self.assertNotIn("brk-KXOLD-yes", self.pm.positions)
+        self.assertEqual(report["status"], "MISMATCH")
+        self.assertEqual(report["mismatches"][0]["kind"], "local_only")
+        self.assertEqual(self.pm.open_count(), 1)
+        self.assertIn("brk-KXOLD-yes", self.pm.positions)
+        self.assertIsNotNone(self.pm.reconcile_halt)
 
     def test_a_zero_quantity_broker_row_never_opens_a_position(self):
         self.client.get_positions.return_value = [
@@ -95,7 +91,7 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
 
         report = self.pm.reconcile_with_broker()
 
-        self.assertEqual(report["rebuilt"], [])
+        self.assertEqual(report["status"], "MATCH")
         self.assertEqual(self.pm.open_count(), 0)
 
 
