@@ -363,7 +363,13 @@ def _trades(data_dir: str) -> list[dict]:
     except (OSError, json.JSONDecodeError):
         return []
     if isinstance(data, list):
-        return [t for t in data if isinstance(t, dict)]
+        # Vue effective: un evenement ``ledger_correction`` n'est pas un
+        # trade et ne doit jamais etre servi comme une resolution
+        # supplementaire; son economie (PnL, frais, quantite) est repliee
+        # dans le trade qu'il corrige, lequel porte alors ``corrected`` et
+        # ``correction_ids`` pour l'audit.
+        from trade_logger import fold_corrections
+        return fold_corrections([t for t in data if isinstance(t, dict)])
     return []
 
 

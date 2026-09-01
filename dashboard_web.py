@@ -57,6 +57,14 @@ def build_state(data_dir: str) -> dict:
     trades = _load(data_dir, "kalshi_trades.json", [])
     if isinstance(trades, dict):                         # schema {id: trade}
         trades = list(trades.values())
+    try:                                                 # jamais de crash UI
+        from trade_logger import fold_corrections
+        # Une correction de ledger n'est pas un trade : son economie est
+        # repliee dans le trade corrige, sinon le dashboard afficherait un
+        # trade supplementaire inexistant.
+        trades = fold_corrections([t for t in trades if isinstance(t, dict)])
+    except Exception:
+        pass
     positions = _load(data_dir, "positions_state.json", {})
     orders = _load(data_dir, "orders_state.json", {})
     risk = _load(data_dir, "risk_state.json", {})

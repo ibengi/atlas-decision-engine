@@ -41,8 +41,10 @@ class RiskManager:
         return sum(t["net_pnl"] for t in self._today_settled() if t["net_pnl"] > 0)
 
     def trades_today(self) -> int:
+        # trade_rows(), pas trades : une correction de ledger n'est pas un
+        # trade et ne consomme aucun quota quotidien.
         today = datetime.now(timezone.utc).date().isoformat()
-        return sum(1 for t in self.tlog.trades
+        return sum(1 for t in self.tlog.trade_rows()
                    if t["timestamp"].startswith(today))
 
     def rolling_drawdown(self) -> float:
@@ -251,7 +253,9 @@ class RiskManager:
             "daily_realized_profit": round(self.daily_realized_profit(), 2),
             "gross_pnl":             round(sum(t["gross_pnl"] for t in settled), 2),
             "net_pnl":               round(sum(t["net_pnl"] for t in settled), 2),
-            "fees_paid":             round(sum(t["fees"] for t in self.tlog.trades), 2),
+            # frais : vue EFFECTIVE (corrections de frais broker incluses)
+            "fees_paid":             round(sum(t["fees"] for t in
+                                               self.tlog.effective_trades()), 2),
             "win_rate":  round(len(wins) / len(settled), 4) if settled else 0.0,
             "profit_factor": round(gp / gl, 3) if gl > 0 else None,
             "rolling_drawdown": round(self.rolling_drawdown(), 2),

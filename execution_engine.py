@@ -121,6 +121,11 @@ class ExecutionEngine:
         self.configured_capital = capital           # PLAFOND, pas la verite
         self.capital  = capital                     # effectif (maj par solde)
         self.tlog     = TradeLogger()
+        # Corrections broker-authoritative du journal (append-only, avant
+        # que quiconque ne lise les agregats). Preconditions strictes par
+        # correction: no-op partout sauf sur le ledger exact vise.
+        from ledger_corrections import apply_ledger_corrections
+        apply_ledger_corrections(self.tlog)
         self.posmgr   = PositionManager(client, self.tlog)
         self.orders   = OrderManager(client)
         self.risk     = RiskManager(self.tlog, self.posmgr, capital)

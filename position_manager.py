@@ -516,7 +516,10 @@ class PositionManager:
             # et reconcile_with_broker armera alors un verrou MISMATCH
             # (broker_only) qui bloque toute soumission jusqu'a decision
             # de l'operateur : plus aucune reconstruction automatique.
-            if not self.tlog.trades:
+            # Un journal ne contenant qu'une correction de ledger n'est PAS
+            # la preuve qu'un moteur a deja trade.
+            from trade_logger import is_correction
+            if not [t for t in self.tlog.trades if not is_correction(t)]:
                 log_pos.warning(
                     "[STATE_EMPTY] aucune position locale ET journal de "
                     "trades vide au demarrage. Si le broker detient des "
