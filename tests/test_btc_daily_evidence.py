@@ -599,3 +599,65 @@ class TestSettlementConfirmationProtocol(unittest.TestCase):
             self.assertEqual(st.calibration_records(), [])
             self.assertEqual(len(st.calibration_records(
                 decisive_strike_only=False)), 1)
+
+
+class TestConfirmedEventsContract(unittest.TestCase):
+    """The only surface calibration should read: confirmed settlements,
+    each carrying provenance, model identity and the confirmation trail."""
+
+    REQUIRED = ("ticker", "decision_ts", "close_time", "strike",
+                "strike_source", "spot", "market_probability", "spread",
+                "model_probability", "model_version", "model_hash",
+                "first_result_seen", "first_result_seen_ts",
+                "confirmed_result", "confirmed_result_ts",
+                "confirmation_method", "settlement_status")
+
+    def _store(self, tmp, mins=-100):
+        st = BtcDailyEvidenceStore(tmp)
+        st.record(decision={"ticker": "KXBTCD-A", "strategy": "btc_daily",
+                            "decision_id": "c1-x", "market_type": "d"},
+                  model_output={"valid": True, "probability_yes": 0.7,
+                                "confidence": 6, "features": dict(FEATURES)},
+                  market=mkt("KXBTCD-A", mins),
+                  book={"yes_bid": 44, "yes_ask": 46, "yes_mid": 45},
+                  minutes_remaining=mins, cycle_id="c1")
+        return st
+
+    def test_an_unconfirmed_settlement_never_appears(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t)
+            st.settle(lambda tk: {"result": "no"})        # observation only
+            self.assertEqual(st.confirmed_events(), [])
+
+    def test_a_confirmed_event_carries_every_required_field(self):
+        from btc_probability_model import model_hash
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t)
+            st.settle(lambda tk: {"result": "yes", "status": "settled"})
+            ev = st.confirmed_events()
+            self.assertEqual(len(ev), 1)
+            e = ev[0]
+            for k in self.REQUIRED:
+                self.assertIn(k, e, k)
+            self.assertEqual(e["confirmed_result"], "yes")
+            self.assertEqual(e["confirmation_method"], "status")
+            self.assertEqual(e["settlement_status"], "settled")
+            self.assertEqual(e["strike_source"], "field")
+            self.assertEqual(e["spread"], 2)
+            self.assertEqual(e["model_hash"], model_hash())
+            self.assertIsNone(e["first_result_seen"])   # confirmed on poll 1
+
+    def test_the_first_observation_is_preserved_next_to_the_confirmed_one(self):
+        from btc_daily_evidence import SETTLE_MIN_LAG_S, SETTLE_CONFIRM_MIN_S
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t, mins=-1)
+            now = datetime.now(timezone.utc)
+            first = now + timedelta(seconds=SETTLE_MIN_LAG_S + 1)
+            second = first + timedelta(seconds=SETTLE_CONFIRM_MIN_S + 1)
+            st.settle(lambda tk: {"result": "no"}, now=first)
+            st.settle(lambda tk: {"result": "no"}, now=second)
+            e = st.confirmed_events()[0]
+            self.assertEqual(e["first_result_seen"], "no")
+            self.assertEqual(e["first_result_seen_ts"],
+                             first.isoformat(timespec="seconds"))
+            self.assertEqual(e["confirmation_method"], "repeat")

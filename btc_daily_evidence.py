@@ -442,6 +442,49 @@ class BtcDailyEvidenceStore:
         })
         return rep
 
+    def confirmed_events(self) -> list:
+        """One consolidated record per CONFIRMED settlement, carrying the
+        fields the operator's evidence contract requires. This is the only
+        surface that calibration, training or evaluation should read: a
+        record appears here only when `confirmed_result` exists.
+
+        `first_result_seen` is the earliest observation the protocol
+        journaled for the record (None when the settlement was confirmed
+        on its first poll by a finalized status)."""
+        final = self.settlements()
+        obs = self._observations()
+        out = []
+        for r in self.predictions():
+            s = final.get(r.get("record_id"))
+            if not s or not s.get("confirmed_by"):
+                continue
+            first = (obs.get(r["record_id"]) or [None])[0]
+            ask, bid = r.get("market_yes_ask"), r.get("market_yes_bid")
+            out.append({
+                "record_id": r.get("record_id"),
+                "ticker": r.get("ticker"),
+                "decision_ts": r.get("observed_at"),
+                "close_time": r.get("market_close_time"),
+                "strike": r.get("strike"),
+                "strike_source": r.get("strike_source") or "field",
+                "spot": r.get("underlying_price"),
+                "market_probability": r.get("market_implied_probability"),
+                "market_yes_bid": bid, "market_yes_ask": ask,
+                "spread": ((ask - bid) if isinstance(ask, (int, float))
+                           and isinstance(bid, (int, float)) else None),
+                "model_probability": r.get("predicted_probability"),
+                "model_version": r.get("model_version"),
+                "model_hash": r.get("model_hash"),
+                "first_result_seen": first.get("result") if first else None,
+                "first_result_seen_ts": first.get("observed_at") if first else None,
+                "confirmed_result": s.get("result"),
+                "confirmed_result_ts": s.get("settled_at"),
+                "confirmation_method": s.get("confirmed_by"),
+                "settlement_status": s.get("market_status"),
+                "settle_lag_s": s.get("settle_lag_s"),
+            })
+        return out
+
     def observation_keys(self) -> set:
         """Every `observation_key` already on disk (T7-K dedup index).
 
