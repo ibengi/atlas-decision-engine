@@ -401,9 +401,9 @@ class TestSettlementAndCounting(unittest.TestCase):
     def test_settlement_joins_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as t:
             _ev_, store = self._seeded(t)
-            n = store.settle(lambda tk: {"result": "yes"})
+            n = store.settle(lambda tk: {"result": "yes", "status": "settled"})
             self.assertEqual(n, 3)
-            self.assertEqual(store.settle(lambda tk: {"result": "yes"}), 0)
+            self.assertEqual(store.settle(lambda tk: {"result": "yes", "status": "settled"}), 0)
             self.assertEqual(len(store.calibration_records()), 3)
 
     def test_unmatured_observation_is_never_settled(self):
@@ -424,7 +424,7 @@ class TestSettlementAndCounting(unittest.TestCase):
     def test_independent_outcomes_counts_expiries_not_rows(self):
         with tempfile.TemporaryDirectory() as t:
             _ev_, store = self._seeded(t)
-            store.settle(lambda tk: {"result": "yes"})
+            store.settle(lambda tk: {"result": "yes", "status": "settled"})
             st = store.statistics()
             self.assertEqual(st["settled_prediction_rows"], 3)
             self.assertEqual(st["settled_unique_tickers"], 3)

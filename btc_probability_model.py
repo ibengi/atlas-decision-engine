@@ -19,9 +19,23 @@ La probabilite N'EST CALCULEE QUE si toutes les entrees indispensables
 sont presentes et valides. Aucune valeur par defaut n'est inventee.
 """
 
+import hashlib
 import math
+import os
 
 MODEL_VERSION = "btc15m-v1.0-ref"
+
+
+def model_hash() -> str:
+    """Content hash of THIS module's source: 16 hex chars of SHA-256.
+
+    A version string is a promise; a hash is a fact. Evidence rows carry
+    both so that a row can never be attributed to a model whose code
+    differs from the one that produced it — even if the version string was
+    never bumped.
+    """
+    with open(os.path.abspath(__file__), "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
 MOMENTUM_CAP = 0.5          # borne de l'ajustement momentum (en unites de d)
 P_FLOOR, P_CEIL = 0.0001, 0.9999
 
