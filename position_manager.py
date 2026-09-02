@@ -170,6 +170,19 @@ class PositionManager:
         broker a publie un resultat, la position n'existe plus chez lui, la
         garder localement ne protege rien et bloque MAX_OPEN_POSITIONS.
         """
+        already = self.tlog.settled_row(p["trade_id"])
+        if already is not None:
+            # The journal was written and the process died before the
+            # position was removed. The settlement stands as first booked;
+            # all that is owed here is releasing the slot. Returning None
+            # keeps it out of `realized`, so no PnL is reported twice.
+            self._audit("DUPLICATE_SETTLEMENT_IGNORED", p,
+                        settled_at=already.get("settled_at"),
+                        result=already.get("result"),
+                        net_pnl=already.get("net_pnl"))
+            self.positions.pop(tid, None)
+            self.flush()
+            return None
         t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
         if t is None:
             log_pos.warning(
@@ -261,6 +274,9 @@ class PositionManager:
             if p.get("state", "open") != "open":
                 continue
             m = self.client.get_market(p["ticker"])
+            result = str(pick(m, "result", default="") or "").lower() if m else ""
+            status = str(pick(m, "status", default="") or "").lower() if m else ""
+            settleable = result in ("yes", "no", "void")
 
             # ── max-age escape hatch ──────────────────────────────────
             opened_str = p.get("opened_at", "")
@@ -273,8 +289,17 @@ class PositionManager:
             else:
                 age_days = None
 
-            if age_days is not None and age_days > CFG.MAX_POSITION_AGE_DAYS:
-                if not m or str(pick(m, "status", default="") or "").lower() != "open":
+            # A stale position whose market DOES report a usable result is
+            # not a cleanup case: booking it as expired_stale would throw
+            # away the real outcome. Measured cost of the old ordering: a
+            # winning 10-contract position at 50c booked -0.14 instead of
+            # +4.93. Such a position goes through the confirmation protocol
+            # like any other; only a position with no usable result left is
+            # swept, and an unreadable result on a still-open market is kept
+            # rather than guessed.
+            if age_days is not None and age_days > CFG.MAX_POSITION_AGE_DAYS \
+                    and not settleable:
+                if not m or status != "open":
                     gross = -p["fees"]   # conservative: lose fees on stale position
                     net = gross - p["fees"]
                     t = self._settle_and_release(tid, p, "expired_stale", False, gross, net)
@@ -283,7 +308,7 @@ class PositionManager:
                     log_pos.warning(
                         f"{p['ticker']}: position agee de {age_days:.0f}j > "
                         f"{CFG.MAX_POSITION_AGE_DAYS}j, statut marche="
-                        f"{str(pick(m, 'status', default='N/A') or 'N/A').lower() if m else 'inaccessible'}"
+                        f"{status or 'N/A' if m else 'inaccessible'}"
                         f" -- nettoyee comme expired_stale (gross={gross:+.2f}$)")
                     continue
 
@@ -296,9 +321,6 @@ class PositionManager:
                     log_pos.warning(f"{p['ticker']}: get_market() a echoue, "
                                     f"age={age_days}j -- conservee.")
                 continue
-
-            result = str(pick(m, "result", default="") or "").lower()
-            status = str(pick(m, "status", default="") or "").lower()
 
             # ── confirmation protocol: a readable result is booked only
             # ── once confirmed; until then the position stays open ─────

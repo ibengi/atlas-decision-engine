@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
+import trade_logger  # noqa: E402
 import position_manager as pmod  # noqa: E402
 
 MIN_LAG = pmod.SETTLE_MIN_LAG_S
@@ -41,6 +42,10 @@ class _Base(unittest.TestCase):
         self.client = MagicMock()
         self.tlog = MagicMock()
         self.tlog.settle_trade.return_value = {"trade_id": "t-1"}
+        # No prior settlement unless a test says so: a MagicMock attribute is
+        # truthy, and an unconfigured settled_row would make EVERY settlement
+        # look like a duplicate.
+        self.tlog.settled_row.return_value = None
         with patch.object(pmod.JsonStore, "save"):
             self.pm = bot.PositionManager(self.client, self.tlog)
         self.pm.positions = {"t-1": position()}
@@ -210,3 +215,174 @@ class UntouchedPathsTest(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DuplicateSettlementTest(_Base):
+    """B1: a settlement happens once. A crash between writing the trade
+    journal and removing the position must not re-book it, and must not
+    move its date into a later day's risk accounting."""
+
+    def _settle_once(self):
+        got = self.poll("no", T0 + timedelta(minutes=1), status="settled")
+        self.assertEqual(len(got), 1)
+        return got[0]
+
+    def setUp(self):
+        super().setUp()
+        # a real TradeLogger so the journal semantics are exercised
+        self.tlog = bot.TradeLogger.__new__(bot.TradeLogger)
+        self.tlog.path = os.devnull
+        self.tlog.flush = lambda: None
+        self.tlog.trades = [{
+            "trade_id": "t-1", "ticker": "KXBTCD-26SEP0208-T77000",
+            "timestamp": (T0 - timedelta(hours=5)).isoformat(),
+            "avg_fill_price": 50, "filled_count": 10, "fees": 0.07,
+            "state": "open", "result": None, "won": None,
+            "gross_pnl": None, "net_pnl": None}]
+        self.pm.tlog = self.tlog
+
+    def test_a_second_settlement_is_a_no_op(self):
+        self._settle_once()
+        row = dict(self.tlog.trades[0])
+        # the crash: journal persisted, positions.json did not
+        self.pm.positions = {"t-1": position()}
+        again = self.poll("no", T0 + timedelta(days=1), status="settled")
+        self.assertEqual(again, [], "a duplicate settlement was reported as realized")
+        self.assertEqual(self.tlog.trades[0], row, "the settled row was rewritten")
+
+    def test_settled_at_is_never_rewritten(self):
+        self._settle_once()
+        first = self.tlog.trades[0]["settled_at"]
+        with patch.object(trade_logger, "now_iso",
+                          lambda: "2030-01-01T00:00:00+00:00"):
+            self.tlog.settle_trade("t-1", "no", False, -5.0, -5.07)
+        self.assertEqual(self.tlog.trades[0]["settled_at"], first)
+
+    def test_realized_pnl_is_not_duplicated(self):
+        self._settle_once()
+        self.pm.positions = {"t-1": position()}
+        self.poll("no", T0 + timedelta(days=1), status="settled")
+        settled = [t for t in self.tlog.trades if t.get("state") == "settled"]
+        self.assertEqual(len(settled), 1)
+        self.assertEqual(sum(t["net_pnl"] for t in settled),
+                         self.tlog.trades[0]["net_pnl"])
+
+    def test_daily_loss_accounting_stays_on_the_original_date(self):
+        # The defect's real cost: a loss booked yesterday re-counting against
+        # today's MAX_DAILY_LOSS because settled_at moved.
+        with patch.object(trade_logger, "now_iso",
+                          lambda: "2026-09-01T12:00:00+00:00"):
+            self.tlog.settle_trade("t-1", "no", False, -5.0, -5.07)
+        with patch.object(trade_logger, "now_iso",
+                          lambda: "2026-09-02T09:00:00+00:00"):
+            self.tlog.settle_trade("t-1", "no", False, -5.0, -5.07)
+        self.assertTrue(self.tlog.trades[0]["settled_at"].startswith("2026-09-01"))
+
+    def test_the_slot_is_still_released_after_a_duplicate(self):
+        # A zombie position must not hold a MAX_OPEN_POSITIONS slot forever.
+        self._settle_once()
+        self.pm.positions = {"t-1": position()}
+        self.poll("no", T0 + timedelta(days=1), status="settled")
+        self.assertNotIn("t-1", self.pm.positions)
+
+    def test_the_duplicate_is_logged_by_name(self):
+        self._settle_once()
+        self.pm.positions = {"t-1": position()}
+        with self.assertLogs("POSITION", level="INFO") as cm:
+            self.poll("no", T0 + timedelta(days=1), status="settled")
+        self.assertTrue(any("DUPLICATE_SETTLEMENT_IGNORED" in l for l in cm.output))
+
+    def test_an_unsettled_trade_still_settles_normally(self):
+        row = self._settle_once()
+        self.assertEqual(row["result"], "no")
+        self.assertEqual(self.tlog.trades[0]["state"], "settled")
+
+
+class MaxAgeTest(_Base):
+    """B2: a stale position whose market reports a usable result must be
+    booked from that result, not swept as expired_stale."""
+
+    def _stale(self, days=40):
+        p = position()
+        p["opened_at"] = (T0 - timedelta(days=days)).isoformat()
+        self.pm.positions = {"t-1": p}
+
+    def test_a_stale_winner_is_not_swept_as_expired_stale(self):
+        self._stale()
+        got = self.poll("yes", T0 + timedelta(minutes=1), status="settled")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.tlog.settle_trade.call_args[0][1], "yes")
+        self.assertTrue(self.tlog.settle_trade.call_args[0][2])   # won
+        self.assertAlmostEqual(self.tlog.settle_trade.call_args[0][3], 5.0)
+
+    def test_a_stale_loser_books_the_real_loss(self):
+        self._stale()
+        got = self.poll("no", T0 + timedelta(minutes=1), status="settled")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.tlog.settle_trade.call_args[0][1], "no")
+        self.assertFalse(self.tlog.settle_trade.call_args[0][2])
+
+    def test_a_stale_void_books_void_not_expired_stale(self):
+        self._stale()
+        self.poll("void", T0 + timedelta(minutes=1), status="settled")
+        self.assertEqual(self.tlog.settle_trade.call_args[0][1], "void")
+
+    def test_a_stale_readable_result_without_a_final_status_still_waits(self):
+        self._stale()
+        got = self.poll("yes", T0 + timedelta(minutes=1))       # status=closed
+        self.assertEqual(got, [], "age bypassed the confirmation protocol")
+        self.assertIn("t-1", self.pm.positions)
+        self.tlog.settle_trade.assert_not_called()
+
+    def test_a_stale_readable_result_confirms_through_the_normal_protocol(self):
+        self._stale()
+        first = T0 + timedelta(seconds=MIN_LAG + 1)
+        self.poll("yes", first)
+        got = self.poll("yes", first + timedelta(seconds=CONFIRM + 1))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.tlog.settle_trade.call_args[0][1], "yes")
+
+    def test_stale_with_conflicting_observations_never_books(self):
+        self._stale()
+        first = T0 + timedelta(seconds=MIN_LAG + 1)
+        self.poll("yes", first)
+        got = self.poll("no", first + timedelta(seconds=CONFIRM + 1))
+        self.assertEqual(got, [])
+        self.tlog.settle_trade.assert_not_called()
+
+    def test_a_stale_unreadable_result_is_still_swept(self):
+        self._stale()
+        got = self.poll("", T0 + timedelta(minutes=1), status="closed")
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.tlog.settle_trade.call_args[0][1], "expired_stale")
+
+    def test_a_stale_position_on_a_still_open_market_fails_closed(self):
+        self._stale()
+        got = self.poll("", T0 + timedelta(minutes=1), status="open")
+        self.assertEqual(got, [])
+        self.assertIn("t-1", self.pm.positions)
+
+    def test_an_api_timeout_on_a_stale_position_still_sweeps(self):
+        self._stale()
+        self.client.get_market.return_value = None
+        got = self.pm.check_settlements(now=T0 + timedelta(minutes=1))
+        self.assertEqual(len(got), 1)
+        self.assertEqual(self.tlog.settle_trade.call_args[0][1], "expired_stale")
+
+    def test_a_fresh_position_is_never_swept(self):
+        self._stale(days=1)
+        self.client.get_market.return_value = None
+        self.assertEqual(self.pm.check_settlements(now=T0), [])
+        self.assertIn("t-1", self.pm.positions)
+
+    def test_a_stale_pending_observation_survives_a_restart(self):
+        self._stale()
+        first = T0 + timedelta(seconds=MIN_LAG + 1)
+        self.poll("yes", first)
+        snapshot = json.loads(json.dumps(self.pm.positions))
+        with patch.object(pmod.JsonStore, "save"):
+            pm2 = bot.PositionManager(self.client, self.tlog)
+        pm2.positions = snapshot
+        self.client.get_market.return_value = market("yes")
+        got = pm2.check_settlements(now=first + timedelta(seconds=CONFIRM + 1))
+        self.assertEqual(len(got), 1)
