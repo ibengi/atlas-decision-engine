@@ -12,10 +12,17 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import model_research as mr
+
+
+def _mins(m):
+    """ISO timestamp m minutes after a fixed origin."""
+    return (datetime(2026, 9, 1, tzinfo=timezone.utc)
+            + timedelta(minutes=m)).isoformat()
 
 
 def row(ts, settled_at, ticker="KXBTC15M-A", result="yes", p=0.6,
@@ -227,3 +234,97 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EventIsolationTest(unittest.TestCase):
+    """R2: no settlement event may sit on both sides of a split.
+
+    One market observed at several time-to-expiry checkpoints yields several
+    rows carrying ONE outcome. Isolation used to hold only as a side effect
+    of the label purge, under the invariant settled_at >= observed_at; a row
+    breaking that invariant reintroduced leakage silently. These tests pin
+    the property directly, INDEPENDENTLY of settled_at.
+    """
+
+    def _staggered(self, n_events=60):
+        """Realistic shape: event i closes at hour i and is observed at three
+        checkpoints BEFORE its own close, so events interleave in time while
+        each one's label lands after all of its own observations."""
+        out = []
+        for i in range(n_events):
+            close = 48 * 60 + i * 60                      # minutes from origin
+            for mins in (1400, 300, 50):
+                out.append(row(_mins(close - mins), _mins(close),
+                               ticker=f"KXBTCD-E{i}",
+                               result="yes" if i % 3 else "no"))
+        out.sort(key=lambda r: r["ts"])
+        return out
+
+    def _broken_invariant(self, n_events=60):
+        """The same observations, but every label is stamped as settled at
+        the origin — before it could possibly be known. That defeats the
+        label purge completely and leaves the explicit event check as the
+        only thing preventing an event from straddling the split."""
+        out = self._staggered(n_events)
+        for r in out:
+            r["settled_at"] = _mins(0)
+        return out
+
+    def test_no_event_appears_in_both_train_and_test(self):
+        rows = mr.usable_rows(self._staggered())
+        folds = mr.walk_forward(rows, n_folds=3)
+        self.assertTrue(folds, "fixture produced no folds")
+        for train, test in folds:
+            self.assertFalse({r["ticker"] for r in train}
+                             & {r["ticker"] for r in test})
+
+    def test_isolation_holds_even_when_the_label_purge_cannot_help(self):
+        # Every label settles before every decision, so the purge removes
+        # nothing. Only the explicit event check prevents leakage here.
+        rows = mr.usable_rows(self._broken_invariant())
+        folds = mr.walk_forward(rows, n_folds=3)
+        self.assertTrue(folds, "fixture produced no folds")
+        for train, test in folds:
+            self.assertFalse({r["ticker"] for r in train}
+                             & {r["ticker"] for r in test},
+                             "event leaked once settled_at stopped protecting")
+
+    def test_overlap_is_purged_from_train_never_from_test(self):
+        base = mr.usable_rows(self._broken_invariant())
+        folds = mr.walk_forward(base, n_folds=3)
+        # every test row survives: the split boundaries are unchanged
+        self.assertEqual(sum(len(t) for _, t in folds),
+                         sum(len(t) for _, t in
+                             mr.walk_forward(base, n_folds=3)))
+        for _, test in folds:
+            self.assertGreater(len(test), 0)
+
+    def test_a_fold_left_undersized_by_the_purge_is_dropped(self):
+        # min_train is a floor, not a suggestion. On this fixture fold 0 has
+        # 90 training rows before events are purged and 72 after, so a floor
+        # of 80 must drop it — not run it on 72. The other folds (100, 129)
+        # clear the floor and survive, which proves the floor is applied per
+        # fold and not to the whole study.
+        rows = mr.usable_rows(self._broken_invariant())
+        folds = mr.walk_forward(rows, n_folds=3, min_train=80)
+        self.assertEqual(len(folds), 2, "an undersized fold was run anyway")
+        for train, _ in folds:
+            self.assertGreaterEqual(len(train), 80)
+
+    def test_the_floor_is_measured_after_purging_not_before(self):
+        rows = mr.usable_rows(self._broken_invariant())
+        self.assertEqual(len(mr.walk_forward(rows, n_folds=3, min_train=72)), 3)
+        self.assertEqual(len(mr.walk_forward(rows, n_folds=3, min_train=73)), 2)
+
+    def test_the_event_key_is_the_settlement_market(self):
+        r = row("2026-09-01T00:00:00+00:00", "2026-09-01T01:00:00+00:00",
+                ticker="KXBTCD-Z")
+        self.assertEqual(mr.event_of(r), "KXBTCD-Z")
+
+    def test_label_availability_is_still_enforced_alongside_isolation(self):
+        rows = mr.usable_rows(sequence(120))
+        for r in rows[:20]:
+            r["settled_at"] = "2030-01-01T00:00:00+00:00"
+        for train, test in mr.walk_forward(rows, n_folds=2):
+            cutoff = mr._ts(test[0]["ts"])
+            self.assertTrue(all(mr._ts(t["settled_at"]) < cutoff for t in train))

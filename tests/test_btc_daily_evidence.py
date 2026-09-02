@@ -39,7 +39,10 @@ def mkt(ticker="KXBTCD-26AUG20-T70000", mins=600):
             "open_interest": 120, "floor_strike": 70000}
 
 
-FEATURES = {"model_version": "btc15m-v1.0-ref", "spot": 70500.0,
+_MISSING = object()
+
+FEATURES = {"model_version": "btc15m-v1.0-ref",
+            "strike_source": "field", "spot": 70500.0,
             "strike": 70000.0, "sigma_1m": 0.0008, "minutes_remaining": 2000,
             "ret_5m": 0.001, "data_quality": 80.0,
             "horizon_mode": "extended", "sigma_effective": 0.0008}
@@ -661,3 +664,76 @@ class TestConfirmedEventsContract(unittest.TestCase):
             self.assertEqual(e["first_result_seen_ts"],
                              first.isoformat(timespec="seconds"))
             self.assertEqual(e["confirmation_method"], "repeat")
+
+
+class TestStrikeProvenanceIsExplicit(unittest.TestCase):
+    """R1: provenance must be stated, not inferred from a missing key.
+
+    The router used to stamp strike_source only for NON-field sources, so a
+    genuine market strike and a row that simply failed to record its
+    provenance were byte-identical. Both counted as decisive evidence.
+    """
+
+    def _settled(self, tmp, source):
+        st = BtcDailyEvidenceStore(tmp)
+        feats = dict(FEATURES)
+        if source is _MISSING:
+            feats.pop("strike_source", None)
+        else:
+            feats["strike_source"] = source
+        st.record(decision={"ticker": "KXBTCD-S", "strategy": "btc_daily",
+                            "decision_id": "c-s", "market_type": "d"},
+                  model_output={"valid": True, "probability_yes": 0.5,
+                                "confidence": 6, "features": feats},
+                  market=mkt("KXBTCD-S", -100), book={"yes_mid": 45},
+                  minutes_remaining=-100, cycle_id="c")
+        st.settle(lambda tk: {"result": "yes", "status": "settled"})
+        return st
+
+    def test_a_market_field_strike_is_decisive(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(len(self._settled(t, "field").calibration_records()), 1)
+
+    def test_a_ticker_parsed_strike_is_decisive(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(len(self._settled(t, "ticker").calibration_records()), 1)
+
+    def test_a_spot_proxy_strike_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, "spot_proxy").calibration_records(), [])
+
+    def test_a_missing_strike_source_is_refused(self):
+        # The finding: absence used to read as "field".
+        with tempfile.TemporaryDirectory() as t:
+            st = self._settled(t, _MISSING)
+            self.assertIsNone(st.predictions()[0]["strike_source"])
+            self.assertEqual(st.calibration_records(), [])
+
+    def test_an_explicit_null_strike_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, None).calibration_records(), [])
+
+    def test_an_unknown_strike_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, "guessed").calibration_records(), [])
+
+    def test_a_refused_provenance_never_reaches_confirmed_events(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, _MISSING).confirmed_events(), [])
+
+    def test_the_router_stamps_field_explicitly(self):
+        from strategy_router import BtcDailyStrategy
+
+        class _Ctx:
+            valid = True
+            spot = 70500.0
+            realized_vol_1m = 0.0008
+            data_quality_score = 90.0
+            returns = {"5m": 0.001}
+            reason = "ok"
+
+        out = BtcDailyStrategy(lambda **kw: _Ctx()).evaluate(
+            {"ticker": "KXBTCD-26SEP0217-T70000", "floor_strike": 70000},
+            {}, 600)
+        self.assertTrue(out.valid, out.reason)
+        self.assertEqual(out.features["strike_source"], "field")

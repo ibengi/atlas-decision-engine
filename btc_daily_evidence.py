@@ -66,12 +66,19 @@ FINALIZED_STATUSES = ("settled", "finalized")
 SETTLE_MIN_LAG_S = 1800.0
 SETTLE_CONFIRM_MIN_S = 1800.0
 
-#: Strike provenances that may enter decisive evidence. `None` is the
-#: router's "field" case (it only stamps non-field sources); "ticker" is a
-#: real strike parsed from the ticker. "spot_proxy" sets strike := spot and
-#: is excluded: it forces d=0 and the model degenerates to its momentum
-#: term, so such a row measures nothing about the model.
-DECISIVE_STRIKE_SOURCES = (None, "field", "ticker")
+#: Strike provenances that may enter decisive evidence.
+#:
+#: "field"  - an explicit floor_strike/cap_strike/strike_price from the API.
+#: "ticker" - parsed from the ticker's own T<price> segment, a real strike.
+#:
+#: Everything else is excluded, INCLUDING a missing value. "spot_proxy" sets
+#: strike := spot, which forces d=0 and degenerates the model to its
+#: momentum term, so such a row measures nothing. An absent strike_source
+#: used to be accepted because the router only stamped non-field sources —
+#: provenance expressed by absence, which a consumer cannot verify and any
+#: future producer could reproduce by accident. The router now stamps
+#: "field" explicitly, so absence means unknown, and unknown is not decisive.
+DECISIVE_STRIKE_SOURCES = ("field", "ticker")
 
 #: Horizon buckets required by T7-I Phase 5. Upper bound exclusive, minutes.
 HORIZON_BUCKETS = (("<=24h", 0.0, 1440.0), ("24-48h", 1440.0, 2880.0),
@@ -442,7 +449,7 @@ class BtcDailyEvidenceStore:
         })
         return rep
 
-    def confirmed_events(self) -> list:
+    def confirmed_events(self, *, decisive_strike_only=True) -> list:
         """One consolidated record per CONFIRMED settlement, carrying the
         fields the operator's evidence contract requires. This is the only
         surface that calibration, training or evaluation should read: a
@@ -450,13 +457,21 @@ class BtcDailyEvidenceStore:
 
         `first_result_seen` is the earliest observation the protocol
         journaled for the record (None when the settlement was confirmed
-        on its first poll by a finalized status)."""
+        on its first poll by a finalized status).
+
+        Strike provenance is filtered here on the same terms as
+        `calibration_records`: being the surface research reads, it must not
+        be the one place a spot-proxy or unprovenanced strike slips through.
+        """
         final = self.settlements()
         obs = self._observations()
         out = []
         for r in self.predictions():
             s = final.get(r.get("record_id"))
             if not s or not s.get("confirmed_by"):
+                continue
+            if decisive_strike_only and \
+                    r.get("strike_source") not in DECISIVE_STRIKE_SOURCES:
                 continue
             first = (obs.get(r["record_id"]) or [None])[0]
             ask, bid = r.get("market_yes_ask"), r.get("market_yes_bid")

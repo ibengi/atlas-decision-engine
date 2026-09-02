@@ -46,7 +46,8 @@ def liquid(ticker="KXBTCD-26AUG20-T71000", mins=600):
     return m
 
 
-FEATURES = {"model_version": "btc15m-v1.0-ref", "spot": 70500.0,
+FEATURES = {"model_version": "btc15m-v1.0-ref",
+            "strike_source": "field", "spot": 70500.0,
             "strike": 70000.0, "sigma_1m": 0.0008, "data_quality": 80.0}
 
 

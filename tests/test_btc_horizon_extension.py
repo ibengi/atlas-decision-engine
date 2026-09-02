@@ -55,7 +55,10 @@ class TestDailyHorizonExtension(unittest.TestCase):
             "model_version": "btc15m-v1.0-ref",
             "spot": 65200.0, "strike": 64999.99,
             "sigma_1m": 8e-4, "minutes_remaining": 300.0,
-            "ret_5m": 0.001, "data_quality": 85.0})
+            "ret_5m": 0.001, "data_quality": 85.0,
+            # provenance is now stated explicitly, not implied by absence
+            "strike_source": "field",
+        })
         self.assertAlmostEqual(
             out.probability_yes,
             _model_p(65200.0, 64999.99, 8e-4, 300.0), places=9)
@@ -70,7 +73,11 @@ class TestDailyHorizonExtension(unittest.TestCase):
         self.assertEqual(out.features["horizon_mode"], "extended")
         self.assertEqual(out.features["sigma_effective"], 8e-4)
         self.assertEqual(out.features["strike"], 66499.99)
-        self.assertNotIn("strike_source", out.features)
+        # Provenance used to be signalled by the key being ABSENT, so a
+        # genuine market strike and a row that failed to record its source
+        # were indistinguishable and both counted as decisive evidence. A
+        # field strike now says so.
+        self.assertEqual(out.features["strike_source"], "field")
         self.assertAlmostEqual(
             out.probability_yes,
             _model_p(65200.0, 66499.99, 8e-4, 10080.0), places=9)
@@ -140,14 +147,16 @@ class TestModelStrikeProxy(unittest.TestCase):
         self.assertFalse(out.valid)
         self.assertIn("sources_spot_insuffisantes", out.reason)
 
-    def test_legacy_field_strike_unchanged(self):
-        """floor_strike present (production) : chemin byte-identique,
-        aucune cle supplementaire."""
+    def test_legacy_field_strike_states_its_provenance(self):
+        """floor_strike present (production) : meme strike, meme probabilite ;
+        la provenance est desormais ECRITE ("field") au lieu d'etre deduite de
+        l'absence de la cle — une ligne sans provenance ne peut plus se faire
+        passer pour un strike de marche."""
         m = {"ticker": "KXBTC15M-26JUL311230-30", "floor_strike": 65100.0}
         out = self.s.evaluate(m, {}, 12.0)
         self.assertTrue(out.valid, out.reason)
         self.assertEqual(out.features["strike"], 65100.0)
-        self.assertNotIn("strike_source", out.features)
+        self.assertEqual(out.features["strike_source"], "field")
         self.assertEqual(out.confidence, 8)
         self.assertAlmostEqual(
             out.probability_yes,
