@@ -1,0 +1,62 @@
+{
+ "generated_ts": 1788289094.1211157,
+ "generated_at": "2026-09-01T18:58:14Z",
+ "model_version": "btc15m-baseline-0.1",
+ "commit": "acb9c01b47462b10534f52eb6fd4f0016a793856",
+ "approved": false,
+ "approval_blocked_reason": "aucune validation statistique executee; echantillons sous les seuils documentes dans MODEL_VALIDATION_GUIDE.md",
+ "criteria": [
+  {
+   "name": "shadow_predictions_settled",
+   "required": ">=300",
+   "observed": 108,
+   "source": "log [SHADOW] total regle @2026-09-01T18:45Z",
+   "passed": false
+  },
+  {
+   "name": "theoretical_trades",
+   "required": ">=100",
+   "observed": null,
+   "source": "non mesure (aucun backtest execute)",
+   "passed": false
+  },
+  {
+   "name": "calibration_fitted",
+   "required": ">=150 reglements puis model_calibration.fit sur le split train",
+   "observed": "model_calibration.json absent de /data/state5",
+   "passed": false
+  },
+  {
+   "name": "brier_beats_market_baseline_out_of_sample",
+   "required": "brier_modele < brier(yes_ask/100) hors echantillon",
+   "observed": null,
+   "source": "non mesure",
+   "passed": false
+  },
+  {
+   "name": "real_settled_trades",
+   "required": ">=30 (seuil low_sample du moteur) et >=100 pour conclure sur le PnL",
+   "observed": 7,
+   "source": "kalshi_trades.json (journal /data/state5)",
+   "passed": false
+  },
+  {
+   "name": "rti_vs_consensus_spread_measured",
+   "required": "ecart CF Benchmarks RTI / consensus mesure avant tout live",
+   "observed": null,
+   "source": "non mesure",
+   "passed": false
+  },
+  {
+   "name": "real_fill_slippage_calibrated",
+   "required": "fills demo reels pour calibrer le proxy de slippage",
+   "observed": "0 fill depuis le hold",
+   "passed": false
+  }
+ ],
+ "notes": [
+  "Fichier genere pour rendre le gatekeeper EVALUABLE, pas pour le faire passer. Il refuse le live, ce qui est le resultat correct.",
+  "Les seuils viennent de MODEL_VALIDATION_GUIDE.md du depot, pas d'un jugement ad hoc.",
+  "Aucun ordre, aucun credential, aucune variable Railway touchee."
+ ]
+}

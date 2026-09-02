@@ -10,6 +10,12 @@ kalshi_*.json
 cycle_report.json
 orders_state.json
 universe_cache.json
+# test_report.json reste ignore VOLONTAIREMENT. Il est genere par
+# l'etape `tests` du Dockerfile, a partir de la suite du commit
+# reellement construit, et copie dans l'image a /app. Le versionner
+# reintroduirait exactement ce qu'on veut eviter : un rapport fige
+# decrivant un autre arbre de travail, qui se perime en 7 jours et
+# qu'il faudrait rafraichir a la main. Voir Dockerfile.
 test_report.json
 raw_samples/
 backups/
