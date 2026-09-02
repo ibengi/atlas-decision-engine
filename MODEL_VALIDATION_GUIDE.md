@@ -37,15 +37,24 @@ demontree ni pretendue. Le livrable est pret pour le SHADOW MODE uniquement.
 1) SHADOW : `SHADOW_MODE=1 python kalshi_alpha_bot.py --demo --btc --loop`
    (ou --shadow). Chaque candidat BTC est journalise dans
    shadow_predictions.json puis regle automatiquement.
-2) CALIBRATION apres >=150 reglements :
-   ```python
-   from shadow_prediction_store import ShadowPredictionStore
-   import model_calibration as mc, backtest_btc15m as bt
-   obs = ShadowPredictionStore().as_calibration_obs()
-   tr, va, te = bt.split_chronological([{**o} for o in obs])
-   mc.save(mc.fit(tr))          # ecrit model_calibration.json (train SEUL)
-   print(mc.evaluate(te, label="test"))
+2) BRIER HORS ECHANTILLON (la regle decisive, voir "Interpretation
+   honnete" plus bas) :
    ```
+   python tools/brier_oos.py $DATA_DIR/shadow_predictions.json
+   ```
+   Decoupe chronologique 60/20/20, modele et baseline marche (`yes_ask/100`)
+   notes sur les MEMES lignes, seule la tranche TEST decide. Le rapport
+   porte le SHA-256 du jeu de donnees. Sortie 0 seulement si PASS.
+
+   Le seuil "nombre minimal de dates de reglement INDEPENDANTES" n'est pas
+   defini dans ce depot (T7-I sect. 9 : "REQUIRES OPERATOR APPROVAL"). Tant
+   qu'il ne l'est pas, le verdict plafonne a INDETERMINATE : l'outil ne peut
+   pas se declarer valide lui-meme.
+
+   NOTE : la version precedente de cette section appelait
+   `ShadowPredictionStore().as_calibration_obs()` et `mc.save(...)`. Ni l'un
+   ni l'autre n'existe dans ce depot — la procedure documentee n'etait pas
+   executable, donc la regle decisive n'avait jamais pu etre verifiee.
 3) BACKTEST : exporter les lignes du shadow store au format backtest puis
    `bt.save_report(bt.run_backtest(rows), "model_validation_report.json")`
    et y ajouter `"model_hash": model_gatekeeper.model_hash()`.
