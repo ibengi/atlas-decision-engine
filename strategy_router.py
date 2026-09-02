@@ -346,8 +346,11 @@ class _BtcAboveStrikeBase(Strategy):
                     "minutes_remaining": t,
                     "ret_5m": (ctx.returns or {}).get("5m"),
                     "data_quality": ctx.data_quality_score}
-        if strike_source != "field":
-            features["strike_source"] = strike_source
+        # Always stamped, including "field". Provenance encoded by ABSENCE
+        # is provenance a consumer cannot check: a row missing the key was
+        # indistinguishable from a genuine market-field strike, so anything
+        # that failed to record it counted as decisive evidence.
+        features["strike_source"] = strike_source
         if extended:
             # MEME formule, vol ancree : les horizons multi-jours ne doivent
             # pas extrapoler une vol 1m calmee sur plusieurs jours.

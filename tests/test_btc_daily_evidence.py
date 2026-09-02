@@ -39,7 +39,10 @@ def mkt(ticker="KXBTCD-26AUG20-T70000", mins=600):
             "open_interest": 120, "floor_strike": 70000}
 
 
-FEATURES = {"model_version": "btc15m-v1.0-ref", "spot": 70500.0,
+_MISSING = object()
+
+FEATURES = {"model_version": "btc15m-v1.0-ref",
+            "strike_source": "field", "spot": 70500.0,
             "strike": 70000.0, "sigma_1m": 0.0008, "minutes_remaining": 2000,
             "ret_5m": 0.001, "data_quality": 80.0,
             "horizon_mode": "extended", "sigma_effective": 0.0008}
@@ -284,7 +287,7 @@ class TestJoinability(unittest.TestCase):
     def test_invariant_8_settlement_joins_on_record_id(self):
         with tempfile.TemporaryDirectory() as t:
             st = self._store(t)
-            n = st.settle(lambda tk: {"result": "yes"})
+            n = st.settle(lambda tk: {"result": "yes", "status": "settled"})
             self.assertEqual(n, 1)
             rows = st.calibration_records()
             self.assertEqual(len(rows), 1)
@@ -296,8 +299,8 @@ class TestJoinability(unittest.TestCase):
     def test_duplicate_settlement_does_not_duplicate_samples(self):
         with tempfile.TemporaryDirectory() as t:
             st = self._store(t)
-            st.settle(lambda tk: {"result": "yes"})
-            again = st.settle(lambda tk: {"result": "yes"})
+            st.settle(lambda tk: {"result": "yes", "status": "settled"})
+            again = st.settle(lambda tk: {"result": "yes", "status": "settled"})
             self.assertEqual(again, 0, "settled record was polled twice")
             self.assertEqual(len(st.calibration_records()), 1)
 
@@ -313,7 +316,8 @@ class TestJoinability(unittest.TestCase):
                       minutes_remaining=-10, cycle_id="c1")
             ids = {r["record_id"] for r in st.predictions()}
             self.assertEqual(len(ids), 2)
-            st.settle(lambda tk: {"result": "yes" if tk == "KXBTCD-A" else "no"})
+            st.settle(lambda tk: {"result": "yes" if tk == "KXBTCD-A" else "no",
+                                  "status": "settled"})
             got = {r["ticker"]: r["result"] for r in st.calibration_records()}
             self.assertEqual(got, {"KXBTCD-A": "yes", "KXBTCD-B": "no"})
 
@@ -324,7 +328,7 @@ class TestJoinability(unittest.TestCase):
 
             def get_market(tk):
                 calls.append(tk)
-                return {"result": "yes"}
+                return {"result": "yes", "status": "settled"}
             self.assertEqual(st.settle(get_market), 0)
             self.assertEqual(calls, [], "an unmatured market cost an API call")
 
@@ -348,7 +352,7 @@ class TestCalibrationHygiene(unittest.TestCase):
     def test_invariant_9_unsettled_never_enter_metrics(self):
         with tempfile.TemporaryDirectory() as t:
             st = self._seed(t)
-            st.settle(lambda tk: {"result": "yes"})
+            st.settle(lambda tk: {"result": "yes", "status": "settled"})
             rows = st.calibration_records()
             self.assertEqual(len(rows), 2, "an unsettled record leaked in")
             self.assertNotIn("KXBTCD-2", [r["ticker"] for r in rows])
@@ -360,7 +364,7 @@ class TestCalibrationHygiene(unittest.TestCase):
     def test_segmentation_never_pools_silently(self):
         with tempfile.TemporaryDirectory() as t:
             st = self._seed(t)
-            st.settle(lambda tk: {"result": "yes"})
+            st.settle(lambda tk: {"result": "yes", "status": "settled"})
             self.assertEqual(
                 st.calibration_report(model_version="nope")["count"], 0)
             rep = st.calibration_report(model_version="btc15m-v1.0-ref",
@@ -393,7 +397,7 @@ class TestFailureSemantics(unittest.TestCase):
                         minutes_remaining=2000, cycle_id="c")
         self.assertIsNone(rid)
         self.assertEqual(st.predictions(), [])
-        self.assertEqual(st.settle(lambda tk: {"result": "yes"}), 0)
+        self.assertEqual(st.settle(lambda tk: {"result": "yes", "status": "settled"}), 0)
 
     def test_invariant_10_failing_evidence_leaves_the_funnel_unchanged(self):
         with tempfile.TemporaryDirectory() as t:
@@ -451,6 +455,17 @@ class TestEvidenceContract(unittest.TestCase):
         self.assertFalse(row["model_valid"])
         self.assertEqual(row["series"], "KXBTCD")
 
+    def test_a_row_with_a_model_version_carries_the_model_hash(self):
+        # A version string is a promise; the hash is what the code was.
+        from btc_probability_model import model_hash
+        row = build_prediction_record(
+            decision={"ticker": "KXBTCD-A", "strategy": "btc_daily"},
+            model_output={"valid": True, "probability_yes": 0.5,
+                          "confidence": 6, "features": dict(FEATURES)},
+            market=mkt(), book={}, minutes_remaining=600, cycle_id="c")
+        self.assertEqual(row["model_hash"], model_hash())
+        self.assertEqual(len(row["model_hash"]), 16)
+
     def test_record_is_json_serialisable(self):
         row = build_prediction_record(
             decision={"ticker": "KXBTCD-A", "strategy": "btc_daily",
@@ -465,3 +480,260 @@ class TestEvidenceContract(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSettlementConfirmationProtocol(unittest.TestCase):
+    """A first-poll answer is never a settlement on its own.
+
+    Measured 2026-09-02: 62 KXBTCD events that closed with BTC above the
+    strike were journaled "no" because the API was polled within minutes
+    of close and its first answer was frozen. These tests pin the protocol
+    that makes that impossible.
+    """
+
+    def _store(self, tmp, mins=-100):
+        st = BtcDailyEvidenceStore(tmp)
+        st.record(decision={"ticker": "KXBTCD-A", "strategy": "btc_daily",
+                            "decision_id": "c1-x", "market_type": "d"},
+                  model_output={"valid": True, "probability_yes": 0.7,
+                                "confidence": 6, "features": dict(FEATURES)},
+                  market=mkt("KXBTCD-A", mins), book={"yes_mid": 45},
+                  minutes_remaining=mins, cycle_id="c1")
+        return st
+
+    def test_a_bare_result_without_finalized_status_is_only_an_observation(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t)
+            self.assertEqual(st.settle(lambda tk: {"result": "no"}), 0)
+            self.assertEqual(st.settlements(), {})
+            self.assertEqual(st.calibration_records(), [])
+            obs = st._observations()
+            self.assertEqual(len(obs), 1)
+            self.assertEqual(list(obs.values())[0][0]["kind"], "observation")
+
+    def test_a_finalized_status_is_authoritative_at_once(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t)
+            self.assertEqual(st.settle(lambda tk: {"result": "no",
+                                                   "status": "finalized"}), 1)
+            row = list(st.settlements().values())[0]
+            self.assertEqual(row["confirmed_by"], "status")
+            self.assertEqual(row["kind"], "settlement")
+
+    def test_two_agreeing_observations_far_enough_apart_confirm(self):
+        from btc_daily_evidence import SETTLE_MIN_LAG_S, SETTLE_CONFIRM_MIN_S
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t, mins=-1)          # closed a minute ago
+            now = datetime.now(timezone.utc)
+            close = now - timedelta(minutes=1)
+            first = close + timedelta(seconds=SETTLE_MIN_LAG_S + 1)
+            second = first + timedelta(seconds=SETTLE_CONFIRM_MIN_S + 1)
+            self.assertEqual(st.settle(lambda tk: {"result": "yes"}, now=first), 0)
+            self.assertEqual(st.settle(lambda tk: {"result": "yes"}, now=second), 1)
+            row = list(st.settlements().values())[0]
+            self.assertEqual(row["confirmed_by"], "repeat")
+            self.assertEqual(row["prior_observations"], 1)
+
+    def test_an_observation_taken_too_soon_after_close_cannot_confirm(self):
+        # Exactly the failure mode: polled minutes after close, then again
+        # later with the same answer. The first observation is too early to
+        # count, so the second only becomes the first valid one.
+        from btc_daily_evidence import SETTLE_CONFIRM_MIN_S
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t, mins=-1)
+            now = datetime.now(timezone.utc)
+            early = now + timedelta(minutes=5)
+            later = early + timedelta(seconds=SETTLE_CONFIRM_MIN_S + 1)
+            self.assertEqual(st.settle(lambda tk: {"result": "no"}, now=early), 0)
+            self.assertEqual(st.settle(lambda tk: {"result": "no"}, now=later), 0)
+            self.assertEqual(st.settlements(), {})
+
+    def test_disagreeing_observations_never_confirm(self):
+        from btc_daily_evidence import SETTLE_MIN_LAG_S, SETTLE_CONFIRM_MIN_S
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t, mins=-1)
+            now = datetime.now(timezone.utc)
+            first = now + timedelta(seconds=SETTLE_MIN_LAG_S + 1)
+            second = first + timedelta(seconds=SETTLE_CONFIRM_MIN_S + 1)
+            st.settle(lambda tk: {"result": "no"}, now=first)
+            self.assertEqual(st.settle(lambda tk: {"result": "yes"}, now=second), 0)
+            self.assertEqual(st.settlements(), {})
+
+    def test_no_api_call_while_the_confirmation_window_is_open(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t, mins=-100)
+            now = datetime.now(timezone.utc)
+            calls = []
+
+            def gm(tk):
+                calls.append(tk)
+                return {"result": "no"}
+            st.settle(gm, now=now)
+            st.settle(gm, now=now + timedelta(minutes=1))
+            self.assertEqual(len(calls), 1, "re-polled inside the window")
+
+    def test_legacy_first_poll_rows_are_excluded_from_calibration_by_default(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t)
+            rid = st.predictions()[0]["record_id"]
+            with open(st.settlements_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"schema_version": 1, "record_id": rid,
+                                    "ticker": "KXBTCD-A", "result": "no",
+                                    "settled_at": _iso(0)}) + "\n")
+            self.assertEqual(len(st.settlements()), 1)         # inventory
+            self.assertEqual(st.calibration_records(), [])       # not evidence
+            self.assertEqual(len(st.calibration_records(
+                require_confirmed=False)), 1)                    # only if asked
+            cov = st.coverage()
+            self.assertEqual(cov["settled_unconfirmed_legacy"], 1)
+            self.assertEqual(cov["settled_confirmed"], 0)
+
+    def test_a_spot_proxy_strike_never_enters_decisive_evidence(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = BtcDailyEvidenceStore(t)
+            feats = dict(FEATURES, strike_source="spot_proxy")
+            st.record(decision={"ticker": "KXBTCD-P", "strategy": "btc_daily",
+                                "decision_id": "c-p", "market_type": "d"},
+                      model_output={"valid": True, "probability_yes": 0.5,
+                                    "confidence": 6, "features": feats},
+                      market=mkt("KXBTCD-P", -100), book={"yes_mid": 45},
+                      minutes_remaining=-100, cycle_id="c")
+            st.settle(lambda tk: {"result": "yes", "status": "settled"})
+            self.assertEqual(st.calibration_records(), [])
+            self.assertEqual(len(st.calibration_records(
+                decisive_strike_only=False)), 1)
+
+
+class TestConfirmedEventsContract(unittest.TestCase):
+    """The only surface calibration should read: confirmed settlements,
+    each carrying provenance, model identity and the confirmation trail."""
+
+    REQUIRED = ("ticker", "decision_ts", "close_time", "strike",
+                "strike_source", "spot", "market_probability", "spread",
+                "model_probability", "model_version", "model_hash",
+                "first_result_seen", "first_result_seen_ts",
+                "confirmed_result", "confirmed_result_ts",
+                "confirmation_method", "settlement_status")
+
+    def _store(self, tmp, mins=-100):
+        st = BtcDailyEvidenceStore(tmp)
+        st.record(decision={"ticker": "KXBTCD-A", "strategy": "btc_daily",
+                            "decision_id": "c1-x", "market_type": "d"},
+                  model_output={"valid": True, "probability_yes": 0.7,
+                                "confidence": 6, "features": dict(FEATURES)},
+                  market=mkt("KXBTCD-A", mins),
+                  book={"yes_bid": 44, "yes_ask": 46, "yes_mid": 45},
+                  minutes_remaining=mins, cycle_id="c1")
+        return st
+
+    def test_an_unconfirmed_settlement_never_appears(self):
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t)
+            st.settle(lambda tk: {"result": "no"})        # observation only
+            self.assertEqual(st.confirmed_events(), [])
+
+    def test_a_confirmed_event_carries_every_required_field(self):
+        from btc_probability_model import model_hash
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t)
+            st.settle(lambda tk: {"result": "yes", "status": "settled"})
+            ev = st.confirmed_events()
+            self.assertEqual(len(ev), 1)
+            e = ev[0]
+            for k in self.REQUIRED:
+                self.assertIn(k, e, k)
+            self.assertEqual(e["confirmed_result"], "yes")
+            self.assertEqual(e["confirmation_method"], "status")
+            self.assertEqual(e["settlement_status"], "settled")
+            self.assertEqual(e["strike_source"], "field")
+            self.assertEqual(e["spread"], 2)
+            self.assertEqual(e["model_hash"], model_hash())
+            self.assertIsNone(e["first_result_seen"])   # confirmed on poll 1
+
+    def test_the_first_observation_is_preserved_next_to_the_confirmed_one(self):
+        from btc_daily_evidence import SETTLE_MIN_LAG_S, SETTLE_CONFIRM_MIN_S
+        with tempfile.TemporaryDirectory() as t:
+            st = self._store(t, mins=-1)
+            now = datetime.now(timezone.utc)
+            first = now + timedelta(seconds=SETTLE_MIN_LAG_S + 1)
+            second = first + timedelta(seconds=SETTLE_CONFIRM_MIN_S + 1)
+            st.settle(lambda tk: {"result": "no"}, now=first)
+            st.settle(lambda tk: {"result": "no"}, now=second)
+            e = st.confirmed_events()[0]
+            self.assertEqual(e["first_result_seen"], "no")
+            self.assertEqual(e["first_result_seen_ts"],
+                             first.isoformat(timespec="seconds"))
+            self.assertEqual(e["confirmation_method"], "repeat")
+
+
+class TestStrikeProvenanceIsExplicit(unittest.TestCase):
+    """R1: provenance must be stated, not inferred from a missing key.
+
+    The router used to stamp strike_source only for NON-field sources, so a
+    genuine market strike and a row that simply failed to record its
+    provenance were byte-identical. Both counted as decisive evidence.
+    """
+
+    def _settled(self, tmp, source):
+        st = BtcDailyEvidenceStore(tmp)
+        feats = dict(FEATURES)
+        if source is _MISSING:
+            feats.pop("strike_source", None)
+        else:
+            feats["strike_source"] = source
+        st.record(decision={"ticker": "KXBTCD-S", "strategy": "btc_daily",
+                            "decision_id": "c-s", "market_type": "d"},
+                  model_output={"valid": True, "probability_yes": 0.5,
+                                "confidence": 6, "features": feats},
+                  market=mkt("KXBTCD-S", -100), book={"yes_mid": 45},
+                  minutes_remaining=-100, cycle_id="c")
+        st.settle(lambda tk: {"result": "yes", "status": "settled"})
+        return st
+
+    def test_a_market_field_strike_is_decisive(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(len(self._settled(t, "field").calibration_records()), 1)
+
+    def test_a_ticker_parsed_strike_is_decisive(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(len(self._settled(t, "ticker").calibration_records()), 1)
+
+    def test_a_spot_proxy_strike_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, "spot_proxy").calibration_records(), [])
+
+    def test_a_missing_strike_source_is_refused(self):
+        # The finding: absence used to read as "field".
+        with tempfile.TemporaryDirectory() as t:
+            st = self._settled(t, _MISSING)
+            self.assertIsNone(st.predictions()[0]["strike_source"])
+            self.assertEqual(st.calibration_records(), [])
+
+    def test_an_explicit_null_strike_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, None).calibration_records(), [])
+
+    def test_an_unknown_strike_source_is_refused(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, "guessed").calibration_records(), [])
+
+    def test_a_refused_provenance_never_reaches_confirmed_events(self):
+        with tempfile.TemporaryDirectory() as t:
+            self.assertEqual(self._settled(t, _MISSING).confirmed_events(), [])
+
+    def test_the_router_stamps_field_explicitly(self):
+        from strategy_router import BtcDailyStrategy
+
+        class _Ctx:
+            valid = True
+            spot = 70500.0
+            realized_vol_1m = 0.0008
+            data_quality_score = 90.0
+            returns = {"5m": 0.001}
+            reason = "ok"
+
+        out = BtcDailyStrategy(lambda **kw: _Ctx()).evaluate(
+            {"ticker": "KXBTCD-26SEP0217-T70000", "floor_strike": 70000},
+            {}, 600)
+        self.assertTrue(out.valid, out.reason)
+        self.assertEqual(out.features["strike_source"], "field")

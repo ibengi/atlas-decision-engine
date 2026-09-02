@@ -47,6 +47,39 @@ EVIDENCE_SCHEMA_VERSION = 1
 PREDICTIONS_FILE = "btc_daily_predictions.jsonl"
 SETTLEMENTS_FILE = "btc_daily_settlements.jsonl"
 
+#: Market statuses under which the API's `result` is authoritative.
+FINALIZED_STATUSES = ("settled", "finalized")
+
+#: SETTLEMENT CONFIRMATION PROTOCOL — why it exists.
+#:
+#: Measured on 2026-09-02: 62 KXBTCD events that closed with BTC ABOVE the
+#: strike (by up to $9,360) carried result="no" in this journal. Every one
+#: had been polled within 0.6 h of close, when the demo API answers "no"
+#: for a closed-but-undetermined market, and the first non-empty answer
+#: was frozen forever. A label written that way is not evidence.
+#:
+#: A result is therefore accepted only when EITHER the market reports a
+#: finalized status, OR the same value is observed twice at least
+#: SETTLE_CONFIRM_MIN_S apart with the first observation at least
+#: SETTLE_MIN_LAG_S after close. Anything else is recorded as an
+#: observation and re-polled — never as a settlement.
+SETTLE_MIN_LAG_S = 1800.0
+SETTLE_CONFIRM_MIN_S = 1800.0
+
+#: Strike provenances that may enter decisive evidence.
+#:
+#: "field"  - an explicit floor_strike/cap_strike/strike_price from the API.
+#: "ticker" - parsed from the ticker's own T<price> segment, a real strike.
+#:
+#: Everything else is excluded, INCLUDING a missing value. "spot_proxy" sets
+#: strike := spot, which forces d=0 and degenerates the model to its
+#: momentum term, so such a row measures nothing. An absent strike_source
+#: used to be accepted because the router only stamped non-field sources —
+#: provenance expressed by absence, which a consumer cannot verify and any
+#: future producer could reproduce by accident. The router now stamps
+#: "field" explicitly, so absence means unknown, and unknown is not decisive.
+DECISIVE_STRIKE_SOURCES = ("field", "ticker")
+
 #: Horizon buckets required by T7-I Phase 5. Upper bound exclusive, minutes.
 HORIZON_BUCKETS = (("<=24h", 0.0, 1440.0), ("24-48h", 1440.0, 2880.0),
                    ("2-3d", 2880.0, 4320.0), ("3-7d", 4320.0, 10080.0),
@@ -89,6 +122,16 @@ def _num(value):
     except (TypeError, ValueError):
         return None
     return f if f == f and f not in (float("inf"), float("-inf")) else None
+
+
+def _model_hash() -> Optional[str]:
+    """Hash of the model source, or None if the model cannot be imported.
+    Never raises: evidence capture must not be able to break a cycle."""
+    try:
+        from btc_probability_model import model_hash
+        return model_hash()
+    except Exception:                                   # noqa: BLE001
+        return None
 
 
 def make_record_id(*, cycle_id, ticker, observed_at, model_version) -> str:
@@ -146,7 +189,7 @@ def build_prediction_record(*, decision, model_output, market, book,
         # explicit null rather than silently reusing the model version.
         "strategy_version": strategy_version,
         "model_version": model_version,
-        "model_hash": None,          # not exposed by the model today
+        "model_hash": _model_hash() if model_version else None,
         "observed_at": observed_at,
         "market_close_time": m.get("close_time"),
         "expiration_time": m.get("expiration_time"),
@@ -230,9 +273,24 @@ class BtcDailyEvidenceStore:
         return self._read(self.predictions_path)
 
     def settlements(self) -> dict:
-        """record_id -> settlement row. Last write wins on replay."""
+        """record_id -> FINAL settlement row. Last write wins on replay.
+
+        Observation rows (kind="observation") are the confirmation
+        protocol's working state and never count as settled. Rows without a
+        `kind` predate the protocol: they were frozen from a first poll and
+        are returned here for inventory, but `calibration_records` excludes
+        them unless explicitly asked otherwise.
+        """
         return {r["record_id"]: r for r in self._read(self.settlements_path)
-                if r.get("record_id")}
+                if r.get("record_id") and r.get("kind") != "observation"}
+
+    def _observations(self) -> dict:
+        """record_id -> list of observation rows, in write order."""
+        out = {}
+        for r in self._read(self.settlements_path):
+            if r.get("kind") == "observation" and r.get("record_id"):
+                out.setdefault(r["record_id"], []).append(r)
+        return out
 
     # ── settlement ─────────────────────────────────────────────────────────
     def mature_unsettled(self, now: datetime = None) -> list:
@@ -253,14 +311,20 @@ class BtcDailyEvidenceStore:
         return out
 
     def settle(self, get_market_fn, now: datetime = None) -> int:
-        """Resolve matured predictions from the API's own `result` field.
+        """Resolve matured predictions from the API's own `result` field,
+        under the confirmation protocol documented at SETTLE_MIN_LAG_S.
 
-        One API call per distinct matured ticker, never per record. No
-        settlement is ever assumed without an explicit yes/no from the API.
-        Returns the number of settlement rows written; never raises.
+        One API call per distinct matured ticker per pass, and none at all
+        for a record whose last observation is younger than
+        SETTLE_CONFIRM_MIN_S. No settlement is ever assumed without an
+        explicit yes/no from the API, and no first-poll answer is ever
+        final on its own. Returns the number of FINAL settlement rows
+        written; never raises.
         """
         try:
+            now = now or datetime.now(timezone.utc)
             pending = self.mature_unsettled(now)
+            obs = self._observations()
         except Exception as e:                            # noqa: BLE001
             log.debug(f"[BTC_DAILY_EVIDENCE] settle scan failed: {e}")
             return 0
@@ -268,22 +332,53 @@ class BtcDailyEvidenceStore:
             return 0
         seen, written = {}, 0
         for r in pending:
-            tk = r.get("ticker")
+            rid, tk = r["record_id"], r.get("ticker")
+            prev = obs.get(rid) or []
+            last = prev[-1] if prev else None
+            last_at = _parse_iso(last.get("observed_at")) if last else None
+            if last_at is not None and \
+                    (now - last_at).total_seconds() < SETTLE_CONFIRM_MIN_S:
+                continue              # confirmation window still open: no call
             if tk not in seen:
                 try:
-                    m = get_market_fn(tk) or {}
+                    seen[tk] = get_market_fn(tk) or {}
                 except Exception as e:                    # noqa: BLE001
                     log.debug(f"[BTC_DAILY_EVIDENCE] get_market({tk}): {e}")
-                    m = {}
-                seen[tk] = str(m.get("result") or "").strip().lower()
-            result = seen[tk]
+                    seen[tk] = {}
+            m = seen[tk]
+            result = str(m.get("result") or "").strip().lower()
+            status = str(m.get("status") or "").strip().lower()
             if result not in ("yes", "no"):
                 continue                  # unresolved stays unresolved
+            close = _parse_iso(r.get("market_close_time"))
+            lag = (now - close).total_seconds() if close else None
+            confirmed_by = None
+            if status in FINALIZED_STATUSES:
+                confirmed_by = "status"
+            elif (close is not None
+                  and last is not None and last.get("result") == result
+                  and last_at is not None
+                  and (last_at - close).total_seconds() >= SETTLE_MIN_LAG_S
+                  and (now - last_at).total_seconds() >= SETTLE_CONFIRM_MIN_S):
+                # The current poll is necessarily >= MIN_LAG + CONFIRM after
+                # close, so no separate check on it is needed.
+                confirmed_by = "repeat"
+            base = {"schema_version": EVIDENCE_SCHEMA_VERSION,
+                    "record_id": rid, "ticker": tk, "result": result,
+                    "market_status": status or None,
+                    "observed_at": now.isoformat(timespec="seconds"),
+                    "settle_lag_s": round(lag, 1) if lag is not None else None}
+            if confirmed_by is None:
+                self._append(self.settlements_path,
+                             {**base, "kind": "observation"})
+                continue
             if self._append(self.settlements_path, {
-                    "schema_version": EVIDENCE_SCHEMA_VERSION,
-                    "record_id": r["record_id"], "ticker": tk,
-                    "result": result, "settled_at": _now_iso(),
+                    **base, "kind": "settlement",
+                    "confirmed_by": confirmed_by,
+                    "settled_at": now.isoformat(timespec="seconds"),
+                    "prior_observations": len(prev),
                     "model_version": r.get("model_version"),
+                    "model_hash": r.get("model_hash"),
                     "strategy_name": r.get("strategy_name"),
                     "horizon_bucket": r.get("horizon_bucket")}):
                 written += 1
@@ -291,12 +386,20 @@ class BtcDailyEvidenceStore:
 
     # ── calibration surface ────────────────────────────────────────────────
     def calibration_records(self, *, model_version=None, strategy=None,
-                            bucket=None) -> list:
+                            bucket=None, require_confirmed=True,
+                            decisive_strike_only=True) -> list:
         """Settled predictions only, in the shape `calibration.py` consumes.
 
         Unsettled predictions are structurally excluded: a record without a
         settlement row cannot appear here at all. Filters exist so model
         versions and horizons are never pooled without saying so.
+
+        Two integrity filters are ON by default and must be switched off
+        explicitly, in code, by whoever wants contaminated rows:
+          require_confirmed    — drop settlements not confirmed under the
+                                 protocol (legacy first-poll rows included);
+          decisive_strike_only — drop rows whose strike was not the market's
+                                 own (see DECISIVE_STRIKE_SOURCES).
         """
         settled = self.settlements()
         out = []
@@ -304,6 +407,11 @@ class BtcDailyEvidenceStore:
             s = settled.get(r.get("record_id"))
             if not s or s.get("result") not in ("yes", "no"):
                 continue
+            if require_confirmed and not s.get("confirmed_by"):
+                continue          # frozen first-poll label: not evidence
+            if decisive_strike_only and \
+                    r.get("strike_source") not in DECISIVE_STRIKE_SOURCES:
+                continue          # strike := spot measures nothing
             p = r.get("predicted_probability")
             if p is None:
                 continue          # no prediction -> not a calibration sample
@@ -315,7 +423,8 @@ class BtcDailyEvidenceStore:
                 continue
             out.append({**r, "probability_yes": p,
                         "result": s["result"],
-                        "settled_at": s.get("settled_at")})
+                        "settled_at": s.get("settled_at"),
+                        "confirmed_by": s.get("confirmed_by")})
         return out
 
     def calibration_report(self, *, bins: int = 10, model_version=None,
@@ -339,6 +448,57 @@ class BtcDailyEvidenceStore:
             "unsettled_excluded": True,
         })
         return rep
+
+    def confirmed_events(self, *, decisive_strike_only=True) -> list:
+        """One consolidated record per CONFIRMED settlement, carrying the
+        fields the operator's evidence contract requires. This is the only
+        surface that calibration, training or evaluation should read: a
+        record appears here only when `confirmed_result` exists.
+
+        `first_result_seen` is the earliest observation the protocol
+        journaled for the record (None when the settlement was confirmed
+        on its first poll by a finalized status).
+
+        Strike provenance is filtered here on the same terms as
+        `calibration_records`: being the surface research reads, it must not
+        be the one place a spot-proxy or unprovenanced strike slips through.
+        """
+        final = self.settlements()
+        obs = self._observations()
+        out = []
+        for r in self.predictions():
+            s = final.get(r.get("record_id"))
+            if not s or not s.get("confirmed_by"):
+                continue
+            if decisive_strike_only and \
+                    r.get("strike_source") not in DECISIVE_STRIKE_SOURCES:
+                continue
+            first = (obs.get(r["record_id"]) or [None])[0]
+            ask, bid = r.get("market_yes_ask"), r.get("market_yes_bid")
+            out.append({
+                "record_id": r.get("record_id"),
+                "ticker": r.get("ticker"),
+                "decision_ts": r.get("observed_at"),
+                "close_time": r.get("market_close_time"),
+                "strike": r.get("strike"),
+                "strike_source": r.get("strike_source") or "field",
+                "spot": r.get("underlying_price"),
+                "market_probability": r.get("market_implied_probability"),
+                "market_yes_bid": bid, "market_yes_ask": ask,
+                "spread": ((ask - bid) if isinstance(ask, (int, float))
+                           and isinstance(bid, (int, float)) else None),
+                "model_probability": r.get("predicted_probability"),
+                "model_version": r.get("model_version"),
+                "model_hash": r.get("model_hash"),
+                "first_result_seen": first.get("result") if first else None,
+                "first_result_seen_ts": first.get("observed_at") if first else None,
+                "confirmed_result": s.get("result"),
+                "confirmed_result_ts": s.get("settled_at"),
+                "confirmation_method": s.get("confirmed_by"),
+                "settlement_status": s.get("market_status"),
+                "settle_lag_s": s.get("settle_lag_s"),
+            })
+        return out
 
     def observation_keys(self) -> set:
         """Every `observation_key` already on disk (T7-K dedup index).
@@ -392,6 +552,10 @@ class BtcDailyEvidenceStore:
                 e["settled"] += 1
         return {"schema_version": EVIDENCE_SCHEMA_VERSION,
                 "predictions": len(preds), "settled": len(settled),
+                "settled_confirmed": sum(1 for v in settled.values()
+                                         if v.get("confirmed_by")),
+                "settled_unconfirmed_legacy": sum(
+                    1 for v in settled.values() if not v.get("confirmed_by")),
                 "by_horizon_bucket": by_bucket,
                 "model_versions": sorted({r.get("model_version")
                                           for r in preds} - {None})}

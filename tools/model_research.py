@@ -295,10 +295,34 @@ def build_candidates():
 
 # ── walk-forward ─────────────────────────────────────────────────────────
 
-def walk_forward(rows, n_folds=4, min_train=40):
-    """Expanding-window folds over decision time. Yields
-    (train, test), with training rows PURGED of any whose label was not
-    yet known when the test fold's first decision was taken."""
+def event_of(row):
+    """The settlement event a row belongs to. Several observations of one
+    market resolve from a single price path and share one outcome."""
+    return row.get("ticker")
+
+
+def walk_forward(rows, n_folds=4, min_train=40, event_key=event_of):
+    """Expanding-window folds over decision time. Yields (train, test).
+
+    Two independent guarantees, both enforced here rather than relied upon:
+
+      LABEL AVAILABILITY - a training row whose `settled_at` was still in
+      the future when the test fold's first decision was taken is purged.
+      You cannot train on a label you could not yet have scored.
+
+      EVENT ISOLATION - no settlement event may appear on both sides. One
+      market observed at several time-to-expiry checkpoints yields several
+      rows carrying ONE outcome; splitting them across train and test would
+      let the model see the answer it is being asked for. Overlapping
+      events are purged from TRAIN, never from test, so the evaluation set
+      is never quietly shrunk.
+
+    Event isolation was previously an emergent consequence of the label
+    purge under the invariant settled_at >= observed_at. It held, but was
+    undefended: a row violating that invariant reintroduced leakage
+    silently. It is now checked directly, and a fold whose training set no
+    longer meets `min_train` is dropped rather than run undersized.
+    """
     n = len(rows)
     if n < min_train + n_folds:
         return []
@@ -311,8 +335,13 @@ def walk_forward(rows, n_folds=4, min_train=40):
             continue
         test = rows[a:b]
         cutoff = _ts(test[0]["ts"])
-        train = [r for r in rows[:a] if _ts(r["settled_at"]) < cutoff]
+        test_events = {event_key(r) for r in test}
+        train = [r for r in rows[:a]
+                 if _ts(r["settled_at"]) < cutoff
+                 and event_key(r) not in test_events]
         if len(train) >= min_train:
+            assert not ({event_key(r) for r in train} & test_events), \
+                "event isolation violated"
             folds.append((train, test))
     return folds
 

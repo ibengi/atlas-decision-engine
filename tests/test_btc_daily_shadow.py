@@ -46,7 +46,8 @@ def liquid(ticker="KXBTCD-26AUG20-T71000", mins=600):
     return m
 
 
-FEATURES = {"model_version": "btc15m-v1.0-ref", "spot": 70500.0,
+FEATURES = {"model_version": "btc15m-v1.0-ref",
+            "strike_source": "field", "spot": 70500.0,
             "strike": 70000.0, "sigma_1m": 0.0008, "data_quality": 80.0}
 
 
@@ -401,9 +402,9 @@ class TestSettlementAndCounting(unittest.TestCase):
     def test_settlement_joins_and_is_idempotent(self):
         with tempfile.TemporaryDirectory() as t:
             _ev_, store = self._seeded(t)
-            n = store.settle(lambda tk: {"result": "yes"})
+            n = store.settle(lambda tk: {"result": "yes", "status": "settled"})
             self.assertEqual(n, 3)
-            self.assertEqual(store.settle(lambda tk: {"result": "yes"}), 0)
+            self.assertEqual(store.settle(lambda tk: {"result": "yes", "status": "settled"}), 0)
             self.assertEqual(len(store.calibration_records()), 3)
 
     def test_unmatured_observation_is_never_settled(self):
@@ -424,7 +425,7 @@ class TestSettlementAndCounting(unittest.TestCase):
     def test_independent_outcomes_counts_expiries_not_rows(self):
         with tempfile.TemporaryDirectory() as t:
             _ev_, store = self._seeded(t)
-            store.settle(lambda tk: {"result": "yes"})
+            store.settle(lambda tk: {"result": "yes", "status": "settled"})
             st = store.statistics()
             self.assertEqual(st["settled_prediction_rows"], 3)
             self.assertEqual(st["settled_unique_tickers"], 3)

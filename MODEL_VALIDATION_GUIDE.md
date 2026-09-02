@@ -19,6 +19,19 @@ demontree ni pretendue. Le livrable est pret pour le SHADOW MODE uniquement.
    RTI/consensus doit etre mesure avant tout live.
 4. Fills reels demo pour calibrer le proxy de slippage (actuellement un
    tampon constant SLIPPAGE_BUFFER_CENTS + UNCERTAINTY_BUFFER).
+5. Des etiquettes de reglement KXBTCD FIABLES. Mesure le 2026-09-02 :
+   62 evenements quotidiens clos avec BTC AU-DESSUS du strike (jusqu'a
+   +12 %) portaient result="no" dans btc_daily_settlements.jsonl — l'API
+   avait ete interrogee dans les minutes suivant la cloture et sa premiere
+   reponse figee. Depuis, un reglement n'est accepte que sous statut
+   finalise OU confirme par deux lectures identiques espacees de 30 min
+   (btc_daily_evidence.SETTLE_MIN_LAG_S / SETTLE_CONFIRM_MIN_S). Les lignes
+   anterieures a ce protocole sont conservees mais EXCLUES de
+   calibration_records() par defaut. Verifier n'importe quel journal :
+   ```
+   python tools/daily_label_audit.py $DATA_DIR/btc_daily_settlements.jsonl <serie_spot.json>
+   ```
+   Sortie 0 seulement si aucune etiquette impossible n'est trouvee.
 
 ## Procedure
 1) SHADOW : `SHADOW_MODE=1 python kalshi_alpha_bot.py --demo --btc --loop`
@@ -50,6 +63,23 @@ demontree ni pretendue. Le livrable est pret pour le SHADOW MODE uniquement.
 5) LIVE (jamais automatique) : exige KALSHI_ENV_CONFIRM=LIVE,
    LIVE_TRADING_CONFIRMED=YES, LIVE_TRADING=1, MODEL_APPROVED_FOR_LIVE=YES
    ET un rapport de validation recent accepte par le gatekeeper.
+
+## Modele QUOTIDIEN (KXBTCD) — a ne pas confondre avec le 15 min
+Le modele btc15m-v1.0-ref extrapole une vol 1 min (29 rendements) par
+sqrt(T) jusqu'a ~900 min : vol 24 h implicite ~1,6 % contre 2,5-4 %
+realisee, terme de momentum sature a la borne dans 97 % des cas
+quotidiens, penalite d'horizon inactive sous 1440 min. Il est
+surconfiant sur chaque strike quotidien. Un modele quotidien separe se
+valide avec :
+   ```
+   python tools/daily_research.py $DATA_DIR/btc_daily_predictions.jsonl $DATA_DIR/btc_daily_settlements.jsonl
+   ```
+(une observation par evenement et par checkpoint, etiquettes confirmees
+seulement, strikes spot_proxy exclus, arret si l'etiquette est degeneree,
+tranches spread<=4/6/10 et pipeline-accepted rapportees separement). Les
+estimateurs de volatilite candidats sont dans tools/daily_vol.py ; ils ne
+sont valides que sur GBM synthetique tant qu'aucun historique de bougies
+reel n'est accessible.
 
 ## Interpretation honnete
 - Brier du modele DOIT battre le baseline marche (yes_ask/100) hors
