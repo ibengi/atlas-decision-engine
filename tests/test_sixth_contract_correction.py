@@ -54,10 +54,25 @@ TRADE_ID = "c91a43f56c9c"
 CID = SIXTH_CONTRACT_CORRECTION["correction_id"]
 
 
-def production_journal():
+#: The real settlement date of the incident. Everything historical is
+#: pinned to it.
+SETTLED_AT = "2026-09-01T05:42:31+00:00"
+
+
+def today_iso():
+    """Now, to the second, in the shape settled_at uses."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def production_journal(settled_at=SETTLED_AT):
     """Field-for-field mirror of the live state5 journal after the
     2026-09-01 settlements: the target trade settled on 5/6 contracts,
-    plus two other settled trades from the same batch."""
+    plus two other settled trades from the same batch.
+
+    `settled_at` is a parameter because "today's PnL" is the one metric
+    whose correct value depends on WHEN the settlement happened, and both
+    answers need pinning."""
     base = {
         "schema": "v11", "decision_id": None, "spread": 2, "edge": None,
         "ev": None, "confidence": None, "grade": None, "analysis": None,
@@ -71,14 +86,14 @@ def production_journal():
              filled_count=3, fees=0.06, order_id="ord-other-1",
              state="settled", result="no", won=False,
              gross_pnl=-1.35, net_pnl=-1.41,   # net = gross - fees
-             settled_at="2026-09-01T05:42:31+00:00"),
+             settled_at=settled_at),
         dict(base, trade_id="bbbb33334444", timestamp="2026-08-28T11:31:00+00:00",
              ticker="KXBTCD-26AUG2808-T78949.99", side="no",
              requested_price=76, avg_fill_price=76, requested_count=1,
              filled_count=1, fees=0.06, order_id="ord-other-2",
              state="settled", result="no", won=True,
              gross_pnl=0.24, net_pnl=0.18,
-             settled_at="2026-09-01T05:42:31+00:00"),
+             settled_at=settled_at),
         dict(base, trade_id=TRADE_ID, decision_id="9512fbe0e7-0f1af560",
              timestamp="2026-08-28T11:32:11+00:00", ticker=TICKER,
              side="no", requested_price=19, avg_fill_price=19,
@@ -86,7 +101,7 @@ def production_journal():
              order_id=ORDER_ID, order_status="unknown_cancel_failed",
              state="settled", result="no", won=True,
              gross_pnl=4.05, net_pnl=3.99,
-             settled_at="2026-09-01T05:42:31+00:00"),
+             settled_at=settled_at),
     ]
 
 
@@ -265,6 +280,24 @@ class AccountingSemanticsTest(_Base):
                                  if t["ticker"] == TICKER),
         }
 
+    def test_a_same_day_correction_does_move_today_pnl(self):
+        """The other half, and the reason the assertion above is not just
+        "daily never moves": when the corrected trade settled TODAY, the
+        delta belongs to today and must show up in the daily figure the
+        risk gates read."""
+        tlog = self._tlog(production_journal(settled_at=today_iso()))
+        before = self._metrics(tlog)
+
+        self.assertEqual(len(apply_ledger_corrections(tlog)), 1)
+        after = self._metrics(tlog)
+
+        self.assertAlmostEqual(after["daily_realized_pnl"],
+                               before["daily_realized_pnl"] + 0.8161, places=6)
+        self.assertAlmostEqual(after["realized_pnl"],
+                               before["realized_pnl"] + 0.8161, places=6)
+        # Still not a trade: the daily TRADE COUNT is untouched either way.
+        self.assertEqual(after["trades_today"], before["trades_today"])
+
     def test_before_after_semantics(self):
         tlog = self._tlog(production_journal())
         before = self._metrics(tlog)
@@ -284,8 +317,19 @@ class AccountingSemanticsTest(_Base):
         # ---- economics move by EXACTLY the broker delta ------------------
         self.assertAlmostEqual(after["realized_pnl"],
                                before["realized_pnl"] + 0.8161, places=6)
+        # TODAY's PnL must NOT move: this trade settled on 2026-09-01, and
+        # a correction to a past day's settlement is not today's profit.
+        # Letting it count would retroactively consume today's daily loss
+        # limit with money earned days ago -- a risk gate moved by
+        # bookkeeping. (This assertion previously read `+ 0.8161`, which
+        # only held on the day the fixture was written and then failed
+        # every day after; it pinned the wrong invariant, not just a
+        # fragile one.)
         self.assertAlmostEqual(after["daily_realized_pnl"],
-                               before["daily_realized_pnl"] + 0.8161, places=6)
+                               before["daily_realized_pnl"], places=6)
+        self.assertNotIn(today_iso()[:10], SETTLED_AT,
+                         "fixture no longer historical: this case only means "
+                         "something while the settlement is in the past")
         self.assertAlmostEqual(after["gross_pnl"],
                                before["gross_pnl"] + 0.81, places=6)
         self.assertAlmostEqual(after["fees_paid"],
