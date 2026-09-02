@@ -282,8 +282,14 @@ class TestSettlementReconciliation(unittest.TestCase):
         eng.cycle(1)
         # pas de resultat API -> rien n'est regle
         self.assertEqual(eng.posmgr.check_settlements(), [])
-        # resultat API yes -> reglement, PnL net = (1-0.48)*1 - frais
+        # un resultat sur un marche encore OUVERT n'est pas un reglement :
+        # c'est exactement la premiere reponse que le protocole refuse
         cli.market["result"] = "yes"
+        self.assertEqual(eng.posmgr.check_settlements(), [])
+        self.assertEqual(eng.posmgr.open_count(), 1)
+        # resultat API yes sous statut finalise -> reglement,
+        # PnL net = (1-0.48)*1 - frais
+        cli.market["status"] = "settled"
         realized = eng.posmgr.check_settlements()
         self.assertEqual(len(realized), 1)
         t = realized[0]
