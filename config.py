@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 
 def _env_f(name, default): 
     try: return float(os.getenv(name, str(default)))
@@ -64,14 +65,76 @@ def daily_oracle_approved() -> bool:
     return bool(CFG.DAILY_RESEARCH_ORACLE_APPROVED)
 
 
+#: Prefixe de serie des marches BTC quotidiens de Kalshi.
+DAILY_TICKER_PREFIX = "KXBTCD"
+
+#: Grammaire d'un ticker Kalshi sous forme canonique. Kalshi n'emet que des
+#: majuscules, des chiffres, des tirets et des points ('KXBTCD-26SEP0306-
+#: T77599.99'). Tout ce qui en sort n'est pas un ticker : c'est un bug
+#: d'appelant ou une tentative de contournement, et le chemin monetaire le
+#: refuse au lieu de le transmettre au broker.
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]*$")
+
+
+def canonical_ticker(ticker) -> str:
+    """Forme canonique d'un ticker, pour la CLASSIFICATION uniquement.
+
+    Ne retire QUE les blancs de bordure et n'harmonise que la casse. Un
+    blanc INTERIEUR n'existe pas dans le format Kalshi : le supprimer
+    transformerait une chaine invalide en ticker valide, ce qui est
+    exactement ce qu'un contournement chercherait. Donc ' kxbtcd-x ',
+    '\tKXBTCD-x' et '\nKXBTCD-x' se classent tous comme quotidiens, mais
+    'KX BTCD-x' ne devient jamais 'KXBTCD-x'.
+
+    La valeur retournee ne sert JAMAIS a appeler le broker : l'appel
+    conserve le ticker d'origine. C'est une cle de decision, pas une
+    reecriture.
+    """
+    if ticker is None:
+        return ""
+    if isinstance(ticker, (bytes, bytearray)):
+        ticker = bytes(ticker).decode("utf-8", "replace")
+    elif not isinstance(ticker, str):
+        ticker = str(ticker)
+    return ticker.strip().upper()
+
+
+def ticker_is_wellformed(ticker) -> bool:
+    """Vrai si `ticker` a la forme d'un ticker Kalshi une fois canonise.
+
+    Faux pour None, la chaine vide, une chaine de blancs, un objet non
+    textuel, ou tout ce qui porte un caractere invisible que `strip()` ne
+    retire pas (U+200B, U+2060...). Ces valeurs ne peuvent pas etre classees
+    de maniere fiable : le chemin monetaire les bloque au lieu de parier sur
+    leur innocuite.
+
+    Le type est exige STRICTEMENT `str` : `canonical_ticker` sait decoder des
+    octets pour CLASSER defensivement (b"KXBTCD-..." reste un ticker
+    quotidien et reste mis en quarantaine), mais un objet non textuel qui
+    arrive jusqu'ici est un bug d'appelant, pas un ticker -- on ne le
+    transmet pas au broker en esperant que son __str__ soit fidele.
+    """
+    if not isinstance(ticker, str):
+        return False
+    return bool(_TICKER_RE.match(canonical_ticker(ticker)))
+
+
+def is_daily_ticker(ticker) -> bool:
+    """Vrai si le ticker canonise appartient a la serie BTC quotidienne."""
+    return canonical_ticker(ticker).startswith(DAILY_TICKER_PREFIX)
+
+
 def daily_quarantine_blocks(ticker) -> bool:
     """Vrai si ce ticker est du BTC quotidien et que l'oracle n'est pas
     approuve. Volontairement indexe sur le TICKER et non sur market_type :
     cette garde doit tenir pour une Decision fabriquee a la main, un outil,
     ou tout appelant futur qui ne renseigne aucun market_type.
+
+    La canonisation vit ICI, dans la fonction que les DEUX gardes appellent,
+    pour qu'aucun des deux chemins ne puisse normaliser differemment de
+    l'autre.
     """
-    return (str(ticker or "").upper().startswith("KXBTCD")
-            and not daily_oracle_approved())
+    return is_daily_ticker(ticker) and not daily_oracle_approved()
 
 
 class Config:

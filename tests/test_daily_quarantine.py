@@ -17,7 +17,10 @@ B2  The daily strategy reached ORDER_SUBMIT_ATTEMPT while its settlement label
     ticker so it holds for callers that never set a market_type at all.
 """
 
+import json
 import os
+import subprocess
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -25,7 +28,9 @@ import _bootstrap  # noqa: F401  — dummy DEMO creds BEFORE config is imported
 
 import config
 from config import (GATE_FALSE_WORDS, GATE_TRUE_WORDS, _env_gate,
-                    daily_oracle_approved, daily_quarantine_blocks)
+                    canonical_ticker, daily_oracle_approved,
+                    daily_quarantine_blocks, is_daily_ticker,
+                    ticker_is_wellformed)
 
 
 class StrictGateParser(unittest.TestCase):
@@ -268,20 +273,25 @@ class DailyExecutionQuarantine(unittest.TestCase):
                               ee.executable_market_types())
 
 
+def _order_manager():
+    """An OrderManager with only the fields place_and_track touches, so the
+    test exercises the real money path rather than a re-implementation."""
+    import order_manager as om_mod
+    om = om_mod.OrderManager.__new__(om_mod.OrderManager)
+    om.client = MagicMock()
+    om.client.env = "demo"
+    om.client.create_order = MagicMock()
+    om.resolution_halt = None
+    om.pending_intents = {}
+    om.session_submitted = {}
+    om.exchange_pause_until = 0.0
+    return om
+
+
 class SecondaryMoneyPathGuard(unittest.TestCase):
     """Part 3: place_and_track refuses KXBTCD on its own, with no broker call."""
 
-    def _om(self):
-        import order_manager as om_mod
-        om = om_mod.OrderManager.__new__(om_mod.OrderManager)
-        om.client = MagicMock()
-        om.client.env = "demo"
-        om.client.create_order = MagicMock()
-        om.resolution_halt = None
-        om.pending_intents = {}
-        om.session_submitted = {}
-        om.exchange_pause_until = 0.0
-        return om
+    _om = staticmethod(_order_manager)
 
     def test_direct_invocation_with_kxbtcd_is_refused_without_broker_call(self):
         om = self._om()
@@ -354,6 +364,336 @@ class GuardIndependence(unittest.TestCase):
         with patch.object(config.CFG, "ALLOW_ORDER_SUBMISSION", False), \
              patch.object(config.CFG, "DAILY_RESEARCH_ORACLE_APPROVED", True):
             self.assertFalse(config.CFG.ALLOW_ORDER_SUBMISSION)
+
+
+#: Every spelling of one daily ticker that a caller could plausibly produce —
+#: a stray space from a CSV column, a tab from a copy/paste, a newline from a
+#: file read, a lowercase series from a hand-written tool. Before the fix,
+#: EVERY entry but the first two walked through both guards and reached
+#: create_order, because the classifier was a bare `.upper().startswith()`.
+DAILY_TICKER_VARIANTS = (
+    "KXBTCD-26SEP0306-T77599.99",
+    "kxbtcd-26sep0306-t77599.99",
+    " KXBTCD-26SEP0306-T77599.99",
+    "\tKXBTCD-26SEP0306-T77599.99",
+    "\nKXBTCD-26SEP0306-T77599.99",
+    "\rKXBTCD-26SEP0306-T77599.99",
+    "KXBTCD-26SEP0306-T77599.99 ",
+    "  kxbtcd-26sep0306-t77599.99  ",
+    "\r\n kxbtcd-26SEP0306-T77599.99 \t\n",
+    "\x0bKXBTCD-26SEP0306-T77599.99",
+    "\x0cKXBTCD-26SEP0306-T77599.99",
+    "\xa0KXBTCD-26SEP0306-T77599.99",      # NBSP: str.strip() removes it
+)
+
+#: Values that cannot be classified at all. A guard keyed on a prefix has
+#: nothing to say about them, so the money path must refuse them outright
+#: rather than hand them to the broker and hope.
+UNCLASSIFIABLE_TICKERS = (
+    None, "", " ", "   ", "\t", "\n", "\r\n \t",
+    b"KXBTCD-26SEP0306-T1",                 # bytes are not a Kalshi ticker
+    bytearray(b"KXBTC15M-X"), 123, 12.5, True, ["KXBTCD-X"],
+    {"ticker": "KXBTCD-X"}, object(),
+    "\u200bKXBTCD-26SEP0306-T1",            # zero width space: strip() keeps it
+    "\u2060KXBTCD-26SEP0306-T1",            # word joiner
+    "KX BTCD-26SEP0306-T1",                 # inner blank: NOT a daily ticker
+    "-KXBTCD-X",                            # cannot start with a separator
+    "KXBTCD/26SEP0306",                     # '/' is not a Kalshi ticker char
+)
+
+
+class TickerCanonicalisation(unittest.TestCase):
+    """A: one canonical form, shared by both guards.
+
+    The bypass this closes: `" KXBTCD-…"` — a single leading space — used to
+    classify as NOT daily, so both the engine quarantine and the money-path
+    guard passed it straight through to create_order.
+    """
+
+    def test_border_whitespace_and_case_are_normalised(self):
+        for t in DAILY_TICKER_VARIANTS:
+            self.assertEqual(canonical_ticker(t), "KXBTCD-26SEP0306-T77599.99",
+                             repr(t))
+
+    def test_inner_whitespace_is_never_removed(self):
+        """Stripping INSIDE a ticker would manufacture a valid ticker out of an
+        invalid string — the transformation an attacker would want, and one
+        the Kalshi ticker format does not authorise."""
+        self.assertEqual(canonical_ticker(" KX BTCD-X "), "KX BTCD-X")
+        self.assertNotEqual(canonical_ticker("KX BTCD-X"), "KXBTCD-X")
+        self.assertFalse(is_daily_ticker("KX BTCD-X"))
+        self.assertFalse(ticker_is_wellformed("KX BTCD-X"))
+
+    def test_every_variant_classifies_as_daily(self):
+        for t in DAILY_TICKER_VARIANTS:
+            self.assertTrue(is_daily_ticker(t), repr(t))
+
+    def test_every_variant_is_quarantined_when_unapproved(self):
+        with patch.object(config.CFG, "DAILY_RESEARCH_ORACLE_APPROVED", False):
+            for t in DAILY_TICKER_VARIANTS:
+                self.assertTrue(daily_quarantine_blocks(t), repr(t))
+
+    def test_non_daily_tickers_stay_unblocked_through_the_same_path(self):
+        with patch.object(config.CFG, "DAILY_RESEARCH_ORACLE_APPROVED", False):
+            for t in (" KXBTC15M-26SEP030900-00", "\tKXTEST-CANARY-T1",
+                      "kxnfl-game", "KXETHD-26SEP0306-T1", "KXBTC-26SEP03"):
+                self.assertFalse(daily_quarantine_blocks(t), repr(t))
+                self.assertTrue(ticker_is_wellformed(t), repr(t))
+
+    def test_unclassifiable_values_are_not_wellformed(self):
+        for t in UNCLASSIFIABLE_TICKERS:
+            self.assertFalse(ticker_is_wellformed(t), repr(t))
+
+    def test_bytes_are_still_classified_defensively_as_daily(self):
+        """Belt and braces: bytes are refused as malformed on the money path,
+        but the CLASSIFIER still reads them as daily, so the quarantine holds
+        even if a future caller learns to accept bytes."""
+        for t in (b"KXBTCD-26SEP0306-T1", bytearray(b" kxbtcd-x"),
+                  b"\tKXBTCD-X"):
+            self.assertTrue(is_daily_ticker(t), repr(t))
+            with patch.object(config.CFG, "DAILY_RESEARCH_ORACLE_APPROVED",
+                              False):
+                self.assertTrue(daily_quarantine_blocks(t), repr(t))
+            self.assertFalse(ticker_is_wellformed(t), repr(t))
+
+    def test_canonicalisation_never_raises(self):
+        for t in UNCLASSIFIABLE_TICKERS + DAILY_TICKER_VARIANTS:
+            canonical_ticker(t)
+            is_daily_ticker(t)
+            ticker_is_wellformed(t)
+            daily_quarantine_blocks(t)
+
+    def test_both_guards_share_the_single_classifier(self):
+        """Neither path may grow its own normalisation. Asserted on the source
+        of both call sites: each defers to daily_quarantine_blocks, whose one
+        canonical form is the subject of every test above."""
+        root = os.path.join(os.path.dirname(__file__), "..")
+        for mod, marker in (("execution_engine.py", "_execute_decision"),
+                            ("order_manager.py", "place_and_track")):
+            src = open(os.path.join(root, mod), encoding="utf-8").read()
+            self.assertIn("daily_quarantine_blocks(ticker)", src, mod)
+            self.assertIn("ticker_is_wellformed(ticker)", src, mod)
+            self.assertIn(marker, src, mod)
+            # No second, local spelling of the prefix test anywhere.
+            self.assertNotIn('.upper().startswith("KXBTCD")', src, mod)
+            self.assertNotIn('startswith("KXBTCD")', src, mod)
+
+
+class MalformedTickerFailsClosed(unittest.TestCase):
+    """A: a ticker that cannot be classified never becomes a broker write."""
+
+    _om = staticmethod(_order_manager)
+
+    def test_place_and_track_refuses_every_unclassifiable_value(self):
+        for t in UNCLASSIFIABLE_TICKERS:
+            om = self._om()
+            with patch.object(config.CFG, "ALLOW_ORDER_SUBMISSION", True), \
+                 patch.object(config.CFG, "DAILY_RESEARCH_ORACLE_APPROVED",
+                              True), \
+                 patch.object(config.CFG, "MAX_CONTRACTS_PER_ORDER", "1"), \
+                 patch("order_manager.PersistenceSentinel") as sentinel, \
+                 patch("order_manager.assert_real_demo_integrity"):
+                sentinel.healthy.return_value = True
+                res = om.place_and_track(t, "yes", 1, 40)
+            self.assertEqual(res.status, "blocked:ticker_malformed", repr(t))
+            self.assertEqual(res.state, "rejected", repr(t))
+            self.assertEqual(om.client.create_order.call_count, 0, repr(t))
+
+    def test_engine_refuses_unclassifiable_before_reading_a_book(self):
+        for t in UNCLASSIFIABLE_TICKERS:
+            report = {"rejections": {}}
+            with patch.object(config.CFG, "DAILY_RESEARCH_ORACLE_APPROVED",
+                              True):
+                eng = _engine()
+                placed = eng._execute_decision(
+                    _Dec(ticker=t, market_type="btc_15m_above_strike"), report)
+            self.assertEqual(placed, 0, repr(t))
+            self.assertEqual(report["rejections"].get("ticker_malformed"), 1,
+                             repr(t))
+            eng.fresh_book.assert_not_called()
+            eng.orders.place_and_track.assert_not_called()
+
+
+class DefenceInDepthMatrix(unittest.TestCase):
+    """B: the two gates are independent, and neither can override the other."""
+
+    def _om(self, dedup_ticker=None):
+        om = _order_manager()
+        if dedup_ticker is not None:
+            import time as _t
+            om.session_submitted = {dedup_ticker: _t.time()}
+        return om
+
+    def _call(self, ticker, *, allow, approved, dedup_ticker=None):
+        om = self._om(dedup_ticker)
+        with patch.object(config.CFG, "ALLOW_ORDER_SUBMISSION", allow), \
+             patch.object(config.CFG, "DAILY_RESEARCH_ORACLE_APPROVED",
+                          approved), \
+             patch.object(config.CFG, "MAX_CONTRACTS_PER_ORDER", "1"), \
+             patch.object(config.CFG, "SUBMIT_DEDUP_TTL_S", 3600.0), \
+             patch("order_manager.PersistenceSentinel") as sentinel, \
+             patch("order_manager.assert_real_demo_integrity"):
+            sentinel.healthy.return_value = True
+            res = om.place_and_track(ticker, "yes", 1, 40)
+        self.assertEqual(om.client.create_order.call_count, 0, repr(ticker))
+        return res
+
+    def test_every_variant_is_blocked_with_submission_enabled(self):
+        """The exact adversarial case: the global hold is OPEN, so only the
+        daily guard stands between these tickers and the broker."""
+        for t in DAILY_TICKER_VARIANTS:
+            res = self._call(t, allow=True, approved=False)
+            self.assertEqual(res.status, "blocked:daily_oracle_unapproved",
+                             repr(t))
+
+    def test_global_false_daily_false_blocks_globally(self):
+        res = self._call("KXBTCD-26SEP0306-T1", allow=False, approved=False)
+        self.assertEqual(res.status, "blocked:submission_disabled")
+
+    def test_global_false_daily_true_blocks_globally(self):
+        res = self._call("KXBTCD-26SEP0306-T1", allow=False, approved=True)
+        self.assertEqual(res.status, "blocked:submission_disabled")
+
+    def test_global_true_daily_false_blocks_on_the_daily_guard(self):
+        res = self._call("KXBTCD-26SEP0306-T1", allow=True, approved=False)
+        self.assertEqual(res.status, "blocked:daily_oracle_unapproved")
+
+    def test_global_true_daily_true_reaches_only_the_normal_gates(self):
+        """Both policy gates open: the call must proceed PAST them and stop at
+        an ordinary operational gate. Proven with the session dedup lock,
+        which is unreachable unless both policy guards passed."""
+        res = self._call("KXBTCD-26SEP0306-T1", allow=True, approved=True,
+                         dedup_ticker="KXBTCD-26SEP0306-T1")
+        self.assertEqual(res.status, "blocked:duplicate_submission_guard")
+
+    def test_fifteen_minute_path_is_unchanged_by_the_daily_state(self):
+        for approved in (True, False):
+            res = self._call("KXBTC15M-26SEP030900-00", allow=True,
+                             approved=approved,
+                             dedup_ticker="KXBTC15M-26SEP030900-00")
+            self.assertEqual(res.status, "blocked:duplicate_submission_guard",
+                             f"approved={approved}")
+
+
+# Environment variables that decide whether an order may leave this process.
+# The subprocess test below scrubs them so it observes the SHIPPED defaults
+# rather than whatever this suite's conftest set for its own convenience.
+_GATE_VARS = ("ALLOW_ORDER_SUBMISSION", "DAILY_RESEARCH_ORACLE_APPROVED")
+
+_PROBE = (
+    "import json, config;"
+    "print(json.dumps({"
+    "'allow': bool(config.CFG.ALLOW_ORDER_SUBMISSION),"
+    "'daily': bool(config.CFG.DAILY_RESEARCH_ORACLE_APPROVED),"
+    "'resolver': bool(config.daily_oracle_approved()),"
+    "'warned': sorted({n for n, _ in config.GATE_PARSE_WARNINGS}),"
+    "}))"
+)
+
+
+class CleanEnvironmentDefaults(unittest.TestCase):
+    """C: what the SHIPPED code does in a clean environment, observed.
+
+    Every other test in this file runs inside a process whose conftest sets
+    both gates to "true" so that ~130 unrelated order-plumbing tests keep
+    working. That conftest is exactly the thing that could hide a regression
+    in the defaults, so these assertions are made in a SEPARATE interpreter
+    with the variables removed — behaviour, not a source string.
+    """
+
+    def _probe(self, **overrides):
+        env = {k: v for k, v in os.environ.items() if k not in _GATE_VARS}
+        for k, v in overrides.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        out = subprocess.run([sys.executable, "-c", _PROBE], env=env, cwd=root,
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_the_probe_sees_a_scrubbed_environment(self):
+        """Guards the guard: if the scrub silently stopped working, every
+        assertion below would pass for the wrong reason."""
+        self.assertTrue(all(v in os.environ for v in _GATE_VARS),
+                        "conftest is expected to set both gates in-process")
+        got = self._probe()
+        self.assertIn("allow", got)
+
+    def test_absent_variables_ship_closed(self):
+        got = self._probe()
+        self.assertFalse(got["allow"], "ALLOW_ORDER_SUBMISSION must ship FALSE")
+        self.assertFalse(got["daily"], "daily approval must ship FALSE")
+        self.assertFalse(got["resolver"], "the resolver must agree")
+        self.assertEqual(got["warned"], [], "an absent gate is not a warning")
+
+    def test_blank_and_whitespace_are_false(self):
+        for v in ("", " ", "   ", "\t", "\n", "\t \n"):
+            got = self._probe(ALLOW_ORDER_SUBMISSION=v,
+                              DAILY_RESEARCH_ORACLE_APPROVED=v)
+            self.assertFalse(got["allow"], repr(v))
+            self.assertFalse(got["daily"], repr(v))
+            self.assertFalse(got["resolver"], repr(v))
+
+    def test_malformed_values_are_false_and_reported(self):
+        for v in ("maybe", "fasle", "TRUE!", "enabled", "2", "-1", "null",
+                  "none", "T", "F", "oui"):
+            got = self._probe(ALLOW_ORDER_SUBMISSION=v,
+                              DAILY_RESEARCH_ORACLE_APPROVED=v)
+            self.assertFalse(got["allow"], repr(v))
+            self.assertFalse(got["daily"], repr(v))
+            self.assertFalse(got["resolver"], repr(v))
+            self.assertEqual(got["warned"], sorted(_GATE_VARS),
+                             f"{v!r} must be reported loudly at start-up")
+
+    def test_explicit_false_words_are_false(self):
+        for v in GATE_FALSE_WORDS + ("FALSE", "Off", " no "):
+            got = self._probe(ALLOW_ORDER_SUBMISSION=v,
+                              DAILY_RESEARCH_ORACLE_APPROVED=v)
+            self.assertFalse(got["allow"], repr(v))
+            self.assertFalse(got["daily"], repr(v))
+
+    def test_only_the_true_vocabulary_opens_a_gate(self):
+        for v in GATE_TRUE_WORDS + ("TRUE", "Yes", " on "):
+            got = self._probe(ALLOW_ORDER_SUBMISSION=v,
+                              DAILY_RESEARCH_ORACLE_APPROVED=v)
+            self.assertTrue(got["allow"], repr(v))
+            self.assertTrue(got["daily"], repr(v))
+            self.assertTrue(got["resolver"], repr(v))
+            self.assertEqual(got["warned"], [], repr(v))
+
+    def test_the_two_gates_are_read_independently(self):
+        got = self._probe(ALLOW_ORDER_SUBMISSION="true",
+                          DAILY_RESEARCH_ORACLE_APPROVED=None)
+        self.assertTrue(got["allow"])
+        self.assertFalse(got["daily"], "daily must not follow the global gate")
+        got = self._probe(ALLOW_ORDER_SUBMISSION=None,
+                          DAILY_RESEARCH_ORACLE_APPROVED="true")
+        self.assertFalse(got["allow"], "global must not follow the daily gate")
+        self.assertTrue(got["daily"])
+
+
+class ImportOrderIsIrrelevant(unittest.TestCase):
+    """D: CFG safety state must not depend on which module imported first."""
+
+    def test_config_state_is_identical_whatever_is_imported_first(self):
+        env = {k: v for k, v in os.environ.items() if k not in _GATE_VARS}
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        first = None
+        for lead in ("", "import execution_engine;", "import order_manager;",
+                     "import strategy_router;", "import market_scanner;"):
+            out = subprocess.run([sys.executable, "-c", lead + _PROBE],
+                                 env=env, cwd=root, capture_output=True,
+                                 text=True, timeout=120)
+            self.assertEqual(out.returncode, 0, f"{lead}: {out.stderr}")
+            got = json.loads(out.stdout.strip().splitlines()[-1])
+            self.assertFalse(got["allow"], lead)
+            self.assertFalse(got["daily"], lead)
+            if first is None:
+                first = got
+            self.assertEqual(got, first, lead)
 
 
 if __name__ == "__main__":

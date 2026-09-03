@@ -9,7 +9,8 @@ from typing import Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
 from config import (CFG, GATE_PARSE_WARNINGS, _env_b, _p, contract_cap_config,
-                    daily_oracle_approved, daily_quarantine_blocks)
+                    daily_oracle_approved, daily_quarantine_blocks,
+                    ticker_is_wellformed)
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
 from market_validator import MarketValidator
@@ -784,6 +785,19 @@ class ExecutionEngine:
         # MAX_TRADES_CYCLE, donc un candidat quotidien refuse ne peut pas
         # affamer un candidat 15m du meme cycle.
         mtype = getattr(dec, "market_type", None)
+        # Un ticker non classable (None, blancs, objet non textuel,
+        # caractere invisible) ne peut PAS etre soumis a la quarantaine de
+        # maniere fiable : on refuse ici, avant toute lecture de carnet, au
+        # lieu de laisser la seule garde du gestionnaire d'ordres decider.
+        if not ticker_is_wellformed(ticker):
+            report["rejections"]["ticker_malformed"] = \
+                report["rejections"].get("ticker_malformed", 0) + 1
+            log_trd.info(
+                f"[TICKER_MALFORMED] {ticker!r}: forme non reconnue -- non "
+                f"classable, aucun carnet, aucun ordre.",
+                extra={"ticker": str(ticker), "strategy": dec.strategy,
+                       "market_type": mtype})
+            return 0
         if daily_quarantine_blocks(ticker) or mtype == DAILY_MARKET_TYPE:
             if not daily_oracle_approved():
                 report["rejections"]["daily_oracle_unapproved"] = \
