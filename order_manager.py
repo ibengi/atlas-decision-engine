@@ -5,7 +5,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from config import CFG, _p, contract_cap_config
+from config import CFG, _p, contract_cap_config, daily_quarantine_blocks
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
@@ -658,6 +658,19 @@ class OrderManager:
                           "ALLOW_ORDER_SUBMISSION=false")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:submission_disabled", "rejected")
+        # INVARIANT DUR : le BTC quotidien (KXBTCD) n'atteint pas le broker
+        # tant que l'oracle de reglement independant n'est pas approuve. Garde
+        # SECONDE et independante de celle du moteur : elle est indexee sur le
+        # TICKER, donc elle tient meme pour un appel direct a place_and_track,
+        # un outil, ou une Decision fabriquee sans market_type.
+        if daily_quarantine_blocks(ticker):
+            log_api.error(
+                f"[ORDER_SUBMIT_ATTEMPT] bloque: {ticker} est un marche BTC "
+                f"quotidien et l'oracle de reglement n'est pas approuve "
+                f"-- create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:daily_oracle_unapproved",
+                                   "rejected")
         now = time.time()
         if now < self.exchange_pause_until:
             log_api.warning("[ORDER_SUBMIT_SKIPPED] exchange en cooldown "
