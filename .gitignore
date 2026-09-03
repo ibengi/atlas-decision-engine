@@ -30,3 +30,20 @@ backups/
 positions_state.json*
 seen_fill_ids.json*
 reconciliation_report.json*
+
+# Etat d'execution ecrit par le moteur ET regenere par la suite de tests
+# (memes familles que orders_state.json / cycle_report.json ci-dessus, qui
+# manquaient a la liste). Jamais versionne : c'est de l'etat runtime, il
+# decrit une autre execution que celle du commit qui le contiendrait.
+pending_intents.json*
+risk_state.json*
+submission_guard.json*
+positions_state.json*
+seen_fill_ids.json*
+state_epoch.json*
+reconciliation_report.json*
+capital_curve.json*
+dashboard_state.json*
+pipeline_stats.json*
+reject_reasons.json*
+intent_alerts.json*
