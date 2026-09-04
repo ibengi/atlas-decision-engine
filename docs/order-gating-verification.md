@@ -97,6 +97,77 @@ was claimed and this note shows what was true. The shuffled and adversarial
 orders listed above are the first genuine ones, and they were run against the
 current head, not against `151860a`.
 
+## Build-gate compatibility (the independent review's blocker)
+
+An independent review found that the branch could not produce a Docker image:
+`run_tests.py` uses `unittest.TestLoader().discover("tests")` and never loads a
+`conftest.py`, so the gate defaults the suite needs lived in a file only pytest
+reads. Measured, gate variables absent: `python run_tests.py` exited 1 with 88
+failures and 47 errors, while `pytest` was green — the same suite red under the
+runner that stops the build and green under the one that does not.
+
+The fix adds **no production change**. `tests/_gates.py` holds the two
+`os.environ.setdefault` calls plus the dummy-credential bootstrap, and both
+entry points import it: `tests/conftest.py` for pytest, and `run_tests.py`
+immediately before discovery (order matters — `config` freezes its class
+attributes at import). `setdefault`, never assignment, so a run that
+deliberately sets a gate to `false` stays closed.
+
+| Runner, gate variables absent | Result |
+| --- | --- |
+| `python run_tests.py` | exit 0, ran 794, failures 0, errors 0 (twice) |
+| `pytest tests` | 799 passed + 142 subtests (twice) |
+| 3 shuffled module orders, 1 adversarial order | 799 passed each |
+
+Four tests pin this so it cannot regress silently: importing `run_tests` in a
+scrubbed subprocess must set both variables; setting them explicitly must not
+be overridden; the import must appear before `loader.discover`; and the
+plumbing may not import `config` or write `CFG`. Mutations M13–M16 (import
+removed, import moved after discovery, either `setdefault` turned into an
+assignment) are all killed.
+
+## Restart harness
+
+The same review found `tools/restart_harness.py` degraded from 16/16 to 15/16:
+with the global gate closed by default, its seed order was refused and the
+duplicate-submission invariant — the defence against the 2026-07-25 eight-fill
+incident — never executed.
+
+The harness now opts in **explicitly and narrowly**: `bot.CFG.ALLOW_ORDER_SUBMISSION
+= True` on that one process's config object. No environment variable is written,
+so nothing escapes to a subprocess; the broker is a `MagicMock`; the ticker is
+the synthetic `KXTEST-CANARY-T1`; and `DAILY_RESEARCH_ORACLE_APPROVED` is left
+alone, so the KXBTCD quarantine stays fully in force inside the harness.
+
+A new `[PRE]` check asserts the seed order actually reached the broker
+(`create_order` called once, the dedup guard armed). Without it the harness could
+go **vacuous** rather than red — comparing an empty guard to an empty guard and
+passing for the wrong reason. Verified by removing the opt-in: 15/17 with both
+the `[PRE]` check and `restart cannot duplicate a submitted order` failing.
+With the opt-in: **17/17**, the resubmit blocked by
+`blocked:duplicate_submission_guard` with `create_order_calls=0`.
+
+## Follow-up findings — deliberately NOT fixed here
+
+Raised by the independent review, out of this patch's authorized scope:
+
+* **MEDIUM** — `kalshi_demo_execution_check.py` calls `client.create_order`
+  directly, bypassing `OrderManager` and therefore both new guards *and* the
+  pre-existing global gate; its `CANDIDATE_SERIES` searches `KXBTCD` first.
+  Pre-existing, DEMO-only, gated behind `ENABLE_DEMO_INTEGRATION_TEST=true`,
+  cannot touch LIVE.
+* **MEDIUM** — `_env_b` still reads `ALLOW_FRESH_STATE` and
+  `ALLOW_FALLBACK_CAPITAL` as TRUE on `""`, `"off"`, a typo, or `"disabled"`.
+  The B1 defect class on two safety-relevant flags; `ALLOW_FRESH_STATE` in
+  particular suppresses the persistence-continuity sentinel.
+* **LOW** — `ticker_is_wellformed` matches the ASCII grammar against the
+  case-folded form, so ten non-ASCII code points (`ß ı ſ ﬀ ﬁ ﬂ ﬃ ﬄ ﬅ ﬆ`) launder
+  into it. No daily-quarantine bypass was demonstrated.
+* **LOW** — NBSP-wrapped gate values read TRUE, because `str.strip()` removes
+  U+00A0. Permissive direction only for a deliberate `true`.
+* **LOW** — `shadow_predictions.json` is written by `JsonStore` but is not in
+  the runtime-state ignore list.
+
 ## Residual risks
 
 * **Prefix matching is a naming bet.** `KXBTCD` covers today's series. A future

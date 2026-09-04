@@ -17,6 +17,7 @@ B2  The daily strategy reached ORDER_SUBMIT_ATTEMPT while its settlement label
     ticker so it holds for callers that never set a market_type at all.
 """
 
+import ast
 import json
 import os
 import subprocess
@@ -576,9 +577,15 @@ class DefenceInDepthMatrix(unittest.TestCase):
 
 
 # Environment variables that decide whether an order may leave this process.
-# The subprocess test below scrubs them so it observes the SHIPPED defaults
-# rather than whatever this suite's conftest set for its own convenience.
-_GATE_VARS = ("ALLOW_ORDER_SUBMISSION", "DAILY_RESEARCH_ORACLE_APPROVED")
+# Imported from the module that SETS them for the suite, so the scrub below
+# can never drift from the thing it is scrubbing: the subprocess tests observe
+# the SHIPPED defaults rather than whatever the test runners set for their own
+# convenience. Two spellings because `tests/` is on sys.path as a package under
+# pytest and as the top level under `unittest discover("tests")`.
+try:
+    from tests._gates import GATE_VARS as _GATE_VARS
+except ImportError:            # pragma: no cover - depends on the runner
+    from _gates import GATE_VARS as _GATE_VARS
 
 _PROBE = (
     "import json, config;"
@@ -694,6 +701,95 @@ class ImportOrderIsIrrelevant(unittest.TestCase):
             if first is None:
                 first = got
             self.assertEqual(got, first, lead)
+
+
+class BothRunnersShareTestGates(unittest.TestCase):
+    """A: pytest and unittest discovery must see the same test assumptions.
+
+    `tests/conftest.py` is a PYTEST mechanism. The repository's build gate is
+    `run_tests.py` (unittest discovery -> test_report.json -> the Dockerfile's
+    test stage -> model_gatekeeper). Gate defaults that lived only in conftest
+    made the suite green under pytest and red under the runner that actually
+    stops the build, so no image could be produced. These tests pin the fix.
+    """
+
+    def _import_run_tests(self, scrub=True):
+        """Import run_tests in a child and report what it did to the env.
+
+        Importing is enough: `main()` is behind `if __name__ == "__main__"`,
+        so nothing is discovered or executed — only the module-level import
+        of the shared gate defaults runs.
+        """
+        env = dict(os.environ)
+        if scrub:
+            for v in _GATE_VARS:
+                env.pop(v, None)
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        probe = (
+            "import json, os, run_tests;"
+            "print(json.dumps({v: os.environ.get(v) for v in "
+            f"{list(_GATE_VARS)!r}}}))"
+        )
+        out = subprocess.run([sys.executable, "-c", probe], env=env, cwd=root,
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_importing_run_tests_applies_the_shared_gate_defaults(self):
+        got = self._import_run_tests()
+        for v in _GATE_VARS:
+            self.assertEqual(got[v], "true",
+                             f"{v} must be set for the unittest runner too")
+
+    def test_run_tests_does_not_override_an_explicit_setting(self):
+        """setdefault, not assignment: a deliberately CLOSED run stays closed."""
+        env = dict(os.environ)
+        env["ALLOW_ORDER_SUBMISSION"] = "false"
+        env["DAILY_RESEARCH_ORACLE_APPROVED"] = "false"
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        probe = ("import json, os, run_tests;"
+                 "print(json.dumps({v: os.environ.get(v) for v in "
+                 f"{list(_GATE_VARS)!r}}}))")
+        out = subprocess.run([sys.executable, "-c", probe], env=env, cwd=root,
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        for v in _GATE_VARS:
+            self.assertEqual(got[v], "false", f"{v} must not be overridden")
+
+    def test_the_gate_defaults_are_loaded_before_discovery(self):
+        """Order matters: `config` freezes its class attributes at import, so
+        the defaults must be in place before any test module is discovered."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = open(os.path.join(root, "run_tests.py"), encoding="utf-8").read()
+        self.assertIn("_gates", src, "run_tests.py must load the shared gates")
+        self.assertLess(src.index("_gates"), src.index("loader.discover"),
+                        "gate defaults must be imported BEFORE discovery")
+
+    def test_production_defaults_are_untouched_by_the_test_plumbing(self):
+        """The plumbing may only add ENV defaults — never edit the shipped
+        parser or its default. Asserted behaviourally in the scrubbed
+        subprocess above; asserted here as source, so a future edit that
+        reopens the production default is caught in two independent ways."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        raw = open(os.path.join(root, "tests", "_gates.py"),
+                   encoding="utf-8").read()
+        # Assert on the EXECUTABLE source only: the docstring and comments
+        # discuss CFG and config by name, and a prose mention is not a call.
+        tree = ast.parse(raw)
+        doc = ast.get_docstring(tree) or ""
+        body = raw.replace(doc, "", 1) if doc else raw
+        code = "\n".join(ln for ln in body.splitlines()
+                          if not ln.lstrip().startswith("#"))
+        self.assertNotIn("import config", code,
+                         "the test plumbing must not import production config")
+        self.assertNotIn("CFG.", code,
+                         "the test plumbing must not write production CFG")
+        for v in _GATE_VARS:
+            self.assertIn(f'os.environ.setdefault("{v}"', code,
+                          f"{v} must be a setdefault, never an assignment")
+        self.assertNotIn("os.environ[", code,
+                         "no unconditional env assignment in the test plumbing")
 
 
 if __name__ == "__main__":
