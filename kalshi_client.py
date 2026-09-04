@@ -20,7 +20,24 @@ class KalshiAPIError(Exception):
         self.status, self.body = status, body[:500]
         super().__init__(f"HTTP {status}: {message}")
 
+class BrokerWriteForbidden(KalshiAPIError):
+    """Une ecriture broker a ete refusee par POLITIQUE, pas par le reseau.
+
+    Sous-classe de KalshiAPIError pour que tout appelant qui gere deja les
+    erreurs API continue de fonctionner, mais distincte pour qu'un test — et
+    un operateur lisant un journal — puisse separer "le broker a refuse" de
+    "nous avons refuse d'appeler le broker".
+    """
+
+
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+#: Verbes HTTP qui MUTENT l'etat cote broker. Tout ce qui n'est pas une
+#: lecture. La liste est volontairement exhaustive plutot que limitee aux
+#: verbes actuellement utilises (POST, DELETE) : une methode future qui
+#: emploierait PUT ou PATCH doit etre couverte le jour ou elle est ecrite,
+#: pas le jour ou quelqu'un pense a mettre a jour cette liste.
+MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 def pick(d: dict, *names, default=None):
     """Extraction tolerante : retourne la premiere cle presente et non nulle."""
@@ -129,8 +146,48 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
         }
 
+    # -- Autorisation d'ecriture broker ---------------------------------------
+    def _assert_broker_write_allowed(self, operation: str) -> None:
+        """INVARIANT DE SECURITE — point de controle UNIQUE des ecritures.
+
+            "Une ecriture broker en PRODUCTION exige une autorisation
+             explicite au niveau du client. L'observation LIVE en lecture
+             seule n'en exige aucune."
+
+        Toute methode qui MUTE l'etat cote broker passe par ici, et le
+        transport (`_req`) le re-verifie pour tout verbe mutant : une methode
+        d'ecriture future est donc couverte le jour ou elle est ecrite, meme
+        si son auteur oublie d'appeler ce garde.
+
+        L'autorisation est DELIBEREMENT distincte de ALLOW_ORDER_SUBMISSION,
+        LIVE_TRADING, LIVE_TRADING_CONFIRMED et MODEL_APPROVED. Chacune de
+        celles-la peut etre ouverte pour une raison legitime sans que
+        quiconque ait decide qu'une ecriture reelle sur le compte de
+        production est autorisee. Aucune d'elles ne peut donc armer une
+        ecriture LIVE a la place de celle-ci.
+
+        DEMO est inchange : ce garde ne concerne que l'environnement de
+        production.
+        """
+        if self.env == "demo":
+            return
+        if not CFG.LIVE_BROKER_WRITES_AUTHORIZED:
+            raise BrokerWriteForbidden(
+                0, f"{operation} REFUSE au niveau client: environnement "
+                   f"{self.env!r} (production) et "
+                   f"LIVE_BROKER_WRITES_AUTHORIZED n'est pas explicitement "
+                   f"vrai. Le LIVE est en LECTURE SEULE par construction. "
+                   f"Aucune requete reseau mutante n'a ete emise.")
+
     # -- Requete avec retry/backoff ------------------------------------------
     def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
+        # BUTOIR DE TRANSPORT. Place AVANT tout le reste (y compris la
+        # verification de cle) pour qu'une ecriture LIVE non autorisee soit
+        # refusee quelle que soit la raison pour laquelle elle serait sinon
+        # partie. C'est le point le plus bas que toute mutation doit
+        # traverser : aucun appelant, present ou futur, ne peut l'eviter.
+        if method.upper() in MUTATING_HTTP_METHODS:
+            self._assert_broker_write_allowed(f"{method.upper()} {path}")
         if self._pk is None and path.startswith("/portfolio"):
             raise KalshiAPIError(
                 0, f"{method} {path}: requete authentifiee IMPOSSIBLE — cle "
@@ -272,6 +329,9 @@ class KalshiClient:
         `cancel_order` n'est deliberement PAS garde de la meme facon : annuler
         REDUIT l'exposition. Un coupe-circuit qui empecherait d'annuler
         piegerait un ordre ouvert au lieu de proteger le compte."""
+        # Refus INDEPENDANT par methode, en plus du butoir de transport : si
+        # `_req` changeait un jour, cette methode refuserait encore.
+        self._assert_broker_write_allowed("create_order")
         if not CFG.ALLOW_ORDER_SUBMISSION:
             raise KalshiAPIError(
                 0, "create_order refuse au niveau client: "
@@ -350,6 +410,12 @@ class KalshiClient:
         La reponse V2 contient normalement order_id, client_order_id et
         reduced_by. Une erreur HTTP n'est jamais transformee en faux succes.
         """
+        # Une ANNULATION mute aussi l'etat cote broker. Elle reduit
+        # l'exposition, donc le coupe-circuit ne la bloque pas -- mais sur un
+        # compte de PRODUCTION non autorise en ecriture, elle reste une
+        # mutation d'un compte reel et doit etre refusee comme les autres.
+        # "Lecture seule" ne signifie pas "sauf quand cela nous arrange".
+        self._assert_broker_write_allowed("cancel_order")
         r = self._req("DELETE", f"{self.ORDERS_V2_PATH}/{order_id}")
         raw = r.get("order", r) or {}
         returned_id = str(raw.get("order_id") or order_id)

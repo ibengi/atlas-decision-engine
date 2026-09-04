@@ -269,6 +269,19 @@ class Config:
     # explicitement. Aucun changement pour le service deploye, ou la variable
     # vaut deja la chaine "false".
     ALLOW_ORDER_SUBMISSION = _env_gate("ALLOW_ORDER_SUBMISSION", default=False)
+    # PORTE DE SECURITE (E-2) — AUTORISATION D'ECRITURE BROKER EN PRODUCTION.
+    # DELIBEREMENT DISTINCTE de ALLOW_ORDER_SUBMISSION, LIVE_TRADING,
+    # LIVE_TRADING_CONFIRMED et MODEL_APPROVED : chacune de celles-la peut
+    # etre ouverte pour une raison legitime (canary, debug, promotion du
+    # modele) sans que quiconque ait decide qu'une ECRITURE reelle chez le
+    # broker de PRODUCTION est autorisee. Tant qu'elle est fausse, le
+    # LIVE est observable mais pas mutable -- lecture seule PAR
+    # CONSTRUCTION, pas par configuration.
+    #
+    # Stricte et fail-closed : absente, vide, blanche ou illisible => FALSE.
+    # Aucune valeur que le parseur ne comprend pas n'arme une ecriture reelle.
+    LIVE_BROKER_WRITES_AUTHORIZED = _env_gate("LIVE_BROKER_WRITES_AUTHORIZED",
+                                              default=False)
     # PORTE DE SECURITE : le BTC quotidien (KXBTCD) ne peut pas atteindre le
     # chemin argent tant que l'oracle de reglement independant n'est pas
     # approuve. Representation TEMPORAIRE : l'approbation definitive sera

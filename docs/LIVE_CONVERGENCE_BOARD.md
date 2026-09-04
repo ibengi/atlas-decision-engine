@@ -159,6 +159,49 @@ builder look applicable could have produced an image with no test stage.
 
 ---
 
+## RC-2 — Workstream E-2 (hard LIVE read-only enforcement)
+
+| ID | Sev | Discovered by | Affected SHA | Owner | Status |
+|---|---|---|---|---|---|
+| [E-2](#e-2) | HIGH | this program (go/no-go + RC-1 audit) | `9b906e8` / `e2d9d41` | Opus 5 | REVIEW |
+
+### E-2
+**Nothing refused a broker write *because the environment was production*.**
+Every control was a policy flag some legitimate operation might open for its own
+reasons, so LIVE read-only would have rested on a single boolean rather than on
+structure.
+
+- **Inventory** — `BROKER_WRITE_PATHS_TOTAL=2` client methods
+  (`create_order` → `POST /portfolio/events/orders`, `cancel_order` →
+  `DELETE /portfolio/events/orders/{id}`) across 5 call sites. No
+  `replace_order`, `amend_order`, batch or close-position helper exists; no read
+  uses a mutating verb; `alert_notifier.py`'s `requests.post` targets a
+  configured webhook, not Kalshi. `UNPROTECTED_PATHS=0`.
+- **Patch** — `LIVE_BROKER_WRITES_AUTHORIZED`, strict and fail-closed,
+  deliberately independent of `ALLOW_ORDER_SUBMISSION`, `LIVE_TRADING`,
+  `LIVE_TRADING_CONFIRMED` and `MODEL_APPROVED`. Enforced in TWO independent
+  layers: per method, and at the transport for every verb in
+  `MUTATING_HTTP_METHODS` (broader than the two verbs in use today, so a future
+  write method is covered the day it is written).
+- **Cancellation is a write.** The kill switch deliberately permits it — it
+  reduces exposure — but on an unauthorized production account it still mutates
+  a real account and is refused.
+- **Test evidence** — `tests/test_live_write_authorization.py`, 21 tests
+  including the critical case: every higher-level flag permissive
+  (`ALLOW_ORDER_SUBMISSION=true`, `LIVE_TRADING=1`, `LIVE_TRADING_CONFIRMED=YES`,
+  `KALSHI_ENV_CONFIRM=LIVE`, `MODEL_APPROVED_FOR_LIVE=YES`, `NO_LIVE_PROMOTION=0`)
+  and the write still refused, with `POST/PUT/PATCH/DELETE` counts all 0.
+  Anti-vacuity control: with authorization true, the write reaches the transport.
+- **Mutations** — M1–M5 all killed.
+  **M3 and M4 SURVIVED the first pass**: deleting either per-method guard left
+  every test green, because the transport backstop caught the write anyway. Two
+  layers existed but only one was pinned. Three tests were added that neutralise
+  one layer and assert the other still refuses, in both directions. Recorded
+  because a surviving mutation is the most useful result the matrix produces.
+- **Deployment evidence** — none. RC-2 is not merged and not deployed.
+
+---
+
 ## Open, not addressed in RC-1
 
 | ID | Sev | Summary | Status |
@@ -167,7 +210,7 @@ builder look applicable could have produced an image with no test stage.
 | F-4 | LOW | `tools/restart_harness.py` runs in no CI step and neither Docker stage | DISCOVERED |
 | H-1 | MEDIUM | `model_validation.json` is stale — generated 2026-09-01 at `acb9c01`; shadow settlements read 108 there vs **383** at runtime, and OOS Brier reads "non mesure" though the tooling and a negative result now exist. Verdict `approved:false` stays correct and conservative, but the artifact the LIVE gate reads is not a current picture | DISCOVERED |
 | E-1 | BLOCKER | No PROD credentials exist; none may be created by the agent | BLOCKED — operator |
-| E-2 | HIGH | No **env-keyed** read-only enforcement. The RC-1 backstop gates `create_order` on policy flags, but nothing refuses writes *because the environment is production*. Required before any LIVE credential is installed | DISCOVERED |
+| E-2 | HIGH | *(moved to RC-2 above)* | REVIEW |
 
 ---
 
@@ -176,7 +219,7 @@ builder look applicable could have produced an image with no test stage.
 | Level | State | Gate |
 |---|---|---|
 | 1 · Platform live-ready | **YES** (RC-1 pending review) | — |
-| 2 · LIVE read-only ready | **NO** | E-1, E-2 |
+| 2 · LIVE read-only ready | **NO** | E-1 (no PROD credentials — operator). E-2 patched in RC-2, pending independent review; a merged E-2 is a PRECONDITION for Level 2, not an achievement of it |
 | 3 · LIVE shadow ready | **NO** | Level 2; also the gatekeeper refuses prod start while `approved:false`, so LIVE shadow is unreachable without approving the model |
 | 4 · LIVE canary tech ready | **NO** | Levels 2–3, B-1 runtime verification |
 | 5 · Capital live | **NO** | all scientific gates + explicit operator authorization |
