@@ -1,6 +1,8 @@
 """Centralized environment-backed configuration for the trading engine."""
 
+import logging
 import os
+import re
 
 def _env_f(name, default): 
     try: return float(os.getenv(name, str(default)))
@@ -10,6 +12,130 @@ def _env_i(name, default):
     except ValueError: return default
 def _env_b(name, *, default):
     return os.getenv(name, "1" if default else "0").strip().lower() not in ("0","false","no","non")
+
+# ── Portes de securite : lecture STRICTE, fail-closed ────────────────────────
+#: `_env_b` ci-dessus lit tout ce qu'il ne reconnait pas comme VRAI : une
+#: variable vide, un "off", une faute de frappe ("fasle") ouvrent la porte.
+#: Acceptable pour une preference; inacceptable pour une porte qui autorise
+#: l'envoi d'ordres. `_env_gate` n'active JAMAIS sur une valeur qu'il ne
+#: comprend pas : une porte illisible est une porte fermee, parce que
+#: l'alternative est un ordre que l'operateur n'a jamais autorise.
+GATE_TRUE_WORDS  = ("true", "1", "yes", "y", "on")
+GATE_FALSE_WORDS = ("false", "0", "no", "n", "off", "non")
+
+#: Valeurs refusees a la lecture, conservees pour que le demarrage puisse les
+#: reafficher : une porte fermee par malentendu doit etre VISIBLE, pas
+#: silencieuse. (nom, valeur brute) — jamais de secret ici : ces variables
+#: sont des booleens de politique.
+GATE_PARSE_WARNINGS: list = []
+
+
+def _env_gate(name, *, default=False):
+    """Booleen STRICT et fail-closed pour les portes de securite.
+
+    Absente -> `default` (False pour toute porte d'ordre). Vide, blanche ou
+    non reconnue -> False, avec un avertissement bruyant. Aucune valeur
+    inconnue n'active quoi que ce soit.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    v = raw.strip().lower()
+    if v in GATE_TRUE_WORDS:
+        return True
+    if v in GATE_FALSE_WORDS:
+        return False
+    GATE_PARSE_WARNINGS.append((name, raw))
+    logging.getLogger("CONFIG").error(
+        f"[CONFIG_GATE_INVALID] {name}={raw!r} n'est ni vrai ni faux "
+        f"(attendu: {'/'.join(GATE_TRUE_WORDS)} ou "
+        f"{'/'.join(GATE_FALSE_WORDS)}) -- lu comme FALSE (fail-closed).")
+    return False
+
+
+def daily_oracle_approved() -> bool:
+    """Source UNIQUE de l'eligibilite d'execution du quotidien (KXBTCD).
+
+    Aujourd'hui : un drapeau strict, faux par defaut. Demain : un artefact de
+    validation DERIVE (provenance du flux BRTI, regles de contrat capturees,
+    reproductibilite du calcul, monotonicite des echelles, echantillon OOS
+    propre) — jamais un booleen pose a la main. Les deux gardes appellent
+    cette fonction pour qu'elles ne puissent pas diverger.
+    """
+    return bool(CFG.DAILY_RESEARCH_ORACLE_APPROVED)
+
+
+#: Prefixe de serie des marches BTC quotidiens de Kalshi.
+DAILY_TICKER_PREFIX = "KXBTCD"
+
+#: Grammaire d'un ticker Kalshi sous forme canonique. Kalshi n'emet que des
+#: majuscules, des chiffres, des tirets et des points ('KXBTCD-26SEP0306-
+#: T77599.99'). Tout ce qui en sort n'est pas un ticker : c'est un bug
+#: d'appelant ou une tentative de contournement, et le chemin monetaire le
+#: refuse au lieu de le transmettre au broker.
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9._-]*$")
+
+
+def canonical_ticker(ticker) -> str:
+    """Forme canonique d'un ticker, pour la CLASSIFICATION uniquement.
+
+    Ne retire QUE les blancs de bordure et n'harmonise que la casse. Un
+    blanc INTERIEUR n'existe pas dans le format Kalshi : le supprimer
+    transformerait une chaine invalide en ticker valide, ce qui est
+    exactement ce qu'un contournement chercherait. Donc ' kxbtcd-x ',
+    '\tKXBTCD-x' et '\nKXBTCD-x' se classent tous comme quotidiens, mais
+    'KX BTCD-x' ne devient jamais 'KXBTCD-x'.
+
+    La valeur retournee ne sert JAMAIS a appeler le broker : l'appel
+    conserve le ticker d'origine. C'est une cle de decision, pas une
+    reecriture.
+    """
+    if ticker is None:
+        return ""
+    if isinstance(ticker, (bytes, bytearray)):
+        ticker = bytes(ticker).decode("utf-8", "replace")
+    elif not isinstance(ticker, str):
+        ticker = str(ticker)
+    return ticker.strip().upper()
+
+
+def ticker_is_wellformed(ticker) -> bool:
+    """Vrai si `ticker` a la forme d'un ticker Kalshi une fois canonise.
+
+    Faux pour None, la chaine vide, une chaine de blancs, un objet non
+    textuel, ou tout ce qui porte un caractere invisible que `strip()` ne
+    retire pas (U+200B, U+2060...). Ces valeurs ne peuvent pas etre classees
+    de maniere fiable : le chemin monetaire les bloque au lieu de parier sur
+    leur innocuite.
+
+    Le type est exige STRICTEMENT `str` : `canonical_ticker` sait decoder des
+    octets pour CLASSER defensivement (b"KXBTCD-..." reste un ticker
+    quotidien et reste mis en quarantaine), mais un objet non textuel qui
+    arrive jusqu'ici est un bug d'appelant, pas un ticker -- on ne le
+    transmet pas au broker en esperant que son __str__ soit fidele.
+    """
+    if not isinstance(ticker, str):
+        return False
+    return bool(_TICKER_RE.match(canonical_ticker(ticker)))
+
+
+def is_daily_ticker(ticker) -> bool:
+    """Vrai si le ticker canonise appartient a la serie BTC quotidienne."""
+    return canonical_ticker(ticker).startswith(DAILY_TICKER_PREFIX)
+
+
+def daily_quarantine_blocks(ticker) -> bool:
+    """Vrai si ce ticker est du BTC quotidien et que l'oracle n'est pas
+    approuve. Volontairement indexe sur le TICKER et non sur market_type :
+    cette garde doit tenir pour une Decision fabriquee a la main, un outil,
+    ou tout appelant futur qui ne renseigne aucun market_type.
+
+    La canonisation vit ICI, dans la fonction que les DEUX gardes appellent,
+    pour qu'aucun des deux chemins ne puisse normaliser differemment de
+    l'autre.
+    """
+    return is_daily_ticker(ticker) and not daily_oracle_approved()
+
 
 class Config:
     # Environnements
@@ -124,7 +250,18 @@ class Config:
     # garde anti-mock : tout client non authentique => arret FATAL.
     EXECUTION_MODE    = os.getenv("EXECUTION_MODE", "standard").lower()
     DRY_RUN           = _env_b("DRY_RUN", default=False)
-    ALLOW_ORDER_SUBMISSION = _env_b("ALLOW_ORDER_SUBMISSION", default=True)
+    # PORTE DE SECURITE (lecture stricte) : absente, vide ou illisible =>
+    # FALSE. L'ancien defaut permissif signifiait qu'EFFACER la variable sur
+    # Railway suffisait a rouvrir les soumissions ; desormais il faut l'ecrire
+    # explicitement. Aucun changement pour le service deploye, ou la variable
+    # vaut deja la chaine "false".
+    ALLOW_ORDER_SUBMISSION = _env_gate("ALLOW_ORDER_SUBMISSION", default=False)
+    # PORTE DE SECURITE : le BTC quotidien (KXBTCD) ne peut pas atteindre le
+    # chemin argent tant que l'oracle de reglement independant n'est pas
+    # approuve. Representation TEMPORAIRE : l'approbation definitive sera
+    # derivee d'un artefact de validation, pas d'une variable d'environnement.
+    DAILY_RESEARCH_ORACLE_APPROVED = _env_gate("DAILY_RESEARCH_ORACLE_APPROVED",
+                                               default=False)
     ORDER_VERIFY_INTERVAL_S = _env_f("ORDER_VERIFY_INTERVAL_SECONDS", 3.0)
     # Verrou anti-doublon de session (s) : re-soumettre le meme ticker est
     # refuse pendant ce delai meme sans trade local (defense contre toute

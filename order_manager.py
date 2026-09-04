@@ -5,7 +5,8 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from config import CFG, _p, contract_cap_config
+from config import (CFG, _p, contract_cap_config,
+                    daily_quarantine_blocks, ticker_is_wellformed)
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
@@ -658,6 +659,33 @@ class OrderManager:
                           "ALLOW_ORDER_SUBMISSION=false")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:submission_disabled", "rejected")
+        # INVARIANT DUR : un ticker qu'on ne sait pas CLASSER ne part pas.
+        # None, "", des blancs, un objet non textuel ou un caractere
+        # invisible que strip() ne retire pas (U+200B) rendraient la
+        # classification quotidienne muette : on refuse au lieu de parier
+        # que la valeur est inoffensive. Fail-closed avant, pas apres.
+        if not ticker_is_wellformed(ticker):
+            log_api.error(
+                f"[ORDER_SUBMIT_ATTEMPT] bloque: ticker={ticker!r} n'a pas la "
+                f"forme d'un ticker Kalshi -- non classable, create_order NON "
+                f"appele (fail-closed).")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:ticker_malformed", "rejected")
+        # INVARIANT DUR : le BTC quotidien (KXBTCD) n'atteint pas le broker
+        # tant que l'oracle de reglement independant n'est pas approuve. Garde
+        # SECONDE et independante de celle du moteur : elle est indexee sur le
+        # TICKER, donc elle tient meme pour un appel direct a place_and_track,
+        # un outil, ou une Decision fabriquee sans market_type. La forme
+        # canonique (bordures rognees, casse harmonisee) vit dans
+        # daily_quarantine_blocks, partagee avec la garde du moteur.
+        if daily_quarantine_blocks(ticker):
+            log_api.error(
+                f"[ORDER_SUBMIT_ATTEMPT] bloque: {ticker!r} est un marche BTC "
+                f"quotidien et l'oracle de reglement n'est pas approuve "
+                f"-- create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:daily_oracle_unapproved",
+                                   "rejected")
         now = time.time()
         if now < self.exchange_pause_until:
             log_api.warning("[ORDER_SUBMIT_SKIPPED] exchange en cooldown "

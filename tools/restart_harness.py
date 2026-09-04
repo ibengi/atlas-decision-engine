@@ -105,6 +105,20 @@ bot.CFG.ALLOW_FRESH_STATE = True         # one-time operator ack
 # Une configuration LIVE-capable EXIGE un plafond de contrats explicite
 # (contract_cap_config: valeur absente => soumissions desactivees).
 bot.CFG.MAX_CONTRACTS_PER_ORDER = "1"
+# La porte GLOBALE de soumission est la CONDITION MEME que ce harnais
+# verifie : il doit soumettre un ordre pour pouvoir prouver qu'un
+# redemarrage ne le duplique pas. Fermee, le premier envoi repart en
+# `blocked:submission_disabled`, le verrou anti-doublon n'est jamais arme,
+# et la verification passerait pour la mauvaise raison -- exactement le
+# mode de defaillance que le harnais existe pour exclure.
+#
+# On l'ouvre donc EXPLICITEMENT et le plus etroitement possible : un
+# attribut sur l'objet CFG de ce seul processus, jamais une variable
+# d'environnement (rien ne peut s'echapper vers un sous-processus). Le
+# broker est un MagicMock, le ticker est synthetique (KXTEST-CANARY-T1),
+# aucun chemin LIVE n'est cable, et DAILY_RESEARCH_ORACLE_APPROVED n'est
+# PAS touche : la quarantaine KXBTCD reste pleinement en vigueur ici.
+bot.CFG.ALLOW_ORDER_SUBMISSION = True
 cli, tlog, pm, om, rm = build_managers()
 bot.CFG.ALLOW_FRESH_STATE = False        # never implied afterwards
 seed_history(tlog)
@@ -112,6 +126,18 @@ seed_history(tlog)
 res = om.place_and_track(TICKER, "yes", 1, 40)
 print(f"  order submitted: state={res.state} status={res.status} "
       f"filled={res.filled} order_id={res.order_id}")
+# Le harnais ne doit jamais pouvoir devenir VACUE. Si une porte en amont
+# refuse ce premier envoi, `session_submitted` reste vide et les controles
+# "submission_guard survived" puis "restart cannot duplicate" comparent du
+# vide a du vide : ils passeraient sans rien prouver. Ce controle rend cette
+# degradation VISIBLE au lieu de silencieuse.
+check("[PRE] seed order really reached the broker (dedup guard armed)",
+      cli.create_order.call_count == 1
+      and res.order_id is not None
+      and not str(res.status).startswith("blocked:")
+      and om.session_submitted.get(TICKER) is not None,
+      f"create_order_calls={cli.create_order.call_count} "
+      f"status={res.status} guard_tickers={sorted(om.session_submitted)}")
 pm.positions["t-canary"] = {
     "trade_id": "t-canary", "ticker": TICKER, "side": "yes",
     "count": 1, "count_initial": 1, "avg_price": 40, "fees": 0.05,

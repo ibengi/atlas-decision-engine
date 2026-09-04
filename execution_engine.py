@@ -8,7 +8,9 @@ import time
 from typing import Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
-from config import CFG, _env_b, _p, contract_cap_config
+from config import (CFG, GATE_PARSE_WARNINGS, _env_b, _p, contract_cap_config,
+                    daily_oracle_approved, daily_quarantine_blocks,
+                    ticker_is_wellformed)
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
 from market_validator import MarketValidator
@@ -30,6 +32,34 @@ def _json_shadow(counters: dict) -> str:
     """Compact one-line render of the T7-K shadow counters (logging only)."""
     import json as _j
     return _j.dumps(counters, ensure_ascii=False, sort_keys=True)
+
+#: market_type du BTC quotidien (serie KXBTCD).
+DAILY_MARKET_TYPE = "btc_above_strike_daily"
+
+#: LISTE BLANCHE des market_type autorises a atteindre le chemin argent.
+#: Une liste blanche, pas une liste noire : `Decision.market_type` vaut None
+#: par defaut, donc une Decision mal formee, un alias de strategie futur ou
+#: un market_type "unknown" traverseraient une liste noire sans etre vus.
+#: `btc_above_strike_daily` en est volontairement ABSENT tant que l'oracle de
+#: reglement quotidien n'est pas approuve (voir daily_oracle_approved).
+#: Tout le reste conserve exactement son comportement : chaque type ici
+#: reste soumis a toutes les portes globales existantes.
+EXECUTABLE_MARKET_TYPES = frozenset({
+    "btc_15m_above_strike",
+    "sports_moneyline", "sports_spread", "sports_total",
+    "election_winner",
+})
+
+
+def executable_market_types() -> frozenset:
+    """La liste blanche effective. `btc_above_strike_daily` n'y entre QUE si
+    l'oracle de reglement quotidien est approuve, pour qu'il n'existe qu'UN
+    seul interrupteur : approuver l'oracle suffit, et editer la liste sans
+    approuver l'oracle ne suffit pas (la garde quotidienne refuse d'abord).
+    """
+    if daily_oracle_approved():
+        return EXECUTABLE_MARKET_TYPES | {DAILY_MARKET_TYPE}
+    return EXECUTABLE_MARKET_TYPES
 
 # Module-level loggers (memes canaux que dans kalshi_alpha_bot.py)
 log     = logging.getLogger("BOT")
@@ -101,6 +131,13 @@ def log_execution_banner(client):
     log.info(f"mock_enabled={str(not genuine).lower()}")
     log.info(f"order_submission_enabled="
              f"{str(CFG.ALLOW_ORDER_SUBMISSION and not CFG.SHADOW_MODE).lower()}")
+    log.info(f"daily_execution_enabled={str(daily_oracle_approved()).lower()}")
+    log.info(f"executable_market_types="
+             f"{','.join(sorted(executable_market_types()))}")
+    # Une porte fermee par malentendu doit etre visible au demarrage.
+    for _name, _raw in GATE_PARSE_WARNINGS:
+        log.error(f"[CONFIG_GATE_INVALID] {_name}={_raw!r} illisible -- "
+                  f"lu comme FALSE (fail-closed).")
     if client.env == "demo":
         log.info("NOTE: ordres reels sur l'API DEMO — fonds DEMO uniquement, "
                  "aucun argent reel.")
@@ -740,6 +777,51 @@ class ExecutionEngine:
 
     def _execute_decision(self, dec, report) -> int:
         ticker = dec.ticker
+        # 5.0) QUARANTAINE QUOTIDIENNE + LISTE BLANCHE.
+        #
+        # Place AVANT tout : aucun carnet, aucun budget de risque, aucun
+        # dimensionnement, aucune reservation de disjoncteur, aucun compteur
+        # de soumission. Retourner 0 ici ne consomme pas non plus le budget
+        # MAX_TRADES_CYCLE, donc un candidat quotidien refuse ne peut pas
+        # affamer un candidat 15m du meme cycle.
+        mtype = getattr(dec, "market_type", None)
+        # Un ticker non classable (None, blancs, objet non textuel,
+        # caractere invisible) ne peut PAS etre soumis a la quarantaine de
+        # maniere fiable : on refuse ici, avant toute lecture de carnet, au
+        # lieu de laisser la seule garde du gestionnaire d'ordres decider.
+        if not ticker_is_wellformed(ticker):
+            report["rejections"]["ticker_malformed"] = \
+                report["rejections"].get("ticker_malformed", 0) + 1
+            log_trd.info(
+                f"[TICKER_MALFORMED] {ticker!r}: forme non reconnue -- non "
+                f"classable, aucun carnet, aucun ordre.",
+                extra={"ticker": str(ticker), "strategy": dec.strategy,
+                       "market_type": mtype})
+            return 0
+        if daily_quarantine_blocks(ticker) or mtype == DAILY_MARKET_TYPE:
+            if not daily_oracle_approved():
+                report["rejections"]["daily_oracle_unapproved"] = \
+                    report["rejections"].get("daily_oracle_unapproved", 0) + 1
+                log_trd.info(
+                    f"[DAILY_QUARANTINE] {ticker}: candidat quotidien NON "
+                    f"executable (oracle de reglement non approuve) -- aucun "
+                    f"carnet, aucun risque, aucun ordre.",
+                    extra={"ticker": ticker, "strategy": dec.strategy,
+                           "market_type": mtype})
+                return 0
+        # LISTE BLANCHE, jamais une liste noire : Decision.market_type vaut
+        # None par defaut, et un market_type absent, inconnu ou nouvellement
+        # ajoute doit etre refuse tant que personne ne l'a inscrit ici
+        # deliberement. Une liste noire laisserait passer None.
+        if mtype not in executable_market_types():
+            report["rejections"]["market_type_not_executable"] = \
+                report["rejections"].get("market_type_not_executable", 0) + 1
+            log_trd.info(
+                f"[EXECUTION_ALLOWLIST] {ticker}: market_type={mtype!r} "
+                f"absent de la liste blanche -- aucun ordre.",
+                extra={"ticker": ticker, "strategy": dec.strategy,
+                       "market_type": mtype})
+            return 0
         # 5a) carnet FRAIS une DERNIERE fois, juste avant l'ordre (TEST L)
         with timed("api_fetch"):
             m, book = self.fresh_book(ticker)
