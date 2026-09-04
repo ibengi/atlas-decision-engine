@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-04T17:05:00Z",
+
+  "git_sha": "9b906e8d0a0a4e183291aa439855519c2d6e19e7",
+  "deployment_id": "2a3da86f-d925-4c4e-9eba-fd48d41ba9c9",
+  "deployment_created_at": "2026-09-04T16:24:39Z",
+  "deployment_ready_at": "2026-09-04T16:26:24Z",
+  "deployment_status": "SUCCESS",
+
+  "docker_build_pass": true,
+  "test_count": 794,
+  "test_failures": 0,
+  "test_errors": 0,
+  "test_skipped": 0,
+
+  "independent_review_pass": true,
+
+  "environment": "DEMO",
+  "allow_order_submission": false,
+  "daily_oracle_approved": false,
+  "model_approved": false,
+  "reconciliation": "MATCH",
+  "persistence": "HEALTHY",
+  "broker_writes": 0,
+  "fills": 0,
+  "cancels": 0,
+
+  "ready_for_investor_demo": true,
+  "ready_for_capital_live": false,
+
+  "observation_window": {
+    "from": "2026-09-04T16:26:21Z",
+    "to": "2026-09-04T16:47:35Z",
+    "cycles_observed": 22,
+    "note": "broker_writes, fills and cancels are counts for THIS release's observation window on deployment 2a3da86f. They are not lifetime totals: the local journal carries 7 historical settled DEMO trades from earlier releases."
+  },
+
+  "evidence": {
+    "docker_build": {
+      "railway_build": "Ran 794 tests in 55.986s / OK; test_report.json {ran:794, failures:0, errors:0, skipped:0}",
+      "github_actions_pr": "https://github.com/ibengi/atlas-decision-engine/actions/runs/33894507449",
+      "github_actions_main": "https://github.com/ibengi/atlas-decision-engine/actions/runs/33894973954",
+      "image_artifact_check": "report OK: 794 tests, 0 failure, 0 error (read from /app/test_report.json inside the built image)",
+      "red_suite_canary": "job 'a-red-suite-blocks-the-build' passed: a deliberately failing suite does fail the image build"
+    },
+    "model_gate": {
+      "probe": "check_live_allowed() executed with NO_LIVE_PROMOTION=0 and MODEL_APPROVED_FOR_LIVE=YES",
+      "result": false,
+      "refusal_reasons": ["model_validation.json absent ou non approuve"],
+      "observed_in": ["built CI image", "deployed commit 9b906e8 source"]
+    },
+    "runtime": {
+      "banner_environment": "Environnement : DEMO -> https://demo-api.kalshi.co/trade-api/v2",
+      "banner_submission": "order_submission_enabled=false",
+      "reconcile_startup": "[RECONCILE_STARTUP] MATCH (tickers broker=0 local=0) @ 16:26:21Z",
+      "reconcile_periodic": "[RECONCILE_VERIFY] MATCH (tickers broker=0 local=0) @ 16:42:19Z",
+      "persistence": "volume mounted, DATA_DIR=/data/state5; no [PERSISTENCE_HALT] in any observed cycle",
+      "order_submit_attempts": 0,
+      "tracebacks": 0
+    },
+    "independent_review": {
+      "security_review": {
+        "scope": "e0e2f83",
+        "branch": "claude/independent-security-review-e0e2f83",
+        "commit": "568fd982c520ae5bace94015c30360d888ca79dc",
+        "document": "docs/reviews/independent-security-review-e0e2f83.md",
+        "blockers": 1,
+        "blocker_resolved_by": "5d6e994"
+      },
+      "delta_review": {
+        "scope": "e0e2f83..5d6e994",
+        "branch": "claude/independent-delta-review-5d6e994",
+        "commit": "9c5ffbefe5e77c25a3041288d55bcc0d3413402e",
+        "document": "docs/reviews/independent-delta-review-5d6e994.md",
+        "blockers": 0,
+        "high_findings": 0,
+        "medium_findings": 1,
+        "low_findings": 3,
+        "verdict": "PR_MERGE_READY=YES (delta only), PR_DEPLOY_READY=NO"
+      },
+      "reviewer_independence": "Both reviews were produced by separate sessions with no authoring history on 151860a, 5757c09, e0e2f83 or 5d6e994. The author of these commits did not review them."
+    }
+  },
+
+  "open_findings": [
+    {
+      "id": "F1",
+      "severity": "MEDIUM",
+      "status": "OPEN",
+      "summary": "unittest discovery collects 794 tests; pytest collects 799. Five module-level test functions in tests/test_calibration.py are not counted in test_report.json, the artifact the LIVE gatekeeper reads.",
+      "pre_existing_since": "b0d5327 (PR #34)",
+      "blocks_investor_demo": false,
+      "blocks_capital_live": true
+    },
+    {
+      "id": "F2",
+      "severity": "LOW",
+      "status": "OPEN",
+      "summary": "test_the_gate_defaults_are_loaded_before_discovery uses a source-order string index that a comment could fool."
+    },
+    {
+      "id": "F3",
+      "severity": "LOW",
+      "status": "OPEN",
+      "summary": "The Dockerfile runtime stage ships run_tests.py, tests/ and _bootstrap.py into the deployed image. No execution path reaches them."
+    },
+    {
+      "id": "F4",
+      "severity": "LOW",
+      "status": "OPEN",
+      "summary": "tools/restart_harness.py runs in no CI step and in neither Docker stage."
+    }
+  ],
+
+  "capital_live_gates_unmet": [
+    "model_approved is false; model_validation.json carries approved:false",
+    "no model has beaten the market baseline out of sample (walk-forward study found no candidate significant)",
+    "daily settlement oracle (BRTI) is not implemented, so KXBTCD is quarantined",
+    "F1 must be closed so the artifact the LIVE gatekeeper reads counts every test",
+    "independent review cleared the change for MERGE only; PR_DEPLOY_READY was NO for capital"
+  ],
+
+  "not_changed_by_this_release": [
+    "no Railway variable was created, changed or deleted",
+    "no credential was read, written or rotated",
+    "no order was submitted and no position was cancelled or settled by hand",
+    "model_validation.json still carries approved:false",
+    "PR-D remains unmerged and on hold"
+  ]
+}
