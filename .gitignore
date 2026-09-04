@@ -7,9 +7,9 @@ venv/
 data/
 *.jsonl
 kalshi_*.json
-cycle_report.json
-orders_state.json
-universe_cache.json
+cycle_report.json*
+orders_state.json*
+universe_cache.json*
 # test_report.json reste ignore VOLONTAIREMENT. Il est genere par
 # l'etape `tests` du Dockerfile, a partir de la suite du commit
 # reellement construit, et copie dans l'image a /app. Le versionner
@@ -47,3 +47,9 @@ dashboard_state.json*
 pipeline_stats.json*
 reject_reasons.json*
 intent_alerts.json*
+
+# Les familles ci-dessus generent aussi des rotations et des sommes
+# de controle (orders_state.json.bak1, .sha256). Le motif exact ne
+# les couvrait pas : une execution locale de la suite laissait des
+# fichiers d'ETAT RUNTIME non suivis a la racine, candidats a un
+# `git add .` accidentel. Le suffixe '*' ferme la famille.

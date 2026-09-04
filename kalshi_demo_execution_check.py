@@ -36,7 +36,11 @@ MAX_ASK_CENTS = 30          # cout maximal accepte pour 1 contrat (fonds DEMO)
 FILL_TIMEOUT_S = float(os.getenv("ORDER_FILL_TIMEOUT_SECONDS", "45"))
 VERIFY_EVERY_S = max(2.0, min(5.0, float(
     os.getenv("ORDER_VERIFY_INTERVAL_SECONDS", "3"))))
-CANDIDATE_SERIES = ("KXBTCD", "KXBTC15M", "KXETHD")
+# KXBTCD est DELIBEREMENT absent : le BTC quotidien est en quarantaine tant
+# que l'oracle de reglement n'est pas approuve, et le butoir de
+# kalshi_client.create_order le refuserait de toute facon. Le retirer ici
+# evite de choisir un marche que la sonde ne peut pas soumettre.
+CANDIDATE_SERIES = ("KXBTC15M", "KXETHD")
 
 
 def fatal(msg):

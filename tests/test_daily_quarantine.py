@@ -759,12 +759,61 @@ class BothRunnersShareTestGates(unittest.TestCase):
 
     def test_the_gate_defaults_are_loaded_before_discovery(self):
         """Order matters: `config` freezes its class attributes at import, so
-        the defaults must be in place before any test module is discovered."""
+        the defaults must be in place before any test module is discovered.
+
+        Asserted BEHAVIOURALLY — importing `run_tests` (without running it)
+        must already have applied the defaults. The previous version of this
+        test compared `str.index("_gates")` against `str.index("loader.discover")`
+        in the source, which a comment could satisfy and which broke the moment
+        discovery moved behind a helper. Source position is not the invariant;
+        "the defaults exist before anything imports `config`" is.
+        """
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        src = open(os.path.join(root, "run_tests.py"), encoding="utf-8").read()
-        self.assertIn("_gates", src, "run_tests.py must load the shared gates")
-        self.assertLess(src.index("_gates"), src.index("loader.discover"),
-                        "gate defaults must be imported BEFORE discovery")
+        probe = (
+            "import os, sys, json\n"
+            "for v in ('ALLOW_ORDER_SUBMISSION', 'DAILY_RESEARCH_ORACLE_APPROVED'):\n"
+            "    os.environ.pop(v, None)\n"
+            "sys.argv = ['run_tests.py']\n"
+            "import run_tests\n"          # module import only; main() not called
+            "print(json.dumps({v: os.environ.get(v)\n"
+            "                  for v in ('ALLOW_ORDER_SUBMISSION',\n"
+            "                            'DAILY_RESEARCH_ORACLE_APPROVED')}))\n")
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("ALLOW_ORDER_SUBMISSION",
+                            "DAILY_RESEARCH_ORACLE_APPROVED")}
+        out = subprocess.run([sys.executable, "-c", probe], cwd=root, env=env,
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
+        seen = json.loads(out.stdout.strip().splitlines()[-1])
+        for v in _GATE_VARS:
+            self.assertEqual(
+                seen.get(v), "true",
+                f"{v} was not set by merely IMPORTING run_tests; the gate "
+                f"defaults would land after test modules import config")
+
+    def test_the_gate_import_precedes_collection_structurally(self):
+        """Second, independent check: `_gates` is imported at MODULE scope and
+        before `main` is defined — parsed, so a comment cannot satisfy it."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        tree = ast.parse(open(os.path.join(root, "run_tests.py"),
+                              encoding="utf-8").read())
+        gate_lines, main_line = [], None
+        for node in tree.body:                      # module scope ONLY
+            if isinstance(node, ast.ImportFrom) and node.module == "tests":
+                if any(a.name == "_gates" for a in node.names):
+                    gate_lines.append(node.lineno)
+            elif isinstance(node, ast.Import):
+                if any(a.name.endswith("_gates") for a in node.names):
+                    gate_lines.append(node.lineno)
+            elif isinstance(node, ast.FunctionDef) and node.name == "main":
+                main_line = node.lineno
+        self.assertTrue(gate_lines,
+                        "run_tests.py must import the shared gates at module "
+                        "scope; inside a function is too late")
+        self.assertIsNotNone(main_line, "run_tests.main() not found")
+        self.assertLess(min(gate_lines), main_line,
+                        "gate defaults must be imported before main() is even "
+                        "defined, hence before any collection can run")
 
     def test_production_defaults_are_untouched_by_the_test_plumbing(self):
         """The plumbing may only add ENV defaults — never edit the shipped

@@ -659,6 +659,20 @@ class OrderManager:
                           "ALLOW_ORDER_SUBMISSION=false")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:submission_disabled", "rejected")
+        # COUPE-CIRCUIT, SECONDE COUCHE. `execution_engine` teste deja
+        # KILL_SWITCH en debut de cycle, mais ce test-la est en AMONT du
+        # chemin monetaire : une fois le cycle entame, plus rien ne relisait
+        # l'interrupteur, et tout appelant qui atteint place_and_track
+        # autrement que par la boucle du moteur (outil, recovery, test
+        # d'integration, appelant futur) ne le consultait jamais. Un
+        # coupe-circuit qui ne couvre pas le chemin monetaire n'est pas un
+        # coupe-circuit. Relu ICI, a chaque ordre, juste avant les gardes de
+        # marche.
+        if CFG.KILL_SWITCH:
+            log_api.error("[ORDER_SUBMIT_ATTEMPT] bloque: KILL_SWITCH actif "
+                          "-- create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:kill_switch", "rejected")
         # INVARIANT DUR : un ticker qu'on ne sait pas CLASSER ne part pas.
         # None, "", des blancs, un objet non textuel ou un caractere
         # invisible que strip() ne retire pas (U+200B) rendraient la

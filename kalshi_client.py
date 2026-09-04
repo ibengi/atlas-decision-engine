@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from config import CFG
+from config import CFG, daily_quarantine_blocks
 
 log_api = logging.getLogger("API")
 log = logging.getLogger("BOT")
@@ -256,7 +256,35 @@ class KalshiClient:
         prix en dollars fixed-point, quantite en chaine. La reponse V2 n'a
         PAS de champ status : il est DERIVE de fill/remaining, et la reponse
         est normalisee vers le schema interne (compteurs entiers, prix en
-        cents ramene a NOTRE cote)."""
+        cents ramene a NOTRE cote).
+
+        BUTOIR DE DERNIER RECOURS. Les gardes de politique vivent en amont,
+        dans OrderManager.place_and_track. Elles sont relues ICI parce que
+        `place_and_track` n'est pas le seul appelant possible de cette
+        methode : un outil, un script d'integration, une session de debug ou
+        un appelant futur peut tenir une instance de client et appeler
+        create_order directement, en contournant toute la sequence de gardes.
+        Un inventaire des chemins d'ecriture broker n'a de valeur que si le
+        POINT DE PASSAGE COMMUN refuse aussi. Ce butoir n'est pas une
+        duplication defensive : c'est le seul endroit qu'AUCUN chemin ne peut
+        eviter.
+
+        `cancel_order` n'est deliberement PAS garde de la meme facon : annuler
+        REDUIT l'exposition. Un coupe-circuit qui empecherait d'annuler
+        piegerait un ordre ouvert au lieu de proteger le compte."""
+        if not CFG.ALLOW_ORDER_SUBMISSION:
+            raise KalshiAPIError(
+                0, "create_order refuse au niveau client: "
+                   "ALLOW_ORDER_SUBMISSION=false. Aucun appel reseau emis.")
+        if CFG.KILL_SWITCH:
+            raise KalshiAPIError(
+                0, "create_order refuse au niveau client: KILL_SWITCH actif. "
+                   "Aucun appel reseau emis.")
+        if daily_quarantine_blocks(ticker):
+            raise KalshiAPIError(
+                0, f"create_order refuse au niveau client: {ticker!r} est un "
+                   f"marche BTC quotidien et l'oracle de reglement n'est pas "
+                   f"approuve. Aucun appel reseau emis.")
         price_cents = int(price_cents)
         if side == "yes":
             v2_side, v2_price_c = "bid", price_cents
