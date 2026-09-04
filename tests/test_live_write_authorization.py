@@ -115,11 +115,22 @@ class LiveWritesAreRefusedAtTheClientBoundary(unittest.TestCase):
         for k, v in _PERMISSIVE_EVERYTHING.items():
             setattr(CFG, k, v)
         CFG.LIVE_BROKER_WRITES_AUTHORIZED = False
+        # RC-3 added PROD_ACCESS_MODE, a STRICTLY HIGHER-priority prohibition:
+        # in READ_ONLY nothing can write, so this class's subject — the write
+        # AUTHORIZATION gate below it — would never be reached. CAPITAL is set
+        # so these tests still exercise the gate they were written for.
+        # READ_ONLY dominance is asserted separately, in
+        # tests/test_prod_access_mode.py.
+        self._mode = os.environ.get("PROD_ACCESS_MODE")
+        os.environ["PROD_ACCESS_MODE"] = "CAPITAL"
         self.client = _live_client()
 
     def tearDown(self):
         for k, v in self._saved.items():
             setattr(CFG, k, v)
+        os.environ.pop("PROD_ACCESS_MODE", None)
+        if self._mode is not None:
+            os.environ["PROD_ACCESS_MODE"] = self._mode
 
     def test_create_order_is_refused_with_no_network_write(self):
         with self.assertRaises(BrokerWriteForbidden) as cm:

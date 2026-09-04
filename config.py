@@ -61,6 +61,49 @@ def _env_gate(name, *, default=False, on_invalid=False):
     return bool(on_invalid)
 
 
+#: Les DEUX modes d'acces a la production. Un troisieme n'existe pas : tout
+#: ce qui n'est pas exactement CAPITAL est traite comme READ_ONLY partout ou
+#: la question est posee, et le demarrage refuse de toute facon une valeur
+#: qu'il ne reconnait pas (voir `prod_access_mode`).
+PROD_READ_ONLY = "READ_ONLY"
+PROD_CAPITAL   = "CAPITAL"
+PROD_ACCESS_MODES = (PROD_READ_ONLY, PROD_CAPITAL)
+
+
+def prod_access_mode():
+    """Mode d'acces production demande, ou None si la valeur est inutilisable.
+
+    None signifie EXPLICITEMENT "illisible", pas "par defaut" : le demarrage
+    en production REFUSE sur None (voir kalshi_alpha_bot). C'est le choix A
+    de la specification, retenu parce qu'il est le plus facile a PROUVER sur:
+    un processus qui ne demarre pas ne peut pas muter un compte, et la preuve
+    tient en un seul point de controle. Le choix B (defaut READ_ONLY) est sur
+    lui aussi, mais sa preuve exige de montrer que la dominance READ_ONLY
+    tient sur CHAQUE chemin -- une surface de preuve bien plus large.
+
+    Les deux sont neanmoins combines : le demarrage refuse (A), ET
+    `prod_is_read_only` ci-dessous traite tout ce qui n'est pas exactement
+    CAPITAL comme READ_ONLY (B). Une valeur illisible qui echapperait au
+    controle de demarrage n'autorise donc toujours aucune ecriture.
+    """
+    raw = os.getenv("PROD_ACCESS_MODE")
+    if raw is None:
+        return None
+    v = raw.strip().upper()
+    return v if v in PROD_ACCESS_MODES else None
+
+
+def prod_is_read_only() -> bool:
+    """Vrai sauf si le mode CAPITAL a ete demande EXPLICITEMENT.
+
+    Formule volontairement inversee : on ne demande jamais "sommes-nous en
+    lecture seule ?" a une valeur qui pourrait etre absente ou fausse, on
+    demande "le mode CAPITAL a-t-il ete explicitement demande ?". Absent,
+    vide, mal orthographie, inconnu -> lecture seule.
+    """
+    return prod_access_mode() != PROD_CAPITAL
+
+
 def daily_oracle_approved() -> bool:
     """Source UNIQUE de l'eligibilite d'execution du quotidien (KXBTCD).
 

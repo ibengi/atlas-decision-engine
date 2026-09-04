@@ -50,6 +50,7 @@ load_dotenv()
 # S1. CONFIGURATION (centralisee, surchargeables par variables d'env)
 # ══════════════════════════════════════════════════════════════════════════
 
+import config
 from config import (Config, CFG, _env_b, _env_i, _env_f, _p,
                     prod_credentials_config)
 
@@ -202,6 +203,22 @@ def main():
     ap.add_argument("--capital", type=float, default=_env_f("CAPITAL", 500.0),
                     help="PLAFOND de capital; le solde broker reel prime "
                          "s'il est inferieur")
+    # MODES D'ACCES PRODUCTION, mutuellement exclusifs. Volontairement des
+    # drapeaux DISTINCTS de --capital, qui est un MONTANT de dimensionnement
+    # et non un mode : surcharger --capital en mode aurait rendu ambigu un
+    # argument existant, exactement le genre d'ambiguite que ce travail
+    # supprime.
+    ap.add_argument("--live-read-only", action="store_true",
+                    help="PRODUCTION en LECTURE SEULE: observation et shadow "
+                         "complet sur donnees reelles, aucune mutation broker "
+                         "possible. N'implique NI approbation modele, NI "
+                         "autorisation d'ecriture, NI soumission d'ordres.")
+    ap.add_argument("--live-capital", action="store_true",
+                    help="PRODUCTION en mode CAPITAL. N'AUTORISE rien par "
+                         "lui-meme: toutes les portes existantes restent "
+                         "requises (gatekeeper modele, autorisation "
+                         "d'ecriture, ALLOW_ORDER_SUBMISSION, coupe-circuit, "
+                         "quarantaine quotidienne, risque, anti-doublon).")
     ap.add_argument("--shadow", action="store_true",
                     help="mode shadow: pipeline et decisions complets, "
                          "AUCUN ordre envoye")
@@ -224,31 +241,80 @@ def main():
     from state_restore import restore_or_die
     restore_or_die()
 
+    # ── Modes d'acces production : un seul, jamais deux ─────────────────
+    if args.live_read_only and args.live_capital:
+        log.error("--live-read-only et --live-capital sont exclusifs. Arret.")
+        sys.exit(1)
+    if (args.live_read_only or args.live_capital) and args.demo:
+        log.error("--demo est incompatible avec un mode d'acces PRODUCTION. "
+                  "Arret.")
+        sys.exit(1)
+    if args.live_read_only:
+        os.environ["PROD_ACCESS_MODE"] = config.PROD_READ_ONLY
+    elif args.live_capital:
+        os.environ["PROD_ACCESS_MODE"] = config.PROD_CAPITAL
+
     env = "demo" if (args.demo or os.getenv("DEMO_TRADING", "") == "1") \
         else "prod"
     if env == "prod" and not (args.scan_only or args.rank_only):
-        # DOUBLE confirmation exigee pour l'argent reel.
+        mode = config.prod_access_mode()
+        # CHOIX A : une valeur absente, vide, mal orthographiee ou inconnue
+        # ARRETE le processus. Un processus qui ne demarre pas ne peut pas
+        # muter un compte, et la preuve tient en ce seul point de controle.
+        # (La formulation inverse de `prod_is_read_only` couvre en plus tout
+        # chemin qui atteindrait le client sans passer par ici.)
+        if mode is None:
+            raw = os.getenv("PROD_ACCESS_MODE")
+            log.error(
+                f"PRODUCTION demandee avec PROD_ACCESS_MODE={raw!r}: valeur "
+                f"absente ou non reconnue. Valeurs admises: "
+                f"{'/'.join(config.PROD_ACCESS_MODES)}. Une valeur illisible "
+                f"n'est JAMAIS interpretee comme CAPITAL. Arret.")
+            sys.exit(1)
+        # Confirmation d'INTENTION de production. Exigee dans les deux modes:
+        # atteindre le compte reel, meme en lecture, doit etre delibere.
         if os.getenv("KALSHI_ENV_CONFIRM", "") != "LIVE":
             log.error("PRODUCTION demandee sans KALSHI_ENV_CONFIRM=LIVE. Arret.")
             sys.exit(1)
-        if os.getenv("LIVE_TRADING_CONFIRMED", "") != "YES" \
-                and not CFG.SHADOW_MODE:
-            log.error("PRODUCTION demandee sans LIVE_TRADING_CONFIRMED=YES. "
-                      "Definir les DEUX variables, ou utiliser --shadow. Arret.")
-            sys.exit(1)
-        if os.getenv("LIVE_TRADING", "") != "1":
-            log.error("PRODUCTION: LIVE_TRADING=1 requis (interdit par defaut). Arret.")
-            sys.exit(1)
-        # GATEKEEPER : le live reste bloque sans validation modele recente.
-        from model_gatekeeper import check_live_allowed
-        ok_gate, failed = check_live_allowed()
-        if not ok_gate:
-            log.error("GATEKEEPER: live REFUSE. Criteres echoues:")
-            for f in failed:
-                log.error(f"  - {f}")
-            sys.exit(1)
-        log.warning("PRODUCTION REAL MONEY ENABLED (double confirmation + "
-                    "gatekeeper valides).")
+
+        if mode == config.PROD_CAPITAL:
+            # DOUBLE confirmation exigee pour l'argent reel.
+            if os.getenv("LIVE_TRADING_CONFIRMED", "") != "YES" \
+                    and not CFG.SHADOW_MODE:
+                log.error("PRODUCTION CAPITAL sans LIVE_TRADING_CONFIRMED=YES. "
+                          "Definir les DEUX variables, ou utiliser --shadow. "
+                          "Arret.")
+                sys.exit(1)
+            if os.getenv("LIVE_TRADING", "") != "1":
+                log.error("PRODUCTION CAPITAL: LIVE_TRADING=1 requis "
+                          "(interdit par defaut). Arret.")
+                sys.exit(1)
+            # GATEKEEPER : le live reste bloque sans validation modele recente.
+            # Les criteres scientifiques eux-memes sont INCHANGES.
+            from model_gatekeeper import check_live_allowed
+            ok_gate, failed = check_live_allowed()
+            if not ok_gate:
+                log.error("GATEKEEPER: live REFUSE. Criteres echoues:")
+                for f in failed:
+                    log.error(f"  - {f}")
+                sys.exit(1)
+            log.warning("PRODUCTION REAL MONEY ENABLED (double confirmation + "
+                        "gatekeeper valides).")
+        else:
+            # LECTURE SEULE. Le gatekeeper modele n'est PAS consulte, et
+            # c'est le coeur de ce changement : `check_live_allowed` traitait
+            # l'ACCES aux donnees de production comme equivalent a
+            # l'AUTORISATION d'engager du capital de production. Observer un
+            # marche n'exige aucune preuve d'edge; engager de l'argent, si.
+            # Confondre les deux forcait a approuver le modele pour pouvoir
+            # seulement REGARDER -- la pire raison possible d'approuver un
+            # modele.
+            log.warning(
+                "PRODUCTION EN LECTURE SEULE (PROD_ACCESS_MODE=READ_ONLY): "
+                "observation et decisions completes sur donnees reelles. "
+                "AUCUNE mutation broker n'est possible, quels que soient les "
+                "drapeaux de trading. Le gatekeeper modele n'est pas requis "
+                "pour observer.")
 
     # INVARIANT DUR : en PRODUCTION, des identifiants absents ou
     # illisibles ARRETENT le processus AVANT toute construction de client,

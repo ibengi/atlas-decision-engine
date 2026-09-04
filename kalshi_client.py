@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from config import CFG, daily_quarantine_blocks
+from config import CFG, daily_quarantine_blocks, prod_is_read_only
 
 log_api = logging.getLogger("API")
 log = logging.getLogger("BOT")
@@ -171,6 +171,22 @@ class KalshiClient:
         """
         if self.env == "demo":
             return
+        # PRIORITE MAXIMALE — DOMINANCE DE LA LECTURE SEULE.
+        # Teste AVANT toute autre autorisation, y compris
+        # LIVE_BROKER_WRITES_AUTHORIZED. En PROD_ACCESS_MODE=READ_ONLY aucune
+        # combinaison de drapeaux ne peut produire une mutation : ni
+        # ALLOW_ORDER_SUBMISSION, ni LIVE_TRADING, ni LIVE_TRADING_CONFIRMED,
+        # ni MODEL_APPROVED_FOR_LIVE, ni LIVE_BROKER_WRITES_AUTHORIZED, ni
+        # l'etat du coupe-circuit. `prod_is_read_only` est vrai sauf si
+        # CAPITAL a ete demande EXPLICITEMENT : une valeur absente, vide ou
+        # mal orthographiee laisse donc la production en lecture seule.
+        if prod_is_read_only():
+            raise BrokerWriteForbidden(
+                0, f"{operation} REFUSE au niveau client: "
+                   f"PROD_ACCESS_MODE n'est pas CAPITAL, donc l'environnement "
+                   f"{self.env!r} est en LECTURE SEULE. Aucun drapeau de "
+                   f"trading ne peut lever cette interdiction. Aucune requete "
+                   f"reseau mutante n'a ete emise.")
         if not CFG.LIVE_BROKER_WRITES_AUTHORIZED:
             raise BrokerWriteForbidden(
                 0, f"{operation} REFUSE au niveau client: environnement "
