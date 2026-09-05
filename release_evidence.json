@@ -1,13 +1,14 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-09-04T17:46:53Z",
-  "git_sha": "9b906e8d0a0a4e183291aa439855519c2d6e19e7",
-  "deployment_id": "2a3da86f-d925-4c4e-9eba-fd48d41ba9c9",
-  "deployment_created_at": "2026-09-04T16:24:39Z",
-  "deployment_ready_at": "2026-09-04T16:26:24Z",
+  "generated_at": "2026-09-05T17:29:34Z",
+  "git_sha": "3d1cc2bf400d1bb64fe8c079e9e174bd6f054c37",
+  "tree_sha": "29f7c2e3908de8932eb9d99209d0edf374ee9f94",
+  "deployment_id": "dc843026-1cb1-41db-a357-bf7af9bdb2cf",
+  "deployment_created_at": "2026-09-05T17:25:21Z",
+  "deployment_ready_at": "2026-09-05T17:27:22Z",
   "deployment_status": "SUCCESS",
   "docker_build_pass": true,
-  "test_count": 794,
+  "test_count": 949,
   "test_failures": 0,
   "test_errors": 0,
   "test_skipped": 0,
@@ -23,80 +24,155 @@
   "cancels": 0,
   "ready_for_investor_demo": true,
   "ready_for_capital_live": false,
-  "observation_window": {
-    "from": "2026-09-04T16:26:21Z",
-    "to": "2026-09-04T16:47:35Z",
-    "cycles_observed": 22,
-    "note": "broker_writes, fills and cancels are counts for THIS release's observation window on deployment 2a3da86f. They are not lifetime totals: the local journal carries 7 historical settled DEMO trades from earlier releases."
+  "stale": false,
+
+  "what_this_release_is": "The pre-merge fix pack (PR #61) merged to main and deployed. The engine still runs DEMO. No production credential exists, so the LIVE READ_ONLY transition is prepared but NOT performed.",
+
+  "binds_to": {
+    "git_sha": "3d1cc2bf400d1bb64fe8c079e9e174bd6f054c37",
+    "tree_sha": "29f7c2e3908de8932eb9d99209d0edf374ee9f94",
+    "audited_sha": "0e44b40f04a6f44d9c92479b98918c5d276fad1d",
+    "audited_tree_sha": "29f7c2e3908de8932eb9d99209d0edf374ee9f94",
+    "tree_identical_to_audited_sha": true,
+    "parent_deployed_sha": "9b906e8d0a0a4e183291aa439855519c2d6e19e7",
+    "deployment_id": "dc843026-1cb1-41db-a357-bf7af9bdb2cf",
+    "note": "The merge commit carries the audited tree byte for byte. git diff 0e44b40..3d1cc2b is empty, so the independent review, the mutation matrix and the CI runs on 0e44b40 all describe exactly the tree that was built and deployed."
   },
+
   "evidence": {
-    "docker_build": {
-      "railway_build": "Ran 794 tests in 55.986s / OK; test_report.json {ran:794, failures:0, errors:0, skipped:0}",
-      "github_actions_pr": "https://github.com/ibengi/atlas-decision-engine/actions/runs/33894507449",
-      "github_actions_main": "https://github.com/ibengi/atlas-decision-engine/actions/runs/33894973954",
-      "image_artifact_check": "report OK: 794 tests, 0 failure, 0 error (read from /app/test_report.json inside the built image)",
-      "red_suite_canary": "job 'a-red-suite-blocks-the-build' passed: a deliberately failing suite does fail the image build"
+    "merge_gate": {
+      "rule": "merge only if PR #61 head is exactly 0e44b40f04a6f44d9c92479b98918c5d276fad1d",
+      "observed_head_at_merge": "0e44b40f04a6f44d9c92479b98918c5d276fad1d",
+      "gate": "PASS",
+      "merge_commit": "3d1cc2bf400d1bb64fe8c079e9e174bd6f054c37",
+      "pull_request": "https://github.com/ibengi/atlas-decision-engine/pull/61"
     },
-    "model_gate": {
-      "probe": "check_live_allowed() executed with NO_LIVE_PROMOTION=0 and MODEL_APPROVED_FOR_LIVE=YES",
-      "result": false,
-      "refusal_reasons": [
-        "model_validation.json absent ou non approuve"
+    "ci": {
+      "runs_on_audited_sha": [
+        "https://github.com/ibengi/atlas-decision-engine/actions/runs/33976894480",
+        "https://github.com/ibengi/atlas-decision-engine/actions/runs/33979489428"
       ],
-      "observed_in": [
-        "built CI image",
-        "deployed commit 9b906e8 source"
-      ]
+      "checks": "image-contains-artifacts SUCCESS; a-red-suite-blocks-the-build SUCCESS; CodeQL python SUCCESS; CodeQL actions SUCCESS",
+      "red_suite_canary": "a deliberately failing suite does fail the image build, so a green build is not vacuous"
+    },
+    "builder": {
+      "railway_service_stored_setting": "RAILPACK",
+      "railway_json_pin": "DOCKERFILE (dockerfilePath: Dockerfile)",
+      "builder_actually_used": "DOCKERFILE",
+      "proof": "BuildKit emitted the Dockerfile stage step '[tests 7/7] RUN python -c ...test_report.json...', matching 'FROM python AS tests' in the Dockerfile, and ran the project suite as a build step. Railpack never runs a project's test suite and has no stage named tests.",
+      "finding": "The service-level stored builder reads RAILPACK while railway.json pins DOCKERFILE. Config-as-code wins at build time, so the deployed image is the Dockerfile image. The stored setting is misleading and should be corrected to DOCKERFILE so the two agree.",
+      "severity": "LOW",
+      "blocks_live_read_only": false
+    },
+    "in_image_suite": {
+      "railway_build": "Ran 949 tests in 74.383s / OK",
+      "test_report_json": {
+        "ran": 949,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "collected": 949,
+        "collected_by_unittest_discovery": 944,
+        "collected_module_level": 5
+      },
+      "note": "949 = 944 discovered by unittest + 5 module-level, compared against real pytest rather than hard-coded. This ran inside the image that is now deployed, not on a developer machine."
     },
     "runtime": {
-      "banner_environment": "Environnement : DEMO -> https://demo-api.kalshi.co/trade-api/v2",
-      "banner_submission": "order_submission_enabled=false",
-      "reconcile_startup": "[RECONCILE_STARTUP] MATCH (tickers broker=0 local=0) @ 16:26:21Z",
-      "reconcile_periodic": "[RECONCILE_VERIFY] MATCH (tickers broker=0 local=0) @ 16:42:19Z",
-      "persistence": "volume mounted, DATA_DIR=/data/state5; no [PERSISTENCE_HALT] in any observed cycle",
+      "banner_version": "v11.4-audit-fixed-2026-07-28",
+      "banner_environment": "environment=DEMO",
+      "reconcile_startup": "[RECONCILE_STARTUP] MATCH (tickers broker=0 local=0) @ 2026-09-05T17:27:22Z",
       "order_submit_attempts": 0,
-      "tracebacks": 0
+      "broker_writes": 0,
+      "persistence": "volume mounted, DATA_DIR=/data/state5; no PERSISTENCE_HALT"
     },
     "independent_review": {
-      "security_review": {
-        "scope": "e0e2f83",
-        "branch": "claude/independent-security-review-e0e2f83",
-        "commit": "568fd982c520ae5bace94015c30360d888ca79dc",
-        "document": "docs/reviews/independent-security-review-e0e2f83.md",
-        "blockers": 1,
-        "blocker_resolved_by": "5d6e994"
-      },
       "delta_review": {
-        "scope": "e0e2f83..5d6e994",
-        "branch": "claude/independent-delta-review-5d6e994",
-        "commit": "9c5ffbefe5e77c25a3041288d55bcc0d3413402e",
-        "document": "docs/reviews/independent-delta-review-5d6e994.md",
+        "scope": "e377df6..0e44b40",
         "blockers": 0,
         "high_findings": 0,
         "medium_findings": 1,
         "low_findings": 3,
-        "verdict": "PR_MERGE_READY=YES (delta only), PR_DEPLOY_READY=NO"
-      },
-      "reviewer_independence": "Both reviews were produced by separate sessions with no authoring history on 151860a, 5757c09, e0e2f83 or 5d6e994. The author of these commits did not review them."
+        "verdict": "MERGE_READY=YES",
+        "reviewer_independence": "produced by a separate session with no authoring history on the fix pack; the author of 0e44b40 did not review it"
+      }
     }
   },
+
+  "live_read_only_transition": {
+    "status": "NOT_PERFORMED",
+    "blocked_by": "PROD_CREDENTIALS_ABSENT",
+    "credential_check": {
+      "method": "Railway get-service-config variableNames, which lists names without values",
+      "observed_names": [
+        "ALLOW_ORDER_SUBMISSION",
+        "ANTHROPIC_API_KEY",
+        "BTC_DAILY_SHADOW_ENABLED",
+        "DATA_DIR",
+        "KALSHI_DEMO_KEY_ID",
+        "KALSHI_DEMO_PRIVATE_KEY",
+        "MAX_CONTRACTS_PER_ORDER",
+        "REQUIRE_PERSISTENT_STATE",
+        "RESEARCH_API_TOKEN"
+      ],
+      "prod_credential_names_present": false,
+      "note": "Only DEMO credentials exist. No production key id or private key was created, read, printed or inferred."
+    },
+    "why_configuration_was_held": "Setting PROD_ACCESS_MODE=READ_ONLY and the live-read-only start command before credentials exist would make the process fail its credential gate and crash-loop, taking the engine off DEMO and collecting no data. The configuration is prepared and applied in one step once the credentials are present.",
+    "prepared_configuration": {
+      "variables_to_set": {
+        "PROD_ACCESS_MODE": "READ_ONLY",
+        "KALSHI_ENV_CONFIRM": "LIVE"
+      },
+      "start_command": "python kalshi_alpha_bot.py --loop --live-read-only",
+      "start_command_reason": "The Dockerfile CMD ends in --demo. A live read-only boot requires an explicit Railway start command. --demo and --live-read-only are never combined.",
+      "variables_deliberately_not_defined": [
+        "LIVE_BROKER_WRITES_AUTHORIZED",
+        "LIVE_TRADING",
+        "LIVE_TRADING_CONFIRMED"
+      ],
+      "variables_deliberately_left_false": [
+        "ALLOW_ORDER_SUBMISSION",
+        "MODEL_APPROVED",
+        "DAILY_RESEARCH_ORACLE_APPROVED"
+      ]
+    },
+    "not_yet_established": [
+      "LIVE_ENVIRONMENT_CONNECTED",
+      "LIVE_READ_ONLY",
+      "LIVE_RECONCILIATION",
+      "LIVE_SHADOW",
+      "BROKER_WRITES=0 under LIVE"
+    ]
+  },
+
   "open_findings": [
     {
-      "id": "F1",
+      "id": "M1-THIRD-DOOR",
       "severity": "MEDIUM",
-      "status": "PATCHED_IN_RC1_PENDING_REVIEW",
-      "summary": "unittest discovery collects 794 tests; pytest collects 799. Five module-level test functions in tests/test_calibration.py are not counted in test_report.json, the artifact the LIVE gatekeeper reads.",
-      "pre_existing_since": "b0d5327 (PR #34)",
-      "blocks_investor_demo": false,
+      "status": "OPEN_IN_THIS_DEPLOYMENT",
+      "summary": "An async def METHOD inside a unittest.TestCase can still report green. tests/_collect.py refuses module-level async and generator functions and fails an un-awaited result, but does not inspect methods of collected TestCase classes. unittest.IsolatedAsyncioTestCase is legitimately exempt.",
+      "reproduced": "pytest reports 1 passed for a deliberately failing async test method while run_tests.py exits 0 and reports ran:950",
+      "fix_exists_on_branch": "claude/railway-atlas-third-door-fix (8947da7)",
+      "fix_status": "NOT REVIEWED, NOT MERGED, NOT DEPLOYED",
+      "blocks_live_read_only": false,
       "blocks_capital_live": true,
-      "patch_evidence": "canonical collector; 828==828==828; mutation survived at 9b906e8 and is killed on RC-1"
+      "note": "Recorded deliberately rather than concealed. It affects the artifact the LIVE gatekeeper reads, so it must close before capital."
     },
     {
-      "id": "F2",
+      "id": "PROV-1",
+      "severity": "MEDIUM",
+      "status": "OPEN",
+      "summary": "Provenance telemetry is computed but never logged. Binance klines returned HTTP 451 in 468 of 468 DEMO cycles and a fallback supplied data every cycle, but accepted providers log at DEBUG only, and data_quality_score, klines source, spot_sources and source_dispersion are never emitted. Which provider actually fed the model is unobservable from logs.",
+      "consequence": "The per-decision provenance fields the audit requires will be MISSING on the LIVE shadow stream until telemetry is added.",
+      "blocks_live_read_only": false,
+      "blocks_capital_live": true
+    },
+    {
+      "id": "BUILDER-1",
       "severity": "LOW",
-      "status": "PATCHED_IN_RC1_PENDING_REVIEW",
-      "summary": "test_the_gate_defaults_are_loaded_before_discovery uses a source-order string index that a comment could fool.",
-      "patch_evidence": "replaced with a behavioural check plus an AST check"
+      "status": "OPEN",
+      "summary": "Railway's stored service builder reads RAILPACK while railway.json pins DOCKERFILE. The Dockerfile is what actually builds, but the two settings disagree and a future change to railway.json handling would silently switch builders.",
+      "blocks_live_read_only": false
     },
     {
       "id": "F3",
@@ -111,72 +187,35 @@
       "summary": "tools/restart_harness.py runs in no CI step and in neither Docker stage."
     },
     {
-      "id": "E2",
-      "severity": "HIGH",
-      "status": "DISCOVERED",
-      "summary": "No environment-keyed read-only enforcement. RC-1 gates create_order on policy flags, but nothing refuses a write BECAUSE the environment is production. Required before any LIVE credential is installed.",
-      "blocks_capital_live": true
-    },
-    {
       "id": "H1",
       "severity": "MEDIUM",
-      "status": "DISCOVERED",
-      "summary": "model_validation.json is stale: generated 2026-09-01 at acb9c01. Shadow settlements read 108 there vs 383 at runtime, and the OOS Brier reads 'non mesure' though tooling and a negative result now exist. approved:false remains correct.",
+      "status": "OPEN",
+      "summary": "model_validation.json is stale, generated 2026-09-01 at acb9c01. approved:false remains correct.",
       "blocks_capital_live": true
-    },
-    {
-      "id": "C4",
-      "severity": "LOW",
-      "status": "SELF_AUDIT_PENDING_REVIEW",
-      "summary": "KILL_SWITCH='off' meant ENGAGED under the permissive parser and means DISENGAGED under the strict one. The new reading matches operator intent; it is the one input in the migration moving toward permissive. KILL_SWITCH is absent in production.",
-      "blocks_capital_live": false
     }
   ],
+
+  "closed_by_this_release": [
+    "F1 (unittest discovery under-counted the suite the LIVE gatekeeper reads): the collector is canonical and the counts are compared against real pytest rather than hard-coded",
+    "F2 (source-order string index in a gate test): replaced with a behavioural check plus an AST check",
+    "E2 (no environment-keyed read-only enforcement): PROD_ACCESS_MODE with read-only dominance, a transport backstop that fails closed on any verb it cannot prove is a read, and a startup refusal when write authorization is already armed"
+  ],
+
   "capital_live_gates_unmet": [
     "model_approved is false; model_validation.json carries approved:false",
-    "no model has beaten the market baseline out of sample (walk-forward study found no candidate significant)",
-    "daily settlement oracle (BRTI) is not implemented, so KXBTCD is quarantined",
-    "F1 must be closed so the artifact the LIVE gatekeeper reads counts every test",
-    "independent review cleared the change for MERGE only; PR_DEPLOY_READY was NO for capital"
+    "no model has beaten the market baseline out of sample",
+    "the daily settlement oracle (BRTI) is not implemented, so KXBTCD stays quarantined",
+    "M1-THIRD-DOOR must close so the artifact the LIVE gatekeeper reads counts every test",
+    "PROV-1 must close so a decision's data provenance is observable",
+    "LIVE reconciliation has never run against a real account"
   ],
+
   "not_changed_by_this_release": [
+    "no production credential was created, read, printed or inferred",
     "no Railway variable was created, changed or deleted",
-    "no credential was read, written or rotated",
     "no order was submitted and no position was cancelled or settled by hand",
+    "no scientific or model gate was touched; check_live_allowed() is unchanged",
     "model_validation.json still carries approved:false",
     "PR-D remains unmerged and on hold"
-  ],
-  "binds_to": {
-    "git_sha": "PENDING_COMMIT",
-    "tree_sha": "PENDING_COMMIT",
-    "parent_deployed_sha": "9b906e8d0a0a4e183291aa439855519c2d6e19e7",
-    "deployment_id": null,
-    "image_identity": null,
-    "independent_review_commit": null,
-    "note": "RC-1 is NOT deployed. Every runtime field below still describes deployment 2a3da86f built from 9b906e8, NOT this candidate."
-  },
-  "stale": true,
-  "stale_reason": "runtime evidence in this file was produced against 9b906e8; RC-1 changes the money path, the build runner and the builder pin, and has not been built or deployed",
-  "release_candidate": {
-    "name": "RC-1",
-    "workstreams": [
-      "A",
-      "B",
-      "C",
-      "D"
-    ],
-    "canonical_test_count": 828,
-    "pytest_count": 828,
-    "build_count": 828,
-    "counts_match": true,
-    "broker_write_paths_total": 5,
-    "protected_paths": 5,
-    "unprotected_paths": 0,
-    "mutation_A_baseline_survived_at_9b906e8": true,
-    "mutation_A_killed_on_rc1": true,
-    "restart_harness": "17/17",
-    "independent_review": "PENDING",
-    "deployed": false,
-    "runtime_verified": false
-  }
+  ]
 }
