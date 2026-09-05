@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-09-05T17:29:34Z",
-  "git_sha": "3d1cc2bf400d1bb64fe8c079e9e174bd6f054c37",
+  "generated_at": "2026-09-05T22:37:00Z",
+  "git_sha": "d5417535874531e51a7df112f1585f21e4066fa9",
   "tree_sha": "29f7c2e3908de8932eb9d99209d0edf374ee9f94",
-  "deployment_id": "dc843026-1cb1-41db-a357-bf7af9bdb2cf",
-  "deployment_created_at": "2026-09-05T17:25:21Z",
-  "deployment_ready_at": "2026-09-05T17:27:22Z",
+  "deployment_id": "eb1dfd55-d534-414c-a46c-2913a1b0eb67",
+  "deployment_created_at": "2026-09-05T22:26:39Z",
+  "deployment_ready_at": "2026-09-05T22:28:23Z",
   "deployment_status": "SUCCESS",
   "docker_build_pass": true,
   "test_count": 949,
@@ -13,7 +13,7 @@
   "test_errors": 0,
   "test_skipped": 0,
   "independent_review_pass": true,
-  "environment": "DEMO",
+  "environment": "PROD",
   "allow_order_submission": false,
   "daily_oracle_approved": false,
   "model_approved": false,
@@ -25,20 +25,16 @@
   "ready_for_investor_demo": true,
   "ready_for_capital_live": false,
   "stale": false,
-
-  "what_this_release_is": "The pre-merge fix pack (PR #61) merged to main and deployed. The engine still runs DEMO. No production credential exists, so the LIVE READ_ONLY transition is prepared but NOT performed.",
-
+  "what_this_release_is": "ATLAS is connected to the REAL Kalshi production account in READ_ONLY. Authentication, balance and reconciliation are verified against the live account. Zero broker writes. The full live SHADOW is NOT yet running: an equity drawdown computed against a near-empty account cuts the scan before any market is looked at.",
   "binds_to": {
-    "git_sha": "3d1cc2bf400d1bb64fe8c079e9e174bd6f054c37",
-    "tree_sha": "29f7c2e3908de8932eb9d99209d0edf374ee9f94",
-    "audited_sha": "0e44b40f04a6f44d9c92479b98918c5d276fad1d",
-    "audited_tree_sha": "29f7c2e3908de8932eb9d99209d0edf374ee9f94",
-    "tree_identical_to_audited_sha": true,
-    "parent_deployed_sha": "9b906e8d0a0a4e183291aa439855519c2d6e19e7",
-    "deployment_id": "dc843026-1cb1-41db-a357-bf7af9bdb2cf",
-    "note": "The merge commit carries the audited tree byte for byte. git diff 0e44b40..3d1cc2b is empty, so the independent review, the mutation matrix and the CI runs on 0e44b40 all describe exactly the tree that was built and deployed."
+    "git_sha": "d5417535874531e51a7df112f1585f21e4066fa9",
+    "merged_pull_requests": [
+      "https://github.com/ibengi/atlas-decision-engine/pull/61",
+      "https://github.com/ibengi/atlas-decision-engine/pull/62"
+    ],
+    "deployment_id": "eb1dfd55-d534-414c-a46c-2913a1b0eb67",
+    "note": "PR #62 made --live-read-only the repository startup default. The engine boots PROD READ_ONLY from that image."
   },
-
   "evidence": {
     "merge_gate": {
       "rule": "merge only if PR #61 head is exactly 0e44b40f04a6f44d9c92479b98918c5d276fad1d",
@@ -97,54 +93,41 @@
       }
     }
   },
-
   "live_read_only_transition": {
-    "status": "NOT_PERFORMED",
-    "blocked_by": "PROD_CREDENTIALS_ABSENT",
-    "credential_check": {
-      "method": "Railway get-service-config variableNames, which lists names without values",
-      "observed_names": [
-        "ALLOW_ORDER_SUBMISSION",
-        "ANTHROPIC_API_KEY",
-        "BTC_DAILY_SHADOW_ENABLED",
-        "DATA_DIR",
-        "KALSHI_DEMO_KEY_ID",
-        "KALSHI_DEMO_PRIVATE_KEY",
-        "MAX_CONTRACTS_PER_ORDER",
-        "REQUIRE_PERSISTENT_STATE",
-        "RESEARCH_API_TOKEN"
-      ],
-      "prod_credential_names_present": false,
-      "note": "Only DEMO credentials exist. No production key id or private key was created, read, printed or inferred."
+    "status": "ACHIEVED",
+    "first_prod_boot_at": "2026-09-05T22:28:21Z",
+    "LIVE_ENVIRONMENT_CONNECTED": "YES",
+    "LIVE_READ_ONLY": "YES",
+    "LIVE_RECONCILIATION": "MATCH",
+    "LIVE_SHADOW": "NO",
+    "BROKER_WRITES": 0,
+    "CAPITAL_LIVE_READY": "NO",
+    "observed": {
+      "banner_environment": "Environnement : PROD -> https://api.elections.kalshi.com/trade-api/v2",
+      "banner_mode": "PRODUCTION EN LECTURE SEULE (PROD_ACCESS_MODE=READ_ONLY): AUCUNE mutation broker n'est possible, quels que soient les drapeaux de trading. Le gatekeeper modele n'est pas requis pour observer.",
+      "PROD_AUTH": "PASS (Identifiants: cles PROD)",
+      "BALANCE_READ": "PASS (solde 0.04$)",
+      "capital_effectif": "min(plafond 500.00$, solde 0.04$) = 0.04$",
+      "POSITIONS_READ": "PASS",
+      "RECONCILE_STARTUP": "MATCH (tickers broker=0 local=0) @ 22:28:25Z",
+      "unexpected_pre_existing_orders_or_positions": "NONE",
+      "orders_submitted": 0,
+      "fills": 0,
+      "cancels": 0,
+      "mutating_http_to_kalshi": 0
     },
-    "why_configuration_was_held": "Setting PROD_ACCESS_MODE=READ_ONLY and the live-read-only start command before credentials exist would make the process fail its credential gate and crash-loop, taking the engine off DEMO and collecting no data. The configuration is prepared and applied in one step once the credentials are present.",
-    "prepared_configuration": {
-      "variables_to_set": {
-        "PROD_ACCESS_MODE": "READ_ONLY",
-        "KALSHI_ENV_CONFIRM": "LIVE"
-      },
-      "start_command": "python kalshi_alpha_bot.py --loop --live-read-only",
-      "start_command_reason": "The Dockerfile CMD ends in --demo. A live read-only boot requires an explicit Railway start command. --demo and --live-read-only are never combined.",
-      "variables_deliberately_not_defined": [
-        "LIVE_BROKER_WRITES_AUTHORIZED",
-        "LIVE_TRADING",
-        "LIVE_TRADING_CONFIRMED"
-      ],
-      "variables_deliberately_left_false": [
-        "ALLOW_ORDER_SUBMISSION",
-        "MODEL_APPROVED",
-        "DAILY_RESEARCH_ORACLE_APPROVED"
-      ]
-    },
-    "not_yet_established": [
-      "LIVE_ENVIRONMENT_CONNECTED",
-      "LIVE_READ_ONLY",
-      "LIVE_RECONCILIATION",
-      "LIVE_SHADOW",
-      "BROKER_WRITES=0 under LIVE"
-    ]
+    "why_the_shadow_is_not_running": {
+      "guard": "equity_drawdown",
+      "observed": "Drawdown 1222.0% (0.48$) >= 20% -- trading coupe. Eight consecutive cycles recorded blocking_global_guard=equity_drawdown with scan_executed=false.",
+      "cause": "The live account holds 0.04$ against roughly -0.48$ of persisted historical PnL, so the rolling drawdown reads over 1200%. The guard is behaving exactly as designed; it is protecting an exposure that READ_ONLY cannot take.",
+      "fix_awaiting_review": {
+        "branch": "claude/railway-atlas-readonly-shadow-scan",
+        "sha": "054a2e1a8130b45447ae57ce48fab36413d7ee1c",
+        "summary": "A capital risk guard is still evaluated and reported in READ_ONLY but no longer decides whether the engine may look. CAPITAL and DEMO are unchanged.",
+        "status": "NOT REVIEWED, NOT MERGED, NOT DEPLOYED"
+      }
+    }
   },
-
   "open_findings": [
     {
       "id": "M1-THIRD-DOOR",
@@ -194,13 +177,11 @@
       "blocks_capital_live": true
     }
   ],
-
   "closed_by_this_release": [
     "F1 (unittest discovery under-counted the suite the LIVE gatekeeper reads): the collector is canonical and the counts are compared against real pytest rather than hard-coded",
     "F2 (source-order string index in a gate test): replaced with a behavioural check plus an AST check",
     "E2 (no environment-keyed read-only enforcement): PROD_ACCESS_MODE with read-only dominance, a transport backstop that fails closed on any verb it cannot prove is a read, and a startup refusal when write authorization is already armed"
   ],
-
   "capital_live_gates_unmet": [
     "model_approved is false; model_validation.json carries approved:false",
     "no model has beaten the market baseline out of sample",
@@ -209,13 +190,12 @@
     "PROV-1 must close so a decision's data provenance is observable",
     "LIVE reconciliation has never run against a real account"
   ],
-
   "not_changed_by_this_release": [
-    "no production credential was created, read, printed or inferred",
-    "no Railway variable was created, changed or deleted",
-    "no order was submitted and no position was cancelled or settled by hand",
-    "no scientific or model gate was touched; check_live_allowed() is unchanged",
-    "model_validation.json still carries approved:false",
-    "PR-D remains unmerged and on hold"
+    "no order was submitted, cancelled or settled by hand",
+    "no drawdown threshold was moved, no PnL reset, no state deleted, no historical trade modified, no balance faked",
+    "ALLOW_ORDER_SUBMISSION false; MODEL_APPROVED and DAILY_RESEARCH_ORACLE_APPROVED unset",
+    "LIVE_BROKER_WRITES_AUTHORIZED, LIVE_TRADING and LIVE_TRADING_CONFIRMED remain undefined",
+    "no credential value was read or printed",
+    "CAPITAL_LIVE remains a separate promotion decision"
   ]
 }
