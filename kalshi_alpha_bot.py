@@ -301,6 +301,33 @@ def main():
             log.warning("PRODUCTION REAL MONEY ENABLED (double confirmation + "
                         "gatekeeper valides).")
         else:
+            # ETAT OPERATEUR INCOHERENT (RC-3 MED-2). Un processus en LECTURE
+            # SEULE dont l'autorisation d'ecriture est DEJA ARMEE demarre avec
+            # une contradiction: `prod_is_read_only` domine, donc rien ne peut
+            # muter aujourd'hui, mais l'autorisation reste chargee dans
+            # l'environnement. Un passage ulterieur en CAPITAL -- un
+            # redemarrage avec un drapeau different, une variable modifiee sur
+            # la plateforme -- HERITERAIT alors d'une ecriture deja autorisee
+            # que personne n'a decidee pour ce mode.
+            #
+            # On REFUSE de demarrer, et on ne REECRIT PAS la variable: effacer
+            # silencieusement l'autorisation cacherait precisement l'erreur de
+            # configuration qu'il faut voir. C'est a l'operateur de retirer
+            # l'une des deux affirmations contradictoires.
+            armed = config._env_gate("LIVE_BROKER_WRITES_AUTHORIZED",
+                                     default=False)
+            if armed or bool(CFG.LIVE_BROKER_WRITES_AUTHORIZED):
+                log.error(
+                    "PROD_ACCESS_MODE=READ_ONLY avec "
+                    "LIVE_BROKER_WRITES_AUTHORIZED deja ARMEE: etat "
+                    "contradictoire. La lecture seule n'a besoin d'AUCUNE "
+                    "autorisation d'ecriture, et une autorisation qui survit "
+                    "a un changement de mode serait heritee par un futur "
+                    "demarrage en CAPITAL. Retirer "
+                    "LIVE_BROKER_WRITES_AUTHORIZED, ou demarrer en "
+                    "--live-capital delibere. Aucune variable n'a ete "
+                    "modifiee. Arret.")
+                sys.exit(1)
             # LECTURE SEULE. Le gatekeeper modele n'est PAS consulte, et
             # c'est le coeur de ce changement : `check_live_allowed` traitait
             # l'ACCES aux donnees de production comme equivalent a

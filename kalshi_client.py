@@ -39,6 +39,49 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 #: pas le jour ou quelqu'un pense a mettre a jour cette liste.
 MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
+#: Verbes de LECTURE reconnus. Une methode qui n'est ni dans cette liste ni
+#: dans MUTATING_HTTP_METHODS est INCLASSABLE, et une methode inclassable est
+#: traitee comme mutante (voir `_is_mutating_method`).
+READ_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _normalized_http_method(method):
+    """Nom de methode canonique en majuscules, ou None si inclassable.
+
+    `method.upper()` seul ne suffit PAS. `b"POST".upper()` vaut `b"POST"`,
+    qui n'appartient pas a un ensemble de chaines : une methode passee en
+    OCTETS traversait donc le butoir de transport sans etre reconnue comme
+    mutante, et `requests` l'envoyait ensuite comme un POST parfaitement
+    valide. Le test de politique et le test d'envoi ne regardaient pas la
+    meme valeur.
+    """
+    if isinstance(method, str):
+        text = method
+    elif isinstance(method, (bytes, bytearray)):
+        try:
+            text = bytes(method).decode("ascii")
+        except (UnicodeDecodeError, ValueError):
+            return None
+    else:
+        return None
+    text = text.strip().upper()
+    return text or None
+
+
+def _is_mutating_method(method) -> bool:
+    """Vrai si la methode MUTE, ou si on ne peut pas prouver qu'elle lit.
+
+    FAIL-CLOSED. Un objet exotique (None, entier, objet avec un `.upper()`
+    fantaisiste, octets non ASCII) n'est pas classable : le refuser comme une
+    ecriture est le seul choix sur pour un compte de production. Une lecture
+    perdue est un incident; une ecriture non gardee est un ordre.
+    """
+    normalized = _normalized_http_method(method)
+    if normalized is None:
+        return True
+    return normalized not in READ_HTTP_METHODS
+
+
 def pick(d: dict, *names, default=None):
     """Extraction tolerante : retourne la premiere cle presente et non nulle."""
     for n in names:
@@ -202,8 +245,17 @@ class KalshiClient:
         # refusee quelle que soit la raison pour laquelle elle serait sinon
         # partie. C'est le point le plus bas que toute mutation doit
         # traverser : aucun appelant, present ou futur, ne peut l'eviter.
-        if method.upper() in MUTATING_HTTP_METHODS:
-            self._assert_broker_write_allowed(f"{method.upper()} {path}")
+        if _is_mutating_method(method):
+            self._assert_broker_write_allowed(
+                f"{_normalized_http_method(method) or repr(method)} {path}")
+        # La politique d'abord, la validation de type ensuite : sur un compte
+        # de production non autorise, la reponse doit etre le REFUS de
+        # politique, pas une erreur de type qui masquerait la raison reelle.
+        method = _normalized_http_method(method)
+        if method is None:
+            raise KalshiAPIError(
+                0, f"methode HTTP inutilisable pour {path}: valeur non "
+                   f"classable. Aucune requete emise.")
         if self._pk is None and path.startswith("/portfolio"):
             raise KalshiAPIError(
                 0, f"{method} {path}: requete authentifiee IMPOSSIBLE — cle "
@@ -216,7 +268,7 @@ class KalshiClient:
         while True:
             attempt += 1
             try:
-                r = self.session.request(method.upper(), url,
+                r = self.session.request(method, url,
                                          headers=self._sign_headers(method, url),
                                          timeout=15, **kw)
             except (requests.Timeout, requests.ConnectionError) as e:

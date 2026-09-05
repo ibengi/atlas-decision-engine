@@ -29,6 +29,30 @@ WHAT IT DELIBERATELY DOES NOT DO
     a silent split between the two runners: the divergence becomes a red test
     instead of a quiet five-test hole in the LIVE gate's evidence.
 
+WHY IT ALSO REFUSES `async def` AND GENERATOR TESTS  (RC-1 M1)
+    A wrapped `async def test_*` was ACCEPTED and COUNTED, but calling it only
+    builds a coroutine that is never awaited: the body never runs and the test
+    "passes". Reproduced on e377df6 with a deliberately failing async test —
+    pytest reported `1 failed`, `run_tests.py` reported `ran:884 failures:0`
+    and exited 0. That is a false-green `test_report.json`, i.e. the exact
+    failure mode this file exists to close, reopened through another door.
+
+    Two layers close it, because one cannot:
+
+    * STATICALLY, `collect()` refuses coroutine, generator and async-generator
+      functions into `uncollectable`. The build then refuses to write a report
+      at all rather than write a green one.
+    * AT RUNTIME, the wrapper in `_case_for` fails a test whose call returns an
+      un-awaited coroutine/generator. Static inspection cannot see this case: a
+      `functools.wraps` decorator around an `async def` reports
+      `iscoroutinefunction() is False` while still returning a coroutine.
+      Verified that real pytest FAILS that same case, so failing it here is
+      parity, not divergence.
+
+    A test that merely returns a non-None value is deliberately NOT failed:
+    real pytest only warns there (`PytestReturnNotNoneWarning`) and passes, and
+    this collector's job is to agree with pytest, not to be stricter than it.
+
 WHAT THIS FILE IS NOT
     It is not production code. No production module imports `tests`, and the
     Dockerfile's `runtime` stage never executes `run_tests.py`.
@@ -70,12 +94,59 @@ def _module_level_tests(module):
         yield name, obj
 
 
+#: Results that prove the test body never actually ran to completion. A
+#: coroutine or generator handed back by a test function is an UNEXECUTED body,
+#: not a value: awaiting/iterating is what would have run the assertions.
+def _unexecuted_body(result):
+    """Describe `result` if it proves the test body did not run, else None."""
+    if inspect.iscoroutine(result):
+        return "returned a coroutine that was never awaited"
+    if inspect.isasyncgen(result):
+        return "returned an async generator that was never iterated"
+    if inspect.isgenerator(result):
+        return "returned a generator that was never iterated"
+    return None
+
+
+#: Function kinds this runner CANNOT execute, whatever their signature. Each
+#: needs machinery unittest does not have (an event loop, or pytest's generator
+#: handling); wrapping one and calling it would count a test whose body never
+#: ran. `isasyncgenfunction` is listed separately because
+#: `iscoroutinefunction()` is False for an `async def` that yields.
+_UNSUPPORTED_KINDS = (
+    (inspect.iscoroutinefunction, "async def; needs an event loop, pytest-only"),
+    (inspect.isasyncgenfunction, "async generator; pytest-only"),
+    (inspect.isgeneratorfunction, "generator (yield); pytest-only"),
+)
+
+
+def _unsupported_kind(func):
+    """Reason this runner cannot execute `func`, or None if it can."""
+    for predicate, reason in _UNSUPPORTED_KINDS:
+        if predicate(func):
+            return reason
+    return None
+
+
 def _case_for(module, funcs):
     """Wrap a module's bare test functions into one real TestCase."""
     attrs = {}
     for name, func in funcs:
         def method(self, _f=func):
-            _f()
+            result = _f()
+            unexecuted = _unexecuted_body(result)
+            if unexecuted is not None:
+                # Closing the result explicitly keeps the failure clean instead
+                # of trailing a "coroutine was never awaited" RuntimeWarning
+                # from the garbage collector at some unrelated later point.
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise AssertionError(
+                    f"{_f.__module__}.{_f.__name__} {unexecuted}; its body "
+                    f"never ran, so a pass here would be false. This runner "
+                    f"executes tests synchronously and does not provide an "
+                    f"event loop or fixtures.")
         method.__name__ = name
         method.__doc__ = func.__doc__
         attrs[name] = method
@@ -105,6 +176,10 @@ def collect(start_dir="tests"):
             continue
         runnable = []
         for name, func in _module_level_tests(module):
+            unsupported = _unsupported_kind(func)
+            if unsupported is not None:
+                uncollectable.append(f"{modname}.{name} ({unsupported})")
+                continue
             if inspect.signature(func).parameters:
                 uncollectable.append(f"{modname}.{name} (declares parameters)")
                 continue

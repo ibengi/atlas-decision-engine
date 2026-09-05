@@ -14,12 +14,19 @@ lift it. CAPITAL authorizes nothing by itself; every pre-existing gate remains.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock
 
 import _bootstrap  # noqa: F401
+
+try:
+    from tests import _netblock
+except ImportError:                     # pragma: no cover - depends on runner
+    import _netblock
 
 import config
 from config import CFG
@@ -255,23 +262,52 @@ class StartupMatrix(unittest.TestCase):
         """Run the entrypoint far enough to observe the startup decision.
 
         --scan-only would skip the very checks under test, so the process is
-        driven with a real (mocked-network) start and killed by the missing
-        production credentials AFTER the mode logic has run. The startup log
-        is what is asserted on.
+        driven with a real start and killed by the missing production
+        credentials AFTER the mode logic has run. The startup log is what is
+        asserted on.
+
+        STRUCTURALLY INCAPABLE OF REACHING PRODUCTION (RC-3 MED-3). The child
+        was previously handed `os.environ` minus seven keys, which did NOT
+        include `KALSHI_KEY_ID` or `KALSHI_PRIVATE_KEY`. On a machine with
+        production credentials exported, the read-only cases booted far
+        enough to issue authenticated `GET /portfolio/*` against the real
+        account. Two independent changes close that:
+
+          * every production credential is stripped from the child env, so
+            the credential gate stops the boot deterministically — which is
+            what this docstring already claimed happened; and
+          * a `sitecustomize.py` on the child's PYTHONPATH makes DNS and
+            socket connection raise before any application code runs, and
+            logs every attempt.
+
+        Each call asserts the child attempted no connection at all. The
+        assertion lives here rather than in one test so that a future case
+        added to this class inherits it.
         """
-        env = {k: v for k, v in os.environ.items()
-               if k not in ("PROD_ACCESS_MODE", "LIVE_TRADING",
-                            "LIVE_TRADING_CONFIRMED", "KALSHI_ENV_CONFIRM",
-                            "MODEL_APPROVED_FOR_LIVE", "NO_LIVE_PROMOTION",
-                            "DEMO_TRADING")}
+        env = dict(os.environ)
         env.update({"PROBE_PROVIDERS_ON_START": "0",
                     "KALSHI_DEMO_KEY_ID": "test",
                     "KALSHI_DEMO_PRIVATE_KEY": "test",
                     "DATA_DIR": os.environ.get("DATA_DIR", ".")})
-        env.update(env_extra)
-        out = subprocess.run(
-            [sys.executable, "kalshi_alpha_bot.py"] + argv,
-            cwd=_ROOT, env=env, capture_output=True, text=True, timeout=180)
+        tmpdir = tempfile.mkdtemp(prefix="atlas-netblock-")
+        try:
+            network_log = os.path.join(tmpdir, "network-attempts.log")
+            env = _netblock.install(tmpdir, env, network_log)
+            env.update(env_extra)
+            out = subprocess.run(
+                [sys.executable, "kalshi_alpha_bot.py"] + argv,
+                cwd=_ROOT, env=env, capture_output=True, text=True,
+                timeout=180)
+            broker = _netblock.broker_attempts(network_log)
+            self.assertEqual(
+                broker, [],
+                f"the test child contacted the real broker: {broker}")
+            self.assertEqual(
+                _netblock.attempts(network_log), [],
+                "the test child attempted an outbound connection; tests must "
+                "not depend on the machine having no credentials")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
         return out.returncode, (out.stdout + out.stderr)
 
     def test_prod_without_a_mode_refuses_startup(self):
