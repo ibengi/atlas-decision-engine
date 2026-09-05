@@ -8,7 +8,7 @@ import time
 from typing import Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
-from config import (CFG, GATE_PARSE_WARNINGS, _env_b, _p, contract_cap_config,
+from config import (CFG, prod_is_read_only, GATE_PARSE_WARNINGS, _env_b, _p, contract_cap_config,
                     daily_oracle_approved, daily_quarantine_blocks,
                     ticker_is_wellformed)
 from fee_model import FeeModel
@@ -895,6 +895,35 @@ class ExecutionEngine:
                             "market_probability": dec.market_probability,
                             "edge_net": dec.net_edge, "ev_net": dec.net_ev,
                             "strategy": dec.strategy})
+
+        # 5d-bis) LECTURE SEULE PRODUCTION : la decision est COMPLETE (modele,
+        # probabilite marche, edge, EV, portes de risque, taille) et le
+        # resultat est journalise comme WOULD_SUBMIT. Le chemin d'ecriture
+        # n'est PAS emprunte : on n'appelle pas place_and_track pour se faire
+        # refuser par le garde client. Ce garde est une defense en
+        # profondeur, pas le chemin d'execution normal du shadow -- un shadow
+        # qui "essaie puis echoue" laisse une tentative reelle a un bug pres
+        # du reseau, et pollue les compteurs de rejet avec des refus qui ne
+        # sont pas des decisions.
+        if self.client.env != "demo" and prod_is_read_only():
+            report["would_submit"] = report.get("would_submit", 0) + 1
+            report["rejections"]["prod_read_only"] = \
+                report["rejections"].get("prod_read_only", 0) + 1
+            log_trd.info(
+                f"[WOULD_SUBMIT] {ticker} {dec.side.upper()} x{count} @ "
+                f"{entry}c -- PROD_ACCESS_MODE=READ_ONLY: decision complete, "
+                f"AUCUN appel au chemin d'ecriture.",
+                extra={"ticker": ticker, "side": dec.side, "size": count,
+                       "price": entry, "would_submit": True,
+                       "model_probability": dec.model_probability,
+                       "market_probability": dec.market_probability,
+                       "edge_net": dec.net_edge, "ev_net": dec.net_ev,
+                       "est_fee_total": est_fee_total,
+                       "strategy": dec.strategy,
+                       "market_type": getattr(dec, "market_type", None),
+                       "rejection_reason": "prod_read_only",
+                       "environment": self.client.env})
+            return 0
 
         # 5d) SHADOW : decision complete journalisee, AUCUN ordre
         if CFG.SHADOW_MODE:

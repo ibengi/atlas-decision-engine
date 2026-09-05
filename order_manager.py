@@ -6,7 +6,8 @@ import time
 from datetime import datetime, timezone
 
 from config import (CFG, _p, contract_cap_config,
-                    daily_quarantine_blocks, ticker_is_wellformed)
+                    daily_quarantine_blocks, prod_is_read_only,
+                    ticker_is_wellformed)
 from execution_result import ExecutionResult
 from fee_model import FeeModel
 from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
@@ -659,6 +660,20 @@ class OrderManager:
                           "ALLOW_ORDER_SUBMISSION=false")
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:submission_disabled", "rejected")
+        # COUPE-CIRCUIT, SECONDE COUCHE. `execution_engine` teste deja
+        # KILL_SWITCH en debut de cycle, mais ce test-la est en AMONT du
+        # chemin monetaire : une fois le cycle entame, plus rien ne relisait
+        # l'interrupteur, et tout appelant qui atteint place_and_track
+        # autrement que par la boucle du moteur (outil, recovery, test
+        # d'integration, appelant futur) ne le consultait jamais. Un
+        # coupe-circuit qui ne couvre pas le chemin monetaire n'est pas un
+        # coupe-circuit. Relu ICI, a chaque ordre, juste avant les gardes de
+        # marche.
+        if CFG.KILL_SWITCH:
+            log_api.error("[ORDER_SUBMIT_ATTEMPT] bloque: KILL_SWITCH actif "
+                          "-- create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:kill_switch", "rejected")
         # INVARIANT DUR : un ticker qu'on ne sait pas CLASSER ne part pas.
         # None, "", des blancs, un objet non textuel ou un caractere
         # invisible que strip() ne retire pas (U+200B) rendraient la
@@ -915,6 +930,15 @@ class OrderManager:
                 return ExecutionResult(order_id, count, filled, limit_cents,
                                        status or "resting", "resting")
 
+            if self.client.env != "demo" and prod_is_read_only():
+                # Inatteignable en pratique -- aucun ordre ne peut avoir ete
+                # cree en lecture seule -- mais une garde qui depend d'un
+                # raisonnement "ne peut pas arriver" n'est pas une garde.
+                log_api.warning(
+                    f"[ORDER_CANCEL_SKIPPED] {order_id}: "
+                    f"PROD_ACCESS_MODE=READ_ONLY, aucune mutation broker.")
+                return ExecutionResult(order_id, count, filled, limit_cents,
+                                       status or "resting", "resting")
             pre_cancel_filled = filled
             log_api.info("[ORDER_CANCEL_ATTEMPT] "
                          f"kalshi_order_id={order_id} "
@@ -1041,6 +1065,20 @@ class OrderManager:
                     status = "executed" if filled >= meta["count"] else "unknown"
 
                 if status not in self.TERMINAL and filled < meta["count"]:
+                    # LECTURE SEULE PRODUCTION : la reconciliation OBSERVE et
+                    # COMPARE, elle ne REPARE pas. Annuler un ordre reste une
+                    # mutation d'un compte reel, et un mode dit "lecture
+                    # seule" qui annule des ordres au demarrage n'est pas en
+                    # lecture seule. L'ecart est journalise et laisse tel
+                    # quel : un humain decidera, avec le mode CAPITAL.
+                    if self.client.env != "demo" and prod_is_read_only():
+                        log_api.warning(
+                            f"[RECOVERY_READ_ONLY] ordre {oid} non conclu "
+                            f"({status or 'inconnu'}, {filled}/{meta['count']}) "
+                            f"-- PROD_ACCESS_MODE=READ_ONLY: AUCUNE "
+                            f"annulation, aucune correction. Ecart observe et "
+                            f"journalise uniquement.")
+                        continue
                     cancel_resp = self.client.cancel_order(oid)
                     reduced_by = pick_int(cancel_resp, "reduced_by", "reduced_count", default=-1)
                     fills = self.client.get_fills(oid, strict=True)

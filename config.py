@@ -30,12 +30,19 @@ GATE_FALSE_WORDS = ("false", "0", "no", "n", "off", "non")
 GATE_PARSE_WARNINGS: list = []
 
 
-def _env_gate(name, *, default=False):
-    """Booleen STRICT et fail-closed pour les portes de securite.
+def _env_gate(name, *, default=False, on_invalid=False):
+    """Booleen STRICT pour les portes de securite.
 
-    Absente -> `default` (False pour toute porte d'ordre). Vide, blanche ou
-    non reconnue -> False, avec un avertissement bruyant. Aucune valeur
-    inconnue n'active quoi que ce soit.
+    Absente -> `default`. Vide, blanche ou non reconnue -> `on_invalid`, avec
+    un avertissement bruyant. Aucune valeur inconnue n'est INTERPRETEE.
+
+    `on_invalid` existe parce que "fail-closed" n'est pas partout le meme
+    booleen. Pour une porte qui AUTORISE (ALLOW_ORDER_SUBMISSION), la valeur
+    sure sur une entree illisible est False. Pour un interrupteur qui INTERDIT
+    (KILL_SWITCH), la valeur sure est True : un `KILL_SWITCH=flase` doit
+    couper, pas laisser passer. Cabler `_env_gate(default=False)` partout
+    aurait transforme le coupe-circuit en porte fail-OPEN — la polarite decide,
+    jamais l'habitude.
     """
     raw = os.getenv(name)
     if raw is None:
@@ -49,8 +56,52 @@ def _env_gate(name, *, default=False):
     logging.getLogger("CONFIG").error(
         f"[CONFIG_GATE_INVALID] {name}={raw!r} n'est ni vrai ni faux "
         f"(attendu: {'/'.join(GATE_TRUE_WORDS)} ou "
-        f"{'/'.join(GATE_FALSE_WORDS)}) -- lu comme FALSE (fail-closed).")
-    return False
+        f"{'/'.join(GATE_FALSE_WORDS)}) -- lu comme "
+        f"{str(bool(on_invalid)).upper()} (direction sure pour cette porte).")
+    return bool(on_invalid)
+
+
+#: Les DEUX modes d'acces a la production. Un troisieme n'existe pas : tout
+#: ce qui n'est pas exactement CAPITAL est traite comme READ_ONLY partout ou
+#: la question est posee, et le demarrage refuse de toute facon une valeur
+#: qu'il ne reconnait pas (voir `prod_access_mode`).
+PROD_READ_ONLY = "READ_ONLY"
+PROD_CAPITAL   = "CAPITAL"
+PROD_ACCESS_MODES = (PROD_READ_ONLY, PROD_CAPITAL)
+
+
+def prod_access_mode():
+    """Mode d'acces production demande, ou None si la valeur est inutilisable.
+
+    None signifie EXPLICITEMENT "illisible", pas "par defaut" : le demarrage
+    en production REFUSE sur None (voir kalshi_alpha_bot). C'est le choix A
+    de la specification, retenu parce qu'il est le plus facile a PROUVER sur:
+    un processus qui ne demarre pas ne peut pas muter un compte, et la preuve
+    tient en un seul point de controle. Le choix B (defaut READ_ONLY) est sur
+    lui aussi, mais sa preuve exige de montrer que la dominance READ_ONLY
+    tient sur CHAQUE chemin -- une surface de preuve bien plus large.
+
+    Les deux sont neanmoins combines : le demarrage refuse (A), ET
+    `prod_is_read_only` ci-dessous traite tout ce qui n'est pas exactement
+    CAPITAL comme READ_ONLY (B). Une valeur illisible qui echapperait au
+    controle de demarrage n'autorise donc toujours aucune ecriture.
+    """
+    raw = os.getenv("PROD_ACCESS_MODE")
+    if raw is None:
+        return None
+    v = raw.strip().upper()
+    return v if v in PROD_ACCESS_MODES else None
+
+
+def prod_is_read_only() -> bool:
+    """Vrai sauf si le mode CAPITAL a ete demande EXPLICITEMENT.
+
+    Formule volontairement inversee : on ne demande jamais "sommes-nous en
+    lecture seule ?" a une valeur qui pourrait etre absente ou fausse, on
+    demande "le mode CAPITAL a-t-il ete explicitement demande ?". Absent,
+    vide, mal orthographie, inconnu -> lecture seule.
+    """
+    return prod_access_mode() != PROD_CAPITAL
 
 
 def daily_oracle_approved() -> bool:
@@ -226,7 +277,12 @@ class Config:
     # d'un repertoire d'etat volontairement vide (premier montage du
     # volume). Les DEUX sont off par defaut: zero changement en DEMO.
     REQUIRE_PERSISTENT_STATE = _env_b("REQUIRE_PERSISTENT_STATE", default=False)
-    ALLOW_FRESH_STATE        = _env_b("ALLOW_FRESH_STATE", default=False)
+    # PORTE DE SECURITE (C): acquitte un volume VIERGE. Lue en permissif,
+    # un "ALLOW_FRESH_STATE=flase" valait TRUE et faisait ecrire un marqueur
+    # d'etat neuf sur un disque efface -- le moteur repartait sur un grand
+    # livre vide en se croyant continu. Stricte, et fail-closed: illisible =
+    # PAS d'acquittement.
+    ALLOW_FRESH_STATE        = _env_gate("ALLOW_FRESH_STATE", default=False)
     # Portfolio controls are opt-in (0 disables each percentage cap).
     MAX_CORRELATION_GROUP_PCT = _env_f("MAX_CORRELATION_GROUP_PCT", 0.0)
     MAX_PORTFOLIO_RISK_PCT = _env_f("MAX_PORTFOLIO_RISK_PCT", 0.0)
@@ -256,6 +312,19 @@ class Config:
     # explicitement. Aucun changement pour le service deploye, ou la variable
     # vaut deja la chaine "false".
     ALLOW_ORDER_SUBMISSION = _env_gate("ALLOW_ORDER_SUBMISSION", default=False)
+    # PORTE DE SECURITE (E-2) — AUTORISATION D'ECRITURE BROKER EN PRODUCTION.
+    # DELIBEREMENT DISTINCTE de ALLOW_ORDER_SUBMISSION, LIVE_TRADING,
+    # LIVE_TRADING_CONFIRMED et MODEL_APPROVED : chacune de celles-la peut
+    # etre ouverte pour une raison legitime (canary, debug, promotion du
+    # modele) sans que quiconque ait decide qu'une ECRITURE reelle chez le
+    # broker de PRODUCTION est autorisee. Tant qu'elle est fausse, le
+    # LIVE est observable mais pas mutable -- lecture seule PAR
+    # CONSTRUCTION, pas par configuration.
+    #
+    # Stricte et fail-closed : absente, vide, blanche ou illisible => FALSE.
+    # Aucune valeur que le parseur ne comprend pas n'arme une ecriture reelle.
+    LIVE_BROKER_WRITES_AUTHORIZED = _env_gate("LIVE_BROKER_WRITES_AUTHORIZED",
+                                              default=False)
     # PORTE DE SECURITE : le BTC quotidien (KXBTCD) ne peut pas atteindre le
     # chemin argent tant que l'oracle de reglement independant n'est pas
     # approuve. Representation TEMPORAIRE : l'approbation definitive sera
@@ -286,9 +355,19 @@ class Config:
     MIN_FILL_PROXY        = _env_f("MIN_FILL_PROXY", 40.0)
     SLIPPAGE_BUFFER_CENTS = _env_i("SLIPPAGE_BUFFER_CENTS", 1)
     # Solde / modes
-    ALLOW_FALLBACK_CAPITAL = _env_b("ALLOW_FALLBACK_CAPITAL", default=False)
+    # PORTE DE SECURITE (C): autorise un capital de SECOURS quand le solde
+    # broker est illisible -- donc un dimensionnement sur un chiffre suppose.
+    # "Ne jamais remplacer une donnee absente par une estimation inventee":
+    # illisible = pas de secours.
+    ALLOW_FALLBACK_CAPITAL = _env_gate("ALLOW_FALLBACK_CAPITAL", default=False)
     SHADOW_MODE            = _env_b("SHADOW_MODE", default=False)   # decide, n'envoie pas
-    KILL_SWITCH            = _env_b("KILL_SWITCH", default=False)   # coupe tout ordre
+    # PORTE DE SECURITE (C) a POLARITE INVERSE: KILL_SWITCH INTERDIT.
+    # Absent -> False (fonctionnement normal; on ne peut pas exiger sa
+    # presence). Illisible -> True: un operateur qui tape "KILL_SWITCH=treu"
+    # veut couper, et une valeur qu'on ne comprend pas ne doit jamais laisser
+    # passer des ordres.
+    KILL_SWITCH            = _env_gate("KILL_SWITCH", default=False,
+                                       on_invalid=True)   # coupe tout ordre
     # Ordres
     ORDER_TTL_SECONDS = _env_i("ORDER_FILL_TIMEOUT_SECONDS",
                                _env_i("ORDER_TTL_SECONDS", 45))

@@ -188,9 +188,15 @@ class ProdBootGateTest(_CredBase):
     def test_full_engine_prod_boot_refuses_after_live_confirmations(self):
         """With every LIVE confirmation and the model gatekeeper satisfied,
         the credential gate is what stops the boot."""
+        # RC-3 added PROD_ACCESS_MODE, validated BEFORE the credential gate.
+        # Without a mode the boot now stops earlier — still a safe refusal,
+        # but not the one this test is about. CAPITAL is supplied so the
+        # credential gate remains the thing under test; the mode refusal has
+        # its own coverage in tests/test_prod_access_mode.py.
         os.environ.update({"KALSHI_ENV_CONFIRM": "LIVE",
                            "LIVE_TRADING_CONFIRMED": "YES",
-                           "LIVE_TRADING": "1"})
+                           "LIVE_TRADING": "1",
+                           "PROD_ACCESS_MODE": "CAPITAL"})
         for label, key_id, key_pem in BAD_CREDENTIALS:
             with self.subTest(case=label):
                 self._set(key_id, key_pem)

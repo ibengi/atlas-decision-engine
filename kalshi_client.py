@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from config import CFG
+from config import CFG, daily_quarantine_blocks, prod_is_read_only
 
 log_api = logging.getLogger("API")
 log = logging.getLogger("BOT")
@@ -20,7 +20,67 @@ class KalshiAPIError(Exception):
         self.status, self.body = status, body[:500]
         super().__init__(f"HTTP {status}: {message}")
 
+class BrokerWriteForbidden(KalshiAPIError):
+    """Une ecriture broker a ete refusee par POLITIQUE, pas par le reseau.
+
+    Sous-classe de KalshiAPIError pour que tout appelant qui gere deja les
+    erreurs API continue de fonctionner, mais distincte pour qu'un test — et
+    un operateur lisant un journal — puisse separer "le broker a refuse" de
+    "nous avons refuse d'appeler le broker".
+    """
+
+
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+#: Verbes HTTP qui MUTENT l'etat cote broker. Tout ce qui n'est pas une
+#: lecture. La liste est volontairement exhaustive plutot que limitee aux
+#: verbes actuellement utilises (POST, DELETE) : une methode future qui
+#: emploierait PUT ou PATCH doit etre couverte le jour ou elle est ecrite,
+#: pas le jour ou quelqu'un pense a mettre a jour cette liste.
+MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+#: Verbes de LECTURE reconnus. Une methode qui n'est ni dans cette liste ni
+#: dans MUTATING_HTTP_METHODS est INCLASSABLE, et une methode inclassable est
+#: traitee comme mutante (voir `_is_mutating_method`).
+READ_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _normalized_http_method(method):
+    """Nom de methode canonique en majuscules, ou None si inclassable.
+
+    `method.upper()` seul ne suffit PAS. `b"POST".upper()` vaut `b"POST"`,
+    qui n'appartient pas a un ensemble de chaines : une methode passee en
+    OCTETS traversait donc le butoir de transport sans etre reconnue comme
+    mutante, et `requests` l'envoyait ensuite comme un POST parfaitement
+    valide. Le test de politique et le test d'envoi ne regardaient pas la
+    meme valeur.
+    """
+    if isinstance(method, str):
+        text = method
+    elif isinstance(method, (bytes, bytearray)):
+        try:
+            text = bytes(method).decode("ascii")
+        except (UnicodeDecodeError, ValueError):
+            return None
+    else:
+        return None
+    text = text.strip().upper()
+    return text or None
+
+
+def _is_mutating_method(method) -> bool:
+    """Vrai si la methode MUTE, ou si on ne peut pas prouver qu'elle lit.
+
+    FAIL-CLOSED. Un objet exotique (None, entier, objet avec un `.upper()`
+    fantaisiste, octets non ASCII) n'est pas classable : le refuser comme une
+    ecriture est le seul choix sur pour un compte de production. Une lecture
+    perdue est un incident; une ecriture non gardee est un ordre.
+    """
+    normalized = _normalized_http_method(method)
+    if normalized is None:
+        return True
+    return normalized not in READ_HTTP_METHODS
+
 
 def pick(d: dict, *names, default=None):
     """Extraction tolerante : retourne la premiere cle presente et non nulle."""
@@ -129,8 +189,73 @@ class KalshiClient:
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
         }
 
+    # -- Autorisation d'ecriture broker ---------------------------------------
+    def _assert_broker_write_allowed(self, operation: str) -> None:
+        """INVARIANT DE SECURITE — point de controle UNIQUE des ecritures.
+
+            "Une ecriture broker en PRODUCTION exige une autorisation
+             explicite au niveau du client. L'observation LIVE en lecture
+             seule n'en exige aucune."
+
+        Toute methode qui MUTE l'etat cote broker passe par ici, et le
+        transport (`_req`) le re-verifie pour tout verbe mutant : une methode
+        d'ecriture future est donc couverte le jour ou elle est ecrite, meme
+        si son auteur oublie d'appeler ce garde.
+
+        L'autorisation est DELIBEREMENT distincte de ALLOW_ORDER_SUBMISSION,
+        LIVE_TRADING, LIVE_TRADING_CONFIRMED et MODEL_APPROVED. Chacune de
+        celles-la peut etre ouverte pour une raison legitime sans que
+        quiconque ait decide qu'une ecriture reelle sur le compte de
+        production est autorisee. Aucune d'elles ne peut donc armer une
+        ecriture LIVE a la place de celle-ci.
+
+        DEMO est inchange : ce garde ne concerne que l'environnement de
+        production.
+        """
+        if self.env == "demo":
+            return
+        # PRIORITE MAXIMALE — DOMINANCE DE LA LECTURE SEULE.
+        # Teste AVANT toute autre autorisation, y compris
+        # LIVE_BROKER_WRITES_AUTHORIZED. En PROD_ACCESS_MODE=READ_ONLY aucune
+        # combinaison de drapeaux ne peut produire une mutation : ni
+        # ALLOW_ORDER_SUBMISSION, ni LIVE_TRADING, ni LIVE_TRADING_CONFIRMED,
+        # ni MODEL_APPROVED_FOR_LIVE, ni LIVE_BROKER_WRITES_AUTHORIZED, ni
+        # l'etat du coupe-circuit. `prod_is_read_only` est vrai sauf si
+        # CAPITAL a ete demande EXPLICITEMENT : une valeur absente, vide ou
+        # mal orthographiee laisse donc la production en lecture seule.
+        if prod_is_read_only():
+            raise BrokerWriteForbidden(
+                0, f"{operation} REFUSE au niveau client: "
+                   f"PROD_ACCESS_MODE n'est pas CAPITAL, donc l'environnement "
+                   f"{self.env!r} est en LECTURE SEULE. Aucun drapeau de "
+                   f"trading ne peut lever cette interdiction. Aucune requete "
+                   f"reseau mutante n'a ete emise.")
+        if not CFG.LIVE_BROKER_WRITES_AUTHORIZED:
+            raise BrokerWriteForbidden(
+                0, f"{operation} REFUSE au niveau client: environnement "
+                   f"{self.env!r} (production) et "
+                   f"LIVE_BROKER_WRITES_AUTHORIZED n'est pas explicitement "
+                   f"vrai. Le LIVE est en LECTURE SEULE par construction. "
+                   f"Aucune requete reseau mutante n'a ete emise.")
+
     # -- Requete avec retry/backoff ------------------------------------------
     def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
+        # BUTOIR DE TRANSPORT. Place AVANT tout le reste (y compris la
+        # verification de cle) pour qu'une ecriture LIVE non autorisee soit
+        # refusee quelle que soit la raison pour laquelle elle serait sinon
+        # partie. C'est le point le plus bas que toute mutation doit
+        # traverser : aucun appelant, present ou futur, ne peut l'eviter.
+        if _is_mutating_method(method):
+            self._assert_broker_write_allowed(
+                f"{_normalized_http_method(method) or repr(method)} {path}")
+        # La politique d'abord, la validation de type ensuite : sur un compte
+        # de production non autorise, la reponse doit etre le REFUS de
+        # politique, pas une erreur de type qui masquerait la raison reelle.
+        method = _normalized_http_method(method)
+        if method is None:
+            raise KalshiAPIError(
+                0, f"methode HTTP inutilisable pour {path}: valeur non "
+                   f"classable. Aucune requete emise.")
         if self._pk is None and path.startswith("/portfolio"):
             raise KalshiAPIError(
                 0, f"{method} {path}: requete authentifiee IMPOSSIBLE — cle "
@@ -143,7 +268,7 @@ class KalshiClient:
         while True:
             attempt += 1
             try:
-                r = self.session.request(method.upper(), url,
+                r = self.session.request(method, url,
                                          headers=self._sign_headers(method, url),
                                          timeout=15, **kw)
             except (requests.Timeout, requests.ConnectionError) as e:
@@ -256,7 +381,38 @@ class KalshiClient:
         prix en dollars fixed-point, quantite en chaine. La reponse V2 n'a
         PAS de champ status : il est DERIVE de fill/remaining, et la reponse
         est normalisee vers le schema interne (compteurs entiers, prix en
-        cents ramene a NOTRE cote)."""
+        cents ramene a NOTRE cote).
+
+        BUTOIR DE DERNIER RECOURS. Les gardes de politique vivent en amont,
+        dans OrderManager.place_and_track. Elles sont relues ICI parce que
+        `place_and_track` n'est pas le seul appelant possible de cette
+        methode : un outil, un script d'integration, une session de debug ou
+        un appelant futur peut tenir une instance de client et appeler
+        create_order directement, en contournant toute la sequence de gardes.
+        Un inventaire des chemins d'ecriture broker n'a de valeur que si le
+        POINT DE PASSAGE COMMUN refuse aussi. Ce butoir n'est pas une
+        duplication defensive : c'est le seul endroit qu'AUCUN chemin ne peut
+        eviter.
+
+        `cancel_order` n'est deliberement PAS garde de la meme facon : annuler
+        REDUIT l'exposition. Un coupe-circuit qui empecherait d'annuler
+        piegerait un ordre ouvert au lieu de proteger le compte."""
+        # Refus INDEPENDANT par methode, en plus du butoir de transport : si
+        # `_req` changeait un jour, cette methode refuserait encore.
+        self._assert_broker_write_allowed("create_order")
+        if not CFG.ALLOW_ORDER_SUBMISSION:
+            raise KalshiAPIError(
+                0, "create_order refuse au niveau client: "
+                   "ALLOW_ORDER_SUBMISSION=false. Aucun appel reseau emis.")
+        if CFG.KILL_SWITCH:
+            raise KalshiAPIError(
+                0, "create_order refuse au niveau client: KILL_SWITCH actif. "
+                   "Aucun appel reseau emis.")
+        if daily_quarantine_blocks(ticker):
+            raise KalshiAPIError(
+                0, f"create_order refuse au niveau client: {ticker!r} est un "
+                   f"marche BTC quotidien et l'oracle de reglement n'est pas "
+                   f"approuve. Aucun appel reseau emis.")
         price_cents = int(price_cents)
         if side == "yes":
             v2_side, v2_price_c = "bid", price_cents
@@ -322,6 +478,12 @@ class KalshiClient:
         La reponse V2 contient normalement order_id, client_order_id et
         reduced_by. Une erreur HTTP n'est jamais transformee en faux succes.
         """
+        # Une ANNULATION mute aussi l'etat cote broker. Elle reduit
+        # l'exposition, donc le coupe-circuit ne la bloque pas -- mais sur un
+        # compte de PRODUCTION non autorise en ecriture, elle reste une
+        # mutation d'un compte reel et doit etre refusee comme les autres.
+        # "Lecture seule" ne signifie pas "sauf quand cela nous arrange".
+        self._assert_broker_write_allowed("cancel_order")
         r = self._req("DELETE", f"{self.ORDERS_V2_PATH}/{order_id}")
         raw = r.get("order", r) or {}
         returned_id = str(raw.get("order_id") or order_id)
