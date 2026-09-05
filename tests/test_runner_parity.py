@@ -315,6 +315,81 @@ class UnrunnableTestKindsCannotReportGreen(unittest.TestCase):
                 unittest.TestLoader().loadTestsFromTestCase(case))
         self.assertTrue(res.wasSuccessful())
 
+    # ---- the third door: an async METHOD of a TestCase ------------------
+
+    def test_an_async_method_of_a_testcase_is_refused(self):
+        """The door the module-level refusal does not cover.
+
+        `loader.discover` collects a `TestCase`; `TestCase.run` calls the
+        method, gets an un-awaited coroutine back, discards it, and records a
+        pass. Found by the independent review of this fix pack and reproduced
+        before fixing: `run_tests.py` exited 0 with `ran:950 failures:0` for a
+        method whose body raised.
+        """
+        probe = os.path.join(_ROOT, "tests", "test_zz_async_method_probe.py")
+        if os.path.exists(probe):                     # pragma: no cover
+            self.skipTest("probe file already present")
+        with open(probe, "w") as fh:
+            fh.write("import unittest\n\n\n"
+                     "class AsyncInsideTestCase(unittest.TestCase):\n"
+                     "    async def test_async_method(self):\n"
+                     "        raise AssertionError('body ran')\n")
+        try:
+            sys.modules.pop("tests.test_zz_async_method_probe", None)
+            _, diag = _collect.collect("tests")
+        finally:
+            os.remove(probe)
+            sys.modules.pop("tests.test_zz_async_method_probe", None)
+        joined = " ".join(diag["uncollectable"])
+        self.assertIn("test_async_method", joined,
+                      "an async TestCase method was collected as runnable; "
+                      "run_tests.py would write a green report for a body "
+                      "that never ran")
+
+    def test_CONTROL_an_IsolatedAsyncioTestCase_method_is_still_accepted(self):
+        """Anti-vacuity: the refusal must not blanket every coroutine method.
+
+        `IsolatedAsyncioTestCase` supplies an event loop and genuinely runs
+        coroutine methods. Refusing it would break a legitimate style and make
+        the test above pass for the wrong reason.
+        """
+        probe = os.path.join(_ROOT, "tests", "test_zz_iso_async_probe.py")
+        if os.path.exists(probe):                     # pragma: no cover
+            self.skipTest("probe file already present")
+        with open(probe, "w") as fh:
+            fh.write("import unittest\n\n\n"
+                     "class RealAsyncCase(unittest.IsolatedAsyncioTestCase):\n"
+                     "    async def test_iso_runs(self):\n"
+                     "        self.assertTrue(True)\n")
+        try:
+            sys.modules.pop("tests.test_zz_iso_async_probe", None)
+            _, diag = _collect.collect("tests")
+        finally:
+            os.remove(probe)
+            sys.modules.pop("tests.test_zz_iso_async_probe", None)
+        self.assertNotIn(
+            "test_iso_runs", " ".join(diag["uncollectable"]),
+            "IsolatedAsyncioTestCase can run coroutine methods and must not "
+            "be refused")
+
+    def test_a_generator_method_of_a_testcase_is_refused(self):
+        """Same door, generator shape."""
+        probe = os.path.join(_ROOT, "tests", "test_zz_gen_method_probe.py")
+        if os.path.exists(probe):                     # pragma: no cover
+            self.skipTest("probe file already present")
+        with open(probe, "w") as fh:
+            fh.write("import unittest\n\n\n"
+                     "class GenInsideTestCase(unittest.TestCase):\n"
+                     "    def test_gen_method(self):\n"
+                     "        yield\n")
+        try:
+            sys.modules.pop("tests.test_zz_gen_method_probe", None)
+            _, diag = _collect.collect("tests")
+        finally:
+            os.remove(probe)
+            sys.modules.pop("tests.test_zz_gen_method_probe", None)
+        self.assertIn("test_gen_method", " ".join(diag["uncollectable"]))
+
     # ---- end to end, through the real build runner ---------------------
 
     def test_the_build_runner_refuses_and_writes_no_green_report(self):

@@ -37,7 +37,13 @@ WHY IT ALSO REFUSES `async def` AND GENERATOR TESTS  (RC-1 M1)
     and exited 0. That is a false-green `test_report.json`, i.e. the exact
     failure mode this file exists to close, reopened through another door.
 
-    Two layers close it, because one cannot:
+    THREE doors, not two: a bare `async def test_*` at module level, the same
+    thing written as a METHOD of a `unittest.TestCase` (which `discover`
+    collects and `TestCase.run` calls without awaiting), and a decorated
+    function whose coroutine-ness is invisible to `inspect`. All three are
+    closed below.
+
+    Two layers close the first and third, because one cannot:
 
     * STATICALLY, `collect()` refuses coroutine, generator and async-generator
       functions into `uncollectable`. The build then refuses to write a report
@@ -156,11 +162,50 @@ def _case_for(module, funcs):
     return cls
 
 
+def _iter_tests(suite):
+    """Every leaf TestCase in a (possibly nested) suite."""
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _iter_tests(item)
+        else:
+            yield item
+
+
+def _unsupported_methods(suite):
+    """Ids of discovered TEST METHODS this runner cannot execute.
+
+    THE THIRD DOOR. The module-level refusal above covers bare `test_*`
+    functions. It does not see an `async def test_*` written as a METHOD of a
+    `unittest.TestCase`: `loader.discover` collects it, `TestCase.run` calls
+    it, the call returns an un-awaited coroutine, the return value is
+    discarded, and the test "passes". Reproduced at 0e44b40 --
+    `run_tests.py` exited 0 with `ran:950 failures:0` for a method whose body
+    raised. Same false-green artifact, same LIVE gate reading it, reached
+    through a door the first fix did not cover.
+
+    `IsolatedAsyncioTestCase` is exempt: it provides an event loop and really
+    does run coroutine methods, so refusing it would be wrong.
+    """
+    refused = []
+    for test in _iter_tests(suite):
+        if isinstance(test, unittest.IsolatedAsyncioTestCase):
+            continue
+        name = getattr(test, "_testMethodName", "")
+        method = getattr(type(test), name, None)
+        if method is None:
+            continue
+        reason = _unsupported_kind(method)
+        if reason is not None:
+            refused.append(f"{test.id()} ({reason})")
+    return refused
+
+
 def collect(start_dir="tests"):
     """Return (suite, diagnostics).
 
-    `diagnostics["uncollectable"]` lists module-level test functions this
-    collector cannot run. It must stay empty; the parity test enforces that.
+    `diagnostics["uncollectable"]` lists tests this collector cannot run --
+    module-level functions AND TestCase methods. It must stay empty; the
+    parity test enforces that, and `run_tests.py` refuses to write a report.
     """
     loader = unittest.TestLoader()
     suite = loader.discover(start_dir)
@@ -187,6 +232,8 @@ def collect(start_dir="tests"):
         if runnable:
             suite.addTests(loader.loadTestsFromTestCase(_case_for(module, runnable)))
             added += len(runnable)
+
+    uncollectable.extend(_unsupported_methods(suite))
 
     return suite, {
         "discovered_by_unittest": discovered,

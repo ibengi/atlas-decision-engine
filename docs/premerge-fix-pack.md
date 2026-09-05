@@ -23,7 +23,7 @@ async calibration-style test in `tests/`:
 
 | runner | result |
 |---|---|
-| `pytest` | `1 failed, 828 passed` |
+| `pytest` | `1 failed, 883 passed, 186 subtests passed` |
 | `run_tests.py` | `EXIT=0`, `ran:884 failures:0`, `OK` |
 
 `test_report.json` is what `model_gatekeeper.check_live_allowed()` reads

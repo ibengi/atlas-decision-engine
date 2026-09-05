@@ -87,10 +87,26 @@ def _blocked_connect(self, address):
         "outbound connections are blocked in tests: %r" % (address,))
 
 
+def _blocked_connect_ex(self, address):
+    # Records like the other three. A silent hook would let an attempt through
+    # `connect_ex` pass the `attempts() == []` assertion unseen -- isolation
+    # would hold, but the evidence for it would be blind.
+    _record(("connect_ex",) + tuple(address if isinstance(address, tuple)
+                                    else (address,)))
+    return 1
+
+
 socket.getaddrinfo = _blocked_getaddrinfo
 socket.create_connection = _blocked_create_connection
 socket.socket.connect = _blocked_connect
-socket.socket.connect_ex = lambda self, address: 1
+socket.socket.connect_ex = _blocked_connect_ex
+
+# Proof the block INSTALLED in this child. `site.execsitecustomize()` swallows
+# a non-ImportError failure here with only a stderr warning, so without a
+# marker "no attempts recorded" is satisfied both by "guarded and quiet" and
+# by "silently unguarded".
+os.environ["ATLAS_NETBLOCK_INSTALLED"] = "1"
+_record(("netblock-installed",))
 '''
 
 #: Credential and mode variables that must never reach a test child process.
@@ -125,13 +141,30 @@ def install(tmpdir, env, network_log):
     return hardened
 
 
-def attempts(network_log):
-    """Every blocked network attempt the child made, as raw text lines."""
+#: Sentinel the child writes at import to prove the block installed.
+INSTALL_MARKER = "netblock-installed"
+
+
+def installed(network_log):
+    """True if the child actually installed the block (LOW-2)."""
+    return any(INSTALL_MARKER in line for line in _lines(network_log))
+
+
+def _lines(network_log):
     try:
         with open(network_log, encoding="utf-8") as fh:
             return [line.strip() for line in fh if line.strip()]
     except OSError:
         return []
+
+
+def attempts(network_log):
+    """Every blocked network attempt the child made, as raw text lines.
+
+    Excludes the install marker, which is bookkeeping rather than an attempt.
+    """
+    return [line for line in _lines(network_log)
+            if INSTALL_MARKER not in line]
 
 
 def broker_attempts(network_log):

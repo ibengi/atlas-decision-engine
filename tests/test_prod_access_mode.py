@@ -298,6 +298,11 @@ class StartupMatrix(unittest.TestCase):
                 [sys.executable, "kalshi_alpha_bot.py"] + argv,
                 cwd=_ROOT, env=env, capture_output=True, text=True,
                 timeout=180)
+            self.assertTrue(
+                _netblock.installed(network_log),
+                "the network block did not install in this child; "
+                "'no attempts recorded' would then be satisfied by an "
+                "UNGUARDED child rather than by a guarded one")
             broker = _netblock.broker_attempts(network_log)
             self.assertEqual(
                 broker, [],
