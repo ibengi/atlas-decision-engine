@@ -1,1 +1,1 @@
-worker: python kalshi_alpha_bot.py --loop --demo
+worker: python kalshi_alpha_bot.py --loop --live-read-only
