@@ -58,6 +58,38 @@ EXIT=1     (no report written)
 
 **`ASYNC_SILENT_PASS_CLOSED=YES` · `GENERATOR_SILENT_PASS_CLOSED=YES`**
 
+#### Correction — this was only half the story
+
+The two layers above were applied to **module-level functions only**. The same
+shapes written as a METHOD of a `unittest.TestCase` were still collected by
+`discover`, called by `TestCase.run`, and passed with their bodies unexecuted.
+
+There are four doors, not two, along two independent axes:
+
+| where | `inspect` sees it | `inspect` cannot see it |
+|---|---|---|
+| module-level function | static refusal | `_case_for` wrapper |
+| `TestCase` method | static refusal *(added later)* | `_guard_method` wrapper *(added later)* |
+
+`8947da7` closed the first method cell — the statically visible async,
+generator and async-generator methods — and its docstring then claimed every
+door was shut. It was not: a `functools.wraps`-decorated `async def` method
+reports `iscoroutinefunction() is False`, so the static scan cannot see it, and
+nothing looked at what the call returned. An independent review reproduced the
+silent pass on Python 3.13.
+
+The runtime layer for methods closes it, and closes it without asking what kind
+of function it was: `_guard_method` inspects the object the call actually
+returned, which no decorator can disguise. A coroutine, async generator or
+generator handed back by a test is an unexecuted body.
+
+Deliberate decision, pinned by a control test: a synchronous test that returns
+some other non-`None` value still **passes**. Its body did run, and the value
+proves nothing. Real pytest only warns there, and this collector agrees with
+pytest rather than being stricter than it.
+
+**`DECORATED_ASYNC_METHOD_SILENT_PASS_CLOSED=YES`**
+
 ### FIX 2 — RC-3 HIGH-1: the shadow claim was defended by reading, not running
 
 `SHADOW_INVOKES_WRITE_LAYER=NO` rested on assertions over the *source text* of

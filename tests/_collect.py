@@ -37,19 +37,38 @@ WHY IT ALSO REFUSES `async def` AND GENERATOR TESTS  (RC-1 M1)
     and exited 0. That is a false-green `test_report.json`, i.e. the exact
     failure mode this file exists to close, reopened through another door.
 
-    THREE doors, not two: a bare `async def test_*` at module level, the same
-    thing written as a METHOD of a `unittest.TestCase` (which `discover`
-    collects and `TestCase.run` calls without awaiting), and a decorated
-    function whose coroutine-ness is invisible to `inspect`. All three are
-    closed below.
+    FOUR doors, along two independent axes: WHERE the test lives (a bare
+    `test_*` at module level, or a METHOD of a `unittest.TestCase`, which
+    `discover` collects and `TestCase.run` calls without awaiting) crossed with
+    WHETHER `inspect` can see what it is (a bare `async def`, or one hidden
+    behind a `functools.wraps` decorator that reports
+    `iscoroutinefunction() is False` while still returning a coroutine).
 
-    Two layers close the first and third, because one cannot:
+    An earlier revision of this file claimed three doors and said all three
+    were closed. That was wrong, and the way it was wrong is the reason the
+    claim is spelled out in a table now: the decorator case was closed only for
+    module-level functions, and the same shape written as a METHOD still
+    reported a silent pass. An independent review caught it on Python 3.13.
+    A false assurance in this file is worse than no assurance, because it is
+    exactly what stops the next reader from checking.
+
+    Both axes need BOTH layers, because neither layer alone covers a row:
+
+    | where          | `inspect` sees it | `inspect` cannot see it |
+    |----------------|-------------------|-------------------------|
+    | module-level   | static refusal    | `_case_for` wrapper     |
+    | TestCase method| static refusal    | `_guard_method` wrapper |
+
+    The two layers:
 
     * STATICALLY, `collect()` refuses coroutine, generator and async-generator
       functions into `uncollectable`. The build then refuses to write a report
       at all rather than write a green one.
-    * AT RUNTIME, the wrapper in `_case_for` fails a test whose call returns an
-      un-awaited coroutine/generator. Static inspection cannot see this case: a
+    * AT RUNTIME, `_case_for` (module level) and `_guard_method` (methods)
+      fail a test whose call returns an un-awaited coroutine/generator. This
+      layer never asks what kind of function it was; it looks at the object the
+      call actually returned, which no decorator can disguise. Static
+      inspection cannot see this case: a
       `functools.wraps` decorator around an `async def` reports
       `iscoroutinefunction() is False` while still returning a coroutine.
       Verified that real pytest FAILS that same case, so failing it here is
@@ -65,8 +84,9 @@ WHAT THIS FILE IS NOT
 """
 
 
-import inspect
+import functools
 import importlib
+import inspect
 import pathlib
 import unittest
 
@@ -200,6 +220,71 @@ def _unsupported_methods(suite):
     return refused
 
 
+def _guard_method(bound):
+    """Wrap one bound test method so an UNEXECUTED body cannot report a pass.
+
+    THE FOURTH DOOR, and the reason the static scan above is not sufficient on
+    its own. `functools.wraps` around an `async def` produces a plain function:
+    `inspect.iscoroutinefunction()` is False, so `_unsupported_methods` cannot
+    see it, `TestCase.run` calls it, gets a coroutine back, discards it, and
+    records a pass for a body that never ran. Confirmed independently on
+    Python 3.13 as well as 3.11.
+
+    This layer never asks what KIND of function it was. It looks at the object
+    the call actually RETURNED, which no decorator can disguise: a coroutine,
+    an async generator or a generator handed back by a test IS an unexecuted
+    body. That is the same rule `_case_for` already applies to module-level
+    functions; this gives TestCase methods the second layer they were missing.
+
+    `functools.wraps` carries `__unittest_skip__`, `__unittest_skip_why__` and
+    `__unittest_expecting_failure__` across, because `TestCase.run` reads those
+    off the method it is about to call. A wrapper that dropped them would
+    silently start RUNNING tests that were meant to be skipped.
+    """
+    @functools.wraps(bound)
+    def guarded(*args, **kwargs):
+        result = bound(*args, **kwargs)
+        unexecuted = _unexecuted_body(result)
+        if unexecuted is None:
+            # A non-None return that is not a coroutine or generator is NOT
+            # proof of anything: the body did run. Real pytest only warns on
+            # it, and this collector's job is to agree with pytest rather than
+            # to be stricter. Deliberate, and pinned by a test.
+            return result
+        close = getattr(result, "close", None)
+        if callable(close):
+            close()                      # keeps the failure clean, no stray
+                                         # "never awaited" warning at GC time
+        raise AssertionError(
+            f"{getattr(bound, '__qualname__', bound)} {unexecuted}; its body "
+            f"never ran, so a pass here would be false. This runner executes "
+            f"tests synchronously and does not provide an event loop.")
+    return guarded
+
+
+def _install_runtime_guards(suite):
+    """Give every discovered test method the returned-value backstop.
+
+    The guard is set on the INSTANCE, so it shadows the class attribute that
+    `TestCase.run` looks up without mutating the class other tests share.
+
+    `IsolatedAsyncioTestCase` is exempt for the same reason as above: it awaits
+    the coroutine itself, so a coroutine return there is a body about to run,
+    not a body that never did. Guarding it would fail correct tests.
+    """
+    guarded = 0
+    for test in _iter_tests(suite):
+        if isinstance(test, unittest.IsolatedAsyncioTestCase):
+            continue
+        name = getattr(test, "_testMethodName", "")
+        bound = getattr(test, name, None)
+        if not callable(bound):
+            continue
+        setattr(test, name, _guard_method(bound))
+        guarded += 1
+    return guarded
+
+
 def collect(start_dir="tests"):
     """Return (suite, diagnostics).
 
@@ -234,12 +319,14 @@ def collect(start_dir="tests"):
             added += len(runnable)
 
     uncollectable.extend(_unsupported_methods(suite))
+    guarded = _install_runtime_guards(suite)
 
     return suite, {
         "discovered_by_unittest": discovered,
         "module_level_added": added,
         "total": discovered + added,
         "uncollectable": uncollectable,
+        "runtime_guarded_methods": guarded,
     }
 
 

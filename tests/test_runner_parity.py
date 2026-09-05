@@ -12,9 +12,11 @@ totals are compared against each other, so the suite can grow without editing
 this file, and cannot silently split again.
 """
 
+import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 
 import _bootstrap  # noqa: F401
@@ -437,3 +439,193 @@ class UnrunnableTestKindsCannotReportGreen(unittest.TestCase):
 
 if __name__ == "__main__":                              # pragma: no cover
     unittest.main()
+
+
+class TheRuntimeGuardClosesTheDecoratedDoor(unittest.TestCase):
+    """The fourth door: a decorated `async def` METHOD of a `TestCase`.
+
+    `functools.wraps` makes `inspect.iscoroutinefunction()` False, so the
+    static scan cannot see it. `TestCase.run` calls it, receives a coroutine,
+    discards it, and records a pass for a body that never executed. An earlier
+    revision closed this only for module-level functions while claiming all
+    doors were shut; an independent review reproduced the method case on
+    Python 3.13.
+
+    Every test here proves what actually happened with an OBSERVABLE SIDE
+    EFFECT written from inside the body, never with an exit code or a pass
+    count. "Did the body run?" is answered by a file existing on disk.
+    """
+
+    #: Written from inside a probe body. Absence proves the body never ran.
+    _MARK_ENV = "ATLAS_PROBE_MARK"
+
+    def _run_probe(self, name, source):
+        """Collect and RUN one probe through the real collector.
+
+        Returns `(result, body_ran)`. The probe is executed by the same
+        `collect()` the build runner uses, so the guard under test is the one
+        that ships.
+        """
+        probe = os.path.join(_ROOT, "tests", f"test_zz_{name}_probe.py")
+        modname = f"tests.test_zz_{name}_probe"
+        if os.path.exists(probe):                     # pragma: no cover
+            self.skipTest("probe file already present")
+        mark = os.path.join(tempfile.mkdtemp(), "body_ran")
+        previous = os.environ.get(self._MARK_ENV)
+        os.environ[self._MARK_ENV] = mark
+        with open(probe, "w") as fh:
+            fh.write(source)
+        try:
+            sys.modules.pop(modname, None)
+            suite, diag = _collect.collect("tests")
+            selected = unittest.TestSuite()
+
+            def walk(s):
+                for t in s:
+                    if isinstance(t, unittest.TestSuite):
+                        walk(t)
+                    elif f"test_zz_{name}_probe" in t.id():
+                        selected.addTest(t)
+
+            walk(suite)
+            self.assertEqual(
+                selected.countTestCases(), 1,
+                f"probe {name} was not collected exactly once; the rest of "
+                f"this test would be measuring nothing")
+            res = unittest.TextTestRunner(
+                verbosity=0, stream=io.StringIO()).run(selected)
+        finally:
+            os.remove(probe)
+            sys.modules.pop(modname, None)
+            if previous is None:
+                os.environ.pop(self._MARK_ENV, None)
+            else:                                     # pragma: no cover
+                os.environ[self._MARK_ENV] = previous
+        return res, os.path.exists(mark)
+
+    _DECORATOR = (
+        "import functools, os, unittest\n"
+        "def passthrough(fn):\n"
+        "    @functools.wraps(fn)\n"
+        "    def wrapper(*a, **k):\n"
+        "        return fn(*a, **k)\n"
+        "    return wrapper\n"
+        "def _mark():\n"
+        "    open(os.environ['ATLAS_PROBE_MARK'], 'w').write('ran')\n\n\n"
+    )
+
+    def test_a_decorated_async_method_cannot_report_a_pass(self):
+        res, body_ran = self._run_probe("dec_async", self._DECORATOR +
+            "class C(unittest.TestCase):\n"
+            "    @passthrough\n"
+            "    async def test_decorated_async(self):\n"
+            "        _mark()\n"
+            "        raise AssertionError('body ran')\n")
+        self.assertFalse(
+            body_ran,
+            "the coroutine body executed, so this probe no longer models the "
+            "defect and the assertion below would pass for the wrong reason")
+        self.assertFalse(
+            res.wasSuccessful(),
+            "a decorated async method reported a PASS while its body never "
+            "ran; test_report.json would be green for a test that did nothing")
+        message = " ".join(tb for _, tb in res.failures + res.errors)
+        self.assertIn("never ran", message)
+        self.assertIn("coroutine", message)
+
+    def test_a_decorated_generator_method_cannot_report_a_pass(self):
+        res, body_ran = self._run_probe("dec_gen", self._DECORATOR +
+            "class C(unittest.TestCase):\n"
+            "    @passthrough\n"
+            "    def test_decorated_gen(self):\n"
+            "        _mark()\n"
+            "        raise AssertionError('body ran')\n"
+            "        yield\n")
+        self.assertFalse(body_ran)
+        self.assertFalse(res.wasSuccessful())
+        self.assertIn("never ran", " ".join(
+            tb for _, tb in res.failures + res.errors))
+
+    # ---- controls: the guard must not be satisfied by refusing everything ---
+
+    def test_CONTROL_IsolatedAsyncioTestCase_passes_AND_its_body_runs(self):
+        """Anti-vacuity, and the reason the exemption exists.
+
+        This class supplies an event loop and genuinely awaits the coroutine.
+        Guarding it would fail correct tests, and asserting only "it passes"
+        would be satisfied by a test that never ran at all -- so the body's
+        side effect is asserted too.
+        """
+        res, body_ran = self._run_probe("iso", 
+            "import os, unittest\n\n\n"
+            "class C(unittest.IsolatedAsyncioTestCase):\n"
+            "    async def test_iso(self):\n"
+            "        open(os.environ['ATLAS_PROBE_MARK'], 'w').write('ran')\n"
+            "        self.assertTrue(True)\n")
+        self.assertTrue(res.wasSuccessful(),
+                        "IsolatedAsyncioTestCase must remain usable")
+        self.assertTrue(body_ran,
+                        "it passed without running its body, which is the very "
+                        "failure this module exists to catch")
+
+    def test_CONTROL_a_sync_test_returning_a_value_still_passes(self):
+        """The deliberate policy for a non-None return that is NOT a body.
+
+        A test that returns 42 DID execute; the value proves nothing either
+        way. Real pytest only warns here, and this collector's job is to agree
+        with pytest rather than to be stricter than it. Pinned so the choice
+        cannot drift into a stricter rule by accident.
+        """
+        res, body_ran = self._run_probe("nonnone",
+            "import os, unittest\n\n\n"
+            "class C(unittest.TestCase):\n"
+            "    def test_returns_a_value(self):\n"
+            "        open(os.environ['ATLAS_PROBE_MARK'], 'w').write('ran')\n"
+            "        return 42\n")
+        self.assertTrue(body_ran)
+        self.assertTrue(
+            res.wasSuccessful(),
+            "a synchronous test whose body ran was failed for returning a "
+            "value; that is stricter than pytest and breaks legitimate tests")
+
+    def test_the_guard_preserves_skip_semantics(self):
+        """`TestCase.run` reads `__unittest_skip__` off the method it calls.
+
+        The guard replaces that method, so a wrapper that dropped the flag
+        would silently START RUNNING tests someone deliberately skipped.
+        """
+        res, body_ran = self._run_probe("skipped",
+            "import os, unittest\n\n\n"
+            "class C(unittest.TestCase):\n"
+            "    @unittest.skip('deliberate')\n"
+            "    def test_skipped(self):\n"
+            "        open(os.environ['ATLAS_PROBE_MARK'], 'w').write('ran')\n")
+        self.assertEqual(len(res.skipped), 1, "the skip was not honoured")
+        self.assertFalse(body_ran, "a skipped test's body executed")
+
+    def test_the_guard_preserves_expected_failure_semantics(self):
+        res, body_ran = self._run_probe("xfail",
+            "import os, unittest\n\n\n"
+            "class C(unittest.TestCase):\n"
+            "    @unittest.expectedFailure\n"
+            "    def test_xfail(self):\n"
+            "        open(os.environ['ATLAS_PROBE_MARK'], 'w').write('ran')\n"
+            "        raise AssertionError('expected')\n")
+        self.assertEqual(len(res.expectedFailures), 1)
+        self.assertTrue(res.wasSuccessful())
+        self.assertTrue(body_ran)
+
+    def test_the_guard_is_actually_installed_on_the_real_suite(self):
+        """Anti-vacuity for every test above.
+
+        If `collect()` guarded zero methods, each probe above could pass for
+        an unrelated reason. The count must track the discovered suite.
+        """
+        _, diag = _collect.collect("tests")
+        self.assertGreater(diag["runtime_guarded_methods"], 0,
+                           "no method was guarded; the backstop is inert")
+        self.assertGreaterEqual(
+            diag["runtime_guarded_methods"],
+            diag["discovered_by_unittest"] - 50,
+            "far fewer methods were guarded than were discovered; the walk "
+            "is missing part of the suite")
