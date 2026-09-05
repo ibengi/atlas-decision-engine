@@ -98,5 +98,10 @@ sys.exit(0) if (isinstance(mv.get('approved'), bool) \
      sys.exit('model_validation.json: schema invalide (approved=%r, '\
               'generated_ts=%r)' % (mv.get('approved'), mv.get('generated_ts')))"
 
-# Identique au Procfile : DEMO, boucle. Aucun passage LIVE n'est cable ici.
-CMD ["python", "kalshi_alpha_bot.py", "--loop", "--demo"]
+# Identique au Procfile : PRODUCTION EN LECTURE SEULE, boucle.
+# --live-read-only selectionne le mode d'acces; il n'AUTORISE rien. Le
+# demarrage refuse encore sans KALSHI_ENV_CONFIRM=LIVE, PROD_ACCESS_MODE
+# domine en lecture seule, et aucune ecriture broker n'est cablee ici :
+# LIVE_BROKER_WRITES_AUTHORIZED, LIVE_TRADING et ALLOW_ORDER_SUBMISSION
+# restent absents ou faux. CAPITAL reste une decision separee.
+CMD ["python", "kalshi_alpha_bot.py", "--loop", "--live-read-only"]
