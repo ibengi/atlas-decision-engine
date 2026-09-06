@@ -23,6 +23,7 @@ WHAT THESE TESTS REFUSE TO ACCEPT
     drives those same recorders above zero, so a broken harness cannot pass
     for a safe one.
 """
+import json
 import os
 import sys
 import unittest
@@ -47,6 +48,7 @@ INTEGRITY_GUARDS = (
     "kill_switch",
     "balance_gate",
     "risk_can_trade_unclassified",
+    "mode_drift",
 )
 
 _MODE_VARS = ("PROD_ACCESS_MODE", "DEMO_TRADING")
@@ -72,10 +74,16 @@ class _ModeEnv(unittest.TestCase):
             os.environ["PROD_ACCESS_MODE"] = value
 
     def _predicate(self, env, guard):
-        """The REAL predicate, bound to a stub carrying only `client.env`."""
+        """The REAL predicate, reached the way the cycle reaches it.
+
+        The mode is captured by the shipping `_capture_access_mode` rather
+        than constructed here, so these cases still exercise the whole path
+        from the environment variable to the answer.
+        """
         stub = type("S", (), {"client": type("C", (), {"env": env})()})()
+        mode = execution_engine.ExecutionEngine._capture_access_mode(stub)
         return execution_engine.ExecutionEngine._guard_is_observation_only(
-            stub, guard)
+            stub, guard, mode)
 
 
 class ThePredicateNamesExactlyOneSituation(_ModeEnv):
@@ -169,6 +177,7 @@ class _CycleEngine:
         self.tlog = type("T", (), {"has_open_on": lambda self, t: False})()
         self.evidence = []
         self.finished = []
+        self.modes = []
         self._guard = guard
 
     def _balance_gate(self, *a):
@@ -183,14 +192,17 @@ class _CycleEngine:
                               "would_block_capital": would_block_capital})
         return {}
 
-    def _finish_cycle(self, n, res, path="sequential",
-                      would_block_capital=None):
+    def _finish_cycle(self, n, res, path, would_block_capital, mode):
         self.finished.append(would_block_capital)
+        self.modes.append(mode)
         return 0
 
-    def _guard_is_observation_only(self, guard):
+    def _capture_access_mode(self):
+        return execution_engine.ExecutionEngine._capture_access_mode(self)
+
+    def _guard_is_observation_only(self, guard, mode):
         return execution_engine.ExecutionEngine._guard_is_observation_only(
-            self, guard)
+            self, guard, mode)
 
     def _report_would_block_capital(self, guard):
         return execution_engine.ExecutionEngine._report_would_block_capital(
@@ -499,3 +511,349 @@ class TheStartupRefusalIsUnchanged(unittest.TestCase):
             "refusal, so this test would pass with the refusal deleted")
         self.assertEqual(_netblock.attempts(log), [],
                          "the child attempted an outbound connection")
+
+
+# --------------------------------------------------------------------------
+# The SEAM. `_finish_cycle` is what carries the reported guard from the cycle
+# into the durable row, and nothing above tests it: the evidence tests call
+# `_record_cycle_evidence` directly, and the cycle tests stub `_finish_cycle`.
+# Deleting `would_block_capital=` from that one call therefore left the whole
+# suite green while the durable record silently lost the only machine-readable
+# statement that CAPITAL would have refused the cycle.
+#
+# These tests run the REAL `_cycle_sequential` / `_cycle_parallel`, the REAL
+# `_finish_cycle` and the REAL `_record_cycle_evidence`, and read the row back
+# out of the sink it was written to.
+# --------------------------------------------------------------------------
+
+class _DurableSink:
+    def __init__(self):
+        self.rows = []
+
+    def write(self, row):
+        # A durable writer serializes. Anything unserializable would be lost
+        # on the real path, so it must fail here too.
+        self.rows.append(json.loads(json.dumps(row)))
+
+
+class _FullCycleEngine:
+    """Enough collaborators for the REAL finalization path to run.
+
+    Nothing on the evidence path is stubbed: `_finish_cycle`,
+    `_record_cycle_evidence` and `_FUNNEL_KEYS` are the shipping articles, and
+    the row is read back from the sink rather than from a return value.
+    """
+
+    _FUNNEL_KEYS = execution_engine.ExecutionEngine._FUNNEL_KEYS
+
+    def __init__(self, env="prod", guard="equity_drawdown", gates_ok=False):
+        self.client = type("C", (), {"env": env})()
+        self.cycles_jsonl = _DurableSink()
+        self.stats = _Stats()
+        self.posmgr = type("P", (), {"tickers_open": lambda self: set()})()
+        self.tlog = type("T", (), {"has_open_on": lambda self, t: False})()
+        self.orders = type("O", (), {"exchange_pause_until": 0.0})()
+        self.scanner = type("S", (), {"shadow_population": lambda self: []})()
+        self.btc_daily_shadow = type(
+            "B", (), {"run": lambda self, pop, cid: {}})()
+        self.capital = 0.04
+        self.configured_capital = 0.04
+        self.last_balance = 0.04
+        self.pipeline = _FullPipeline()
+        self._guard = guard
+        self._gates_ok = gates_ok
+        self.executed = []
+        self.drift_to = None
+
+    # -- collaborators the cycle needs before the gates -------------------
+    def _balance_gate(self, *a):
+        return True, "solde=0.04$"
+
+    def _post_balance_gates(self):
+        return (True, None) if self._gates_ok else (False, self._guard)
+
+    def _execute_decision(self, dec, report):
+        self.executed.append(dec)
+        return 0
+
+    # -- everything below is the shipping implementation ------------------
+    def _capture_access_mode(self):
+        mode = execution_engine.ExecutionEngine._capture_access_mode(self)
+        # A test hook, used ONLY by the drift cases: the second capture --
+        # the one `_finish_cycle` takes to compare -- sees a changed
+        # environment, exactly as it would if something rewrote the variable
+        # mid-cycle.
+        if self.drift_to is not None:
+            os.environ["PROD_ACCESS_MODE"] = self.drift_to
+            self.drift_to = None
+        return mode
+
+    def _guard_is_observation_only(self, guard, mode):
+        return execution_engine.ExecutionEngine._guard_is_observation_only(
+            self, guard, mode)
+
+    def _report_would_block_capital(self, guard):
+        return execution_engine.ExecutionEngine._report_would_block_capital(
+            self, guard)
+
+    def _record_cycle_evidence(self, *a, **kw):
+        return execution_engine.ExecutionEngine._record_cycle_evidence(
+            self, *a, **kw)
+
+    def _finish_cycle(self, *a, **kw):
+        return execution_engine.ExecutionEngine._finish_cycle(self, *a, **kw)
+
+    def sequential(self, n=1):
+        return execution_engine.ExecutionEngine._cycle_sequential(self, n)
+
+    def parallel(self, n=1):
+        self._executor = type(
+            "E", (), {"submit": lambda self, fn: type(
+                "F", (), {"result": lambda self: (0.04, None)})()})()
+        self._background_balance_health = lambda: (0.04, None)
+        return execution_engine.ExecutionEngine._cycle_parallel(self, n)
+
+
+class _FullPipeline:
+    def __init__(self):
+        self.calls = 0
+
+    def run_cycle(self, **kw):
+        self.calls += 1
+        return {"report": {"cycle_id": "cyc-seam", "scanned_raw": 9,
+                           "scanned": 9, "ranker_eligible": 3,
+                           "accepted": 0, "rejections": {}},
+                "accepted": []}
+
+
+class TheDurableRowKeepsTheCapitalBlockFact(
+        shadow_iso._IsolatedState, _ModeEnv):
+    """A READ_ONLY cycle that observed past a capital guard must SAY SO in
+    the durable record, not only in a log line.
+
+    Mutation this pins: deleting `would_block_capital=` from the
+    `_finish_cycle` -> `_record_cycle_evidence` call.
+    """
+
+    def setUp(self):
+        shadow_iso._IsolatedState.setUp(self)
+        _ModeEnv.setUp(self)
+
+    def tearDown(self):
+        _ModeEnv.tearDown(self)
+        shadow_iso._IsolatedState.tearDown(self)
+
+    def _only_row(self, eng):
+        self.assertEqual(len(eng.cycles_jsonl.rows), 1,
+                         f"expected exactly one durable row, got "
+                         f"{eng.cycles_jsonl.rows}")
+        return eng.cycles_jsonl.rows[0]
+
+    def test_sequential_row_names_the_guard_capital_would_have_obeyed(self):
+        self._mode(config.PROD_READ_ONLY)
+        eng = _FullCycleEngine()
+        eng.sequential()
+        row = self._only_row(eng)
+        self.assertTrue(row["scan_executed"],
+                        "the scan did not run, so this is not the cycle "
+                        "under test")
+        self.assertIsNone(row["blocking_global_guard"],
+                          "the cycle stopped at the guard after all")
+        self.assertEqual(
+            row["would_block_capital"], "equity_drawdown",
+            "the durable row lost the fact that CAPITAL would have refused "
+            "this cycle -- the log line alone is not the record")
+
+    def test_parallel_row_names_it_too(self):
+        self._mode(config.PROD_READ_ONLY)
+        eng = _FullCycleEngine()
+        eng.parallel()
+        row = self._only_row(eng)
+        self.assertTrue(row["scan_executed"])
+        self.assertIsNone(row["blocking_global_guard"])
+        self.assertEqual(row["would_block_capital"], "equity_drawdown")
+
+    def test_every_capital_guard_survives_the_seam(self):
+        """Not just the one guard that prompted the change."""
+        for guard in sorted(CAPITAL_RISK_GUARDS):
+            with self.subTest(guard=guard):
+                self._mode(config.PROD_READ_ONLY)
+                eng = _FullCycleEngine(guard=guard)
+                eng.sequential()
+                self.assertEqual(self._only_row(eng)["would_block_capital"],
+                                 guard)
+
+    def test_ANTIVACUITY_a_clean_cycle_writes_null(self):
+        """The field is not simply always populated: a cycle no capital guard
+        objected to must record `None`, or the assertions above would pass
+        against a constant."""
+        self._mode(config.PROD_READ_ONLY)
+        eng = _FullCycleEngine(gates_ok=True)
+        eng.sequential()
+        row = self._only_row(eng)
+        self.assertTrue(row["scan_executed"])
+        self.assertIsNone(row["would_block_capital"])
+
+    def test_finalization_refuses_to_run_without_the_facts_it_carries(self):
+        """`would_block_capital` and `mode` are facts only the caller has.
+
+        `_finish_cycle` cannot re-derive either honestly -- re-reading the
+        mode is the very drift this change exists to stop, and the reported
+        guard exists nowhere else by then. So both are REQUIRED parameters,
+        and a caller that omits one fails loudly here rather than finalizing
+        a cycle it cannot describe. Asserted by calling, not by inspecting
+        the signature: the contract is what the code does when you break it.
+        """
+        eng = _FullCycleEngine()
+        res = _FullPipeline().run_cycle()
+        finish = execution_engine.ExecutionEngine._finish_cycle
+        with self.assertRaises(TypeError):
+            finish(eng, 1, res, "sequential")
+        with self.assertRaises(TypeError):
+            finish(eng, 1, res, "sequential", "equity_drawdown")
+        self.assertEqual(eng.cycles_jsonl.rows, [],
+                         "a cycle was finalized despite the refusal")
+
+    def test_the_row_is_serializable_so_it_can_actually_be_durable(self):
+        self._mode(config.PROD_READ_ONLY)
+        eng = _FullCycleEngine()
+        eng.sequential()
+        json.dumps(self._only_row(eng))
+
+
+class TheModeCannotDriftBetweenObservationAndAction(
+        shadow_iso._IsolatedState, _ModeEnv):
+    """The cycle is AUTHORIZED under one reading of PROD_ACCESS_MODE and then
+    ACTS under another. Both directions are refused before any decision runs.
+
+    `PROD_ACCESS_MODE` is an environment variable, so it is mutable for the
+    life of the process. Reading it twice in one cycle reads two facts that
+    merely share a name.
+    """
+
+    def setUp(self):
+        shadow_iso._IsolatedState.setUp(self)
+        _ModeEnv.setUp(self)
+
+    def tearDown(self):
+        _ModeEnv.tearDown(self)
+        shadow_iso._IsolatedState.tearDown(self)
+
+    def _drifted(self, start, finish, gates_ok=False, env="prod"):
+        self._mode(start)
+        eng = _FullCycleEngine(env=env, gates_ok=gates_ok)
+        eng.drift_to = finish
+        eng.sequential()
+        return eng
+
+    def test_a_read_only_cycle_cannot_finalize_as_capital(self):
+        """The dangerous direction: relaxed past a capital guard, then acting
+        under an authorization that would have refused the relaxation."""
+        eng = self._drifted(config.PROD_READ_ONLY, config.PROD_CAPITAL)
+        self.assertEqual(eng.executed, [],
+                         "a decision was executed on a cycle whose mode "
+                         "changed under it")
+        row = eng.cycles_jsonl.rows[-1]
+        self.assertEqual(row["blocking_global_guard"], "mode_drift")
+        self.assertEqual(
+            row["would_block_capital"], "equity_drawdown",
+            "the drift stop threw away the capital-guard fact it was "
+            "supposed to preserve")
+        self.assertTrue(row["scan_executed"],
+                        "the observation that DID happen was lost")
+
+    def test_a_capital_cycle_cannot_finalize_as_read_only(self):
+        eng = self._drifted(config.PROD_CAPITAL, config.PROD_READ_ONLY,
+                            gates_ok=True)
+        self.assertEqual(eng.executed, [])
+        self.assertEqual(eng.cycles_jsonl.rows[-1]["blocking_global_guard"],
+                         "mode_drift")
+
+    def test_capital_drifting_to_an_unreadable_value_fails_closed(self):
+        """An unreadable mode reads as read-only, so this is a real change of
+        authorization and must stop the cycle."""
+        eng = self._drifted(config.PROD_CAPITAL, "READ0NLY", gates_ok=True)
+        self.assertEqual(eng.executed, [])
+        self.assertEqual(eng.cycles_jsonl.rows[-1]["blocking_global_guard"],
+                         "mode_drift")
+
+    def test_two_spellings_of_the_same_authorization_are_not_drift(self):
+        """Anti-vacuity in the other direction: the check must not stop a
+        cycle whose EFFECTIVE authorization never moved, or it would halt
+        production on a cosmetic difference."""
+        eng = self._drifted(config.PROD_READ_ONLY, "READ0NLY")
+        row = eng.cycles_jsonl.rows[-1]
+        self.assertIsNone(row["blocking_global_guard"],
+                          "an unchanged authorization was reported as drift")
+        self.assertEqual(row["would_block_capital"], "equity_drawdown")
+
+    def test_no_drift_is_the_ordinary_case(self):
+        self._mode(config.PROD_READ_ONLY)
+        eng = _FullCycleEngine()
+        eng.sequential()
+        self.assertIsNone(
+            eng.cycles_jsonl.rows[-1]["blocking_global_guard"])
+
+    def test_DEMO_is_not_subject_to_the_drift_check(self):
+        """Demo's mode does not come from PROD_ACCESS_MODE, so changing that
+        variable beside a demo run must not stop a demo cycle."""
+        eng = self._drifted(config.PROD_READ_ONLY, config.PROD_CAPITAL,
+                            gates_ok=True, env="demo")
+        row = eng.cycles_jsonl.rows[-1]
+        self.assertIsNone(row["blocking_global_guard"],
+                          "DEMO behaviour changed")
+        self.assertTrue(row["scan_executed"])
+
+    def test_the_parallel_path_refuses_drift_too(self):
+        self._mode(config.PROD_READ_ONLY)
+        eng = _FullCycleEngine()
+        eng.drift_to = config.PROD_CAPITAL
+        eng.parallel()
+        self.assertEqual(eng.executed, [])
+        self.assertEqual(eng.cycles_jsonl.rows[-1]["blocking_global_guard"],
+                         "mode_drift")
+
+    def test_the_captured_mode_is_immutable(self):
+        """A carried value that can be edited in flight is not a snapshot."""
+        self._mode(config.PROD_READ_ONLY)
+        stub = type("S", (), {"client": type("C", (), {"env": "prod"})()})()
+        mode = execution_engine.ExecutionEngine._capture_access_mode(stub)
+        with self.assertRaises(AttributeError):
+            mode.read_only = False
+
+    def test_mode_drift_is_never_observational(self):
+        self._mode(config.PROD_READ_ONLY)
+        stub = type("S", (), {"client": type("C", (), {"env": "prod"})()})()
+        mode = execution_engine.ExecutionEngine._capture_access_mode(stub)
+        self.assertFalse(
+            execution_engine.ExecutionEngine._guard_is_observation_only(
+                stub, execution_engine.MODE_DRIFT_GUARD, mode))
+        self.assertNotIn(execution_engine.MODE_DRIFT_GUARD,
+                         CAPITAL_RISK_GUARDS)
+
+    def test_an_unrecognised_environment_is_treated_as_PRODUCTION(self):
+        """"Not demo", never "is prod".
+
+        The write boundary reads the environment this way on purpose: only
+        the string `demo` earns demo's exemption, and anything else -- a
+        future environment name, an unset value, a typo -- is production.
+        Rewriting the test as `== "prod"` would be safe HERE (an unknown
+        environment would simply stop being relaxed) but it would break the
+        shared idiom, and the same rewrite on the write boundary is not safe
+        at all. Pinning it here keeps the two spellings from diverging.
+        """
+        self._mode(config.PROD_READ_ONLY)
+        for env in ("prod", "staging", "", None, "PROD"):
+            with self.subTest(environment=env):
+                stub = type("S", (), {
+                    "client": type("C", (), {"env": env})()})()
+                mode = execution_engine.ExecutionEngine._capture_access_mode(
+                    stub)
+                self.assertTrue(
+                    mode.observation_only_allowed,
+                    f"environment {env!r} is not demo, so it must be treated "
+                    f"as production")
+        stub = type("S", (), {"client": type("C", (), {"env": "demo"})()})()
+        mode = execution_engine.ExecutionEngine._capture_access_mode(stub)
+        self.assertFalse(mode.observation_only_allowed,
+                         "only 'demo' earns demo's exemption")

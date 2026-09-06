@@ -5,7 +5,7 @@ Extrait de kalshi_alpha_bot.py (P3.15).
 import logging
 import os
 import time
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
 from config import (CFG, prod_is_read_only, GATE_PARSE_WARNINGS, _env_b, _p, contract_cap_config,
@@ -123,6 +123,44 @@ CAPITAL_RISK_GUARDS = frozenset({
     "max_trades_cycle",
     "open_risk_budget",
 })
+
+
+#: The guard name for a cycle whose access mode CHANGED under it. Always
+#: blocking, in every mode, and deliberately NOT in CAPITAL_RISK_GUARDS: a
+#: cycle that cannot say which mode it ran in is exactly the cycle that must
+#: not act.
+MODE_DRIFT_GUARD = "mode_drift"
+
+
+class CycleAccessMode(NamedTuple):
+    """The effective access mode of ONE cycle, read once and then frozen.
+
+    `PROD_ACCESS_MODE` lives in the process environment, which is mutable.
+    Reading it twice inside a single cycle reads two different facts that
+    happen to share a name. The decision to keep OBSERVING past a capital
+    guard and the decision to ACT on what that observation produced must rest
+    on the same reading, so the reading is taken once, at the top of the
+    cycle, and carried down instead of re-derived.
+
+    `read_only` holds the EFFECTIVE authorization, not the spelling: two
+    unreadable values that both mean read-only compare equal, and only a
+    change that would actually change what the engine may do counts as drift.
+    """
+
+    environment: str
+    read_only: bool
+
+    @property
+    def observation_only_allowed(self) -> bool:
+        """PRODUCTION READ_ONLY -- the only situation in which a capital
+        guard may be reported instead of obeyed.
+
+        "Not demo", never "is prod": an unreadable environment is treated as
+        production and an unreadable access mode as read-only, which is the
+        safe direction for writes and, here, for observation too -- read-only
+        can only ever observe.
+        """
+        return self.environment != "demo" and self.read_only
 
 
 def assert_real_demo_integrity(client, shadow_mode: bool):
@@ -425,26 +463,35 @@ class ExecutionEngine:
             return False, "equity_drawdown"
         return True, None
 
-    def _guard_is_observation_only(self, guard) -> bool:
+    def _capture_access_mode(self) -> CycleAccessMode:
+        """Read the access mode ONCE, at the top of a cycle.
+
+        Every later question about the mode within that cycle is asked of the
+        returned value, never of the environment again. `_finish_cycle`
+        re-captures purely to COMPARE, and refuses the cycle if the two
+        readings disagree.
+        """
+        return CycleAccessMode(environment=self.client.env,
+                               read_only=prod_is_read_only())
+
+    def _guard_is_observation_only(self, guard, mode: CycleAccessMode) -> bool:
         """True when `guard` may be REPORTED instead of stopping the cycle.
 
         Two conditions, both required. The guard must price capital risk
-        rather than integrity, and the process must be PRODUCTION READ_ONLY.
+        rather than integrity, and `mode` must be PRODUCTION READ_ONLY.
 
-        The mode test is `client.env != "demo" and prod_is_read_only()` --
-        the exact formulation `_execute_decision` already uses for the write
-        boundary, so the two cannot drift apart. "Not demo", never "is prod":
-        an unreadable environment is treated as production, and an unreadable
-        access mode is treated as read-only, which is the safe direction for
-        writes. Here it is also the safe direction for observation, because
-        read-only can only ever observe.
+        `mode` is the reading captured for THIS cycle, not a fresh one, and
+        it is passed rather than re-read on purpose. The caller has already
+        committed the cycle to a mode; asking the environment again here
+        would let the answer change halfway through, and the two answers
+        would then disagree about the same cycle.
 
-        DEMO is excluded, so demo behaviour is unchanged even if someone
-        exports PROD_ACCESS_MODE by hand.
+        DEMO is excluded by `observation_only_allowed`, so demo behaviour is
+        unchanged even if someone exports PROD_ACCESS_MODE by hand.
         """
         if guard not in CAPITAL_RISK_GUARDS:
             return False
-        return self.client.env != "demo" and prod_is_read_only()
+        return mode.observation_only_allowed
 
     def _report_would_block_capital(self, guard: str) -> None:
         """Say plainly that CAPITAL would have been refused, and why.
@@ -697,10 +744,19 @@ class ExecutionEngine:
                 return 0
 
             # 4) Portes de risque globales (dependent desormais du capital a jour)
+            #
+            # Le mode d'acces est lu UNE SEULE fois par cycle, ici, a son
+            # premier usage (voir CycleAccessMode). Il est ensuite PORTE
+            # jusqu'a la finalisation au lieu d'etre relu : la relaxation
+            # d'observation et la decision d'AGIR doivent reposer sur la
+            # meme lecture. Pas plus tot: le kill switch et la porte de
+            # solde n'en dependent pas, et la porte la plus fail-closed du
+            # cycle ne doit dependre de rien de plus qu'avant.
+            mode = self._capture_access_mode()
             gates_ok, guard = self._post_balance_gates()
             would_block_capital = None
             if not gates_ok:
-                if self._guard_is_observation_only(guard):
+                if self._guard_is_observation_only(guard, mode):
                     # PRODUCTION READ_ONLY: the guard is real and is reported,
                     # but it protects capital that cannot be committed here.
                     # Observation continues; no order can follow it.
@@ -716,7 +772,8 @@ class ExecutionEngine:
             skip_ticker_fn=(lambda tk: CFG.ONE_TRADE_PER_MKT and
                             (tk in self.posmgr.tickers_open()
                              or self.tlog.has_open_on(tk))))
-        return self._finish_cycle(n, res, "sequential", would_block_capital)
+        return self._finish_cycle(n, res, "sequential", would_block_capital,
+                                  mode)
 
     def _cycle_parallel(self, n: int) -> int:
         """P8 : solde + checks de sante executes en PARALLELE du scan.
@@ -752,23 +809,60 @@ class ExecutionEngine:
                 self._record_cycle_evidence(n, "parallel", "balance_gate",
                                             detail=why, pipeline=res)
                 return 0
+            # Meme lecture unique du mode d'acces, au meme endroit du cycle
+            # que sur le chemin sequentiel.
+            mode = self._capture_access_mode()
             gates_ok, guard = self._post_balance_gates()
             would_block_capital = None
             if not gates_ok:
-                if self._guard_is_observation_only(guard):
+                if self._guard_is_observation_only(guard, mode):
                     would_block_capital = guard
                     self._report_would_block_capital(guard)
                 else:
                     self._record_cycle_evidence(n, "parallel", guard,
                                                 pipeline=res)
                     self.stats.log_summary(); return 0
-        return self._finish_cycle(n, res, "parallel", would_block_capital)
+        return self._finish_cycle(n, res, "parallel", would_block_capital,
+                                  mode)
 
-    def _finish_cycle(self, n: int, res: dict,
-                      execution_path: str = "sequential",
-                      would_block_capital=None) -> int:
+    def _finish_cycle(self, n: int, res: dict, execution_path: str,
+                      would_block_capital, mode: CycleAccessMode) -> int:
         """Execution des candidats acceptes + rapports de fin de cycle
-        (partage sequentiel/parallele)."""
+        (partage sequentiel/parallele).
+
+        Every parameter is REQUIRED. `would_block_capital` and `mode` carry
+        facts the caller has and this method cannot re-derive honestly, so a
+        caller that forgets one fails loudly here instead of finalizing a
+        cycle it cannot describe.
+        """
+        # CONSISTANCE DU MODE. Le cycle a ete AUTORISE sous `mode`; il est
+        # sur le point d'AGIR. Entre les deux, PROD_ACCESS_MODE -- une
+        # variable d'environnement, donc mutable -- a pu changer. Un cycle
+        # relaxe en LECTURE SEULE qui finaliserait en CAPITAL executerait des
+        # decisions prises alors qu'une porte de capital etait ouverte; un
+        # cycle CAPITAL qui finaliserait en LECTURE SEULE decrirait un mode
+        # qu'il n'a pas eu. Les deux sont refuses: on enregistre la preuve
+        # (le scan a bien eu lieu, et le garde capital eventuel est conserve)
+        # et on s'arrete AVANT toute decision. DEMO est hors sujet: son mode
+        # ne depend pas de PROD_ACCESS_MODE.
+        if mode.environment != "demo":
+            current = self._capture_access_mode()
+            if current != mode:
+                log_rsk.error(
+                    f"[MODE_DRIFT] le mode d'acces a CHANGE pendant le cycle "
+                    f"{n}: autorise sous {mode}, finalise sous {current}. "
+                    f"Aucune decision n'est executee.",
+                    extra={"event": "mode_drift", "cycle": n,
+                           "authorized_read_only": mode.read_only,
+                           "current_read_only": current.read_only,
+                           "environment": mode.environment})
+                self._record_cycle_evidence(
+                    n, execution_path, MODE_DRIFT_GUARD,
+                    detail=(f"authorized read_only={mode.read_only} "
+                            f"finalized read_only={current.read_only}"),
+                    pipeline=res, would_block_capital=would_block_capital)
+                self.stats.log_summary()
+                return 0
         report = res["report"]
         placed = 0
         for dec in res["accepted"]:
