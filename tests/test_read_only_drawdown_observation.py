@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """PROD READ_ONLY may observe through `equity_drawdown`; nothing else changes.
 
-The bootstrap wrapper patches three ExecutionEngine methods at process start.
-These tests install it the way `main()` does and then drive the REAL
+The behaviour is REPO-OWNED: it lives in `execution_engine.ExecutionEngine`
+and is selected by the access mode alone. Nothing is installed or patched
+for these tests. They drive the REAL `_post_balance_gates`,
 `_cycle_sequential`, `_cycle_parallel`, `_finish_cycle`,
-`_record_cycle_evidence` and `_execute_decision`, reading every claim back
-from the durable sink, the dashboard file, or a recorder at the write
-boundary. Only the gate VERDICT is injected (the drawdown arithmetic behind
-it is pinned in test_p0_observability); everything downstream of the verdict
-is the shipping code.
+`_record_cycle_evidence` and `_execute_decision`, and read every claim back
+from the durable sink, the dashboard file, the cycle report, or a recorder at
+the write boundary. Only the underlying guard VERDICT
+(`_evaluate_global_guards`) is injected; the drawdown arithmetic behind it
+is pinned in test_p0_observability.
 
 Written as unittest.TestCase so that `python run_tests.py` -- the runner the
-Docker build and the LIVE gate rely on -- collects them. Fixture-taking
-module-level functions are refused by that collector by design.
+Docker build and the LIVE gate rely on -- collects them.
 """
 import json
 import os
@@ -25,28 +25,26 @@ import _bootstrap  # noqa: F401,E402
 
 import config                                                     # noqa: E402
 import execution_engine                                           # noqa: E402
-import read_only_dashboard_bootstrap as bootstrap                 # noqa: E402
 import test_shadow_write_layer_isolation as shadow_iso            # noqa: E402
 from config import CFG, _p                                        # noqa: E402
-from execution_engine import ExecutionEngine                      # noqa: E402
+from execution_engine import ExecutionEngine, OBSERVATION_ONLY_GUARD  # noqa: E402
 from persistence import JsonStore                                 # noqa: E402
 
-GUARD = bootstrap.OBSERVATION_ONLY_GUARD
-FLAG = bootstrap._CAPITAL_GUARD_ATTR
+GUARD = OBSERVATION_ONLY_GUARD
+FLAG = "_capital_blocking_guard"
 
 
-class _Installed(shadow_iso._IsolatedState, unittest.TestCase):
-    """Wrapper installed for the test, removed after; own DATA_DIR; mode
-    variables saved and restored."""
+class _Observed(shadow_iso._IsolatedState, unittest.TestCase):
+    """Own DATA_DIR; mode variables saved and restored; the underlying guard
+    verdict injectable per test. Nothing installed."""
 
     def setUp(self):
         shadow_iso._IsolatedState.setUp(self)
-        bootstrap.install()
-        self._saved_gate = bootstrap._original_post_balance_gates
+        self._gate_patch = None
 
     def tearDown(self):
-        bootstrap._original_post_balance_gates = self._saved_gate
-        bootstrap.uninstall()
+        if self._gate_patch is not None:
+            self._gate_patch.stop()
         shadow_iso._IsolatedState.tearDown(self)
 
     def _mode(self, value):
@@ -56,8 +54,13 @@ class _Installed(shadow_iso._IsolatedState, unittest.TestCase):
             os.environ["PROD_ACCESS_MODE"] = value
 
     def _gate_returns(self, ok, guard):
-        """Inject the ORIGINAL gate's verdict for this cycle."""
-        bootstrap._original_post_balance_gates = lambda self: (ok, guard)
+        """Inject the verdict of the REAL guard evaluator for this cycle."""
+        if self._gate_patch is not None:
+            self._gate_patch.stop()
+        self._gate_patch = patch.object(ExecutionEngine,
+                                        "_evaluate_global_guards",
+                                        lambda self: (ok, guard))
+        self._gate_patch.start()
 
 
 class _Sink:
@@ -70,11 +73,14 @@ class _Sink:
 
 
 class _Pipeline:
-    def __init__(self):
+    def __init__(self, raises=None):
         self.calls = 0
+        self.raises = raises
 
     def run_cycle(self, **kw):
         self.calls += 1
+        if self.raises is not None:
+            raise self.raises
         return {"report": {"cycle_id": "cyc-ro", "scanned_raw": 9,
                            "scanned": 9, "ranker_eligible": 1, "accepted": 0,
                            "rejections": {}},
@@ -82,12 +88,7 @@ class _Pipeline:
 
 
 def _engine(env="prod"):
-    """A real ExecutionEngine instance with only its collaborators stubbed.
-
-    Being a real instance matters: the wrapper patches the CLASS, so the
-    instance must resolve `_post_balance_gates`, `_record_cycle_evidence` and
-    `_finish_cycle` through it, exactly as production does.
-    """
+    """A real ExecutionEngine instance with only its collaborators stubbed."""
     eng = ExecutionEngine.__new__(ExecutionEngine)
     eng.client = type("C", (), {"env": env})()
     eng.cycles_jsonl = _Sink()
@@ -105,11 +106,18 @@ def _engine(env="prod"):
     return eng
 
 
+def _parallel(eng, n=1):
+    eng._executor = type("E", (), {"submit": lambda self, fn: type(
+        "F", (), {"result": lambda self: (0.04, None)})()})()
+    eng._background_balance_health = lambda: (0.04, None)
+    return eng._cycle_parallel(n)
+
+
 # --------------------------------------------------------------------------
 # The gate verdict.
 # --------------------------------------------------------------------------
 
-class TheGateRelaxesExactlyOneGuardInExactlyOneMode(_Installed):
+class TheGateRelaxesExactlyOneGuardInExactlyOneMode(_Observed):
 
     def test_prod_read_only_equity_drawdown_continues_observation(self):
         self._mode(config.PROD_READ_ONLY)
@@ -136,7 +144,7 @@ class TheGateRelaxesExactlyOneGuardInExactlyOneMode(_Installed):
 
     def test_an_unreadable_mode_is_read_only_and_a_typo_is_not_capital(self):
         """Fail-closed direction for OBSERVATION: unreadable -> read-only ->
-        observe; but the wrapper must still never let a typo mean CAPITAL."""
+        observe; a typo must never mean CAPITAL."""
         for mode in (None, "", "READ0NLY", "capital-ish"):
             with self.subTest(mode=mode):
                 self._mode(mode)
@@ -166,18 +174,32 @@ class TheGateRelaxesExactlyOneGuardInExactlyOneMode(_Installed):
         self.assertEqual(eng._post_balance_gates(), (True, None))
         self.assertIsNone(getattr(eng, FLAG))
 
+    def test_the_real_evaluator_is_what_the_gate_consults(self):
+        """Anti-vacuity: with nothing injected, the shipping evaluator runs
+        and its first fail-closed gate (persistence) is honoured in
+        READ_ONLY too."""
+        self._mode(config.PROD_READ_ONLY)
+        eng = _engine("prod")
+        with patch.object(execution_engine.PersistenceSentinel, "healthy",
+                          classmethod(lambda cls: False)), \
+                patch.object(execution_engine.PersistenceSentinel, "failure",
+                             classmethod(lambda cls: {"path": "x",
+                                                      "reason": "y"})):
+            self.assertEqual(eng._post_balance_gates(),
+                             (False, "persistence_failure"))
+        self.assertIsNone(getattr(eng, FLAG))
+
 
 # --------------------------------------------------------------------------
 # No state leaks between cycles.
 # --------------------------------------------------------------------------
 
-class TheFlagCannotSurviveIntoTheNextCycle(_Installed):
+class TheFlagCannotSurviveIntoTheNextCycle(_Observed):
 
     def test_the_gate_resets_a_stale_flag_before_deciding(self):
-        """A flag left by an earlier cycle must not count for this one."""
         self._mode(config.PROD_READ_ONLY)
         eng = _engine("prod")
-        setattr(eng, FLAG, "equity_drawdown")          # stale, from before
+        setattr(eng, FLAG, GUARD)                       # stale, from before
         self._gate_returns(True, None)                  # this cycle is clean
         eng._post_balance_gates()
         self.assertIsNone(getattr(eng, FLAG))
@@ -185,42 +207,62 @@ class TheFlagCannotSurviveIntoTheNextCycle(_Installed):
     def test_finalization_clears_the_flag_even_when_it_raises(self):
         self._mode(config.PROD_READ_ONLY)
         eng = _engine("prod")
-        setattr(eng, FLAG, "equity_drawdown")
+        setattr(eng, FLAG, GUARD)
 
-        def boom(self, n, res, *a, **k):
+        def boom(self, n, res, execution_path="sequential"):
             raise RuntimeError("finalization failed")
 
-        with patch.object(bootstrap, "_original_finish_cycle", boom):
+        with patch.object(ExecutionEngine, "_finalize_cycle", boom):
             with self.assertRaises(RuntimeError):
                 eng._finish_cycle(1, {"report": {}, "accepted": []},
                                   "sequential")
         self.assertIsNone(getattr(eng, FLAG))
 
     def test_a_stale_flag_never_reaches_a_clean_cycles_evidence(self):
-        """End to end: cycle 1 observes through drawdown, cycle 2 is clean.
-        Cycle 2's durable row must NOT carry cycle 1's guard."""
+        """Cycle 1 observes through drawdown, cycle 2 is clean. Cycle 2's
+        durable row must NOT carry cycle 1's guard."""
         self._mode(config.PROD_READ_ONLY)
         eng = _engine("prod")
         self._gate_returns(False, GUARD)
         eng._cycle_sequential(1)
         self._gate_returns(True, None)
         eng._cycle_sequential(2)
-        rows = eng.cycles_jsonl.rows
-        self.assertEqual([r["would_block_capital"] for r in rows],
-                         [GUARD, None])
+        self.assertEqual([r["would_block_capital"] for r in
+                          eng.cycles_jsonl.rows], [GUARD, None])
+
+    def test_an_exception_between_gate_and_finalization_cannot_leak(self):
+        """The gate records the guard, then the scan raises before
+        finalization ever runs. The next cycle -- whether it stops at the
+        kill switch before the gate, or runs clean -- must not inherit it,
+        on either cycle path."""
+        self._mode(config.PROD_READ_ONLY)
+        for path in ("sequential", "parallel"):
+            with self.subTest(path=path):
+                eng = _engine("prod")
+                self._gate_returns(False, GUARD)
+                eng.pipeline = _Pipeline(raises=RuntimeError("scan died"))
+                run = (lambda n: eng._cycle_sequential(n)) \
+                    if path == "sequential" else (lambda n: _parallel(eng, n))
+                with self.assertRaises(RuntimeError):
+                    run(1)
+                eng.pipeline = _Pipeline()
+                with patch.object(CFG, "KILL_SWITCH", True):
+                    run(2)                       # stops before the gate
+                self._gate_returns(True, None)
+                run(3)                           # clean cycle
+                rows = eng.cycles_jsonl.rows
+                self.assertEqual([r["blocking_global_guard"] for r in rows],
+                                 ["kill_switch", None])
+                self.assertEqual([r["would_block_capital"] for r in rows],
+                                 [None, None])
+                self.assertIsNone(getattr(eng, FLAG))
 
 
 # --------------------------------------------------------------------------
 # Durable evidence, both cycle paths.
 # --------------------------------------------------------------------------
 
-class TheDurableRecordKeepsTheCapitalBlockFact(_Installed):
-
-    def _parallel(self, eng, n=1):
-        eng._executor = type("E", (), {"submit": lambda self, fn: type(
-            "F", (), {"result": lambda self: (0.04, None)})()})()
-        eng._background_balance_health = lambda: (0.04, None)
-        return eng._cycle_parallel(n)
+class TheDurableRecordKeepsTheCapitalBlockFact(_Observed):
 
     def _assert_observed_row(self, eng):
         self.assertEqual(len(eng.cycles_jsonl.rows), 1, eng.cycles_jsonl.rows)
@@ -252,16 +294,17 @@ class TheDurableRecordKeepsTheCapitalBlockFact(_Installed):
         self._mode(config.PROD_READ_ONLY)
         self._gate_returns(False, GUARD)
         eng = _engine("prod")
-        self._parallel(eng)
+        _parallel(eng)
         self._assert_observed_row(eng)
-        self.assertEqual(
-            JsonStore.load(_p("dashboard_state.json"), {})
-            .get("capital_blocking_guard"), GUARD)
+        state = JsonStore.load(_p("dashboard_state.json"), {})
+        self.assertEqual(state.get("capital_blocking_guard"), GUARD)
+        self.assertIs(state.get("capital_eligible"), False)
+        self.assertEqual(JsonStore.load(_p("cycle_report.json"), {})
+                         .get("capital_blocking_guard"), GUARD)
 
     def test_CONTROL_capital_still_stops_before_the_scan(self):
         """Anti-vacuity: the same cycle in CAPITAL never reaches the scan and
-        its row says so. Without this the assertions above could pass
-        against a harness that never blocks anything."""
+        its row says so."""
         self._mode(config.PROD_CAPITAL)
         self._gate_returns(False, GUARD)
         eng = _engine("prod")
@@ -271,19 +314,29 @@ class TheDurableRecordKeepsTheCapitalBlockFact(_Installed):
         self.assertEqual(row["blocking_global_guard"], GUARD)
         self.assertFalse(row["scan_executed"])
         self.assertIsNone(row["would_block_capital"])
-        self.assertIsNone(
-            JsonStore.load(_p("dashboard_state.json"), {})
-            .get("capital_blocking_guard"))
+        self.assertIsNone(JsonStore.load(_p("dashboard_state.json"), {})
+                          .get("capital_blocking_guard"))
 
     def test_CONTROL_capital_parallel_still_stops(self):
         self._mode(config.PROD_CAPITAL)
         self._gate_returns(False, GUARD)
         eng = _engine("prod")
-        self._parallel(eng)
+        _parallel(eng)
+        row = eng.cycles_jsonl.rows[0]
+        self.assertEqual(row["blocking_global_guard"], GUARD)
+        self.assertFalse(row["scan_executed"] and eng.executed)
+        self.assertIsNone(row["would_block_capital"])
+        self.assertEqual(eng.executed, [])
+
+    def test_CONTROL_demo_still_stops(self):
+        self._mode(config.PROD_READ_ONLY)
+        self._gate_returns(False, GUARD)
+        eng = _engine("demo")
+        eng._cycle_sequential(1)
+        self.assertEqual(eng.pipeline.calls, 0)
         row = eng.cycles_jsonl.rows[0]
         self.assertEqual(row["blocking_global_guard"], GUARD)
         self.assertIsNone(row["would_block_capital"])
-        self.assertEqual(eng.executed, [])
 
     def test_a_clean_cycle_records_null(self):
         """Anti-vacuity: the field is not simply always populated."""
@@ -294,9 +347,13 @@ class TheDurableRecordKeepsTheCapitalBlockFact(_Installed):
         row = eng.cycles_jsonl.rows[0]
         self.assertTrue(row["scan_executed"])
         self.assertIsNone(row["would_block_capital"])
+        state = JsonStore.load(_p("dashboard_state.json"), {})
+        self.assertIsNone(state.get("capital_blocking_guard"))
+        self.assertNotIn("capital_eligible", state)
+        self.assertNotIn("capital_blocking_guard",
+                         JsonStore.load(_p("cycle_report.json"), {}))
 
-    def test_an_explicit_engine_value_wins_over_the_flag(self):
-        """If the engine itself carries the fact one day, the wrapper defers."""
+    def test_an_explicit_caller_value_wins_over_the_flag(self):
         self._mode(config.PROD_READ_ONLY)
         eng = _engine("prod")
         setattr(eng, FLAG, GUARD)
@@ -305,46 +362,22 @@ class TheDurableRecordKeepsTheCapitalBlockFact(_Installed):
             would_block_capital="max_open_positions")
         self.assertEqual(row["would_block_capital"], "max_open_positions")
 
-
-# --------------------------------------------------------------------------
-# Interface: the finalization wrapper is signature-agnostic.
-# --------------------------------------------------------------------------
-
-class TheWrapperDoesNotDependOnTheEnginesArity(_Installed):
-
-    def test_extra_positional_and_keyword_arguments_pass_through(self):
+    def test_the_observation_is_logged_with_the_guard_name(self):
         self._mode(config.PROD_READ_ONLY)
+        self._gate_returns(False, GUARD)
         eng = _engine("prod")
-        seen = {}
-
-        def five_arg_finish(self, n, res, execution_path, would_block_capital,
-                            mode):
-            seen.update(n=n, path=execution_path, wbc=would_block_capital,
-                        mode=mode)
-            return 7
-
-        with patch.object(bootstrap, "_original_finish_cycle",
-                          five_arg_finish):
-            out = eng._finish_cycle(42, {"report": {}, "accepted": []},
-                                    "parallel", "equity_drawdown", "MODE")
-        self.assertEqual(out, 7)
-        self.assertEqual(seen, {"n": 42, "path": "parallel",
-                                "wbc": "equity_drawdown", "mode": "MODE"})
-
-    def test_main_style_three_argument_call_still_works(self):
-        self._mode(config.PROD_READ_ONLY)
-        eng = _engine("prod")
-        self._gate_returns(True, None)
-        out = eng._finish_cycle(3, _Pipeline().run_cycle(), "sequential")
-        self.assertEqual(out, 0)
-        self.assertEqual(len(eng.cycles_jsonl.rows), 1)
+        with self.assertLogs("RISK", level="WARNING") as cm:
+            eng._post_balance_gates()
+        self.assertTrue(any("[READ_ONLY_OBSERVATION]" in m and GUARD in m
+                            and "broker_writes=false" in m
+                            for m in cm.output), cm.output)
 
 
 # --------------------------------------------------------------------------
-# The write boundary, with the wrapper installed and the drawdown blown.
+# The write boundary, with the guard observed through and the drawdown blown.
 # --------------------------------------------------------------------------
 
-class NoBrokerWriteWhileObservingThroughTheGuard(_Installed):
+class NoBrokerWriteWhileObservingThroughTheGuard(_Observed):
     """Real `_execute_decision`, real OrderManager, real KalshiClient with the
     transport replaced by a recorder. Three depths, every trading flag armed.
     """
@@ -358,7 +391,7 @@ class NoBrokerWriteWhileObservingThroughTheGuard(_Installed):
             holder, client)
         eng.risk.rolling_drawdown = lambda: -0.48
         eng.risk.rolling_drawdown_pct = lambda: 1222.0
-        # The wrapper's gate has run and let observation continue:
+        # The gate has run and let observation continue:
         setattr(eng, FLAG, GUARD)
         report = {"rejections": {}}
         with patch.object(CFG, "SHADOW_MODE", False), \
@@ -396,21 +429,6 @@ class NoBrokerWriteWhileObservingThroughTheGuard(_Installed):
                            "the recorders never move")
         self.assertGreater(len(b.mutating_http), 0,
                            "the transport recorder is not wired")
-
-
-class InstallIsReversible(unittest.TestCase):
-
-    def test_uninstall_restores_the_originals(self):
-        bootstrap.install()
-        self.assertIs(ExecutionEngine._post_balance_gates,
-                      bootstrap._post_balance_gates_observation_aware)
-        bootstrap.uninstall()
-        self.assertIs(ExecutionEngine._post_balance_gates,
-                      bootstrap._original_post_balance_gates)
-        self.assertIs(ExecutionEngine._finish_cycle,
-                      bootstrap._original_finish_cycle)
-        self.assertIs(ExecutionEngine._record_cycle_evidence,
-                      bootstrap._original_record_cycle_evidence)
 
 
 if __name__ == "__main__":
