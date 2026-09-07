@@ -404,7 +404,8 @@ class ExecutionEngine:
 
     def _record_cycle_evidence(self, n: int, execution_path: str,
                                blocking_global_guard=None, detail: str = "",
-                               pipeline: dict = None) -> dict:
+                               pipeline: dict = None,
+                               would_block_capital=None) -> dict:
         """Write exactly one durable evidence row per cycle. Observability only.
 
         Before P0 a cycle that returned early at a global guard wrote nothing
@@ -426,6 +427,11 @@ class ExecutionEngine:
             "execution_path": execution_path,
             "blocking_global_guard": blocking_global_guard,
             "scan_executed": pipeline is not None,
+            # Names a CAPITAL guard that fired but was REPORTED rather than
+            # obeyed, which only PRODUCTION READ_ONLY observation may do.
+            # None on every other cycle. A row with scan_executed=true and
+            # a value here is a shadow cycle that CAPITAL would have refused.
+            "would_block_capital": would_block_capital,
         }
         if detail:
             row["blocking_detail"] = str(detail)[:300]
@@ -445,11 +451,13 @@ class ExecutionEngine:
             log.warning(f"[CYCLE_EVIDENCE] write failed: {e}")
         log.info(f"[CYCLE_EVIDENCE] cycle={n} path={execution_path} "
                  f"blocking_global_guard={blocking_global_guard} "
-                 f"scan_executed={row['scan_executed']}",
+                 f"scan_executed={row['scan_executed']} "
+                 f"would_block_capital={would_block_capital}",
                  extra={"event": "cycle_evidence", "cycle": n,
                         "execution_path": execution_path,
                         "blocking_global_guard": blocking_global_guard,
-                        "scan_executed": row["scan_executed"]})
+                        "scan_executed": row["scan_executed"],
+                        "would_block_capital": would_block_capital})
         return row
 
     def _probability_engine_report(self):
