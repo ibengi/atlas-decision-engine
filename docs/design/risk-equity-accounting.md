@@ -1,6 +1,10 @@
 # Risk-equity accounting design (audit finding F2)
 
-Status: **DESIGN — not implemented.** Written for cross-audit before any code.
+Status: **DESIGN, revision 2 — not implemented.** Revised after independent
+review: the risk-equity baseline now carries an explicit provenance status
+(§1a), a reconstructed baseline is never presented as reconciled truth (§2),
+and the operator rebase is an audited, exceptional, hold-inducing act (§6).
+Written for cross-audit before any code.
 Scope: `risk_manager.py`, `position_sizer.py`, `execution_engine._balance_gate`
 / `_post_balance_gates`, one new module, one new state file. Nothing in this
 document enables CAPITAL trading, touches the model gate, the daily-oracle gate,
@@ -61,7 +65,18 @@ so a failed write trips `PersistenceSentinel` and blocks new submissions.
     "evidence_sha256": "…",
     "applied_by": "EQUITY_LEDGER_SEED_SHA256"
   },
+  "risk_equity_status": "CONSERVATIVE_ESTIMATE",
+  "status_basis": {
+    "set_at": "2026-09-07T18:01:19Z",
+    "set_by": "migration | reconciliation | operator",
+    "provenance_window": {"from": "2026-09-07T18:01:19Z", "to": null},
+    "unproven": ["funding before 2026-09-07T18:01:19Z"],
+    "evidence_sha256": "…"
+  },
+  "capital_hold": null,
   "hwm": {"risk_equity_reference": 0.5239, "at": "…"},
+  "rebases": [],
+  "consumed_tokens": [],
   "flows": [
     {"id": "flow-0001", "at": "2026-09-07T18:02:20Z",
      "amount": 9.80, "kind": "deposit",
@@ -85,8 +100,52 @@ so a failed write trips `PersistenceSentinel` and blocks new submissions.
   `{"residual": r, "first_seen_cycle": n, "consecutive": k, "first_seen_at": ts}`.
 - `hwm` is persisted **and** recomputable; on load the engine takes
   `max(persisted, recomputed)` (§4), so a crash can never lower it.
+- `risk_equity_status`, `status_basis` and `capital_hold` are defined in §1a.
+  `rebases` and `consumed_tokens` are append-only audit lists defined in §6.
 - Nothing in the trade journal changes. `kalshi_trades.json` remains the single
   source of truth for PnL; this file only adds the seed, the flows and the mark.
+
+## 1a. Baseline provenance: `risk_equity_status`
+
+A number in `seed` says what the baseline **is**; `risk_equity_status` says
+how much of its history is **proven**. The two are never conflated: a
+conservative reconstruction is still a reconstruction.
+
+| status | strict meaning | CAPITAL | READ_ONLY |
+|---|---|---|---|
+| `RECONCILED` | Full provenance: every cash observation from the account's first observation to now reconciles with the journal and the classified flows within ε (§5), there is no `unclassified` flow, no `pending` residual older than K cycles, and no funding before the first observation is asserted or needed to explain any balance. | eligible (subject to every other gate) | observes |
+| `CONSERVATIVE_ESTIMATE` | The baseline was built by the rule in §2 from durable evidence, is not larger than any defensible alternative, but at least one funding event before the provenance window cannot be established (listed in `status_basis.unproven`). | **BLOCKED by default.** Guard `risk_equity_unreconciled`. A separately specified policy may allow it (`RISK_EQUITY_ALLOW_CONSERVATIVE_ESTIMATE=1`, default off, documented and reviewed on its own, never set by migration or by this design). | observes |
+| `UNRECONCILED` | Historical funding or accounting cannot yet be established safely: no seed, a seed whose evidence hash no longer matches the recomputed proposal, a restored journal older than the ledger, an `unclassified` flow, or a pre-seed period the migration could not bound. | **BLOCKED.** Guard `risk_equity_unreconciled`. No policy override. | observes |
+
+Rules:
+
+- The status is **persisted** and **re-derived on every load and every
+  reconciliation pass**; the persisted value is only allowed to move in the
+  conservative direction automatically (`RECONCILED → CONSERVATIVE_ESTIMATE →
+  UNRECONCILED`). Moving up requires a specific event: `UNRECONCILED →
+  CONSERVATIVE_ESTIMATE` by a seed application whose proposal hash matches
+  (§2), and `→ RECONCILED` only when the reconciliation pass proves the full
+  provenance condition above, or by an operator attestation carrying the
+  same audit fields as a rebase (§6) and the funding records' hash.
+- `status_basis.unproven` is a list of plain sentences naming what is not
+  proven. It is never empty while the status is not `RECONCILED`.
+- The status is surfaced, in this exact name, in: the per-cycle evidence row
+  (`risk_equity_status`), the cycle report and `dashboard_state.json`
+  (`risk_equity_status`, and `capital_eligible=false` whenever it is not
+  `RECONCILED`), `health_monitor` state (`risk_equity_status`,
+  `capital_hold`), and the startup banner line
+  `[EQUITY] risk_equity_status=… hwm=… strategy_equity=… drawdown_pct=…
+  capital_eligible=…`.
+- `capital_hold` is `null` or `{"reason": "post_rebase_validation",
+  "since": ts, "rebase_id": …, "released_by": null}`. While non-null, CAPITAL
+  is blocked by guard `capital_hold_post_rebase` regardless of status (§6).
+- `capital_eligible` in every surface is the conjunction: status is
+  `RECONCILED` (or `CONSERVATIVE_ESTIMATE` with the separate policy on),
+  `capital_hold` is null, and no other guard fires. It is a report field,
+  not an authorization: CAPITAL still requires every existing gate
+  (`PROD_ACCESS_MODE=CAPITAL`, `LIVE_TRADING`, `LIVE_TRADING_CONFIRMED`, the
+  model gatekeeper, `LIVE_BROKER_WRITES_AUTHORIZED`), none of which this
+  design touches.
 
 ## 2. Migration strategy for the existing `/data/state5`
 
@@ -116,6 +175,31 @@ Resulting state after migration: `drawdown_pct = 100 × 0.4839 / 0.5239 =
 doing exactly what it says: the deposit made $9.84 affordable and cleared
 nothing. The size throttle also stays halved. READ_ONLY observation is
 unaffected (PR #64 records `would_block_capital=equity_drawdown`).
+
+**These numbers are an estimate, and the ledger must say so.** The migration
+sets `risk_equity_status = CONSERVATIVE_ESTIMATE`, never `RECONCILED`, with
+`status_basis.unproven = ["funding before 2026-09-07T18:01:19Z"]` (plus any
+other gap the dry-run finds, e.g. a period with no cycle evidence). Reason:
+the pre-jump observation bounds the baseline from below, but no record in the
+repository, the volume or the broker API used by the engine proves how the
+account was funded before the evidence window, so a deposit or withdrawal
+older than the window cannot be excluded. The estimate is conservative; it is
+not reconciled truth, and `capital_eligible=false` is written with it.
+
+What would upgrade it to `RECONCILED`: an operator attestation (§6 audit
+fields, plus the sha256 of the funding records) that the account's funding
+history is exactly the flows listed, **and** a reconciliation pass that
+reconciles every observation in the window within ε. Neither happens in the
+migration.
+
+When the migration must instead produce `UNRECONCILED`: the last pre-jump
+observation cannot be found in durable evidence (only in memory or in a
+non-durable log), the journal on the volume does not reproduce the audit's
+$0.4839, positions were open at the jump, or the dry-run finds more than one
+unexplained jump it cannot order. In that case the seed carries
+`account_equity_0 = null`, no drawdown percentage is computed (the guard
+reads as blocked), READ_ONLY keeps observing, and the operator resolves the
+provenance before any CAPITAL discussion. Certainty is never invented.
 
 Why this seed and not another:
 
@@ -244,9 +328,16 @@ Guard outputs, evaluated in `_post_balance_gates` **after** the existing
 |---|---|---|
 | `equity_ledger_unseeded` | no seed and `REQUIRE_PERSISTENT_STATE` | CAPITAL |
 | `equity_flow_unresolved` | any flow with `kind=unclassified` | CAPITAL |
+| `risk_equity_unreconciled` | `risk_equity_status` is `UNRECONCILED`, or `CONSERVATIVE_ESTIMATE` without the separate policy (§1a) | CAPITAL |
+| `capital_hold_post_rebase` | `capital_hold` is non-null (§6) | CAPITAL |
 
-Neither guard is ever cleared by a balance change; only a seed application or an
-operator classification clears them.
+None of these guards is ever cleared by a balance change; only a seed
+application, an operator classification, a reconciliation pass that proves
+full provenance, or a hold release with its own audit record clears them.
+Each is a CAPITAL guard in the sense of PR #64: in PRODUCTION READ_ONLY they
+are recorded (`would_block_capital`) and observation continues only if the
+engine's single-name allow-list is extended explicitly and reviewed (D1);
+until then they stop the READ_ONLY scan like any other guard.
 
 Why "stable for K quiet cycles" and not immediately: the broker credits a
 settlement before the engine's settlement sweep writes `settled_at`, and a fill
@@ -284,15 +375,64 @@ Identity check with today's code: with `seed.strategy_equity_0 = 0`,
 the existing peak-to-trough of the cumulative curve exactly. The only change is
 the denominator.
 
-**Recovery is explicit, never automatic.** Under a high-water mark, a blown
-drawdown can only shrink through trading profit, and trading is blocked by the
-guard. The engine must not resolve this by time-decay (a rolling window would be
-"reset historical losses", which the mission forbids) nor by deposit (the
-invariant). Recovery is an operator **rebase**: `EQUITY_LEDGER_REBASE_SHA256`
-over a dry-run proposal that sets `risk_equity_reference := strategy_equity` and
-appends `{"kind": "rebase", "from": hwm, "to": equity, "drawdown_usd_acknowledged": …}`.
-It is an audit row forever, requires a fresh proposal hash each time, and is a
-separate operator decision from funding the account.
+**Recovery is explicit, never automatic, and never convenient.** Under a
+high-water mark, a blown drawdown can only shrink through trading profit, and
+trading is blocked by the guard. The engine must not resolve this by
+time-decay (a rolling window would be "reset historical losses", which the
+mission forbids), by deposit (the invariant), or by a quick operator switch.
+The only recovery is a **rebase**, specified so that it is rare, exceptional
+and fully auditable:
+
+Preconditions, all checked at apply time, any failure = logged no-op:
+
+1. `risk_equity_status == RECONCILED`. A baseline that is not proven cannot be
+   re-based; provenance is fixed first (§1a).
+2. `equity_drawdown` is currently firing (`drawdown_pct ≥ MAX_EQUITY_DRAWDOWN_PCT`).
+   There is nothing to rebase otherwise.
+3. No `unclassified` flow, no `pending` residual, reconciliation `MATCH`,
+   no open position, no in-flight order.
+4. `capital_hold` is null (a rebase cannot follow a rebase whose validation
+   is still open).
+
+Mechanism (two operator actions with distinct ids, one boot each):
+
+- `tools/equity_ledger_rebase.py --dry-run --reason "<free text, required>"
+  --operator-action-id <id>` reads the ledger and prints a proposal
+  `{rebase_id, reason, operator_action_id, old_baseline: {hwm, strategy_equity,
+  drawdown_usd, drawdown_pct}, new_baseline: {hwm := strategy_equity},
+  evidence_sha256: sha256(journal ∥ ledger ∥ positions ∥ cycles tail),
+  proposed_at}` and a **one-time confirmation token** =
+  `sha256(proposal JSON ∥ operator_action_id ∥ evidence_sha256)`. It writes
+  nothing.
+- The operator sets `EQUITY_LEDGER_REBASE_TOKEN=<token>`. At the next boot the
+  engine recomputes the proposal from current state; the token is accepted
+  only if it matches byte for byte, the preconditions still hold, and the
+  token is not in `consumed_tokens`. Any journal, ledger or position change
+  between dry-run and boot changes `evidence_sha256` and invalidates the token.
+
+Effect, in one atomic ledger save:
+
+- append to `rebases`: the full proposal plus `applied_at`, the token hash,
+  and `prior_hwm_row` (a copy of the `hwm` object it replaces). No row is
+  edited or deleted; `seed`, `flows`, the journal and the risk state are
+  untouched; `rolling_drawdown()` in dollars is unchanged.
+- `hwm.risk_equity_reference := strategy_equity`, `hwm.rebased_from := rebase_id`.
+- append the token to `consumed_tokens` (replay is refused forever).
+- set `capital_hold = {"reason": "post_rebase_validation", "since": now,
+  "rebase_id": …, "released_by": null}`. **CAPITAL stays blocked after the
+  rebase** by `capital_hold_post_rebase` until a second, independent action:
+  `EQUITY_LEDGER_HOLD_RELEASE_TOKEN` computed by a different operator action
+  id over a validation record (who validated, what was checked, its sha256),
+  appended to the same `rebases` entry as `validation`. The release token
+  is single-use as well.
+- log `[EQUITY_REBASE] id=… from_hwm=… to_hwm=… drawdown_acknowledged=…
+  operator_action_id=… capital_hold=post_rebase_validation`.
+
+What a rebase can never do: run without a reason, run twice on one token,
+run while the baseline is not `RECONCILED`, run while drawdown is below the
+guard, clear a guard other than `equity_drawdown`, delete or edit history,
+or make CAPITAL eligible by itself. A deposit is not a rebase and never
+triggers one.
 
 ## 7. Daily-stop reference
 
@@ -342,11 +482,36 @@ from the current code.
 | T12 | day roll: deposit at 18:02, stop computed at 18:03 | stop uses `sod_strategy_equity`, not 9.84 |
 | T13 | `rolling_drawdown()` (dollars) == `hwm − strategy_equity` for 200 random journals | equal to 1e-9 |
 | T14 | `_legacy(..., drawdown_pct=None)` | byte-identical to current sizing for the audit's capital × price matrix |
-| T15 | rebase with fresh hash | reference := equity, guard clears, audit row present; second use of the same hash refused |
+| T15 | rebase with a fresh token (§6 preconditions met) | reference := equity; `equity_drawdown` clears; `capital_hold_post_rebase` blocks CAPITAL until the release token; audit row present; the same token refused a second time |
 | T16 | READ_ONLY with every trading flag armed, guard `equity_flow_unresolved` active | no call reaches `_assert_broker_write_allowed`; `would_block_capital` carries the guard (PR #64 wrapper) |
 | T17 | `equity_ledger.json` save fails | `PersistenceSentinel` tripped, `persistence_failure` first |
 | T19 | reference 0.04, cash 9.84 | stop = 0.01, not 0.00; `can_trade` still enforces it |
 | T18 | both runners (`run_tests.py`, `pytest`) + Docker build + gatekeeper artifacts | green; `model_validation.json` still refuses live |
+
+Required scenarios from the independent review, each mapped to a test (all
+on the isolated `DATA_DIR`, journal fixed unless stated, expected values from
+§1a/§5/§6/§7):
+
+| # | scenario | expected |
+|---|---|---|
+| R1 | known deposit (cash +9.80, quiet K cycles) | `deposit` row auto; `drawdown_pct`, `hwm`, `strategy_equity` unchanged; `self.capital` up; status unchanged |
+| R2 | known withdrawal, then operator classifies `withdrawal` | `unclassified` row → `withdrawal`; `equity_flow_unresolved` clears; drawdown unchanged; `self.capital` down |
+| R3 | unknown positive residual | `deposit` (auto) after K quiet cycles; never raises `strategy_equity` |
+| R4 | unknown negative residual | `unclassified`; `equity_flow_unresolved`; conservative equity used in drawdown; status → `UNRECONCILED` while unresolved |
+| R5 | missing historical flow data (no pre-window funding records) | migration sets `CONSERVATIVE_ESTIMATE`, `unproven` non-empty, `capital_eligible=false`, `risk_equity_unreconciled` fires in CAPITAL, READ_ONLY observes |
+| R6 | partial history (journal present, no cycle evidence for the pre-jump observation) | migration produces `UNRECONCILED`, `account_equity_0=null`, no drawdown % computed, guard reads blocked |
+| R7 | restart | status, `hwm`, flows, `capital_hold` reloaded; `strategy_equity` recomputed from journal; `pending` counter restarts at 0 |
+| R8 | restored old journal (older than the ledger) | status → `UNRECONCILED`; `hwm` kept (monotone); guard fires; log names the mismatch |
+| R9 | stale HWM (persisted lower than the journal implies) | repaired upward on load; persisted higher kept; status unchanged |
+| R10 | seed mismatch (env hash ≠ recomputed proposal; or existing seed) | no-op, logged; `equity_ledger_unseeded` / `UNRECONCILED` as applicable |
+| R11 | manual classification of an unknown id / already-classified row / amount mismatch | refused; ledger byte-identical |
+| R12 | attempted unauthorized rebase (no token, replayed token, wrong evidence hash, status not `RECONCILED`, drawdown below guard, hold open) | each: no-op, logged, `hwm` unchanged, `consumed_tokens` unchanged |
+| R13 | authorized rebase with audit trail | `rebases` row with reason, old/new baseline, evidence hash, timestamp, operator action id, token hash; `hwm` := equity; `capital_hold` set; `capital_hold_post_rebase` blocks CAPITAL; second action releases; both tokens single-use |
+| R14 | deposit after drawdown (journal −0.4839, cash 0.04 → 9.84) | `drawdown_pct` 92.36 % before and after; `equity_drawdown` still fires |
+| R15 | withdrawal after drawdown (cash 9.84 → 2.00) | `drawdown_pct` unchanged; `self.capital` 2.00; `unclassified` until operator |
+| R16 | no-trade deposit (empty journal, cash 0 → 50) | `strategy_equity` = seed, `hwm` = seed, drawdown 0 %; `deposit` row; daily stop uses `sod_strategy_equity`, not 50 |
+| R17 | no-trade withdrawal (empty journal, cash 50 → 20) | drawdown 0 %; `unclassified −30`; guard `equity_flow_unresolved`; affordability 20 |
+| R18 | ambiguous cash movement (residual changes sign across cycles, or a settlement lands mid-observation) | `pending` never reaches K; no flow row; nothing classified; status unchanged |
 
 Existing tests that encode the cash denominator and must be re-derived (not
 weakened): `tests/test_sizing_small_account.py`, `tests/test_daily_quarantine.py`,
@@ -376,13 +541,16 @@ the §6/§7 line that produces it.
 
 ## Open decisions for cross-audit
 
-- **D1.** Should PR #64's READ_ONLY observation also pass through
-  `equity_ledger_unseeded` / `equity_flow_unresolved`, or should those two guards
-  stop the READ_ONLY scan until resolved? The wrapper today relaxes exactly one
-  guard by design. Recommendation: treat both like `equity_drawdown` (observe,
-  record `would_block_capital`), because neither can cause a write; but this
-  widens the wrapper's allow-list from one name to three and needs a reviewer
-  who did not author it.
+- **D1.** Should PRODUCTION READ_ONLY observation also pass through the four
+  CAPITAL guards this design adds (`equity_ledger_unseeded`,
+  `equity_flow_unresolved`, `risk_equity_unreconciled`,
+  `capital_hold_post_rebase`), or should they stop the READ_ONLY scan until
+  resolved? The engine today (`execution_engine.OBSERVATION_ONLY_GUARD`,
+  repo-owned since PR #64 rev. 2) relaxes exactly one name by design.
+  Recommendation: extend the allow-list to these four in the F2 PR itself,
+  because none of them can cause a write and each is recorded as
+  `would_block_capital`; the extension is a reviewed change to a single
+  constant with a test per name, never a wrapper.
 - **D2.** `K = 3` quiet cycles and `ε = 0.01 + 0.005 × n` are proposals; both
   should be pinned by tests T5/T6 with the chosen values.
 - **D3.** Phase B default flip is a policy change with a visible effect on
