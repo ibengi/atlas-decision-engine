@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-"""Observability-only Railway bootstrap for PROD read-only mode.
+"""Safety-preserving Railway bootstrap for PROD read-only observation.
 
-This wrapper does not change trading gates, risk state, order permissions, or
-broker-write authorization. It lets ``kalshi_alpha_bot.main`` perform its
-normal production intent/credential checks, then refreshes dashboard_state.json
-immediately after the normal startup banner has successfully read the broker.
+This wrapper does not change order permissions, broker-write authorization,
+model approval, risk thresholds, or CAPITAL behavior. It has two narrow jobs:
 
-The purpose is narrow: a process blocked by an early global guard can otherwise
-leave a stale dashboard snapshot from an older DEMO process indefinitely.
+1. publish a fresh read-only dashboard snapshot at startup;
+2. let PROD READ_ONLY continue the scanner/model/shadow pipeline when the
+   *only* global blocker is ``equity_drawdown``.
+
+The drawdown remains visible as a CAPITAL blocker. In CAPITAL mode it remains
+fully blocking. Every other global guard remains fail-closed in every mode.
 """
 
 import sys
 
 import kalshi_alpha_bot as bot
-from config import _p
+from config import _p, prod_is_read_only
+from execution_engine import ExecutionEngine
 from persistence import JsonStore
 from trade_logger import now_iso
 
 
 _original_banner = bot.banner
+_original_post_balance_gates = ExecutionEngine._post_balance_gates
+_original_finish_cycle = ExecutionEngine._finish_cycle
 
 
 def _banner_with_runtime_snapshot(client, capital):
@@ -43,6 +48,7 @@ def _banner_with_runtime_snapshot(client, capital):
             "configured_capital": float(capital),
             "read_only": True,
             "startup_snapshot": True,
+            "capital_blocking_guard": None,
             "candidates": [],
         })
         bot.log.info(
@@ -52,8 +58,57 @@ def _banner_with_runtime_snapshot(client, capital):
         bot.log.warning("[DASHBOARD_STARTUP_SNAPSHOT] non ecrit: %s", exc)
 
 
+def _post_balance_gates_observation_aware(self):
+    """Preserve all global gates, except observation may pass drawdown.
+
+    ``equity_drawdown`` is an execution/capital guard. In PROD READ_ONLY there
+    is no broker mutation path to authorize, so stopping before the scanner
+    destroys model evidence without adding money-path safety. We therefore
+    record the guard and continue observation only.
+
+    CAPITAL mode, DEMO, and every other blocker keep the original result.
+    """
+    ok, guard = _original_post_balance_gates(self)
+    is_prod_read_only = (
+        getattr(self.client, "env", None) != "demo" and prod_is_read_only()
+    )
+    if not ok and guard == "equity_drawdown" and is_prod_read_only:
+        self._read_only_capital_guard = guard
+        bot.log.warning(
+            "[READ_ONLY_OBSERVATION] capital_guard=equity_drawdown "
+            "scanner_continues=true broker_writes=false"
+        )
+        return True, None
+    return ok, guard
+
+
+def _finish_cycle_with_capital_guard(self, n, res, execution_path="sequential"):
+    """Carry an observed CAPITAL blocker into cycle/dashboard evidence."""
+    guard = getattr(self, "_read_only_capital_guard", None)
+    if guard:
+        report = res.get("report") if isinstance(res, dict) else None
+        if isinstance(report, dict):
+            report["capital_blocking_guard"] = guard
+            report["capital_eligible"] = False
+    result = _original_finish_cycle(self, n, res, execution_path)
+    if guard:
+        try:
+            state = JsonStore.load(_p("dashboard_state.json"), {}) or {}
+            state["read_only"] = True
+            state["capital_blocking_guard"] = guard
+            state["capital_eligible"] = False
+            JsonStore.save(_p("dashboard_state.json"), state)
+        except Exception as exc:  # observability must never block the engine
+            bot.log.warning("[READ_ONLY_OBSERVATION] dashboard non mis a jour: %s", exc)
+        finally:
+            self._read_only_capital_guard = None
+    return result
+
+
 def main():
     bot.banner = _banner_with_runtime_snapshot
+    ExecutionEngine._post_balance_gates = _post_balance_gates_observation_aware
+    ExecutionEngine._finish_cycle = _finish_cycle_with_capital_guard
     # Keep Railway startup explicit and fail-closed: the wrapped application
     # still receives the repository's normal READ_ONLY production flag.
     sys.argv = [sys.argv[0], "--loop", "--live-read-only"]
