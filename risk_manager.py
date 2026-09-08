@@ -13,8 +13,15 @@ log_rsk = logging.getLogger("RISK")
 
 
 class RiskManager:
+    #: F2 risk-equity ledger (equity_ledger.EquityLedger), attached by the
+    #: engine. None or unseeded -> the historical cash formulas apply.
+    equity = None
+
     def __init__(self, tlog: TradeLogger, posmgr: PositionManager, capital: float):
         self.tlog, self.posmgr, self.capital = tlog, posmgr, capital
+        # F2: the risk-equity ledger (equity_ledger.EquityLedger), attached by
+        # the engine. None or unseeded -> the historical cash formulas.
+        self.equity = None
         st = JsonStore.load(_p(CFG.RISK_FILE), {})
         today = datetime.now(timezone.utc).date().isoformat()
         if st.get("date") != today:
@@ -55,11 +62,23 @@ class RiskManager:
             peak = max(peak, curve)
         return max(0.0, peak - curve)
 
-    def rolling_drawdown_pct(self) -> float:
-        """Drawdown courant en pourcentage du capital effectif.
+    def _strategy_mode(self) -> bool:
+        """True when F2 accounting decides percentages: mode 'strategy' and a
+        seeded ledger. Otherwise the historical cash denominator applies."""
+        return (str(getattr(CFG, "RISK_EQUITY_MODE", "strategy")) == "strategy"
+                and self.equity is not None and getattr(self.equity, "seeded", False))
 
-        Evite l'ancien melange d'un drawdown en dollars avec une limite en %.
+    def rolling_drawdown_pct(self) -> float:
+        """Drawdown courant en pourcentage.
+
+        F2 (strategy mode): 100 x (HWM - strategy_equity) / HWM from the
+        equity ledger -- a deposit cannot lower it, a withdrawal cannot raise
+        it. Otherwise: the historical ratio to effective capital (cash).
         """
+        if self._strategy_mode():
+            pct = self.equity.drawdown_pct()
+            if pct is not None:
+                return float(pct)
         if self.capital <= 0:
             return 0.0
         return 100.0 * self.rolling_drawdown() / self.capital
@@ -69,7 +88,21 @@ class RiskManager:
         CAPITAL EFFECTIF). Pour 93,26$ : min(50, 4.66) = 4,66$. Le capital
         de reference (500$) ne peut plus influencer un solde inferieur."""
         pct_stop = max(0.0, self.capital) * CFG.MAX_DAILY_LOSS_PCT / 100.0
-        return round(min(CFG.MAX_DAILY_LOSS, pct_stop), 2)
+        stop = min(CFG.MAX_DAILY_LOSS, pct_stop)
+        if self._strategy_mode():
+            # F2 §7: the start-of-day strategy equity bounds the stop too, so
+            # an intraday deposit cannot widen it; the cash term stays so a
+            # withdrawal still tightens it. Never below one cent while the
+            # reference is positive: `stop == 0` would read as "disabled".
+            sod = self.equity.sod_strategy_equity()
+            if sod is None:
+                sod = self.equity.strategy_equity()
+            if sod is not None:
+                stop = min(stop, max(0.0, float(sod)) * CFG.MAX_DAILY_LOSS_PCT / 100.0)
+                ref = self.equity.risk_equity_reference()
+                if ref is not None and ref > 0:
+                    stop = max(stop, 0.01)
+        return round(stop, 2)
 
     def consecutive_losses(self) -> int:
         """Pertes consecutives en fin de sequence des trades regles."""
@@ -259,4 +292,6 @@ class RiskManager:
             "win_rate":  round(len(wins) / len(settled), 4) if settled else 0.0,
             "profit_factor": round(gp / gl, 3) if gl > 0 else None,
             "rolling_drawdown": round(self.rolling_drawdown(), 2),
+            "rolling_drawdown_pct": round(self.rolling_drawdown_pct(), 4),
+            "risk_equity": (self.equity.snapshot() if self.equity is not None else None),
         }

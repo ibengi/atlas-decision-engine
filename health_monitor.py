@@ -222,6 +222,7 @@ class HealthMonitor:
         self.run_count = 0
         self.error_count = 0
         self.started = time.time()
+        self.extra = {}                      # e.g. risk_equity snapshot (F2)
 
     # -- registry ---------------------------------------------------------
     def register(self, name: str, fn) -> None:
@@ -315,6 +316,7 @@ class HealthMonitor:
             "error_count": self.error_count,
             "timing_stats": TIMING_STATS.snapshot(),
             "generated_at": now_iso(),
+            **dict(self.extra),
         }
 
 
