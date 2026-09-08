@@ -54,6 +54,10 @@ class TestSettlements(unittest.TestCase):
         self.mock_client = MagicMock()
         self.mock_tlog = MagicMock()
         self.mock_tlog.settle_trade.return_value = {"trade_id": "test-trade-1"}
+        # TradeLogger.settled_row tells a NEW settlement from one that already
+        # happened. A MagicMock attribute is truthy, so leaving it
+        # unconfigured would make every settlement here look like a duplicate.
+        self.mock_tlog.settled_row.return_value = None
         self.pm = bot.PositionManager(self.mock_client, self.mock_tlog)
         # Clear any pre-existing positions from file load
         self.pm.positions = {}

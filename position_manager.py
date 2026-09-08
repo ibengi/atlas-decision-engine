@@ -17,6 +17,33 @@ from trade_logger import TradeLogger, now_iso
 log_pos = logging.getLogger("POSITION")
 
 
+#: SETTLEMENT CONFIRMATION PROTOCOL (money path).
+#:
+#: Measured on 2026-09-02 in the daily evidence journal: KXBTCD markets
+#: polled within minutes of close returned result="no" before the exchange
+#: had determined them, and that first answer was frozen. The same
+#: get_market().result read settles POSITIONS here, so the same protocol
+#: applies: a yes/no/void is booked only under a finalized market status,
+#: or when the identical value is observed twice at least
+#: SETTLE_CONFIRM_MIN_S apart with the first observation at least
+#: SETTLE_MIN_LAG_S after close. Until then the position stays open and the
+#: pending observation is persisted with it, so a restart resumes the
+#: window instead of restarting it.
+SETTLE_FINALIZED_STATUSES = ("settled", "finalized")
+SETTLE_MIN_LAG_S = 1800.0
+SETTLE_CONFIRM_MIN_S = 1800.0
+
+
+def _parse_iso_dt(value):
+    if not value:
+        return None
+    try:
+        d = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
 class PositionManager:
     """Positions indexees par trade_id (plusieurs lots possibles par ticker
     si ONE_TRADE_PER_MARKET est desactive). Migration automatique de
@@ -143,6 +170,19 @@ class PositionManager:
         broker a publie un resultat, la position n'existe plus chez lui, la
         garder localement ne protege rien et bloque MAX_OPEN_POSITIONS.
         """
+        already = self.tlog.settled_row(p["trade_id"])
+        if already is not None:
+            # The journal was written and the process died before the
+            # position was removed. The settlement stands as first booked;
+            # all that is owed here is releasing the slot. Returning None
+            # keeps it out of `realized`, so no PnL is reported twice.
+            self._audit("DUPLICATE_SETTLEMENT_IGNORED", p,
+                        settled_at=already.get("settled_at"),
+                        result=already.get("result"),
+                        net_pnl=already.get("net_pnl"))
+            self.positions.pop(tid, None)
+            self.flush()
+            return None
         t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
         if t is None:
             log_pos.warning(
@@ -154,7 +194,68 @@ class PositionManager:
         self.flush()
         return t
 
-    def check_settlements(self) -> list:
+    def _audit(self, event: str, p: dict, **fields):
+        """Explicit settlement audit trail. The event name is in the message
+        (so a log filter finds it) AND in `extra` (so a JSON sink keys it)."""
+        detail = " ".join(f"{k}={v}" for k, v in fields.items())
+        log_pos.info(f"[{event}] {p.get('ticker')} trade={p.get('trade_id')} "
+                     f"{detail}", extra={"event": event, "ticker": p.get("ticker"),
+                                         "trade_id": p.get("trade_id"), **fields})
+
+    def _settlement_confirmed(self, p: dict, m: dict, result: str,
+                              status: str, now_dt: datetime) -> bool:
+        """The protocol above. True only when `result` may be booked NOW.
+        Every other path leaves the position open and returns False."""
+        if status in SETTLE_FINALIZED_STATUSES:
+            self._audit("SETTLEMENT_CONFIRMED", p, result=result,
+                        status=status, method="status")
+            return True
+        close = _parse_iso_dt(pick(m, "close_time", default=None))
+        lag = (now_dt - close).total_seconds() if close else None
+        now_iso = now_dt.isoformat(timespec="seconds")
+        if lag is not None and lag < SETTLE_MIN_LAG_S:
+            # Exactly the failure mode: an answer minutes after close.
+            self._audit("SETTLEMENT_OBSERVED", p, result=result,
+                        status=status or "-", lag_s=round(lag),
+                        note="too_early_to_count")
+            self._audit("SETTLEMENT_PENDING_CONFIRMATION", p,
+                        reason="observed_before_min_lag")
+            return False
+        prior = p.get("settle_obs")
+        if prior and prior.get("result") != result:
+            self._audit("SETTLEMENT_REJECTED_INCONSISTENT", p,
+                        prior=prior.get("result"), now=result,
+                        prior_at=prior.get("observed_at"))
+            prior = None                     # the clock restarts below
+        if prior:
+            prior_at = _parse_iso_dt(prior.get("observed_at"))
+            prior_lag = prior.get("lag_s")
+            if (prior_at is not None and prior_lag is not None
+                    and (now_dt - prior_at).total_seconds()
+                    >= SETTLE_CONFIRM_MIN_S):
+                self._audit("SETTLEMENT_CONFIRMED", p, result=result,
+                            status=status or "-", method="repeat",
+                            first_seen=prior.get("observed_at"))
+                return True
+            self._audit("SETTLEMENT_PENDING_CONFIRMATION", p,
+                        reason="confirmation_window_open",
+                        first_seen=prior.get("observed_at"))
+            return False
+        p["settle_obs"] = {"result": result, "status": status or None,
+                           "observed_at": now_iso,
+                           "close_time": close.isoformat(timespec="seconds")
+                           if close else None,
+                           "lag_s": round(lag, 1) if lag is not None else None}
+        self.flush()                          # survives a restart
+        self._audit("SETTLEMENT_OBSERVED", p, result=result,
+                    status=status or "-",
+                    lag_s=round(lag) if lag is not None else "unknown")
+        self._audit("SETTLEMENT_PENDING_CONFIRMATION", p,
+                    reason="first_observation"
+                    if lag is not None else "close_time_unknown")
+        return False
+
+    def check_settlements(self, now=None) -> list:
         """Interroge l'API pour les marches regles ; realise le PnL.
         Ecriture du reglement AVANT retrait de la position : un crash entre
         les deux laisse au pire un doublon detecte (trade deja settled),
@@ -168,11 +269,14 @@ class PositionManager:
         - echec get_market() : log WARNING + cleanup si position trop vieille
         """
         realized = []
-        now_dt = datetime.now(timezone.utc)
+        now_dt = now or datetime.now(timezone.utc)
         for tid, p in list(self.positions.items()):
             if p.get("state", "open") != "open":
                 continue
             m = self.client.get_market(p["ticker"])
+            result = str(pick(m, "result", default="") or "").lower() if m else ""
+            status = str(pick(m, "status", default="") or "").lower() if m else ""
+            settleable = result in ("yes", "no", "void")
 
             # ── max-age escape hatch ──────────────────────────────────
             opened_str = p.get("opened_at", "")
@@ -185,8 +289,17 @@ class PositionManager:
             else:
                 age_days = None
 
-            if age_days is not None and age_days > CFG.MAX_POSITION_AGE_DAYS:
-                if not m or str(pick(m, "status", default="") or "").lower() != "open":
+            # A stale position whose market DOES report a usable result is
+            # not a cleanup case: booking it as expired_stale would throw
+            # away the real outcome. Measured cost of the old ordering: a
+            # winning 10-contract position at 50c booked -0.14 instead of
+            # +4.93. Such a position goes through the confirmation protocol
+            # like any other; only a position with no usable result left is
+            # swept, and an unreadable result on a still-open market is kept
+            # rather than guessed.
+            if age_days is not None and age_days > CFG.MAX_POSITION_AGE_DAYS \
+                    and not settleable:
+                if not m or status != "open":
                     gross = -p["fees"]   # conservative: lose fees on stale position
                     net = gross - p["fees"]
                     t = self._settle_and_release(tid, p, "expired_stale", False, gross, net)
@@ -195,7 +308,7 @@ class PositionManager:
                     log_pos.warning(
                         f"{p['ticker']}: position agee de {age_days:.0f}j > "
                         f"{CFG.MAX_POSITION_AGE_DAYS}j, statut marche="
-                        f"{str(pick(m, 'status', default='N/A') or 'N/A').lower() if m else 'inaccessible'}"
+                        f"{status or 'N/A' if m else 'inaccessible'}"
                         f" -- nettoyee comme expired_stale (gross={gross:+.2f}$)")
                     continue
 
@@ -209,8 +322,11 @@ class PositionManager:
                                     f"age={age_days}j -- conservee.")
                 continue
 
-            result = str(pick(m, "result", default="") or "").lower()
-            status = str(pick(m, "status", default="") or "").lower()
+            # ── confirmation protocol: a readable result is booked only
+            # ── once confirmed; until then the position stays open ─────
+            if result in ("yes", "no", "void") and \
+                    not self._settlement_confirmed(p, m, result, status, now_dt):
+                continue
 
             # ── void (legitimate settlement) ──────────────────────────
             if result == "void":

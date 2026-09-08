@@ -144,8 +144,48 @@ class TradeLogger:
                      f"@ {avg_price}c (frais {fees:.2f}$) ordre={order_id}")
         return rec
 
+    def settled_row(self, trade_id: str):
+        """The SETTLED journal row for this id, or None.
+
+        Lets a caller tell "this settlement is new" from "this settlement
+        already happened" before it books anything."""
+        for t in self.trades:
+            if t.get("trade_id") == trade_id and t.get("state") == "settled":
+                return t
+        return None
+
     def settle_trade(self, trade_id: str, result: str, won: bool,
                      gross_pnl: float, net_pnl: float):
+        """Settle a trade ONCE. A second settlement is refused, not applied.
+
+        WHY THE GUARD EXISTS
+            `PositionManager._settle_and_release` writes the trade journal
+            BEFORE removing the position, deliberately: a crash between the
+            two leaves a duplicate rather than a zombie. But nothing used to
+            detect that duplicate. On the next pass the same trade was
+            settled again and `settled_at` was rewritten to the CURRENT
+            time, which moved the settlement into a later day.
+            `RiskManager._today_settled()` selects on
+            `settled_at.startswith(today)`, so a loss booked yesterday
+            re-counted against today's MAX_DAILY_LOSS. The stored figures
+            are re-derived from the same position and so were unchanged;
+            the damage was to the date, and therefore to a risk control.
+
+            An already-settled trade is therefore returned UNCHANGED —
+            result, PnL and settled_at all keep their original values.
+        """
+        already = self.settled_row(trade_id)
+        if already is not None:
+            log_trd.warning(
+                f"[DUPLICATE_SETTLEMENT_IGNORED] {already.get('ticker')} "
+                f"trade={trade_id} deja regle le {already.get('settled_at')} "
+                f"(result={already.get('result')}, net={already.get('net_pnl')}) "
+                f"-- aucune reecriture",
+                extra={"event": "duplicate_settlement_ignored",
+                       "trade_id": trade_id,
+                       "ticker": already.get("ticker"),
+                       "settled_at": already.get("settled_at")})
+            return already
         for t in self.trades:
             if t["trade_id"] == trade_id:
                 opened = datetime.fromisoformat(t["timestamp"])
