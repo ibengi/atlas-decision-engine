@@ -778,11 +778,17 @@ class ExecutionEngine:
         for name in ("scanned_raw", "open_cached", "liquid", "supported",
                      "model_evaluated", "positive_edge", "positive_net_ev",
                      "risk_passed", "orders_submitted", "fills"):
-            n = int(report.get(name) or 0)
-            conv[name] = {"n": n,
-                          "pct_of_prev": round(100.0 * n / prev, 2)
-                          if prev else (100.0 if n else 0.0)}
-            prev = n if n else prev
+            # `stage_n`, never `n`: `n` is this method's cycle number and
+            # is still needed below. Rebinding it here made every completed
+            # cycle record the last stage's count (fills, so 0) as its
+            # cycle number in the durable evidence, the cycle report and the
+            # dashboard -- while blocked cycles, which return before this
+            # loop, numbered correctly.
+            stage_n = int(report.get(name) or 0)
+            conv[name] = {"n": stage_n,
+                          "pct_of_prev": round(100.0 * stage_n / prev, 2)
+                          if prev else (100.0 if stage_n else 0.0)}
+            prev = stage_n if stage_n else prev
         report["funnel_conversion"] = conv
         report["fills_confirmed"] = placed
         report["orders"] = report.get("orders_submitted", 0)
