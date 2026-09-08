@@ -22,6 +22,7 @@ CRITICAL_BASENAMES = frozenset({
     "risk_state.json",         # half-open circuit-breaker claim
     "positions_state.json",    # open positions / slot accounting
     "state_epoch.json",        # persistent-state continuity marker
+    "equity_ledger.json",      # F2 risk-equity baseline, flows, HWM, rebases
 })
 
 
