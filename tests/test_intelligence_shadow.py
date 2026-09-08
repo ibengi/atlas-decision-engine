@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """Safety contract for the Atlas Intelligence Network phase-1 shadow layer."""
+import json
 import os
+import tempfile
 import unittest
-from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from intelligence.budget import DailyBudgetManager
 from intelligence.cache import IntelligenceCache
+from intelligence.evidence import IntelligenceEvidenceStore
 from intelligence.router import IntelligenceRouter, ShadowOnlyPolicy
 from intelligence.schemas import IntelligenceObservation, MarketCandidate
 
@@ -128,6 +131,47 @@ class TestBudgetAndCache(unittest.TestCase):
         clock.t += 6.0
         self.assertIsNone(cache.get("astra", "K"))
         self.assertFalse(cache.peek("astra", "K")["fresh"])
+
+
+class TestEvidenceStore(unittest.TestCase):
+    def test_append_only_row_contains_market_and_provider_prediction(self):
+        candidate = MarketCandidate("KXTEST", 0.42, category="btc")
+        obs = IntelligenceObservation(
+            "KXTEST", "astra", "m", 0.61, 0.82, cost_usd=0.02, latency_ms=15
+        )
+        with tempfile.TemporaryDirectory() as td:
+            store = IntelligenceEvidenceStore(td, fsync=False)
+            ids = store.append(candidate, [obs])
+            lines = Path(td, "ai_shadow_observations.jsonl").read_text().splitlines()
+        self.assertEqual(len(ids), 1)
+        self.assertEqual(len(lines), 1)
+        row = json.loads(lines[0])
+        self.assertEqual(row["contract_id"], "KXTEST")
+        self.assertEqual(row["market_probability"], 0.42)
+        self.assertEqual(row["observation"]["probability"], 0.61)
+        self.assertEqual(row["observation"]["cost_usd"], 0.02)
+        self.assertTrue(row["observation"]["shadow_only"])
+        self.assertEqual(row["evidence_id"], ids[0])
+
+    def test_multiple_appends_never_replace_previous_evidence(self):
+        candidate = MarketCandidate("KXTEST", 0.42)
+        with tempfile.TemporaryDirectory() as td:
+            store = IntelligenceEvidenceStore(td, fsync=False)
+            store.append(candidate, [IntelligenceObservation("KXTEST", "astra", "m", 0.6, 0.8)])
+            store.append(candidate, [IntelligenceObservation("KXTEST", "gemini", "m", 0.55, 0.7)])
+            lines = Path(td, "ai_shadow_observations.jsonl").read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(json.loads(lines[0])["observation"]["provider"], "astra")
+        self.assertEqual(json.loads(lines[1])["observation"]["provider"], "gemini")
+
+    def test_contract_mismatch_is_refused_before_write(self):
+        candidate = MarketCandidate("A", 0.5)
+        obs = IntelligenceObservation("B", "astra", "m", 0.6, 0.8)
+        with tempfile.TemporaryDirectory() as td:
+            store = IntelligenceEvidenceStore(td, fsync=False)
+            with self.assertRaises(ValueError):
+                store.append(candidate, [obs])
+            self.assertFalse(Path(td, "ai_shadow_observations.jsonl").exists())
 
 
 class TestRouter(unittest.TestCase):
