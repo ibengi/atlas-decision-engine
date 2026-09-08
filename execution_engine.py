@@ -142,11 +142,27 @@ def log_execution_banner(client):
         log.info("NOTE: ordres reels sur l'API DEMO — fonds DEMO uniquement, "
                  "aucun argent reel.")
 
+#: The ONE global guard that PRODUCTION READ_ONLY observation may continue
+#: through. Deliberately a single name, not a set: `equity_drawdown` is a
+#: CAPITAL guard (it protects money that READ_ONLY cannot move), so stopping
+#: the scanner on it destroys model evidence without adding money-path
+#: safety. Every other guard, in every mode, and this guard in CAPITAL and
+#: DEMO, keep their fail-closed verdict.
+OBSERVATION_ONLY_GUARD = "equity_drawdown"
+
+
 class ExecutionEngine:
     """Cycle normal = PIPELINE INTEGRE :
     scanner -> ranker -> routeur -> portes edge/EV -> risque -> execution
     -> verification fills -> reconciliation. Plus de dependance exclusive
     a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
+
+    #: Per-cycle: the CAPITAL guard that fired but was REPORTED rather than
+    #: obeyed (PROD READ_ONLY only). Reset at the start of every cycle path,
+    #: at the start of every gate evaluation and in a `finally` at the end of
+    #: every finalization, so it can never survive an exception into the
+    #: next cycle.
+    _capital_blocking_guard = None
 
     def __init__(self, client: KalshiClient, capital: float):
         from strategy_router import (GateConfig, build_default_registry,
@@ -333,7 +349,43 @@ class ExecutionEngine:
         self._last_health = health
         return bal, health
 
+    def _is_prod_read_only(self) -> bool:
+        """"Not demo" and read-only dominance -- the write boundary's own
+        formulation (`_assert_broker_write_allowed`), never "is prod"."""
+        client = getattr(self, "client", None)
+        return getattr(client, "env", None) != "demo" and prod_is_read_only()
+
     def _post_balance_gates(self) -> tuple:
+        """Portes de risque globales APRES le solde. Retourne (ok, guard).
+
+        Every guard is evaluated by `_evaluate_global_guards`, unchanged.
+        Exactly one verdict is then re-read: `equity_drawdown` in PRODUCTION
+        READ_ONLY. There, no broker mutation exists to protect, so the guard
+        is RECORDED for this cycle (`_capital_blocking_guard`, surfaced as
+        `would_block_capital` in the durable row, `capital_blocking_guard` in
+        the cycle report and the dashboard) and observation continues:
+        scanner, model, shadow evidence and sizing all run; the write layer
+        is unreachable regardless. CAPITAL and DEMO keep the block. Every
+        other guard keeps its verdict in every mode.
+
+        The flag is reset FIRST so nothing an earlier cycle left behind can
+        be mistaken for this cycle's verdict.
+        """
+        self._capital_blocking_guard = None
+        ok, guard = self._evaluate_global_guards()
+        if ok:
+            return ok, guard
+        if guard == OBSERVATION_ONLY_GUARD and self._is_prod_read_only():
+            self._capital_blocking_guard = guard
+            log_rsk.warning(
+                f"[READ_ONLY_OBSERVATION] capital_guard={guard} "
+                f"scanner_continues=true broker_writes=false",
+                extra={"event": "read_only_observation",
+                       "would_block_capital": guard})
+            return True, None
+        return ok, guard
+
+    def _evaluate_global_guards(self) -> tuple:
         """Portes de risque globales APRES le solde (capital effectif a
         jour). Retourne (ok, guard) ; ok=False si le cycle doit s'arreter.
 
@@ -404,8 +456,13 @@ class ExecutionEngine:
 
     def _record_cycle_evidence(self, n: int, execution_path: str,
                                blocking_global_guard=None, detail: str = "",
-                               pipeline: dict = None) -> dict:
+                               pipeline: dict = None,
+                               would_block_capital=None) -> dict:
         """Write exactly one durable evidence row per cycle. Observability only.
+
+        `would_block_capital` defaults to this cycle's recorded CAPITAL guard
+        (PROD READ_ONLY observation, see `_post_balance_gates`); an explicit
+        value from the caller wins.
 
         Before P0 a cycle that returned early at a global guard wrote nothing
         at all, so "no decisions this cycle" had three indistinguishable
@@ -419,6 +476,9 @@ class ExecutionEngine:
 
         Never raises: evidence must not be able to break a trading cycle.
         """
+        if would_block_capital is None:
+            # getattr: harnesses borrow this method onto stub objects.
+            would_block_capital = getattr(self, "_capital_blocking_guard", None)
         row = {
             "cycle": n,
             "occurred_at": now_iso(),
@@ -426,6 +486,11 @@ class ExecutionEngine:
             "execution_path": execution_path,
             "blocking_global_guard": blocking_global_guard,
             "scan_executed": pipeline is not None,
+            # Names a CAPITAL guard that fired but was REPORTED rather than
+            # obeyed, which only PRODUCTION READ_ONLY observation may do.
+            # None on every other cycle. A row with scan_executed=true and
+            # a value here is a shadow cycle that CAPITAL would have refused.
+            "would_block_capital": would_block_capital,
         }
         if detail:
             row["blocking_detail"] = str(detail)[:300]
@@ -445,11 +510,13 @@ class ExecutionEngine:
             log.warning(f"[CYCLE_EVIDENCE] write failed: {e}")
         log.info(f"[CYCLE_EVIDENCE] cycle={n} path={execution_path} "
                  f"blocking_global_guard={blocking_global_guard} "
-                 f"scan_executed={row['scan_executed']}",
+                 f"scan_executed={row['scan_executed']} "
+                 f"would_block_capital={would_block_capital}",
                  extra={"event": "cycle_evidence", "cycle": n,
                         "execution_path": execution_path,
                         "blocking_global_guard": blocking_global_guard,
-                        "scan_executed": row["scan_executed"]})
+                        "scan_executed": row["scan_executed"],
+                        "would_block_capital": would_block_capital})
         return row
 
     def _probability_engine_report(self):
@@ -594,6 +661,7 @@ class ExecutionEngine:
     def _cycle_sequential(self, n: int) -> int:
         """Chemin par defaut (P8 desactive) : kill switch, solde, portes de
         risque globales, PUIS scan — ordre historique inchange."""
+        self._capital_blocking_guard = None
         # 2) Kill switch (seule porte qui ne depend pas du capital effectif)
         #    et 3-4) portes de risque globales — mesurees ensemble : ce sont
         #    les controles risque du cycle (P4.4).
@@ -641,6 +709,7 @@ class ExecutionEngine:
         risque. Resultats strictement identiques au sequentiel : solde et
         scan sont independants (le scan ne lit ni n'ecrit self.capital /
         self.risk — portes inchangees, executees apres la jointure)."""
+        self._capital_blocking_guard = None
         # 2) Kill switch d'abord : aucun scan lance inutilement.
         if CFG.KILL_SWITCH:
             log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
@@ -677,7 +746,24 @@ class ExecutionEngine:
     def _finish_cycle(self, n: int, res: dict,
                       execution_path: str = "sequential") -> int:
         """Execution des candidats acceptes + rapports de fin de cycle
-        (partage sequentiel/parallele)."""
+        (partage sequentiel/parallele).
+
+        Carries this cycle's recorded CAPITAL guard (PROD READ_ONLY
+        observation) into the cycle report before it is persisted, and
+        clears the flag in `finally` whether finalization returns or raises.
+        """
+        guard = getattr(self, "_capital_blocking_guard", None)
+        try:
+            report = res.get("report") if isinstance(res, dict) else None
+            if guard and isinstance(report, dict):
+                report["capital_blocking_guard"] = guard
+                report["capital_eligible"] = False
+            return self._finalize_cycle(n, res, execution_path)
+        finally:
+            self._capital_blocking_guard = None
+
+    def _finalize_cycle(self, n: int, res: dict,
+                        execution_path: str = "sequential") -> int:
         report = res["report"]
         placed = 0
         for dec in res["accepted"]:
@@ -755,6 +841,12 @@ class ExecutionEngine:
                 "exchange_paused": time.time() <
                 getattr(self.orders, "exchange_pause_until", 0.0),
                 "candidates": cands,
+                # PROD READ_ONLY observation: the CAPITAL guard this cycle
+                # observed through, None on every other cycle.
+                "capital_blocking_guard":
+                    getattr(self, "_capital_blocking_guard", None),
+                **({"read_only": True, "capital_eligible": False}
+                   if getattr(self, "_capital_blocking_guard", None) else {}),
             })
         except Exception as e:
             log.warning(f"dashboard_state: {e}")
