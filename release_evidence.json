@@ -1,11 +1,11 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-09-05T22:37:00Z",
-  "git_sha": "d5417535874531e51a7df112f1585f21e4066fa9",
-  "tree_sha": "29f7c2e3908de8932eb9d99209d0edf374ee9f94",
-  "deployment_id": "eb1dfd55-d534-414c-a46c-2913a1b0eb67",
-  "deployment_created_at": "2026-09-05T22:26:39Z",
-  "deployment_ready_at": "2026-09-05T22:28:23Z",
+  "generated_at": "2026-09-08T15:20:00Z",
+  "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
+  "tree_sha": "4ae98383c9f07a064885949e6161b58672b50bfe",
+  "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
+  "deployment_created_at": "2026-09-07T13:33:39Z",
+  "deployment_ready_at": "2026-09-07T13:34:28Z",
   "deployment_status": "SUCCESS",
   "docker_build_pass": true,
   "test_count": 949,
@@ -25,15 +25,16 @@
   "ready_for_investor_demo": true,
   "ready_for_capital_live": false,
   "stale": false,
-  "what_this_release_is": "ATLAS is connected to the REAL Kalshi production account in READ_ONLY. Authentication, balance and reconciliation are verified against the live account. Zero broker writes. The full live SHADOW is NOT yet running: an equity drawdown computed against a near-empty account cuts the scan before any market is looked at.",
+  "what_this_release_is": "ATLAS is connected to the REAL Kalshi production account in READ_ONLY. Authentication, balance and reconciliation are verified against the live account. Zero broker writes. The full live SHADOW IS RUNNING: since the 2026-09-07T18:02Z deposit (balance 0.04$ -> 9.84$) the cash-denominated equity drawdown reads 4.9% and no longer cuts the scan; on 2026-09-08T14:54:44Z the engine produced its first production WOULD_SUBMIT (KXBTC15M NO x1 @ 9c) with no call to the write path. The shadow is deposit-dependent, not code-dependent: PR #64 is open and undeployed, and the F2 accounting design (a deposit must never clear a loss-derived guard) is awaiting cross-audit.",
   "binds_to": {
-    "git_sha": "d5417535874531e51a7df112f1585f21e4066fa9",
+    "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
     "merged_pull_requests": [
       "https://github.com/ibengi/atlas-decision-engine/pull/61",
-      "https://github.com/ibengi/atlas-decision-engine/pull/62"
+      "https://github.com/ibengi/atlas-decision-engine/pull/62",
+      "https://github.com/ibengi/atlas-decision-engine/pull/63"
     ],
-    "deployment_id": "eb1dfd55-d534-414c-a46c-2913a1b0eb67",
-    "note": "PR #62 made --live-read-only the repository startup default. The engine boots PROD READ_ONLY from that image."
+    "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
+    "note": "PR #62 made --live-read-only the repository startup default; PR #63 added the read-only dashboard startup snapshot (Railway startCommand: python read_only_dashboard_bootstrap.py). The engine boots PROD READ_ONLY from that image."
   },
   "evidence": {
     "merge_gate": {
@@ -99,24 +100,50 @@
     "LIVE_ENVIRONMENT_CONNECTED": "YES",
     "LIVE_READ_ONLY": "YES",
     "LIVE_RECONCILIATION": "MATCH",
-    "LIVE_SHADOW": "NO",
+    "LIVE_SHADOW": "YES",
     "BROKER_WRITES": 0,
     "CAPITAL_LIVE_READY": "NO",
     "observed": {
       "banner_environment": "Environnement : PROD -> https://api.elections.kalshi.com/trade-api/v2",
       "banner_mode": "PRODUCTION EN LECTURE SEULE (PROD_ACCESS_MODE=READ_ONLY): AUCUNE mutation broker n'est possible, quels que soient les drapeaux de trading. Le gatekeeper modele n'est pas requis pour observer.",
       "PROD_AUTH": "PASS (Identifiants: cles PROD)",
-      "BALANCE_READ": "PASS (solde 0.04$)",
-      "capital_effectif": "min(plafond 500.00$, solde 0.04$) = 0.04$",
+      "BALANCE_READ": "PASS (solde 0.04$ at first boot; 9.84$ since 2026-09-07T18:02:20Z)",
+      "capital_effectif": "min(plafond 500.00$, solde 9.84$) = 9.84$ since 2026-09-07T18:02:20Z",
       "POSITIONS_READ": "PASS",
       "RECONCILE_STARTUP": "MATCH (tickers broker=0 local=0) @ 22:28:25Z",
       "unexpected_pre_existing_orders_or_positions": "NONE",
       "orders_submitted": 0,
       "fills": 0,
       "cancels": 0,
-      "mutating_http_to_kalshi": 0
+      "mutating_http_to_kalshi": 0,
+      "RECONCILE_LATEST": "MATCH (tickers broker=0 local=0) @ 2026-09-08T15:08:42Z, 14 minutes after the first WOULD_SUBMIT"
     },
-    "why_the_shadow_is_not_running": {
+    "live_shadow": {
+      "status": "RUNNING",
+      "first_would_submit_at": "2026-09-08T14:54:44Z",
+      "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
+      "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
+      "cycle_id": "f28e770049",
+      "decision": "KXBTC15M-26SEP081100-00 NO x1 @ 9c | model 23.9% vs market 11.0% | edge_net +0.099 | ev_net +0.109 | strategy btc15m_above_strike",
+      "log_line": "[WOULD_SUBMIT] KXBTC15M-26SEP081100-00 NO x1 @ 9c -- PROD_ACCESS_MODE=READ_ONLY: decision complete, AUCUN appel au chemin d'ecriture.",
+      "cycle_summary": "risk_passed 1, orders_submitted 0, fills 0",
+      "zero_write_verification": {
+        "window": "2026-09-08T14:16Z to 15:14Z (54 cycles, all scan_executed=true, blocking_global_guard=None)",
+        "orders_submitted": 0,
+        "fills": 0,
+        "cancels": 0,
+        "mutating_http_indicators_in_unfiltered_cycle_log": 0,
+        "reconciliation": "MATCH x4 in the window, including 15:08:42Z after the WOULD_SUBMIT",
+        "persistence_halt": "none"
+      },
+      "why_it_started": {
+        "mechanism": "deposit, not code",
+        "detail": "The cash-denominated drawdown (100 * 0.4839 / balance) fell from 1222% at 0.04$ to 4.9% at 9.84$ after the 2026-09-07T18:02Z deposit, below the 20% guard, so the unchanged main image scans every cycle. At a 9c ask, 1% of 9.84$ (0.0984$) buys one contract, so sizing produced 1 and the READ_ONLY decision reached WOULD_SUBMIT. Every candidate priced above 9c still sizes to 0 (audit: capital/risk/position-sizing, 2026-09-07).",
+        "dependency": "A withdrawal below 2.42$ would re-trip the guard with no trade. This is audit finding F2; the design that makes drawdown deposit-independent is docs/design/risk-equity-accounting.md (rev 2), not implemented.",
+        "pr64_status": "https://github.com/ibengi/atlas-decision-engine/pull/64 at e0d7448: repo-owned READ_ONLY observation through equity_drawdown, CI green, NOT MERGED, NOT DEPLOYED"
+      }
+    },
+    "shadow_history": {
       "guard": "equity_drawdown",
       "observed": "Drawdown 1222.0% (0.48$) >= 20% -- trading coupe. Eight consecutive cycles recorded blocking_global_guard=equity_drawdown with scan_executed=false.",
       "cause": "The live account holds 0.04$ against roughly -0.48$ of persisted historical PnL, so the rolling drawdown reads over 1200%. The guard is behaving exactly as designed; it is protecting an exposure that READ_ONLY cannot take.",
@@ -124,8 +151,10 @@
         "branch": "claude/railway-atlas-readonly-shadow-scan",
         "sha": "054a2e1a8130b45447ae57ce48fab36413d7ee1c",
         "summary": "A capital risk guard is still evaluated and reported in READ_ONLY but no longer decides whether the engine may look. CAPITAL and DEMO are unchanged.",
-        "status": "NOT REVIEWED, NOT MERGED, NOT DEPLOYED"
-      }
+        "status": "NOT REVIEWED, NOT MERGED, NOT DEPLOYED",
+        "superseded_by": "https://github.com/ibengi/atlas-decision-engine/pull/64 (e0d7448), open, CI green, not merged, not deployed"
+      },
+      "note": "Historical: how the shadow was blocked from first boot (2026-09-05) until the 2026-09-07T18:02Z deposit."
     }
   },
   "open_findings": [
