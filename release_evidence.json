@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-09-08T15:20:00Z",
+  "generated_at": "2026-09-08T17:20:00Z",
   "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
   "tree_sha": "4ae98383c9f07a064885949e6161b58672b50bfe",
   "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
@@ -226,5 +226,61 @@
     "LIVE_BROKER_WRITES_AUTHORIZED, LIVE_TRADING and LIVE_TRADING_CONFIRMED remain undefined",
     "no credential value was read or printed",
     "CAPITAL_LIVE remains a separate promotion decision"
-  ]
+  ],
+  "candidate_for_capital_review": {
+    "commit_sha": "df85507a9be9091934829a6a9bd1c463ef24fe3a",
+    "branch": "feat/risk-equity-accounting",
+    "pull_request": "https://github.com/ibengi/atlas-decision-engine/pull/66",
+    "stacked_on": {
+      "pull_request": "https://github.com/ibengi/atlas-decision-engine/pull/64",
+      "head": "e0d7448c96d4610ea1cf9e18ef6b5512e898cdf5",
+      "status": "open, CI green, awaiting non-author independent review"
+    },
+    "includes_merged": [
+      "https://github.com/ibengi/atlas-decision-engine/pull/65 (merged 5c4e789)"
+    ],
+    "ci": {
+      "run": "https://github.com/ibengi/atlas-decision-engine/actions/runs/34255551307",
+      "image-contains-artifacts": "SUCCESS",
+      "a-red-suite-blocks-the-build": "SUCCESS"
+    },
+    "local": {
+      "run_tests": "1019 tests, 0 failures, 0 errors, exit 0",
+      "pytest": "1019 passed, 282 subtests",
+      "write_boundary_probe": "126 refusals across 21 ops x 6 modes, socket layer reached: none",
+      "static": "compileall clean; no linter installed in the image"
+    },
+    "f2": {
+      "implemented": true,
+      "design": "docs/design/risk-equity-accounting.md rev 2",
+      "operator_procedure": "docs/risk-equity-operator-procedure.md",
+      "scenarios": "R1-R18 in tests/test_risk_equity_ledger.py",
+      "regression": "journal -0.4839$, cash 0.04$ -> 9.84$: drawdown 92.365% before and after (simulated on a v11 journal)"
+    },
+    "deployment": {
+      "status": "NOT DEPLOYED",
+      "reason": "Railway set-variables and connect-service-source were denied by the session's permission classifier",
+      "operator_steps": [
+        "1. Railway service dbf2df57: set EQUITY_LEDGER_SEED_PRE_FLOW_CASH=0.04, EQUITY_LEDGER_SEED_PRE_FLOW_AT=2026-09-07T18:01:19Z, EQUITY_LEDGER_SEED_EVIDENCE=<reference to the 18:01:19Z [CAPITAL] solde=0.04$ log line> (no SHA yet)",
+        "2. Point the service source at branch feat/risk-equity-accounting (commit df85507) and deploy; PROD_ACCESS_MODE stays READ_ONLY",
+        "3. In the boot log read '[EQUITY_SEED] proposal sha256=...' and check realized_pnl_cum ~ -0.4839, rolling_drawdown ~ 0.4839, hwm_0 ~ 0.5239, drawdown_pct_after ~ 92.36, migration_flow deposit ~ 9.80, status CONSERVATIVE_ESTIMATE; until then the engine runs unseeded: would_block_capital=equity_ledger_unseeded, scan continues, zero writes",
+        "4. Set EQUITY_LEDGER_SEED_SHA256=<that hash> and redeploy; expect '[EQUITY_SEED] applied' and '[EQUITY] risk_equity_status=CONSERVATIVE_ESTIMATE ... drawdown_pct=92.36 capital_guards=[risk_equity_unreconciled] capital_eligible=False'",
+        "5. Verify several cycles: scan_executed=true, would_block_capital=risk_equity_unreconciled, RECONCILE MATCH, no PERSISTENCE_HALT, orders 0, fills 0; remove the four EQUITY_LEDGER_SEED_* variables afterwards (a seed is never overwritten)"
+      ],
+      "expected_after_migration": {
+        "risk_equity_status": "CONSERVATIVE_ESTIMATE",
+        "drawdown_pct": 92.36,
+        "capital_eligible": false,
+        "capital_guard": "risk_equity_unreconciled"
+      }
+    },
+    "capital_technically_ready": false,
+    "remaining_blockers": [
+      "independent review of PR #64 and PR #66 (author cannot self-certify)",
+      "READ_ONLY deployment and ledger migration (steps above)",
+      "risk_equity_status will be CONSERVATIVE_ESTIMATE: CAPITAL stays blocked unless the account's funding history is attested (tools/equity_ledger_tool.py attest) or the separate policy RISK_EQUITY_ALLOW_CONSERVATIVE_ESTIMATE is explicitly decided",
+      "strategy drawdown 92.36% >= 20%: equity_drawdown fires in CAPITAL until an audited rebase (RECONCILED required) with its post-rebase hold and independent release",
+      "model gatekeeper (approved:false), daily settlement oracle, LIVE_TRADING / LIVE_TRADING_CONFIRMED / LIVE_BROKER_WRITES_AUTHORIZED all remain unset"
+    ]
+  }
 }
