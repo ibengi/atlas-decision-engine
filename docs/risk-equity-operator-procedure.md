@@ -73,11 +73,44 @@ The very first positive flow of an account that has never had a stake
 seed (`kind=initial_stake`); with any positive reference a deposit is a
 deposit.
 
+## Journal evidence watermark
+
+On every save the ledger records the most trading history it has ever
+evidenced (`journal_watermark`: settled row count, an order-preserving
+digest of the settled rows, the strategy equity at that point). It only
+ever grows. On every load and every observation the current journal is
+checked against it: a journal that is shorter, older, or replaced (same
+length, different rows) is a **journal mismatch**:
+
+- `risk_equity_status=UNRECONCILED`, CAPITAL blocked (`risk_equity_unreconciled`);
+- the high-water mark is kept, and the drawdown is bounded by the lowest
+  evidenced strategy equity, so a loss cannot vanish because the journal
+  shrank;
+- the watermark is not lowered to the shorter journal;
+- attestation and rebase are refused while the mismatch stands;
+- the mismatch clears only when the evidenced history is back in the
+  journal (a longer journal that keeps the evidenced prefix is fine).
+
+`state_restore` never writes `equity_ledger.json`, so a volume restore
+that brings back an older journal is detected at the next boot.
+
 ## Rebase (rare, exceptional)
 
-Preconditions, all checked at apply time: `RECONCILED`, `equity_drawdown`
-actually firing, no unclassified flow, no pending residual, reconciliation
-MATCH, no open position, no in-flight order, no open `capital_hold`.
+Preconditions, all checked at apply time: `RECONCILED`, no journal
+mismatch, `equity_drawdown` actually firing, no unclassified flow, no
+pending residual, a fresh position verification against the broker that
+returns MATCH, no open position, **no live order of any kind**, no open
+`capital_hold`.
+
+The order check reads the authoritative state the execution path uses
+(`execution_engine.equity_rebase_context`): the persisted OrderManager
+state (`open_orders`, including partially filled and cancel-unconfirmed
+orders, `pending_intents`, `resolution_halt`) **and** a fresh read-only
+broker order listing. An order open on either side, a broker listing that
+fails (unknown), or a disagreement between the local and broker order sets
+refuses the rebase. A refusal changes nothing: no HWM mutation, token not
+consumed, the file byte-identical, the reason logged as
+`[EQUITY_REBASE] refused: [...]`.
 
 ```
 DATA_DIR=/data/state5 python tools/equity_ledger_tool.py rebase \

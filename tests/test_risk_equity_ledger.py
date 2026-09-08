@@ -368,8 +368,13 @@ class RebaseIsAuditedAndExceptional(_Ledger):
         self.assertGreaterEqual(led.drawdown_pct(), CFG.MAX_EQUITY_DRAWDOWN_PCT)
         return led, tlog
 
+    # the authoritative shape execution_engine.equity_rebase_context builds:
+    # a context without the `orders` block is refused (fail-closed)
     OK_CTX = {"drawdown_firing": True, "reconcile_status": "MATCH",
-              "open_positions": 0, "in_flight_orders": 0}
+              "open_positions": 0, "in_flight_orders": 0,
+              "orders": {"local_open": [], "pending_intents": [], "resolution_halt": False,
+                         "broker_open": 0, "broker_open_ids": [], "broker_error": None,
+                         "disagreement": False}}
 
     def test_R12_unauthorized_rebase_attempts_are_no_ops(self):
         led, tlog = self.reconciled_and_blown()
@@ -379,6 +384,8 @@ class RebaseIsAuditedAndExceptional(_Ledger):
         before = json.dumps(self.file(), sort_keys=True)
         cases = [
             ("no token", dict(reason="r", action_id="OPS-11", token="", ctx=self.OK_CTX)),
+            ("no order block", dict(reason="losses acknowledged", action_id="OPS-11", token=prop["token"],
+                                    ctx={k: v for k, v in self.OK_CTX.items() if k != "orders"})),
             ("wrong token", dict(reason="losses acknowledged", action_id="OPS-11", token="f" * 64, ctx=self.OK_CTX)),
             ("no reason", dict(reason="", action_id="OPS-11", token=prop["token"], ctx=self.OK_CTX)),
             ("drawdown not firing", dict(reason="losses acknowledged", action_id="OPS-11",

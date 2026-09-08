@@ -587,3 +587,16 @@ the §6/§7 line that produces it.
   exactly `equity_drawdown` plus the four accounting guards.
 - Rollout: `RISK_EQUITY_MODE` defaults to `strategy`; `cash` is the rollback
   switch (no deploy needed).
+- Independent review (defects on df85507): (1) a restored, shorter or
+  replaced journal could erase a post-seed loss and return the status to
+  RECONCILED; fixed by a monotone journal evidence watermark with an
+  order-preserving digest, checked on load and on every observation, that
+  sets a persisted journal mismatch (UNRECONCILED, HWM kept, drawdown bounded
+  by the lowest evidenced equity, attestation and rebase refused) until the
+  evidenced history is back. (2) a rebase was accepted with an order open
+  because the context only counted pre-submission intents; fixed by
+  `execution_engine.equity_rebase_context`, which reads the persisted
+  OrderManager and PositionManager state and a fresh broker order listing
+  and position verification, and by ledger preconditions that refuse on any
+  open order, unknown broker state, or local/broker disagreement. A context
+  without the order block is refused.

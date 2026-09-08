@@ -157,6 +157,59 @@ OBSERVATION_ONLY_GUARD = "equity_drawdown"
 OBSERVATION_ONLY_GUARDS = frozenset((OBSERVATION_ONLY_GUARD, *ACCOUNTING_GUARDS))
 
 
+def equity_rebase_context(client, orders, posmgr, risk) -> dict:
+    """The authoritative context for an equity rebase (F2 §6).
+
+    Orders come from the persisted OrderManager state (`open_orders`,
+    `pending_intents`, `resolution_halt`) AND a fresh read-only broker
+    listing; positions from the persisted PositionManager state AND a fresh
+    broker verification. A query that fails leaves the broker side
+    `None` (unknown), which the ledger treats as a refusal; a disagreement
+    between local and broker order sets is a refusal too. Nothing here
+    writes to the broker.
+    """
+    from order_manager import OrderManager
+    local_open = sorted(str(k) for k in (getattr(orders, "open_orders", None) or {}))
+    pending = sorted(str(k) for k in (getattr(orders, "pending_intents", None) or {}))
+    halt = getattr(orders, "resolution_halt", None)
+    terminal = {str(s).lower() for s in getattr(orders, "TERMINAL", OrderManager.TERMINAL)}
+    broker_open, broker_ids, broker_error = None, [], None
+    try:
+        rows = client.list_orders()
+        for r in rows or []:
+            status = str((r or {}).get("status") or "").lower()
+            remaining = int((r or {}).get("remaining_count") or 0)
+            if status not in terminal or remaining > 0:
+                broker_ids.append(str(r.get("order_id") or r.get("id") or "?"))
+        broker_open = len(broker_ids)
+    except Exception as e:                                # noqa: BLE001
+        broker_error = f"{type(e).__name__}: {e}"
+    reconcile = "UNKNOWN"
+    verify = getattr(posmgr, "verify_against_broker", None)
+    if callable(verify):
+        try:
+            report = verify() or {}
+            reconcile = str(report.get("status") or "UNKNOWN")
+        except Exception as e:                            # noqa: BLE001
+            reconcile = f"UNKNOWN ({type(e).__name__})"
+    elif getattr(posmgr, "reconcile_halt", None) is None:
+        reconcile = "MATCH"
+    drawdown_firing = False
+    try:
+        drawdown_firing = float(risk.rolling_drawdown_pct()) >= CFG.MAX_EQUITY_DRAWDOWN_PCT
+    except Exception:                                     # noqa: BLE001
+        pass
+    disagreement = broker_open is not None and set(local_open) != set(broker_ids)
+    return {"drawdown_firing": drawdown_firing,
+            "reconcile_status": reconcile,
+            "open_positions": int(posmgr.open_count()),
+            "in_flight_orders": len(local_open) + len(pending) + (broker_open or 0),
+            "orders": {"local_open": local_open, "pending_intents": pending,
+                       "resolution_halt": bool(halt), "broker_open": broker_open,
+                       "broker_open_ids": broker_ids, "broker_error": broker_error,
+                       "disagreement": disagreement}}
+
+
 def _equity_of(engine):
     """The engine's EquityLedger, or None. Module-level so that harnesses
     which borrow engine methods onto stub objects keep working."""
@@ -424,16 +477,17 @@ class ExecutionEngine:
                 cash = self.client.get_balance()
             except Exception as e:                        # noqa: BLE001
                 log_rsk.warning(f"[EQUITY] balance unavailable for the seed proposal: {e}")
-        halt = getattr(self.posmgr, "reconcile_halt", None)
-        drawdown_firing = False
-        try:
-            drawdown_firing = self.risk.rolling_drawdown_pct() >= CFG.MAX_EQUITY_DRAWDOWN_PCT
-        except Exception:                                 # noqa: BLE001
-            pass
-        ctx = {"drawdown_firing": drawdown_firing,
-               "reconcile_status": "MATCH" if halt is None else str(halt.get("status")),
-               "open_positions": self.posmgr.open_count(),
-               "in_flight_orders": len(getattr(self.orders, "pending_intents", {}) or {})}
+        if os.getenv("EQUITY_LEDGER_REBASE_TOKEN"):
+            # a rebase needs the authoritative order and position truth,
+            # including a fresh read-only broker query; anything unknown
+            # refuses. Other actions never need it.
+            ctx = equity_rebase_context(self.client, self.orders, self.posmgr, self.risk)
+        else:
+            halt = getattr(self.posmgr, "reconcile_halt", None)
+            ctx = {"drawdown_firing": False,
+                   "reconcile_status": "MATCH" if halt is None else str(halt.get("status")),
+                   "open_positions": self.posmgr.open_count(),
+                   "in_flight_orders": len(getattr(self.orders, "pending_intents", {}) or {})}
         done = equity.apply_operator_actions(os.environ, cash, ctx)
         if done:
             log.warning(f"[EQUITY] operator actions: {done}")

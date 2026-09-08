@@ -82,6 +82,12 @@ def _round(x) -> float:
     return round(float(x) + 0.0, 4)
 
 
+def journal_digest(rows) -> str:
+    """Order-preserving fingerprint of settled rows: identity, PnL, time."""
+    return _sha(_canonical([(t.get("trade_id"), _round(t.get("net_pnl") or 0.0),
+                             t.get("settled_at")) for t in rows]))
+
+
 class EquityLedger:
     """Persisted risk-equity state under DATA_DIR/equity_ledger.json."""
 
@@ -109,7 +115,10 @@ class EquityLedger:
                         "rebased_from": None, "floor_from_settled_index": 0},
                 "rebases": [], "consumed_tokens": [], "flows": [],
                 "pending": None, "daily": {"date": None, "sod_strategy_equity": None},
-                "anchor": {"settled_since_anchor": 0}}
+                "anchor": {"settled_since_anchor": 0},
+                # the most trading history ever evidenced by this ledger:
+                # a journal that no longer contains it is a mismatch
+                "journal_watermark": None, "journal_mismatch": None}
 
     def _load(self) -> dict:
         raw = JsonStore.load(self.path, None)
@@ -120,6 +129,7 @@ class EquityLedger:
         return base
 
     def save(self) -> bool:
+        self._advance_journal_watermark()
         ok = JsonStore.save(self.path, self.state)
         if not ok:
             log.error("[EQUITY] equity_ledger.json NOT saved (persistence sentinel tripped)")
@@ -168,7 +178,13 @@ class EquityLedger:
         r = float(pend.get("residual") or 0.0)
         unresolved = sum(float(f["amount"]) for f in self.state["flows"]
                          if f.get("kind") == FLOW_UNCLASSIFIED)
-        return eq + min(0.0, r) + min(0.0, unresolved)
+        eq = eq + min(0.0, r) + min(0.0, unresolved)
+        wm = self.state.get("journal_watermark") or {}
+        if self.state.get("journal_mismatch") and wm.get("strategy_equity") is not None:
+            # evidenced losses never disappear because the journal shrank:
+            # the lowest evidenced equity bounds the drawdown from above
+            eq = min(eq, float(wm["strategy_equity"]))
+        return eq
 
     def flows_cum(self) -> float:
         return float(sum(float(f["amount"]) for f in self.state["flows"]
@@ -247,8 +263,65 @@ class EquityLedger:
         rows = self.settled()
         if len(rows) < n0:
             return False
+        if s.get("prefix_digest"):
+            return journal_digest(rows[:n0]) == s["prefix_digest"]
         prefix = float(sum(float(t.get("net_pnl") or 0.0) for t in rows[:n0]))
         return abs(prefix - float(s["realized_pnl_cum_0"])) < 1e-6
+
+    # ── journal evidence watermark (defect 1) ───────────────────────────
+    def _advance_journal_watermark(self) -> None:
+        """Record the most trading history ever evidenced. Only ever grows,
+        and never while the current journal contradicts the evidence."""
+        if not self.seeded or self.state.get("journal_mismatch"):
+            return
+        rows = self.settled()
+        wm = self.state.get("journal_watermark") or {}
+        n_old = int(wm.get("settled_count") or 0)
+        if len(rows) < n_old:
+            return
+        if n_old and journal_digest(rows[:n_old]) != wm.get("digest"):
+            return
+        eq = self.strategy_equity()
+        self.state["journal_watermark"] = {
+            "settled_count": len(rows), "digest": journal_digest(rows),
+            "realized_pnl_cum": _round(self.realized_pnl_cum()),
+            "strategy_equity": _round(eq) if eq is not None else None,
+            "at": now_iso()}
+
+    def _check_journal_against_watermark(self) -> bool:
+        """True when the mismatch state changed. Sets `journal_mismatch`
+        when the journal no longer contains the evidenced history, clears
+        it only when that history is back."""
+        wm = self.state.get("journal_watermark") or {}
+        n = int(wm.get("settled_count") or 0)
+        was = self.state.get("journal_mismatch")
+        if not self.seeded or not n:
+            return False
+        rows = self.settled()
+        reason = None
+        if len(rows) < n:
+            reason = (f"journal has {len(rows)} settled rows, {n} were evidenced "
+                      f"(restored or truncated journal)")
+        elif journal_digest(rows[:n]) != wm.get("digest"):
+            reason = (f"the first {n} settled rows differ from the evidenced history "
+                      f"(replaced journal)")
+        if reason and not was:
+            self.state["journal_mismatch"] = {"detected_at": now_iso(), "reason": reason,
+                                              "evidenced_settled_count": n,
+                                              "found_settled_count": len(rows),
+                                              "evidenced_strategy_equity": wm.get("strategy_equity")}
+            self._note_unproven("journal does not contain the evidenced trading history: " + reason)
+            log.error(f"[EQUITY] JOURNAL MISMATCH: {reason}; risk_equity_status=UNRECONCILED, "
+                      f"HWM kept, evidenced losses kept, CAPITAL blocked")
+            return True
+        if not reason and was:
+            self.state["journal_mismatch"] = None
+            unproven = self.state["status_basis"].get("unproven") or []
+            self.state["status_basis"]["unproven"] = [u for u in unproven
+                                                      if not u.startswith("journal does not contain the evidenced")]
+            log.warning("[EQUITY] the evidenced journal is back; journal mismatch cleared")
+            return True
+        return False
 
     def derive_status(self) -> str:
         """Re-derive; automatic moves are conservative only."""
@@ -257,6 +330,8 @@ class EquityLedger:
         if not self._seed_prefix_intact():
             self._note_unproven("journal does not contain the seed prefix "
                                 "(restored journal older than the ledger?)")
+            return STATUS_UNRECONCILED
+        if self.state.get("journal_mismatch"):
             return STATUS_UNRECONCILED
         if self.unclassified_flows():
             return STATUS_UNRECONCILED
@@ -321,6 +396,9 @@ class EquityLedger:
         when = when or now_iso()
         if cash is None:
             return self.snapshot()
+        if self._check_journal_against_watermark():
+            self._reconcile_status()
+            self.save()
         cash = float(cash)
         basis = self.open_cost_basis()
         settled = self.settled()
@@ -436,6 +514,7 @@ class EquityLedger:
                 "account_equity_0": _round(account_equity_0),
                 "realized_pnl_cum_0": _round(self.realized_pnl_cum()),
                 "settled_count_0": len(rows),
+                "prefix_digest": journal_digest(rows),
                 "strategy_equity_0": _round(strategy_equity_0),
                 "hwm_0": _round(hwm_0),
                 "status_at_seed": status_at_seed,
@@ -602,9 +681,27 @@ class EquityLedger:
             failures.append("pending residual under observation")
         if ctx.get("reconcile_status") != "MATCH":
             failures.append("reconciliation is not MATCH")
+        if self.state.get("journal_mismatch"):
+            failures.append("journal mismatch (evidenced history missing)")
         if int(ctx.get("open_positions") or 0) > 0:
             failures.append("open positions")
-        if int(ctx.get("in_flight_orders") or 0) > 0:
+        orders = ctx.get("orders")
+        if not isinstance(orders, dict):
+            failures.append("order state not provided (authoritative context required)")
+        else:
+            if orders.get("local_open"):
+                failures.append(f"open local orders {sorted(orders['local_open'])}")
+            if orders.get("pending_intents"):
+                failures.append(f"pending submit intents {sorted(orders['pending_intents'])}")
+            if orders.get("resolution_halt"):
+                failures.append("ambiguous order resolution halt")
+            if orders.get("broker_open") is None:
+                failures.append(f"broker order state unknown ({orders.get('broker_error')})")
+            elif int(orders.get("broker_open") or 0) > 0:
+                failures.append(f"open orders at the broker {orders.get('broker_open_ids')}")
+            if orders.get("disagreement"):
+                failures.append("order state disagreement between local and broker")
+        if int(ctx.get("in_flight_orders") or 0) > 0 and "in-flight orders" not in failures:
             failures.append("in-flight orders")
         if self.state.get("capital_hold"):
             failures.append("capital_hold already open")
@@ -714,8 +811,10 @@ class EquityLedger:
         except ValueError as e:
             log.warning(f"[EQUITY_ATTEST] refused: {e}"); return False
         if not self.seeded or self.unclassified_flows() or self.state.get("pending") \
-                or not self._seed_prefix_intact():
-            log.warning("[EQUITY_ATTEST] refused: ledger is not in an attestable state"); return False
+                or not self._seed_prefix_intact() or self.state.get("journal_mismatch"):
+            log.warning("[EQUITY_ATTEST] refused: ledger is not in an attestable state "
+                        "(unseeded, unresolved flow, pending residual or journal mismatch)")
+            return False
         if token in self.state["consumed_tokens"] or token != proposal["token"]:
             log.warning("[EQUITY_ATTEST] refused: token invalid or consumed"); return False
         when = when or now_iso()
@@ -779,7 +878,8 @@ class EquityLedger:
         if not self.seeded:
             return
         before = self.state.get("risk_equity_status")
-        changed = self._refresh_hwm()
+        changed = self._check_journal_against_watermark()
+        changed = self._refresh_hwm() or changed
         self._reconcile_status()
         if changed or self.state.get("risk_equity_status") != before:
             self.save()
@@ -806,6 +906,7 @@ class EquityLedger:
             "unproven": list((self.state.get("status_basis") or {}).get("unproven") or []),
             "sod_strategy_equity": self.sod_strategy_equity(),
             "rebases": len(self.state.get("rebases") or []),
+            "journal_mismatch": self.state.get("journal_mismatch"),
         }
 
     def banner_line(self) -> str:
