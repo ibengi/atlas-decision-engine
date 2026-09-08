@@ -83,7 +83,7 @@ class IntelligenceRouter:
 
     The router intentionally exposes only ``collect`` and telemetry snapshots.
     It has no account, risk manager, position sizer, order manager or broker
-    dependency.  Provider failure therefore degrades to missing intelligence,
+    dependency. Provider failure therefore degrades to missing intelligence,
     never a trading-engine failure.
     """
 
@@ -94,9 +94,11 @@ class IntelligenceRouter:
         cache: IntelligenceCache | None = None,
         policy: ShadowOnlyPolicy | None = None,
     ) -> None:
-        self.providers = {p.provider_name: p for p in providers}
-        if len(self.providers) != len(list(self.providers.values())):
+        provider_list = list(providers)
+        names = [p.provider_name for p in provider_list]
+        if len(set(names)) != len(names):
             raise ValueError("provider names must be unique")
+        self.providers = {p.provider_name: p for p in provider_list}
         self.budget = budget
         self.cache = cache or IntelligenceCache()
         self.policy = policy or ShadowOnlyPolicy.from_environment()
@@ -140,6 +142,7 @@ class IntelligenceRouter:
                 )
                 continue
 
+            settled = False
             try:
                 self._stats["provider_calls"] += 1
                 observation = provider.analyze(candidate)
@@ -151,11 +154,15 @@ class IntelligenceRouter:
                     raise ValueError(
                         "provider contract_id does not match requested candidate"
                     )
-                self.budget.settle(name, estimate, observation.cost_usd)
+                # Validate/cache before settling the reservation. If anything in
+                # provider output is malformed, the reservation is released.
                 self.cache.put(observation, float(provider.cache_ttl_seconds))
+                self.budget.settle(name, estimate, observation.cost_usd)
+                settled = True
                 observations.append(observation)
             except Exception:
-                self.budget.release(name, estimate)
+                if not settled:
+                    self.budget.release(name, estimate)
                 self._stats["provider_errors"] += 1
                 log.exception(
                     "[AI_SHADOW] provider=%s contract=%s failed; continuing without opinion",
