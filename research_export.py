@@ -34,6 +34,10 @@ import os
 from typing import Any, Iterator, Optional
 
 from config import CFG
+#: The NEUTRAL boundary module -- the only research import the engine
+#: side takes. It knows nothing about providers, models or the
+#: gateway, so importing it here cannot widen the engine's surface.
+from research_feed import SPOOL_DIRNAME
 
 RESEARCH_CONTRACT_VERSION = 1
 
@@ -41,7 +45,7 @@ RESEARCH_CONTRACT_VERSION = 1
 #: no existing one, so `decisions` and `settlements` keep their versions and a
 #: v1 consumer that never asks for the new routes is unaffected.
 SCHEMA_VERSIONS = {"decisions": 1, "settlements": 2,
-                   "cycles": 1, "funnel_rejections": 1}
+                   "cycles": 1, "funnel_rejections": 1, "candidates": 1}
 
 #: Modules whose content defines the probability model. Hashing their source
 #: gives an identity that changes when the model changes and not otherwise.
@@ -319,6 +323,74 @@ def funnel_rejections(data_dir: str, cursor: str = "",
         "engine_commit": engine_commit(),
         "unreadable_lines": unreadable,
         "recomputed": False,
+        **page,
+    }
+
+
+def candidates(data_dir: str, cursor: str = "",
+               limit: int = DEFAULT_PAGE) -> dict:
+    """The research spool, served read-only so a SEPARATE service can read it.
+
+    WHY THIS ROUTE EXISTS
+        The spool is a directory under `DATA_DIR`. When the engine and the
+        Alpha Shadow Service run on one host that is enough, but on Railway
+        they are two services with two volumes, and a Railway volume is
+        mounted into exactly one service. A directory written by the engine
+        is simply not visible to Alpha there -- so without this route the
+        automatic feed silently delivers nothing across services, which is
+        the worst possible failure: it looks like "no candidates today".
+
+        Serving the spool over the read-only research API keeps the
+        direction of the dependency correct. The engine PUBLISHES and never
+        learns whether anyone read it; Alpha PULLS and cannot write back.
+        Alpha being down is invisible to the engine, and the engine's
+        producer keeps owning the spool -- including the pruning, which is
+        the one write the consumer must never be able to perform.
+
+    IT ADDS NO AUTHORITY
+        This reads files the producer already wrote and closed, from the
+        dashboard's daemon thread, exactly like every other dataset here.
+        There is no new write path, no new credential, and no way to reach
+        the trading path through it.
+    """
+    rows: list[dict] = []
+    unreadable = 0
+    directory = os.path.join(data_dir, SPOOL_DIRNAME)
+    try:
+        names = sorted(n for n in os.listdir(directory) if n.endswith(".json"))
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            with open(os.path.join(directory, name), "r",
+                      encoding="utf-8", errors="replace") as handle:
+                parsed = json.load(handle)
+        except (OSError, ValueError):
+            unreadable += 1
+            continue
+        if not isinstance(parsed, dict):
+            unreadable += 1
+            continue
+        # The producer's own content hash is the record id: it is stable
+        # across a re-read, identical for an identical candidate, and it is
+        # what the consumer already binds into the snapshot it mints. Using
+        # the filename instead would break the moment the producer changed
+        # its naming.
+        parsed["record_id"] = str(parsed.get("record_sha256") or "")[:20]             or hashlib.sha256(name.encode("utf-8")).hexdigest()[:20]
+        rows.append(parsed)
+    page = _page(rows, cursor, limit, key=lambda r: r["record_id"])
+    return {
+        "dataset": "candidates",
+        "schema_version": SCHEMA_VERSIONS["candidates"],
+        "contract_version": RESEARCH_CONTRACT_VERSION,
+        "engine_commit": engine_commit(),
+        "unreadable_lines": unreadable,
+        "recomputed": False,
+        "retention_note": (
+            "the producer prunes this spool by age and by count, so a "
+            "consumer slower than the emission rate misses candidates "
+            "permanently; that is a dropped research opportunity, never a "
+            "dropped trade"),
         **page,
     }
 

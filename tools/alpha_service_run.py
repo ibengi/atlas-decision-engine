@@ -34,6 +34,12 @@ from config import CFG                                       # noqa: E402
 from logging_config import setup_logging                     # noqa: E402
 
 
+#: Grep-able proof that the startup guard fired. A deployment that
+#: crash-loops on this line is a deployment that is correctly refusing
+#: to run Alpha beside broker authority.
+STARTUP_REFUSED_MARKER = "ALPHA_STARTUP_REFUSED_BROKER_CREDENTIALS"
+
+
 def _service() -> AlphaShadowService:
     return AlphaShadowService()
 
@@ -82,7 +88,10 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # No subcommand means `run`: the production start command is the bare
+    # `python tools/alpha_service_run.py`, so a platform start command needs
+    # no arguments and cannot be mistyped into a different mode.
+    sub = ap.add_subparsers(dest="cmd", required=False)
     sub.add_parser("health")
     o = sub.add_parser("once")
     o.add_argument("--limit", type=int, default=None)
@@ -94,9 +103,15 @@ def main(argv=None) -> int:
     s.add_argument("--outcome", required=True, choices=["0", "1"])
     s.add_argument("--source", default="")
     args = ap.parse_args(argv)
+    if not getattr(args, "cmd", None):
+        args = ap.parse_args(["run"])
     try:
         assert_no_broker_credentials()
     except BrokerCredentialsPresent as e:
+        # ONE marker line a deployment can grep for, then the reason. Both
+        # carry variable NAMES only -- `assert_no_broker_credentials` never
+        # reads a value, so there is nothing here that could print one.
+        print(STARTUP_REFUSED_MARKER, file=sys.stderr)
         print(str(e), file=sys.stderr)
         return 78
     return {"health": cmd_health, "once": cmd_once, "run": cmd_run,

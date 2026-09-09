@@ -530,3 +530,127 @@ providers pass. A provider that has not been proven usable is EXCLUDED, not
 assumed working. AtlasQuant remains unwired and
 `INSUFFICIENT_EVIDENCE`, and carries **no** ensemble weight — an absent
 model contributes nothing rather than contributing a neutral opinion.
+
+---
+
+# Phase 4 — two services, one repository
+
+Alpha and the engine now deploy as SEPARATE services from the same
+repository, with different start commands and different authority. Nothing
+about the safety boundary changes; what changes is that the separation is
+now a deployment fact rather than only a code fact.
+
+## 26. Why two services at all
+
+Co-locating them would mean one process environment holding both the AI keys
+and `KALSHI_PRIVATE_KEY`. Every argument in §2 for Alpha having no execution
+path is weakened if the credential that authorises execution is sitting in
+the same environment — the isolation would rest on Alpha never growing a
+broker client, rather than on Alpha being unable to use one.
+
+| | ATLAS ENGINE | ATLAS ALPHA SHADOW |
+|---|---|---|
+| start | `python kalshi_alpha_bot.py --loop --live-read-only` | `python tools/alpha_service_run.py` |
+| holds | `KALSHI_*`, execution/risk config | `XAI_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY` |
+| must not hold | the three AI keys | any broker credential or write gate |
+| owns on disk | `orders_state`, `positions_state`, risk/equity ledgers, `research_spool/` | `alpha_processed.jsonl`, `alpha_calibration_ledger.jsonl`, `alpha_cost_ledger.jsonl`, `alpha_observations.jsonl`, `alpha_telemetry.json` |
+
+Alpha writes none of the engine's state files and has no code path to one.
+Its own state is small and append-only; a Railway volume mounted at
+`/data` with `DATA_DIR=/data` is sufficient, and losing it costs calibration
+history, never money.
+
+## 27. The startup refusal
+
+`assert_no_broker_credentials()` refuses three kinds of variable:
+
+* **credentials** — `KALSHI_KEY_ID`, `KALSHI_PRIVATE_KEY`, and the demo and
+  prod variants;
+* **boolean gates** — `ALLOW_ORDER_SUBMISSION`, `LIVE_TRADING`,
+  `LIVE_TRADING_CONFIRMED`, `LIVE_BROKER_WRITES_AUTHORIZED`,
+  `KALSHI_ENV_CONFIRM`, `DEMO_TRADING`, `MODEL_APPROVED_FOR_LIVE`,
+  `ALLOW_FALLBACK_CAPITAL`;
+* **variables whose AUTHORITY IS IN THE VALUE** — `PROD_ACCESS_MODE=CAPITAL`
+  and `EXECUTION_MODE=live`. These are the ones a truthiness test misses:
+  `CAPITAL` is not `"1"` or `"true"`, and it is precisely the setting that
+  turns capital on. A guard that only tested truthiness would have passed
+  the one environment it most needed to refuse.
+
+`DEMO_TRADING` is refused deliberately: a demo write is still a broker
+write, and demo credentials are real credentials.
+
+The process exits **78** and prints `ALPHA_STARTUP_REFUSED_BROKER_CREDENTIALS`
+followed by the offending variable NAMES. No value is ever read — the check
+tests presence and, for the valued cases, membership in a fixed list — so
+there is nothing available to print even by accident.
+
+## 28. The research feed across a service boundary
+
+**This is the part that does not survive being assumed.** A Railway volume
+is mounted into exactly ONE service. The engine writes `research_spool/`
+onto its own volume; the Alpha service cannot see that directory at all.
+A two-service deployment that kept the local transport would not crash —
+it would report zero candidates forever, which is indistinguishable from a
+quiet market. Silence is the worst available failure mode here.
+
+So the spool crosses the boundary over the engine's **existing read-only
+research API**, as a new `candidates` dataset:
+
+```
+ENGINE                                    ALPHA SHADOW
+  scanner (read-only observer)
+    └─> research_feed.emit_candidate       ALPHA_FEED_TRANSPORT=http
+          └─> research_spool/ (volume)       └─> GET /api/research/v1/candidates
+                └─> research_export.candidates      (bearer, cursor-paged)
+                      served by dashboard_web              └─> HttpSpoolSource
+                                                                 └─> mint snapshot
+                                                                       └─> providers
+```
+
+Why this and not a queue or a database:
+
+* **No new infrastructure.** The route, the bearer auth
+  (`RESEARCH_API_TOKEN`, constant-time, refuses when unconfigured), the
+  cursor paging and its expiry semantics already exist and are already
+  tested. Adding Redis or Postgres for this would add an operational
+  dependency to a subsystem whose entire purpose is to be optional.
+* **The dependency points the right way.** The engine publishes and never
+  learns whether anyone read it. Alpha down, stopped, or never deployed is
+  invisible to the engine. The reverse is not symmetric and must not be.
+* **The consumer cannot write.** With a shared filesystem, "the consumer
+  never writes into the spool" was a property of which paths we chose to
+  open. Over HTTP the transport offers no write method at all, so it is
+  structural.
+* **Identity is unchanged.** `market_snapshot_id` is derived from content,
+  and the record id served is the producer's own `record_sha256`. A pulled
+  record mints exactly the snapshot a local read would, so the two
+  deployments deduplicate identically.
+
+`ALPHA_FEED_TRANSPORT` defaults to `local`, so every single-host deployment
+behaves exactly as before. Setting it to `http` requires
+`ALPHA_RESEARCH_FEED_URL` (the engine's Railway private endpoint) and
+`ALPHA_RESEARCH_API_TOKEN` (matching the engine's `RESEARCH_API_TOKEN`).
+
+**An unreachable feed raises, and is never an empty page.** `FeedUnavailable`
+is counted, logged and surfaced on the consumer; "the engine published
+nothing" and "we could not ask" are different facts, and reporting the
+second as the first is exactly how a broken deployment looks healthy. The
+paging is capped at `MAX_FEED_PAGES` so a cursor that never advances stops
+loudly instead of spinning.
+
+The feed token is redacted out of transport exceptions the same way provider
+keys are, and `describe()` reports `token_configured: true` rather than the
+token.
+
+## 29. Health
+
+`python tools/alpha_service_run.py health` reports `service_mode`,
+`grok_configured`, `gemini_configured`, `openai_configured`, `pricing_valid`,
+`budget_available`, `broker_credentials_present`, `capital_authority`,
+`execution_imports`, `quant_connected` and the feed transport, alongside the
+detailed per-provider block. No field carries a secret.
+
+`execution_imports` is **measured, not declared**: it counts the money-path
+modules actually present in `sys.modules`. A field that always printed zero
+would report the very property it exists to check, and would be worthless at
+the only moment it mattered.

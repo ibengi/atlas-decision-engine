@@ -457,6 +457,17 @@ class Config:
 
     # ── Alpha Shadow Service (consumer side, SEPARATE process) ───────────
     ALPHA_SPOOL_POLL_S      = _env_f("ALPHA_SPOOL_POLL_S", 15.0)
+    # How the Alpha service reaches the research spool. "local" reads the
+    # producer's directory (same host); "http" pulls from the engine's
+    # read-only research API, which is what a two-service Railway
+    # deployment needs -- a Railway volume is mounted into exactly ONE
+    # service, so the engine's directory is simply not visible to Alpha.
+    # Defaulting to "local" leaves every single-host deployment unchanged.
+    ALPHA_FEED_TRANSPORT    = os.getenv("ALPHA_FEED_TRANSPORT", "local")
+    #: Base URL of the ENGINE service, e.g. its Railway private endpoint.
+    ALPHA_RESEARCH_FEED_URL = os.getenv("ALPHA_RESEARCH_FEED_URL", "")
+    ALPHA_RESEARCH_FEED_TIMEOUT_S = _env_f("ALPHA_RESEARCH_FEED_TIMEOUT_S",
+                                           20.0)
     ALPHA_STATE_FILE        = "alpha_processed.jsonl"
     ALPHA_OBSERVATION_FILE  = "alpha_observations.jsonl"
     ALPHA_TELEMETRY_FILE    = "alpha_telemetry.json"

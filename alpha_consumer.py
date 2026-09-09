@@ -19,6 +19,26 @@ THE AUTHORITY BOUNDARY, STATED AS A RULE ABOUT DIRECTORIES
     right trade: a consumer that can delete producer files is a consumer
     that can destroy evidence the engine has not finished writing.
 
+TWO TRANSPORTS, ONE AUTHORITY RULE
+    On a single host the spool is a directory and the consumer reads it
+    directly (`LocalSpoolSource`). On Railway the engine and this service
+    are SEPARATE services with SEPARATE volumes, and a Railway volume is
+    mounted into exactly one service -- so the directory the engine writes
+    is not visible here at all. Across services the consumer pulls the same
+    records over the engine's read-only research API instead
+    (`HttpSpoolSource`).
+
+    The authority rule is identical either way, which is the point: the
+    producer owns the spool and prunes it, the consumer only reads. HTTP
+    makes that structural rather than merely observed -- the transport
+    offers no way to write, so "the consumer cannot mutate engine state" is
+    true by construction and not just by inspection of which paths we open.
+
+    The dependency direction is also preserved. The engine publishes and
+    never learns whether anyone read it; if this service is down, stopped or
+    was never deployed, the engine is unaffected. The reverse is not
+    symmetric and must not be: this service simply gets nothing to analyse.
+
 DEDUPLICATION IS BY SNAPSHOT IDENTITY, NOT BY FILE
     `market_snapshot_id` is derived from the snapshot's content, so two
     spool records describing the same market at the same prices at the same
@@ -44,6 +64,11 @@ from research_feed import FEED_SCHEMA, spool_dir
 log = logging.getLogger("ALPHA")
 
 STATE_SCHEMA = "atlas-alpha-processed-v1"
+
+#: A cursor that never advances would page forever. The cap RAISES the
+#: paging to a halt and logs it rather than looping, because a silent
+#: infinite pull is far harder to notice than a truncated one.
+MAX_FEED_PAGES = 50
 
 #: Outcomes that end a snapshot's life. Anything else may be retried on a
 #: later poll (a budget refusal, for instance, is worth retrying tomorrow).
@@ -134,35 +159,160 @@ class ProcessedStore:
         return out
 
 
+class FeedUnavailable(RuntimeError):
+    """The feed could not be read this poll. Not a malformed record."""
+
+
+class LocalSpoolSource:
+    """Same-host transport: read the producer's directory directly.
+
+    Opens files for reading only. Nothing here writes, renames or unlinks
+    inside `spool_dir()` -- the producer owns those bytes.
+    """
+
+    kind = "local"
+
+    def __init__(self, directory: str = None):
+        self.directory = directory or spool_dir()
+
+    def describe(self) -> dict:
+        return {"transport": self.kind, "directory": self.directory}
+
+    def records(self) -> list:
+        """Every candidate currently spooled, oldest first."""
+        try:
+            names = sorted(n for n in os.listdir(self.directory)
+                           if n.endswith(".json"))
+        except OSError:
+            return []
+        out = []
+        for name in names:
+            path = os.path.join(self.directory, name)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    out.append(json.load(fh))
+            except (OSError, ValueError) as e:
+                log.debug(f"[ALPHA_CONSUMER] unreadable spool record "
+                          f"{name}: {e}")
+                out.append(None)
+        return out
+
+
+class HttpSpoolSource:
+    """Cross-service transport: pull from the engine's research API.
+
+    GET only, bearer-authenticated with `ALPHA_RESEARCH_API_TOKEN`. There is
+    no method here that writes, so the consumer's inability to mutate engine
+    state is a property of the transport rather than a convention.
+
+    A feed that cannot be reached raises `FeedUnavailable`. It is NOT an
+    empty page: "the engine published nothing" and "we could not ask" are
+    different facts, and reporting the second as the first would make an
+    outage look like a quiet market.
+    """
+
+    kind = "http"
+
+    def __init__(self, base_url: str = None, token: str = None,
+                 session=None, page_limit: int = 100):
+        self.base_url = (base_url or CFG.ALPHA_RESEARCH_FEED_URL).rstrip("/")
+        self._token = token if token is not None else \
+            os.getenv("ALPHA_RESEARCH_API_TOKEN", "")
+        self.session = session
+        self.page_limit = int(page_limit)
+
+    def configured(self) -> bool:
+        return bool(self.base_url and self._token)
+
+    def describe(self) -> dict:
+        """Never includes the token."""
+        return {"transport": self.kind, "url": self.base_url,
+                "token_configured": bool(self._token)}
+
+    def records(self) -> list:
+        if not self.base_url:
+            raise FeedUnavailable("ALPHA_RESEARCH_FEED_URL is not set")
+        if not self._token:
+            raise FeedUnavailable("ALPHA_RESEARCH_API_TOKEN is not set")
+        session = self.session
+        if session is None:
+            import requests
+            session = requests.Session()
+        out, cursor, pages = [], "", 0
+        while True:
+            pages += 1
+            if pages > MAX_FEED_PAGES:
+                # A cursor that never advances would otherwise spin forever.
+                log.warning(f"[ALPHA_CONSUMER] feed paging stopped at "
+                            f"{MAX_FEED_PAGES} pages")
+                break
+            params = {"limit": self.page_limit}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                response = session.get(
+                    f"{self.base_url}/api/research/v1/candidates",
+                    headers={"Authorization": f"Bearer {self._token}"},
+                    params=params, timeout=CFG.ALPHA_RESEARCH_FEED_TIMEOUT_S)
+            except Exception as e:                        # noqa: BLE001
+                raise FeedUnavailable(
+                    f"{type(e).__name__}: {_no_token(e, self._token)}")
+            status = getattr(response, "status_code", 0)
+            if status != 200:
+                raise FeedUnavailable(f"HTTP {status} from the research feed")
+            try:
+                body = response.json()
+            except Exception as e:                        # noqa: BLE001
+                raise FeedUnavailable(
+                    f"unreadable feed body: {type(e).__name__}")
+            rows = body.get("rows") if isinstance(body, dict) else None
+            if not isinstance(rows, list):
+                raise FeedUnavailable("feed response carried no rows")
+            out.extend(rows)
+            nxt = body.get("next_cursor") or ""
+            if not body.get("has_more") or not nxt or nxt == cursor:
+                break
+            cursor = nxt
+        return out
+
+
+def _no_token(value, token: str) -> str:
+    """A transport exception can quote the request, headers included."""
+    text = str(value)
+    if token and len(token) >= 8:
+        text = text.replace(token, "<redacted:ALPHA_RESEARCH_API_TOKEN>")
+    return text
+
+
+def default_source():
+    """`ALPHA_FEED_TRANSPORT` selects the transport. Explicit, not guessed.
+
+    Defaulting to `local` keeps every single-host deployment working exactly
+    as before; a two-service deployment sets `http` and supplies the URL and
+    token.
+    """
+    if str(CFG.ALPHA_FEED_TRANSPORT).strip().lower() == "http":
+        return HttpSpoolSource()
+    return LocalSpoolSource()
+
+
 class SpoolConsumer:
     """Reads research candidates and mints immutable snapshots from them.
 
-    Read-only with respect to the spool: `pending()` opens files for reading
-    and nothing here ever writes, renames or unlinks inside `spool_dir()`.
+    Read-only with respect to the spool under either transport.
     """
 
-    def __init__(self, directory: str = None, store: ProcessedStore = None):
-        self.directory = directory or spool_dir()
+    def __init__(self, directory: str = None, store: ProcessedStore = None,
+                 source=None):
+        self.source = source or (LocalSpoolSource(directory) if directory
+                                 else default_source())
+        self.directory = getattr(self.source, "directory", None)
         self.store = store or ProcessedStore()
         self.stats = {"records_read": 0, "malformed": 0, "duplicates": 0,
-                      "minted": 0}
+                      "minted": 0, "feed_errors": 0}
+        self.feed_error = None
 
-    def _record_paths(self) -> list:
-        try:
-            return [os.path.join(self.directory, n)
-                    for n in sorted(os.listdir(self.directory))
-                    if n.endswith(".json")]
-        except OSError:
-            return []
-
-    def _read(self, path: str):
-        try:
-            with open(path, encoding="utf-8") as fh:
-                record = json.load(fh)
-        except (OSError, ValueError) as e:
-            log.debug(f"[ALPHA_CONSUMER] unreadable spool record "
-                      f"{os.path.basename(path)}: {e}")
-            return None
+    def _valid(self, record):
         if not isinstance(record, dict) or record.get("schema") != FEED_SCHEMA:
             return None
         return record
@@ -198,8 +348,19 @@ class SpoolConsumer:
         and paying two vendors twice for it would be a straightforward waste.
         """
         out, seen_now = [], set()
-        for path in self._record_paths():
-            record = self._read(path)
+        self.feed_error = None
+        try:
+            raw_records = self.source.records()
+        except FeedUnavailable as e:
+            # An unreachable feed is reported, never reported as "no
+            # candidates": an outage must not be indistinguishable from a
+            # quiet market.
+            self.stats["feed_errors"] += 1
+            self.feed_error = str(e)
+            log.warning(f"[ALPHA_CONSUMER] research feed unavailable: {e}")
+            return []
+        for raw in raw_records:
+            record = self._valid(raw)
             if record is None:
                 self.stats["malformed"] += 1
                 continue

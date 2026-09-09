@@ -209,6 +209,10 @@ class _Handler(BaseHTTPRequestHandler):
                 body = rx.cycles(self.data_dir, cursor, limit_n)
             elif route == "funnel_rejections":
                 body = rx.funnel_rejections(self.data_dir, cursor, limit_n)
+            # The research spool, so a SEPARATE Alpha service can pull what
+            # this engine published. Read-only, like everything else here.
+            elif route == "candidates":
+                body = rx.candidates(self.data_dir, cursor, limit_n)
             else:
                 self._send(404, '{"error":"not_found"}', "application/json")
                 return True

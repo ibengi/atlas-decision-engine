@@ -55,6 +55,18 @@ start, each provider must pass a one-call smoke test:
 A provider that fails is EXCLUDED. Nothing falls back to another model and
 no missing answer becomes a probability.
 
+On Railway the engine and Alpha are **two services from this one
+repository**, with different start commands and different authority: the
+engine holds the Kalshi credentials, Alpha holds only the AI keys and
+refuses to start (exit 78,
+`ALPHA_STARTUP_REFUSED_BROKER_CREDENTIALS`) if it can see a broker
+credential or a write gate. Because a Railway volume is mounted into exactly
+one service, the research spool crosses the boundary over the engine's
+read-only research API (`ALPHA_FEED_TRANSPORT=http`) rather than a shared
+directory — an unreachable feed is reported as an error, never as an empty
+one. Runbook:
+[`docs/ops/alpha-railway-deployment.md`](docs/ops/alpha-railway-deployment.md).
+
 Design: [`docs/design/alpha-gateway.md`](docs/design/alpha-gateway.md).
 The shipped endpoints, model ids and rates are **operator-supplied and
 unverified by this repository** — check them against each vendor's current

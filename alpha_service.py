@@ -33,6 +33,7 @@ WHY THIS IS A SEPARATE PROCESS
 
 import logging
 import os
+import sys
 import signal
 import time
 from datetime import datetime, timezone
@@ -52,17 +53,53 @@ log = logging.getLogger("ALPHA")
 STATE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 
 #: Environment variables whose presence means this process can move money.
+#: Modules that constitute the money path. None may be loaded in this
+#: process; `loaded_execution_modules()` checks that at runtime.
+BROKER_MODULES = (
+    "order_manager", "execution_engine", "kalshi_client", "position_manager",
+    "position_sizer", "risk_manager", "equity_ledger", "trade_logger",
+    "kalshi_alpha_bot", "state_restore",
+)
+
 #: The Alpha service refuses to start while any of them is set.
 BROKER_CREDENTIAL_VARS = (
     "KALSHI_KEY_ID", "KALSHI_PRIVATE_KEY",
     "KALSHI_DEMO_KEY_ID", "KALSHI_DEMO_PRIVATE_KEY",
     "KALSHI_PROD_KEY_ID", "KALSHI_PROD_PRIVATE_KEY",
 )
-#: ...and gates that would authorize a write if this process ever grew one.
+#: ...and boolean gates that would authorize a write if this process ever
+#: grew one. `DEMO_TRADING` is here deliberately: a demo write is still a
+#: broker write, and the demo credentials are real credentials.
 BROKER_AUTHORITY_VARS = (
     "ALLOW_ORDER_SUBMISSION", "LIVE_TRADING", "LIVE_TRADING_CONFIRMED",
     "LIVE_BROKER_WRITES_AUTHORIZED", "KALSHI_ENV_CONFIRM",
+    "DEMO_TRADING", "MODEL_APPROVED_FOR_LIVE", "ALLOW_FALLBACK_CAPITAL",
 )
+
+#: Variables that carry authority in a VALUE rather than as a boolean. A
+#: truthiness test would miss `PROD_ACCESS_MODE=CAPITAL` entirely -- the
+#: string is not "1" or "true" -- which is exactly the setting that turns
+#: capital on. Matched case-insensitively against the listed values.
+BROKER_AUTHORITY_VALUES = {
+    "PROD_ACCESS_MODE": ("capital",),
+    "EXECUTION_MODE": ("live",),
+}
+
+#: Truthy spellings. Kept explicit so a new spelling is a deliberate edit.
+_TRUTHY = ("1", "true", "yes", "y", "on", "live", "enabled")
+
+
+def loaded_execution_modules() -> list:
+    """Execution modules actually present in THIS interpreter, by name.
+
+    The AST tests prove no alpha module *imports* one; this is the runtime
+    counterpart, and it is measured rather than asserted. A health field
+    that always printed 0 would report the property it is supposed to be
+    checking, which is worth nothing precisely when it matters -- if
+    something ever did pull the execution path into this process, a
+    hardcoded zero would hide it.
+    """
+    return sorted(name for name in BROKER_MODULES if name in sys.modules)
 
 
 class BrokerCredentialsPresent(RuntimeError):
@@ -82,9 +119,10 @@ def assert_no_broker_credentials(env=None) -> list:
     found = [name for name in BROKER_CREDENTIAL_VARS
              if str(env.get(name, "")).strip()]
     authority = [name for name in BROKER_AUTHORITY_VARS
-                 if str(env.get(name, "")).strip().lower()
-                 in ("1", "true", "yes", "y", "on", "live")]
-    offending = found + authority
+                 if str(env.get(name, "")).strip().lower() in _TRUTHY]
+    valued = [name for name, values in BROKER_AUTHORITY_VALUES.items()
+              if str(env.get(name, "")).strip().lower() in values]
+    offending = found + authority + valued
     if offending and CFG.ALPHA_REFUSE_BROKER_CREDENTIALS:
         raise BrokerCredentialsPresent(
             f"the Alpha Shadow Service must not hold broker credentials or "
@@ -169,15 +207,40 @@ class AlphaShadowService:
                         f"priced={report['priced']} "
                         f"reachable={report['reachable']} "
                         f"{report['detail']}")
-        report = {"service": "atlas-alpha-shadow", "mode": "SHADOW_ONLY",
-                  "broker_credentials": [], "providers": self.health,
-                  "budget": self.budget.snapshot(),
-                  "observation_intervals_s": observation_intervals(),
-                  "spool": self.consumer.directory}
+        budget = self.budget.snapshot()
+        priced = set(budget.get("priced_models") or ())
+        report = {
+            "service": "atlas-alpha-shadow",
+            "service_mode": "SHADOW_ONLY", "mode": "SHADOW_ONLY",
+            # Section 7. Flat booleans as well as the detailed per-provider
+            # block, so a health check can be asserted without parsing.
+            "grok_configured": self._configured("grok"),
+            "gemini_configured": self._configured("gemini"),
+            "openai_configured": self._configured("openai"),
+            "pricing_valid": bool(priced) and all(
+                self._priced(name) for name in ("grok", "gemini", "openai")),
+            "budget_available": not bool(budget.get("exhausted")),
+            "broker_credentials_present": False,
+            "capital_authority": False,
+            "execution_imports": len(loaded_execution_modules()),
+            "execution_modules_loaded": loaded_execution_modules(),
+            "quant_connected": False,
+            "broker_credentials": [], "providers": self.health,
+            "budget": budget,
+            "observation_intervals_s": observation_intervals(),
+            "feed": self.consumer.source.describe(),
+            "spool": self.consumer.directory}
         log.warning(f"[ALPHA_SERVICE] started SHADOW_ONLY; "
                     f"budget={report['budget'].get('caps')} "
                     f"priced_models={report['budget'].get('priced_models')}")
         return report
+
+    def _configured(self, name: str) -> bool:
+        """Whether the provider holds a usable credential. Never its value."""
+        return bool((self.health.get(name) or {}).get("configured"))
+
+    def _priced(self, name: str) -> bool:
+        return bool((self.health.get(name) or {}).get("priced"))
 
     # ── one poll ────────────────────────────────────────────────────────
     def cycle(self, limit: int = None) -> dict:
