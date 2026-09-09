@@ -16,6 +16,12 @@ deposit un-trips a guard that fired on real losses and a withdrawal trips one
 with no losses. Observed in production on 2026-09-07: the same −$0.4839 read as
 1222 % drawdown at $0.04 and 4.92 % at $9.84, with no trade in between.
 
+
+> **Continuity, fencing and crash semantics** (Astra remediation of
+> `508899b`, findings A01/A03/A09/A10) are specified in
+> [continuity-and-crash-semantics.md](continuity-and-crash-semantics.md).
+> That document is the authority on what survives which failure.
+
 ## Core invariant (normative)
 
 > A deposit may increase affordability but must never reduce strategy drawdown

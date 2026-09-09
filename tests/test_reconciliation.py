@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import BrokerMock  # noqa: E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from position_manager import PositionManager  # noqa: E402
@@ -81,7 +82,7 @@ class ParseBrokerQtyTest(unittest.TestCase):
 
 class _StartupBase(unittest.TestCase):
     def setUp(self):
-        self.client = MagicMock()
+        self.client = BrokerMock()
         self.tlog = MagicMock()
         self.tlog.trades = []
         self.pm = bot.PositionManager(self.client, self.tlog)

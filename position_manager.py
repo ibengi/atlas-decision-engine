@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timezone
 
 from config import CFG, _p
-from kalshi_client import KalshiClient, pick, pick_int
+from kalshi_client import KalshiClient, pick, pick_int  # noqa: F401
 from persistence import JsonStore
 from trade_logger import TradeLogger, now_iso
 
@@ -287,6 +287,63 @@ class PositionManager:
             return None, f"champs de quantite contradictoires: {seen}"
         return seen[0][1], None
 
+    def _collect_broker_positions(self):
+        """(rows, proof, error). The proof carries the evidence that the
+        enumeration is COMPLETE (audit finding A02).
+
+        A client that can prove completeness is asked to; one that cannot --
+        an older client, or a test double returning a plain list -- yields a
+        proof marked `complete=False` with the reason. `MATCH` is then
+        impossible: an unproven enumeration cannot establish an absence, and
+        an absence is exactly what authorizes a rebase.
+        """
+        # Class-level lookup: a client whose CLASS declares the contract is
+        # asked for the proof. An object that merely answers every attribute
+        # (a bare MagicMock) is not treated as implementing it.
+        proof_fn = getattr(type(self.client), "get_positions_proof", None)
+        if callable(proof_fn):
+            proof_fn = getattr(self.client, "get_positions_proof")
+            try:
+                proof = proof_fn()
+            except Exception as e:                        # noqa: BLE001
+                return None, {"complete": False,
+                              "reason": f"{type(e).__name__}: {e}"}, str(e)
+            if not isinstance(proof, dict) or "rows" not in proof:
+                return None, {"complete": False,
+                              "reason": "proof envelope unusable"}, \
+                    "get_positions_proof() returned an unusable proof"
+            rows = proof.get("rows")
+            if not isinstance(rows, list):
+                return None, {"complete": False,
+                              "reason": proof.get("reason")
+                              or "rows unusable"}, \
+                    "get_positions_proof() returned no usable rows"
+            if proof.get("complete") is not True:
+                # Readable but not PROVEN complete. The rows are returned so
+                # a position that WAS seen still reports as a divergence;
+                # only the MATCH conclusion is withheld.
+                return rows, {"complete": False,
+                              "reason": proof.get("reason")
+                              or "the broker did not confirm the end of "
+                                 "pagination",
+                              "rows": len(rows)}, None
+            return rows, {"complete": True, "pages": proof.get("pages"),
+                          "rows": len(rows)}, None
+        try:
+            rows = self.client.get_positions()
+        except Exception as e:                            # noqa: BLE001
+            return None, {"complete": False,
+                          "reason": f"{type(e).__name__}: {e}"}, str(e)
+        if rows is None:
+            return None, {"complete": False,
+                          "reason": "get_positions() -> None"}, \
+                "get_positions() -> None"
+        # No completeness evidence available from this client: the rows are
+        # usable for a MISMATCH (a position seen is a position seen) but not
+        # for a MATCH.
+        return rows, {"complete": False,
+                      "reason": "client offers no collection-complete proof"}, None
+
     def _broker_net_positions(self, broker):
         """(dict ticker->net signe, None) ou (None, raison UNKNOWN)."""
         net = {}
@@ -363,13 +420,10 @@ class PositionManager:
                           f"bloquees fail-closed jusqu'a un MATCH.")
             return report
 
-        try:
-            broker = self.client.get_positions()
-        except Exception as e:                                # noqa: BLE001
-            return _unavailable(str(e))
+        broker, proof, err0 = self._collect_broker_positions()
+        report["collection_proof"] = proof
         if broker is None:
-            return _unavailable("get_positions() -> None")
-
+            return _unavailable(err0 or proof.get("reason") or "unknown")
         # Broker : quantite nette signee par ticker (yes>0, no<0) via le
         # parseur PARTAGE avec la reconciliation de demarrage.
         try:
@@ -405,6 +459,23 @@ class PositionManager:
                           f"bloquees fail-closed, etat local INTACT "
                           f"(aucune correction automatique): "
                           f"{report['mismatches']}")
+        elif proof.get("complete") is not True:
+            # A02 rules 8 and 10. A position that WAS seen is a real
+            # divergence and is reported above regardless. But MATCH is a
+            # stronger claim: it says the broker holds nothing beyond what
+            # was seen, and that is exactly what a rebase spends. An
+            # enumeration that cannot be shown complete -- an unfollowed
+            # cursor, a truncated listing, a client that offers no
+            # completeness contract -- cannot support it, however well the
+            # rows that were seen line up. UNKNOWN, never MATCH.
+            report["status"] = "UNKNOWN"
+            report["detail"] = (f"collecte de positions non prouvee complete: "
+                                f"{proof.get('reason')}")
+            self.reconcile_halt = {"status": "UNKNOWN", "detail": report["detail"],
+                                   "at": now_iso()}
+            log_pos.error(f"[RECONCILE_VERIFY] {report['detail']} -- "
+                          f"MATCH impossible sur une enumeration non prouvee "
+                          f"complete ; soumissions bloquees fail-closed.")
         else:
             if self.reconcile_halt is not None:
                 log_pos.warning("[RECONCILE_VERIFY] retablissement: broker "
@@ -455,24 +526,29 @@ class PositionManager:
 
         MAX_RETRIES = 3
         RETRY_BACKOFF_SECONDS = 2.0
-        broker = None
+        broker, proof, err0 = None, {}, None
         for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                broker = self.client.get_positions()
-            except Exception as e:                            # noqa: BLE001
-                return _halt("BROKER_UNAVAILABLE", str(e))
+            broker, proof, err0 = self._collect_broker_positions()
             if broker is not None:
                 break
             if attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
                 log_pos.warning(
-                    f"get_positions() returned None (attempt "
-                    f"{attempt}/{MAX_RETRIES}), retrying in {wait:.0f}s...")
+                    f"collecte des positions impossible ({err0}) (tentative "
+                    f"{attempt}/{MAX_RETRIES}), nouvelle tentative dans "
+                    f"{wait:.0f}s...")
                 time.sleep(wait)
+        report["collection_proof"] = proof
         if broker is None:
             return _halt("BROKER_UNAVAILABLE",
-                         f"get_positions() -> None apres {MAX_RETRIES} "
-                         f"tentatives")
+                         f"positions non collectees apres {MAX_RETRIES} "
+                         f"tentatives: {err0 or proof.get('reason')}")
+        if proof.get("complete") is not True:
+            # A02: the startup pass decides which local positions are
+            # believed. An enumeration that is not proven complete cannot
+            # settle that question either.
+            return _halt("UNKNOWN", f"collecte de positions non prouvee "
+                                    f"complete: {proof.get('reason')}")
 
         try:
             broker_net, err = self._broker_net_positions(broker)

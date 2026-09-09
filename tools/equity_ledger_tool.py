@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Dry-run proposals for the F2 risk-equity ledger. Writes NOTHING.
 
+"Writes nothing" is now enforced rather than asserted (audit finding A12):
+the ledger is built through `EquityLedger.load_readonly`, whose every
+durable write is a logged refusal. `tests/test_operator_tool_readonly.py`
+compares the sha256 of every file under DATA_DIR before and after each
+sub-command, including the restored-journal case that used to trigger a
+reconciliation write from the constructor.
+
 Every operator action on equity_ledger.json is declarative: this tool prints
 the proposal the engine will recompute at boot and the hash or token the
 operator must set for it to apply. If anything in the journal, the ledger or
@@ -88,9 +95,18 @@ def main(argv=None) -> int:
     a.add_argument("--funding-records-sha256", required=True)
     args = ap.parse_args(argv)
 
-    ledger = EquityLedger(_JournalView(), _PositionsView(), env="prod")
+    # A12: a genuinely non-mutating inspection path. Constructing an
+    # EquityLedger normally RECONCILES and SAVES on load, so `status` --
+    # documented as writing nothing -- rewrote equity_ledger.json and rotated
+    # its backups the moment it noticed a restored journal, which is the one
+    # situation an operator most wants to inspect without touching. The
+    # read-only instance computes everything and commits nothing: no ledger
+    # write, no backup rotation, no checksum, no continuity record.
+    ledger = EquityLedger.load_readonly(_JournalView(), _PositionsView(),
+                                        env="prod")
     if args.cmd == "status":
         out = ledger.snapshot()
+        out["readonly"] = True
     elif args.cmd == "seed":
         out = ledger.propose_seed(args.pre_flow_cash, args.pre_flow_at, args.evidence,
                                   args.cash_now)

@@ -157,57 +157,103 @@ OBSERVATION_ONLY_GUARD = "equity_drawdown"
 OBSERVATION_ONLY_GUARDS = frozenset((OBSERVATION_ONLY_GUARD, *ACCOUNTING_GUARDS))
 
 
-def equity_rebase_context(client, orders, posmgr, risk) -> dict:
-    """The authoritative context for an equity rebase (F2 §6).
+def _broker_open_order_ids(client, orders):
+    """(ids, error). A read that fails yields (None, reason): unknown is
+    never an empty set."""
+    from order_manager import OrderManager
+    terminal = {str(s).lower() for s in getattr(orders, "TERMINAL", OrderManager.TERMINAL)}
+    try:
+        rows = client.list_orders()
+    except Exception as e:                                # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+    ids = []
+    for r in rows or []:
+        status = str((r or {}).get("status") or "").lower()
+        remaining = int((r or {}).get("remaining_count") or 0)
+        if status not in terminal or remaining > 0:
+            ids.append(str(r.get("order_id") or r.get("id") or "?"))
+    return sorted(ids), None
+
+
+def equity_rebase_context(client, orders, posmgr, risk, equity=None,
+                          quiescent: bool = True) -> dict:
+    """The authoritative context for an equity rebase (F2 §6, audit A03).
 
     Orders come from the persisted OrderManager state (`open_orders`,
     `pending_intents`, `resolution_halt`) AND a fresh read-only broker
     listing; positions from the persisted PositionManager state AND a fresh
-    broker verification. A query that fails leaves the broker side
-    `None` (unknown), which the ledger treats as a refusal; a disagreement
-    between local and broker order sets is a refusal too. Nothing here
-    writes to the broker.
+    broker verification. A query that fails leaves the broker side `None`
+    (unknown), which the ledger treats as a refusal; a disagreement between
+    local and broker order sets is a refusal too. Nothing here writes to the
+    broker.
+
+    Two GETs are not a transaction. Astra demonstrated an order appearing
+    between the order query and the position query, invisible to both. The
+    broker listing is therefore read TWICE, bracketing the position read: an
+    exposure that appears anywhere inside the bracket shows up in the second
+    listing and marks the evidence unstable. That does not make the pair
+    atomic -- the broker offers no such primitive here -- and it is not
+    claimed to: the bracket narrows the window to zero *observed* orders on
+    both sides of the position read, and anything else refuses. The local
+    files are fingerprinted on both sides of the whole collection for the
+    same reason, and re-checked by the ledger at commit.
     """
-    from order_manager import OrderManager
+    bound_before = equity.bound_state() if equity is not None else None
     local_open = sorted(str(k) for k in (getattr(orders, "open_orders", None) or {}))
     pending = sorted(str(k) for k in (getattr(orders, "pending_intents", None) or {}))
     halt = getattr(orders, "resolution_halt", None)
-    terminal = {str(s).lower() for s in getattr(orders, "TERMINAL", OrderManager.TERMINAL)}
-    broker_open, broker_ids, broker_error = None, [], None
-    try:
-        rows = client.list_orders()
-        for r in rows or []:
-            status = str((r or {}).get("status") or "").lower()
-            remaining = int((r or {}).get("remaining_count") or 0)
-            if status not in terminal or remaining > 0:
-                broker_ids.append(str(r.get("order_id") or r.get("id") or "?"))
-        broker_open = len(broker_ids)
-    except Exception as e:                                # noqa: BLE001
-        broker_error = f"{type(e).__name__}: {e}"
-    reconcile = "UNKNOWN"
+    broker_ids, broker_error = _broker_open_order_ids(client, orders)
+    reconcile, reconcile_detail = "UNKNOWN", None
     verify = getattr(posmgr, "verify_against_broker", None)
     if callable(verify):
         try:
             report = verify() or {}
             reconcile = str(report.get("status") or "UNKNOWN")
+            reconcile_detail = report.get("detail")
         except Exception as e:                            # noqa: BLE001
             reconcile = f"UNKNOWN ({type(e).__name__})"
     elif getattr(posmgr, "reconcile_halt", None) is None:
         reconcile = "MATCH"
+    broker_ids_after, broker_error_after = _broker_open_order_ids(client, orders)
+    unstable = None
+    if broker_ids is None or broker_ids_after is None:
+        unstable = (f"broker order listing unreadable "
+                    f"({broker_error or broker_error_after})")
+    elif broker_ids != broker_ids_after:
+        unstable = (f"the broker order set changed across the position read: "
+                    f"{broker_ids} -> {broker_ids_after}")
+    local_after = sorted(str(k) for k in (getattr(orders, "open_orders", None) or {}))
+    pending_after = sorted(str(k) for k in (getattr(orders, "pending_intents", None) or {}))
+    if (local_after, pending_after) != (local_open, pending):
+        unstable = "local order/intent state changed during collection"
+    if equity is not None:
+        drift = equity._bound_state_drift(bound_before)
+        if drift:
+            unstable = f"local evidence files changed during collection: {drift}"
     drawdown_firing = False
     try:
         drawdown_firing = float(risk.rolling_drawdown_pct()) >= CFG.MAX_EQUITY_DRAWDOWN_PCT
     except Exception:                                     # noqa: BLE001
         pass
-    disagreement = broker_open is not None and set(local_open) != set(broker_ids)
-    return {"drawdown_firing": drawdown_firing,
-            "reconcile_status": reconcile,
-            "open_positions": int(posmgr.open_count()),
-            "in_flight_orders": len(local_open) + len(pending) + (broker_open or 0),
-            "orders": {"local_open": local_open, "pending_intents": pending,
-                       "resolution_halt": bool(halt), "broker_open": broker_open,
-                       "broker_open_ids": broker_ids, "broker_error": broker_error,
-                       "disagreement": disagreement}}
+    broker_open = None if broker_ids is None else len(broker_ids)
+    disagreement = broker_ids is not None and set(local_open) != set(broker_ids)
+    ctx = {"drawdown_firing": drawdown_firing,
+           "reconcile_status": reconcile,
+           "reconcile_detail": reconcile_detail,
+           "open_positions": int(posmgr.open_count()),
+           "in_flight_orders": len(local_open) + len(pending) + (broker_open or 0),
+           "quiescent": bool(quiescent),
+           "evidence_unstable": unstable,
+           "bound_state": bound_before,
+           "orders": {"local_open": local_open, "pending_intents": pending,
+                      "resolution_halt": bool(halt), "broker_open": broker_open,
+                      "broker_open_ids": broker_ids or [],
+                      "broker_error": broker_error or broker_error_after,
+                      "disagreement": disagreement}}
+    if equity is not None:
+        ctx["revalidate"] = lambda: equity_rebase_context(
+            client, orders, posmgr, risk, equity=equity, quiescent=quiescent)
+    return ctx
 
 
 def _equity_of(engine):
@@ -481,7 +527,11 @@ class ExecutionEngine:
             # a rebase needs the authoritative order and position truth,
             # including a fresh read-only broker query; anything unknown
             # refuses. Other actions never need it.
-            ctx = equity_rebase_context(self.client, self.orders, self.posmgr, self.risk)
+            # Boot-time only: the cycle loop has not started, so execution
+            # is quiescent by construction (nothing can submit while this
+            # runs). The ledger re-verifies at commit anyway.
+            ctx = equity_rebase_context(self.client, self.orders, self.posmgr,
+                                        self.risk, equity=equity, quiescent=True)
         else:
             halt = getattr(self.posmgr, "reconcile_halt", None)
             ctx = {"drawdown_firing": False,

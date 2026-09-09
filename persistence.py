@@ -1,4 +1,21 @@
-"""Atomic JSON persistence layer with checksums and backup rotation."""
+"""Atomic JSON persistence layer with checksums, fencing and backups.
+
+Crash semantics (audit finding A01, A09):
+
+  * ``save()`` writes ``path.tmp``, fsyncs it, rotates backups, then
+    ``os.replace``s it over ``path`` and fsyncs the directory. After the
+    directory fsync the new content is durable; before it, a crash
+    leaves the OLD content, never a torn one.
+  * The ``.sha256`` sidecar is written AFTER the replace. A crash in
+    that window leaves new data with a stale checksum, which ``load()``
+    used to answer by silently falling back to an OLDER backup -- a
+    rewind dressed as a repair. It now reports the fallback so
+    continuity-critical callers can re-verify against the continuity
+    chain instead of believing the older bytes (see continuity.py).
+  * ``expect_generation`` fences concurrent writers: a process that
+    loaded generation N refuses to overwrite a file that has since
+    moved to N+1. An old writer can no longer clobber newer state.
+"""
 
 import os
 import json
@@ -23,6 +40,7 @@ CRITICAL_BASENAMES = frozenset({
     "positions_state.json",    # open positions / slot accounting
     "state_epoch.json",        # persistent-state continuity marker
     "equity_ledger.json",      # F2 risk-equity baseline, flows, HWM, rebases
+    "pending_intents.json",    # A09: the proof a submission was intended
 })
 
 
@@ -62,6 +80,44 @@ class PersistenceSentinel:
     def reset(cls) -> None:
         """Tests only."""
         cls._failure = None
+
+
+def file_fingerprint(path: str) -> str:
+    """Content fingerprint used to bind a decision to the exact bytes it was
+    taken on (audit finding A03). ``absent`` is a value like any other: a
+    file that disappears between validation and commit is a change."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return "absent"
+
+
+def read_generation(path: str, key: str = "generation"):
+    """The generation stamped inside a persisted object, or None. Reads the
+    file directly: the point of a fence is to see what is on disk NOW, not
+    what this process remembers."""
+    try:
+        with open(path, "rb") as fh:
+            data = json.loads(fh.read().decode())
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict):
+        gen = data.get(key)
+        if isinstance(gen, int) and gen >= 0:
+            return gen
+    return None
+
+
+def _fsync_dir(parent: str) -> None:
+    try:
+        fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:                # pragma: no cover - platform dependent
+        pass
 
 
 def verify_state_root() -> bool:
@@ -114,11 +170,37 @@ class JsonStore:
     def _sha(payload: bytes) -> str:
         return hashlib.sha256(payload).hexdigest()
 
+    #: Set by load() when the primary file was unusable and an OLDER backup
+    #: answered instead. Keyed by path. A rewind that repairs a checksum
+    #: crash is still a rewind: continuity-critical readers must re-verify
+    #: against an authority the backup could not rewind (continuity.py).
+    recovered_from_backup = {}
+
     @classmethod
-    def save(cls, path: str, data) -> bool:
+    def save(cls, path: str, data, expect_generation=None,
+             generation_key: str = "generation") -> bool:
+        """Atomic, checksummed, optionally fenced write.
+
+        ``expect_generation`` is the generation this writer believes is on
+        disk. If the file has since moved on, another writer owns the state
+        and this one is stale: the write is REFUSED rather than applied.
+        Silently winning that race is how a stale process rewound the
+        evidence watermark (audit finding A01).
+        """
         try:
             parent = os.path.dirname(os.path.abspath(path))
             os.makedirs(parent, exist_ok=True)
+            if expect_generation is not None:
+                on_disk = read_generation(path, generation_key)
+                if on_disk is not None and int(on_disk) != int(expect_generation):
+                    log.critical(
+                        f"[FENCE_REFUSED] {path}: generation on disk "
+                        f"{on_disk} != {expect_generation} held by this "
+                        f"writer -- write REFUSED (stale writer).")
+                    return False
+                if isinstance(data, dict):
+                    data = dict(data)
+                    data[generation_key] = int(expect_generation) + 1
             payload = json.dumps(data, indent=1, ensure_ascii=False).encode()
             tmp = path + ".tmp"
             with open(tmp, "wb") as f:
@@ -130,10 +212,13 @@ class JsonStore:
                     if os.path.exists(src): shutil.copy2(src, dst)
                 shutil.copy2(path, f"{path}.bak1")
             os.replace(tmp, path)
+            _fsync_dir(parent)
             sha_tmp = path + ".sha256.tmp"
             with open(sha_tmp, "w", encoding="utf-8") as f:
                 f.write(cls._sha(payload)); f.flush(); os.fsync(f.fileno())
             os.replace(sha_tmp, path + ".sha256")
+            _fsync_dir(parent)
+            cls.recovered_from_backup.pop(os.path.abspath(path), None)
             return True
         except Exception as e:
             log.error(f"JsonStore.save({path}): {e}")
@@ -159,6 +244,9 @@ class JsonStore:
                 if cand != path:
                     log.warning(f"JsonStore: {path} corrompu/absent -- "
                                 f"recupere depuis {cand}.")
+                    cls.recovered_from_backup[os.path.abspath(path)] = cand
+                else:
+                    cls.recovered_from_backup.pop(os.path.abspath(path), None)
                 return data
             except Exception:
                 continue

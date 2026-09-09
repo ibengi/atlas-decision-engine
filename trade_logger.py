@@ -105,6 +105,19 @@ class TradeLogger:
         raw = JsonStore.load(self.path, [])
         legacy = [t for t in raw if t.get("schema") != self.SCHEMA]
         self.trades = [t for t in raw if t.get("schema") == self.SCHEMA]
+        #: A04: economic identity, computed on load and maintained on every
+        #: append. A journal holding the same trade twice reports a smaller
+        #: loss while its count, its digest and its totals all stay
+        #: self-consistent -- Astra replayed one profitable row and cut the
+        #: drawdown from 30.8% to 7.7% without a single mismatch.
+        self.duplicate_ids = self._scan_duplicate_ids(self.trades)
+        if self.duplicate_ids:
+            log_trd.critical(
+                f"[JOURNAL_IDENTITY] {len(self.duplicate_ids)} identite(s) "
+                f"economique(s) en DOUBLE dans le journal: "
+                f"{sorted(self.duplicate_ids)[:8]} -- l'historique n'est plus "
+                f"une suite d'evenements distincts; le ledger refuse "
+                f"d'etendre son watermark et bloque CAPITAL.")
         if legacy:
             legacy_path = _p("kalshi_trades_legacy.json")
             old = JsonStore.load(legacy_path, [])
@@ -113,6 +126,56 @@ class TradeLogger:
             log_trd.warning(f"{len(legacy)} enregistrement(s) heritee(s) "
                             f"(dry-run/ancien schema) archives dans "
                             f"kalshi_trades_legacy.json -- exclus des statistiques.")
+
+    @staticmethod
+    def event_keys(row: dict) -> list:
+        """The identities that make a row a DISTINCT economic event."""
+        keys = []
+        tid = row.get("trade_id")
+        if tid:
+            keys.append(("trade_id", str(tid)))
+        sid = row.get("settlement_id")
+        if sid:
+            keys.append(("settlement_id", str(sid)))
+        cid = row.get("correction_id")
+        if cid:
+            keys.append(("correction_id", str(cid)))
+        return keys
+
+    @classmethod
+    def _scan_duplicate_ids(cls, rows) -> set:
+        seen, dupes = set(), set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for key in cls.event_keys(row):
+                if key in seen:
+                    dupes.add("%s=%s" % key)
+                else:
+                    seen.add(key)
+        return dupes
+
+    def _reject_duplicate(self, rec: dict) -> bool:
+        """True when `rec` would re-introduce an identity already present.
+
+        A correction or a reversal is a DIFFERENT event with its own
+        `correction_id` that points at the row it corrects: that is how the
+        journal expresses "this economics changed". Re-appending a row that
+        carries an identity already in the journal is not a correction, it
+        is a duplicate, and it is refused.
+        """
+        existing = set()
+        for row in self.trades:
+            existing.update(self.event_keys(row))
+        clash = [k for k in self.event_keys(rec) if k in existing]
+        if not clash:
+            return False
+        log_trd.critical(
+            f"[JOURNAL_IDENTITY] ecriture REFUSEE: {clash} existe deja dans "
+            f"le journal. Un evenement economique ne peut pas etre "
+            f"enregistre deux fois; une economie qui change s'exprime par "
+            f"une correction portant son propre correction_id.")
+        return True
 
     def open_trade(self, *, ticker, market_title, side, req_price, avg_price,
                    req_count, filled_count, spread, fees, edge, ev, confidence,
@@ -138,6 +201,8 @@ class TradeLogger:
             "gross_pnl": None, "net_pnl": None, "roi": None,
             "holding_seconds": None, "settled_at": None,
         }
+        if self._reject_duplicate(rec):
+            raise ValueError(f"duplicate economic identity for {ticker}")
         self.trades.append(rec)
         self.flush()
         log_trd.info(f"OUVERT {ticker} {side.upper()} {filled_count}/{req_count} "
@@ -205,6 +270,11 @@ class TradeLogger:
             "roi": None, "holding_seconds": None, "settled_at": now_iso(),
             "orphan": True,
         }
+        if self._reject_duplicate(rec):
+            # A04: an orphan settlement carries the reconstructed position's
+            # trade_id. Replaying the same one would credit the same
+            # settlement twice.
+            return None
         self.trades.append(rec)
         self.flush()
         log_trd.warning(
@@ -244,4 +314,5 @@ class TradeLogger:
         return [t for t in self.effective_trades() if t["state"] == "settled"]
 
     def flush(self):
+        self.duplicate_ids = self._scan_duplicate_ids(self.trades)
         JsonStore.save(self.path, self.trades)

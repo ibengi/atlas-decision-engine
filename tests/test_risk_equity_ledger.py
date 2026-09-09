@@ -370,11 +370,23 @@ class RebaseIsAuditedAndExceptional(_Ledger):
 
     # the authoritative shape execution_engine.equity_rebase_context builds:
     # a context without the `orders` block is refused (fail-closed)
+    #: The positive control's context. Since the A03 remediation an
+    #: authorization must also carry the versions of the local evidence it
+    #: was taken on (`bound_state`), the collector's own stability verdict
+    #: (`evidence_unstable`) and the quiescence claim; a context without them
+    #: is refused, which is what `no order block` below still exercises.
     OK_CTX = {"drawdown_firing": True, "reconcile_status": "MATCH",
               "open_positions": 0, "in_flight_orders": 0,
+              "quiescent": True, "evidence_unstable": None,
               "orders": {"local_open": [], "pending_intents": [], "resolution_halt": False,
                          "broker_open": 0, "broker_open_ids": [], "broker_error": None,
                          "disagreement": False}}
+
+    def ok_ctx(self, led, **over):
+        """OK_CTX bound to `led`'s current local evidence versions."""
+        ctx = {**self.OK_CTX, "bound_state": led.bound_state()}
+        ctx.update(over)
+        return ctx
 
     def test_R12_unauthorized_rebase_attempts_are_no_ops(self):
         led, tlog = self.reconciled_and_blown()
@@ -422,7 +434,7 @@ class RebaseIsAuditedAndExceptional(_Ledger):
         old_hwm, eq = led.risk_equity_reference(), led.strategy_equity()
         prop = led.propose_rebase("Q3 losses acknowledged by the operator", "OPS-20")
         self.assertTrue(led.apply_rebase("Q3 losses acknowledged by the operator", "OPS-20",
-                                         prop["token"], self.OK_CTX))
+                                         prop["token"], self.ok_ctx(led)))
         f = self.file()
         rb = f["rebases"][-1]
         for key in ("rebase_id", "reason", "operator_action_id", "old_baseline", "new_baseline",
@@ -443,7 +455,7 @@ class RebaseIsAuditedAndExceptional(_Ledger):
                                           prop["token"], self.OK_CTX))
         # a second rebase while the hold is open: refused
         p2 = led.propose_rebase("again", "OPS-21")
-        self.assertFalse(led.apply_rebase("again", "OPS-21", p2["token"], self.OK_CTX))
+        self.assertFalse(led.apply_rebase("again", "OPS-21", p2["token"], self.ok_ctx(led)))
         # release: same action id as the rebase -> refused; a different one -> ok
         with self.assertRaises(ValueError):
             led.propose_hold_release("OPS-20", "review doc sha")

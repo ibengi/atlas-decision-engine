@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import BrokerMock  # noqa: E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from config import CFG, contract_cap_config  # noqa: E402
@@ -60,7 +61,7 @@ class _GateBase(unittest.TestCase):
 
     @staticmethod
     def _client():
-        c = MagicMock()
+        c = BrokerMock()
         c.env = "demo"
         c.last_http_status = 201
         c.get_positions.return_value = []

@@ -39,9 +39,28 @@ def check(name, ok, detail=""):
     return ok
 
 
+class _BrokerMock(MagicMock):
+    """MagicMock + the position-collection completeness contract.
+
+    Since audit finding A02 `PositionManager` may only conclude MATCH (or a
+    definitive MISMATCH) from an enumeration it can show is complete, so a
+    double standing in for the client has to answer the same question the
+    real client answers. The proof is derived from whatever `get_positions`
+    is configured to return, so every `return_value` below keeps working.
+    """
+
+    def get_positions_proof(self, **_kw):
+        rows = self.get_positions()
+        if rows is None:
+            return {"rows": None, "complete": False,
+                    "reason": "get_positions() -> None"}
+        return {"rows": list(rows), "complete": True, "pages": 1,
+                "cursors": [], "reason": None}
+
+
 def fresh_client(order_id="ord-1"):
     """Mock broker: accepts the order, reports it filled, holds the position."""
-    c = MagicMock()
+    c = _BrokerMock()
     c.env = "demo"
     c.last_http_status = 201
     c.create_order.return_value = {

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import BrokerMock  # noqa: E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from persistence import PersistenceSentinel  # noqa: E402
@@ -46,7 +47,7 @@ class OrphanLifecycleTest(unittest.TestCase):
 
     @staticmethod
     def _client(position=1, status="active", result=""):
-        c = MagicMock()
+        c = BrokerMock()
         c.env = "demo"
         c.get_positions.return_value = (
             [{"ticker": TICKER, "position": position}] if position else [])

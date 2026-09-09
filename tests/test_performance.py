@@ -25,6 +25,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import CompletePositionsProof  # noqa: E402
 
 os.environ.setdefault("KALSHI_DEMO_KEY_ID", "test")
 os.environ.setdefault("KALSHI_DEMO_PRIVATE_KEY", "test")
@@ -410,7 +411,7 @@ def _fake_ctx(strike=None, minutes_remaining=None, **kw):
     return _EngCtx()
 
 
-class _EngClient:
+class _EngClient(CompletePositionsProof):
     """FakeClient minimal avec compteur d'appels get_balance (aucun reseau)."""
     env = "demo"
     base_url = "fake://demo"

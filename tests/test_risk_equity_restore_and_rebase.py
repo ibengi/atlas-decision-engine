@@ -47,6 +47,11 @@ class _Client:
     def get_positions(self):
         return list(self.positions)
 
+    def get_positions_proof(self, **_kw):
+        """The completeness contract the real client now answers (A02)."""
+        return {"rows": list(self.positions), "complete": True, "pages": 1,
+                "cursors": []}
+
 
 def _trade(tlog, ticker="KXBTC15M-X", count=6, price=50):
     return tlog.open_trade(ticker=ticker, market_title="m", side="yes", req_price=price,
@@ -257,8 +262,9 @@ class ARebaseIsRefusedWhileAnyOrderIsLive(_Real):
         risk = type("R", (), {"rolling_drawdown_pct": lambda self: 30.0})()
         return client, tlog, pos, om, led, risk
 
-    def ctx(self, client, om, pos, risk):
-        return execution_engine.equity_rebase_context(client, om, pos, risk)
+    def ctx(self, client, om, pos, risk, led=None):
+        return execution_engine.equity_rebase_context(client, om, pos, risk,
+                                                      equity=led, quiescent=True)
 
     def assert_refused(self, led, ctx, expect_reason):
         hwm = led.risk_equity_reference()
@@ -288,7 +294,7 @@ class ARebaseIsRefusedWhileAnyOrderIsLive(_Real):
     def test_pending_submit_intent(self):
         client, tlog, pos, om, led, risk = self.blown()
         om._record_intent("KXBTC15M-X", "cid-1", 1, 9)
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "pending")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "pending")
 
     def test_partial_fill_still_active(self):
         client = _Client(orders=[{"order_id": "ord-2", "status": "resting",
@@ -297,7 +303,7 @@ class ARebaseIsRefusedWhileAnyOrderIsLive(_Real):
         om.open_orders["ord-2"] = {"ticker": "KXBTC15M-X", "side": "no", "count": 6,
                                    "price": 9, "placed_at": "now", "known_filled": 3}
         om.flush()
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "open")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "open")
 
     def test_cancel_requested_but_not_confirmed(self):
         client = _Client(orders=[{"order_id": "ord-3", "status": "resting", "remaining_count": 1}])
@@ -306,46 +312,46 @@ class ARebaseIsRefusedWhileAnyOrderIsLive(_Real):
                                    "price": 9, "placed_at": "now",
                                    "state": "unknown_cancel_failed"}
         om.flush()
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "open")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "open")
 
     def test_stale_locally_closed_order_the_broker_still_holds(self):
         client = _Client(orders=[{"order_id": "ord-4", "status": "resting", "remaining_count": 1}])
         client, tlog, pos, om, led, risk = self.blown(client)
         self.assertEqual(om.open_orders, {})                  # local thinks: nothing open
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "broker")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "broker")
 
     def test_broker_order_state_unknown_is_a_refusal(self):
         client = _Client(orders_error=KalshiAPIError(0, "listing failed"))
         client, tlog, pos, om, led, risk = self.blown(client)
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "unknown")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "unknown")
 
     def test_ambiguous_resolution_halt(self):
         client, tlog, pos, om, led, risk = self.blown()
         om.resolution_halt = {"status": "ambiguous", "detail": "x"}
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "ambiguous")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "ambiguous")
 
     def test_open_position(self):
         client, tlog, pos, om, led, risk = self.blown()
         t = _trade(tlog, ticker="KXBTC15M-P")
         pos.open_position(t)
         self.assertEqual(pos.open_count(), 1)
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "position")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "position")
 
     def test_reconciliation_not_match(self):
         # the broker shows a position the local state does not have
         client = _Client(positions=[{"ticker": "KXBTC15M-Q", "position": 2}])
         client, tlog, pos, om, led, risk = self.blown(client)
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "reconciliation")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "reconciliation")
 
     def test_pending_residual_and_unclassified_flow_and_existing_hold(self):
         client, tlog, pos, om, led, risk = self.blown()
         led.observe(7.55, cycle_n=50, quiet=True)             # pending residual
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "pending residual")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "pending residual")
         led.state["pending"] = None
         for i in range(3):
             led.observe(5.0, cycle_n=60 + i, quiet=True)      # unclassified -2
         self.assertTrue(led.unclassified_flows())
-        self.assert_refused(led, self.ctx(client, om, pos, risk), "unclassified")
+        self.assert_refused(led, self.ctx(client, om, pos, risk, led), "unclassified")
         fid = led.unclassified_flows()[0]["id"]
         led.classify_flow(fid, "withdrawal", action_id="OPS-W")
         led.state["capital_hold"] = {"reason": "post_rebase_validation", "since": "x",
@@ -353,12 +359,12 @@ class ARebaseIsRefusedWhileAnyOrderIsLive(_Real):
         led.save()
         hwm = led.risk_equity_reference()
         rb = led.propose_rebase("r", "OPS-H")
-        self.assertFalse(led.apply_rebase("r", "OPS-H", rb["token"], self.ctx(client, om, pos, risk)))
+        self.assertFalse(led.apply_rebase("r", "OPS-H", rb["token"], self.ctx(client, om, pos, risk, led)))
         self.assertAlmostEqual(led.risk_equity_reference(), hwm, places=9)
 
     def test_positive_control_a_clean_state_is_accepted(self):
         client, tlog, pos, om, led, risk = self.blown()
-        ctx = self.ctx(client, om, pos, risk)
+        ctx = self.ctx(client, om, pos, risk, led)
         self.assertEqual(ctx["orders"]["broker_open"], 0)
         self.assertEqual(ctx["reconcile_status"], "MATCH")
         rb = led.propose_rebase("losses acknowledged", "OPS-OK")
@@ -374,7 +380,7 @@ class ARebaseIsRefusedWhileAnyOrderIsLive(_Real):
         om.open_orders["ord-9"] = {"ticker": "KXBTC15M-X", "side": "no", "count": 1,
                                    "price": 9, "placed_at": "now"}
         om.flush()
-        ctx = self.ctx(client, om, pos, risk)
+        ctx = self.ctx(client, om, pos, risk, led)
         self.assertEqual(sorted(ctx["orders"]["local_open"]), ["ord-9"])
         self.assertEqual(ctx["orders"]["broker_open"], 1)
         self.assertTrue(ctx["orders"]["disagreement"])

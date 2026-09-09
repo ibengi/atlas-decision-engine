@@ -26,6 +26,8 @@ from tests import _gates  # noqa: F401
 # collecte manquante; il ne fige aucun total.
 from tests import _collect
 
+import model_gatekeeper  # noqa: E402
+
 
 def main():
     suite, diag = _collect.collect("tests")
@@ -50,6 +52,12 @@ def main():
     res = runner.run(suite)
     report = {
         "generated_ts": time.time(),
+        # A08: the gate refuses a green report produced by another tree or
+        # against another model manifest. Both bindings are recorded HERE,
+        # by the process that actually ran the suite.
+        "code_identity": model_gatekeeper.code_identity(),
+        "model_validation_sha256":
+            model_gatekeeper.file_sha256("model_validation.json"),
         "ran": res.testsRun,
         "failures": len(res.failures),
         "errors": len(res.errors),

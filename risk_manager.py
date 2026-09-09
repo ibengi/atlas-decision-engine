@@ -63,10 +63,28 @@ class RiskManager:
         return max(0.0, peak - curve)
 
     def _strategy_mode(self) -> bool:
-        """True when F2 accounting decides percentages: mode 'strategy' and a
-        seeded ledger. Otherwise the historical cash denominator applies."""
-        return (str(getattr(CFG, "RISK_EQUITY_MODE", "strategy")) == "strategy"
-                and self.equity is not None and getattr(self.equity, "seeded", False))
+        """True when F2 accounting decides percentages (audit finding A05).
+
+        The old test was `mode == "strategy"`, so ANY other string -- a typo,
+        an empty variable, a stale value from an older release -- silently
+        selected the cash denominator. That is not a neutral fallback: a
+        deposit raises cash, so a cash-denominated drawdown SHRINKS when
+        money is added, which is exactly the loss-derived protection F2
+        exists to preserve. Astra turned a 30% strategy drawdown into 3% that
+        way and walked through the global gate.
+
+        So: only a RECOGNIZED mode may choose a denominator at all, and only
+        the recognized `cash` rollback -- an explicit, deliberate value --
+        gets the historical one. Anything unrecognized keeps the
+        loss-preserving computation whenever a seeded ledger can provide it,
+        and `equity_ledger.GUARD_ACCOUNTING_MODE` blocks CAPITAL either way.
+        """
+        if self.equity is None or not getattr(self.equity, "seeded", False):
+            return False
+        mode = str(getattr(CFG, "RISK_EQUITY_MODE", "strategy") or "").strip().lower()
+        if mode == "cash":
+            return False              # recognized rollback, CAPITAL blocked
+        return True                   # "strategy", or anything unrecognized
 
     def rolling_drawdown_pct(self) -> float:
         """Drawdown courant en pourcentage.

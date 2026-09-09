@@ -134,17 +134,65 @@ class OrderManager:
     # -- resolution d'un POST ambigu par client_order_id ---------------------
 
     def _flush_pending_intents(self) -> bool:
-        return bool(JsonStore.save(_p(self.PENDING_FILE), self.pending_intents))
+        try:
+            return bool(JsonStore.save(_p(self.PENDING_FILE), self.pending_intents))
+        except Exception as e:                                # noqa: BLE001
+            # JsonStore already swallows OSError, but a serialization fault
+            # or a patched store must not escape as an exception either: the
+            # caller's contract is a boolean it is REQUIRED to check.
+            log_api.error(f"[PENDING_INTENTS] ecriture impossible: {e}")
+            PersistenceSentinel.record_failure(_p(self.PENDING_FILE), str(e))
+            return False
 
     def _record_intent(self, ticker: str, client_order_id: str, count: int,
                        limit_cents: int) -> bool:
-        """Enregistre l'INTENTION d'envoyer, avant le POST. Persistee, elle
-        permet de rejouer la resolution apres un redemarrage."""
+        """Enregistre l'INTENTION d'envoyer, AVANT le POST, et VERIFIE que
+        l'ecriture a reellement abouti (audit finding A09).
+
+        L'intention est la seule chose qui rend la question « cet ordre
+        existe-t-il chez le broker ? » posable apres un timeout ou un
+        redemarrage. Un POST parti sans intention persistee est un ordre
+        qu'aucune reprise ne peut retrouver : le retour de cette fonction
+        DOIT etre teste par l'appelant, qui doit s'abstenir d'appeler le
+        broker s'il est faux.
+
+        La verification est une RELECTURE du fichier, pas seulement le
+        booleen de JsonStore : un remplacement atomique qui echoue apres le
+        fsync du temporaire, un checksum non ecrit, un repertoire a la place
+        du fichier, tout cela doit se voir ici.
+        """
         self.pending_intents[ticker] = {
             "client_order_id": client_order_id, "count": int(count),
             "price": int(limit_cents), "at": now_iso(), "resolution": None,
         }
-        return self._flush_pending_intents()
+        if not self._flush_pending_intents():
+            self.pending_intents.pop(ticker, None)
+            return False
+        if not self._verify_intent_durable(ticker, client_order_id):
+            self.pending_intents.pop(ticker, None)
+            return False
+        return True
+
+    def _verify_intent_durable(self, ticker: str, client_order_id: str) -> bool:
+        """Relit pending_intents.json et confirme que l'intention y est."""
+        try:
+            raw = JsonStore.load(_p(self.PENDING_FILE), None)
+        except Exception as e:                                # noqa: BLE001
+            log_api.error(f"[PENDING_INTENTS] relecture impossible: {e}")
+            PersistenceSentinel.record_failure(_p(self.PENDING_FILE), str(e))
+            return False
+        row = (raw or {}).get(ticker) if isinstance(raw, dict) else None
+        if not isinstance(row, dict) or \
+                str(row.get("client_order_id") or "") != str(client_order_id):
+            log_api.critical(
+                f"[PENDING_INTENTS] l'intention de {ticker} n'est PAS "
+                f"relisible apres ecriture (client_order_id attendu "
+                f"{client_order_id}) -- persistance non prouvee.")
+            PersistenceSentinel.record_failure(
+                _p(self.PENDING_FILE),
+                f"intent for {ticker} not readable back after write")
+            return False
+        return True
 
     def _clear_intent(self, ticker: str) -> None:
         if self.pending_intents.pop(ticker, None) is not None:
@@ -770,7 +818,24 @@ class OrderManager:
         # L'intention porte le client_order_id deterministe: c'est elle qui
         # rend la question « cet ordre existe-t-il ? » posable au broker,
         # maintenant ou apres un redemarrage.
-        self._record_intent(ticker, client_order_id, count, limit_cents)
+        #
+        # INVARIANT A09: AUCUNE soumission n'atteint le transport broker tant
+        # que son intention n'est pas DURABLEMENT persistee ET RELUE. Le
+        # retour de _record_intent etait ignore: un repertoire a la place de
+        # pending_intents.json faisait echouer l'ecriture et le POST partait
+        # quand meme -- un ordre potentiellement vivant chez le broker et
+        # invisible pour toute reprise. Pas de retry broker, pas de
+        # continuation silencieuse: on abandonne, et la sentinelle de
+        # persistance (pending_intents.json est un fichier CRITIQUE) coupe
+        # les soumissions jusqu'au redemarrage sur un disque sain.
+        if not self._record_intent(ticker, client_order_id, count, limit_cents):
+            log_api.critical(
+                "[ORDER_SUBMIT_ABORTED] intention d'envoi impossible a "
+                f"persister pour {ticker} -- create_order NON appele "
+                "(un ordre dont l'intention n'est pas durable ne peut plus "
+                "etre retrouve apres un timeout ou un redemarrage).")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:intent_unwritable", "rejected")
         if not self._flush_submission_guard():
             # Verrou non persistable = aucune garantie anti-doublon au
             # redemarrage : on n'appelle PAS le broker (fail-closed).

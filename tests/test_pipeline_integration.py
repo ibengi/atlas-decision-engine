@@ -17,6 +17,7 @@ os.environ["DATA_DIR"] = _TMP0
 os.environ.setdefault("KALSHI_DEMO_KEY_ID", "test")
 os.environ.setdefault("KALSHI_DEMO_PRIVATE_KEY", "test")
 import _bootstrap  # noqa: F401  (ajoute src/* au sys.path)
+from _broker_double import CompletePositionsProof  # noqa: E402
 
 import kalshi_alpha_bot as bot                        # noqa: E402
 from strategy_router import build_default_registry    # noqa: E402
@@ -53,7 +54,7 @@ def fake_ctx(strike=None, minutes_remaining=None, **kw):
     return FakeCtx()
 
 
-class FakeClient:
+class FakeClient(CompletePositionsProof):
     """Client Kalshi factice : AUCUN reseau. Scenarios d'ordre pilotables."""
     env = "demo"
     base_url = "fake://demo"
