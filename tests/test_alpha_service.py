@@ -60,16 +60,10 @@ class ServiceCase(AlphaCase):
             self._saved_env.setdefault(var, os.environ.get(var))
             os.environ.pop(var, None)
 
-    def pricing(self, rates=(3.0, 15.0)):
-        path = os.path.join(self._tmp, "pricing.json")
-        with open(path, "w") as fh:
-            json.dump({"schema": "atlas-alpha-pricing-v1", "version": "t",
-                       "asof": "2026-09-09T00:00:00+00:00",
-                       "models": {f"{m}/{m}": {"input_per_mtok": rates[0],
-                                               "output_per_mtok": rates[1]}
-                                  for m in ("grok", "gemini", "openai",
-                                            "atlas_quant")}}, fh)
-        return PricingTable(path)
+    def pricing(self, rates=(3.0, 15.0), **kw):
+        from _alpha import write_pricing
+        return PricingTable(write_pricing(
+            os.path.join(self._tmp, "pricing.json"), rates=rates, **kw))
 
     def emit(self, ticker="KXBTCD-1", **kw):
         return ResearchFeed().emit_candidate(
@@ -157,7 +151,8 @@ class ProviderHealthIsCheckedNotAssumed(ServiceCase):
         os.environ["XAI_API_KEY"] = "k"
         try:
             with patch("alpha_providers.pricing_table",
-                       return_value=self.pricing(rates=(None, None))), \
+                       return_value=self.pricing(rates=(None, None),
+                                                 models=("grok",))), \
                  patch.object(CFG, "ALPHA_HEALTHCHECK_ENABLED", False):
                 report = GrokProvider().health_check()
             self.assertTrue(report["configured"])

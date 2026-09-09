@@ -22,7 +22,8 @@ from unittest.mock import patch                               # noqa: E402
 
 from alpha_providers import (AtlasQuantProvider, GeminiProvider,   # noqa: E402
                              GrokProvider, OpenAIProvider,
-                             build_prompt, default_providers)
+                             _ChatCompletions, build_prompt,
+                             default_providers)
 from alpha_schema import SCHEMA_VERSION, validate_signal      # noqa: E402
 from config import CFG                                        # noqa: E402
 
@@ -53,12 +54,27 @@ def gemini_response(body_dict, tokens=(1000, 250)):
                               "candidatesTokenCount": tokens[1]}}
 
 
+class _ChatGrok(_ChatCompletions):
+    """The chat-completions surface, kept as a ready fallback.
+
+    No shipped provider uses it -- both xAI and OpenAI go through their
+    Responses APIs -- but a vendor-side problem there should be one
+    configuration change away from being routed around, not a rewrite, so
+    the parser stays covered.
+    """
+    name = "grok"
+    env_key = "XAI_API_KEY"
+    base_url_attr = "ALPHA_GROK_BASE_URL"
+
+    def default_model(self):
+        return CFG.ALPHA_GROK_MODEL
+
+
 class ChatCompletionAdapters(AlphaCase):
-    """xAI publishes an OpenAI-compatible chat-completions surface. OpenAI
-    itself is called through the Responses API and has its own class below."""
+    """The fallback chat-completions parser."""
 
     def cases(self):
-        return ((GrokProvider, "XAI_API_KEY", CFG.ALPHA_GROK_BASE_URL),)
+        return ((_ChatGrok, "XAI_API_KEY", CFG.ALPHA_GROK_BASE_URL),)
 
     def test_a_well_formed_answer_round_trips(self):
         snapshot = self.snapshot()
@@ -80,7 +96,7 @@ class ChatCompletionAdapters(AlphaCase):
         snapshot = self.snapshot()
         os.environ["XAI_API_KEY"] = SECRET
         session = http_session(chat_response(valid_payload(snapshot)))
-        GrokProvider(session=session).analyze(snapshot, 5.0)
+        _ChatGrok(session=session).analyze(snapshot, 5.0)
         post = session.posts[0]
         self.assertEqual(post["headers"]["Authorization"], f"Bearer {SECRET}")
         self.assertNotIn(SECRET, json.dumps(post["json"]))
@@ -92,14 +108,14 @@ class ChatCompletionAdapters(AlphaCase):
         snapshot = self.snapshot()
         os.environ["XAI_API_KEY"] = SECRET
         session = http_session(chat_response(valid_payload(snapshot)))
-        GrokProvider(session=session).analyze(snapshot, 3.5)
+        _ChatGrok(session=session).analyze(snapshot, 3.5)
         self.assertEqual(session.posts[0]["timeout"], 3.5)
 
     def test_an_http_error_is_a_provider_failure(self):
         snapshot = self.snapshot()
         os.environ["XAI_API_KEY"] = SECRET
         session = http_session({"error": "rate limited"}, status=429)
-        raw, meta = GrokProvider(session=session).analyze(snapshot, 5.0)
+        raw, meta = _ChatGrok(session=session).analyze(snapshot, 5.0)
         self.assertIsNone(raw)
         self.assertIn("HTTP 429", meta["error"])
 
@@ -107,7 +123,7 @@ class ChatCompletionAdapters(AlphaCase):
         snapshot = self.snapshot()
         os.environ["XAI_API_KEY"] = SECRET
         session = http_session({}, raises=OSError("connection reset"))
-        raw, meta = GrokProvider(session=session).analyze(snapshot, 5.0)
+        raw, meta = _ChatGrok(session=session).analyze(snapshot, 5.0)
         self.assertIsNone(raw)
         self.assertIn("connection reset", meta["error"])
 
@@ -122,7 +138,7 @@ class ChatCompletionAdapters(AlphaCase):
                             ("not an object", ["choices"])):
             with self.subTest(case=label):
                 session = http_session(body)
-                raw, meta = GrokProvider(session=session).analyze(snapshot, 5.0)
+                raw, meta = _ChatGrok(session=session).analyze(snapshot, 5.0)
                 self.assertIsNone(raw)
                 self.assertIsNotNone(meta["error"])
 
@@ -131,7 +147,7 @@ class ChatCompletionAdapters(AlphaCase):
         os.environ["XAI_API_KEY"] = SECRET
         session = http_session({"choices": [{"message": {
             "content": json.dumps(valid_payload(snapshot))}}]})
-        raw, meta = GrokProvider(session=session).analyze(snapshot, 5.0)
+        raw, meta = _ChatGrok(session=session).analyze(snapshot, 5.0)
         self.assertIsNotNone(raw)
         self.assertEqual(meta["cost"]["input_tokens"], 0)
 
@@ -222,7 +238,7 @@ class GeminiAdapter(AlphaCase):
 
     def test_a_well_formed_answer_round_trips(self):
         snapshot = self.snapshot()
-        os.environ["GOOGLE_GEMINI_API_KEY"] = SECRET
+        os.environ["GEMINI_API_KEY"] = SECRET
         session = http_session(gemini_response(valid_payload(snapshot)))
         raw, meta = GeminiProvider(session=session).analyze(snapshot, 5.0)
         self.assertIsNone(meta["error"])
@@ -234,7 +250,7 @@ class GeminiAdapter(AlphaCase):
     def test_the_key_travels_in_its_own_header_not_the_url(self):
         """A key in a query string ends up in every access log on the path."""
         snapshot = self.snapshot()
-        os.environ["GOOGLE_GEMINI_API_KEY"] = SECRET
+        os.environ["GEMINI_API_KEY"] = SECRET
         session = http_session(gemini_response(valid_payload(snapshot)))
         GeminiProvider(session=session).analyze(snapshot, 5.0)
         post = session.posts[0]
@@ -243,7 +259,7 @@ class GeminiAdapter(AlphaCase):
 
     def test_multipart_text_is_joined(self):
         snapshot = self.snapshot()
-        os.environ["GOOGLE_GEMINI_API_KEY"] = SECRET
+        os.environ["GEMINI_API_KEY"] = SECRET
         body = json.dumps(valid_payload(snapshot))
         session = http_session({"candidates": [{"content": {"parts": [
             {"text": body[:40]}, {"text": body[40:]}]}}],
@@ -263,7 +279,7 @@ class SecretsNeverLeak(AlphaCase):
         session = http_session({"error": {"message": "bad auth",
                                           "authorization": f"Bearer {SECRET}"}},
                                status=400)
-        raw, meta = GrokProvider(session=session).analyze(snapshot, 5.0)
+        raw, meta = _ChatGrok(session=session).analyze(snapshot, 5.0)
         self.assertIsNone(raw)
         self.assertNotIn(SECRET, meta["error"])
         self.assertIn("redacted", meta["error"])
@@ -296,7 +312,7 @@ class SecretsNeverLeak(AlphaCase):
                                status=401)
         with self.assertLogs("ALPHA", level="DEBUG") as captured:
             from alpha_dispatcher import dispatch
-            dispatch(snapshot, [GrokProvider(session=session)])
+            dispatch(snapshot, [_ChatGrok(session=session)])
         self.assertNotIn(SECRET, "\n".join(captured.output))
 
     def test_no_secret_appears_in_the_prompt(self):
@@ -332,12 +348,12 @@ class ThePromptForbidsInstructions(AlphaCase):
         not of prompt -- even though the three request shapes differ."""
         snapshot = self.snapshot()
         prompts = set()
-        bodies = {GrokProvider: chat_response,
+        bodies = {GrokProvider: responses_api_response,
                   OpenAIProvider: responses_api_response,
                   GeminiProvider: gemini_response}
         for cls, env in ((GrokProvider, "XAI_API_KEY"),
                          (OpenAIProvider, "OPENAI_API_KEY"),
-                         (GeminiProvider, "GOOGLE_GEMINI_API_KEY")):
+                         (GeminiProvider, "GEMINI_API_KEY")):
             os.environ[env] = SECRET
             session = http_session(bodies[cls](valid_payload(snapshot)))
             cls(session=session).analyze(snapshot, 5.0)
@@ -427,7 +443,7 @@ class TheDefaultRoster(AlphaCase):
             provider = GrokProvider()
             self.assertEqual(provider.model, "grok-next")
             os.environ["XAI_API_KEY"] = SECRET
-            session = http_session(chat_response(
+            session = http_session(responses_api_response(
                 valid_payload(self.snapshot())))
             provider.session = session
             provider.analyze(self.snapshot(), 5.0)

@@ -43,10 +43,16 @@ from unittest.mock import patch                               # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-#: Every alpha module. Discovered, not listed, so a new one is covered the
-#: moment it exists rather than the moment someone remembers to add it.
-ALPHA_MODULES = sorted(f for f in os.listdir(REPO)
-                       if f.startswith("alpha_") and f.endswith(".py"))
+#: Every alpha module, INCLUDING the `tools/` entry points -- those are the
+#: processes that actually hold the AI credentials and run the provider
+#: calls, so a broker path introduced there would be just as real as one in
+#: the library. Discovered, not listed, so a new one is covered the moment it
+#: exists rather than the moment someone remembers to add it.
+ALPHA_MODULES = sorted(
+    [f for f in os.listdir(REPO)
+     if f.startswith("alpha_") and f.endswith(".py")] +
+    [os.path.join("tools", f) for f in os.listdir(os.path.join(REPO, "tools"))
+     if f.startswith("alpha_") and f.endswith(".py")])
 
 #: Modules the gateway may not import at all. Importing any of them is how
 #: an execution path gets built by accident.
@@ -81,6 +87,9 @@ class TheGatewayCannotReachTheBroker(AlphaCase):
         """A discovery test that finds nothing passes vacuously."""
         self.assertGreaterEqual(len(ALPHA_MODULES), 6, ALPHA_MODULES)
         self.assertIn("alpha_gateway.py", ALPHA_MODULES)
+        # the smoke test is a real-credential entry point; it is in scope
+        self.assertIn(os.path.join("tools", "alpha_smoke_test.py"),
+                      ALPHA_MODULES)
 
     def test_no_alpha_module_imports_an_execution_module(self):
         offences = []

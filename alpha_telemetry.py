@@ -62,6 +62,10 @@ class Telemetry:
         self.counters = {name: 0 for name in COUNTERS}
         self.provider_cost_usd = {}
         self.provider_calls = {}
+        #: Section 8: each provider independently. An aggregate hides the
+        #: thing the ensemble is for -- one vendor timing out while another
+        #: answers is invisible in a combined success rate.
+        self.by_provider = {}
         self.last_error = None
 
     def incr(self, name: str, by: int = 1) -> None:
@@ -102,26 +106,66 @@ class Telemetry:
         if counter:
             self.incr(counter)
 
+    def _provider_slot(self, name: str) -> dict:
+        return self.by_provider.setdefault(str(name or "unknown"), {
+            "calls": 0, "success": 0, "timeouts": 0, "invalid": 0,
+            "stale": 0, "budget_refused": 0, "unpriced_refused": 0,
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "tool_calls": 0, "search_queries": 0,
+            "estimated_cost_usd": 0.0, "billed_cost_usd": 0.0,
+            "cost_usd": 0.0, "latency_ms_total": 0, "latency_samples": 0,
+            "cost_reconciliation_flags": 0, "last_reason": None})
+
     def record_signal(self, signal) -> None:
-        """One provider outcome -> the provider_* counters."""
-        self.incr("provider_calls")
+        """One provider outcome -> the global and the per-provider counters."""
+        from alpha_cost import budgeted_cost
         cost = signal.cost or {}
-        self.add_cost(signal.provider or cost.get("provider"),
-                      cost.get("api_cost_usd") or 0.0)
+        name = signal.provider or cost.get("provider")
+        slot = self._provider_slot(name)
+        self.incr("provider_calls")
+        slot["calls"] += 1
+
+        with self._lock:
+            for field in ("input_tokens", "cached_input_tokens",
+                          "output_tokens", "tool_calls", "search_queries"):
+                slot[field] += int(cost.get(field) or 0)
+            estimated = float(cost.get("api_cost_usd") or 0.0)
+            billed = cost.get("billed_cost_usd")
+            slot["estimated_cost_usd"] = round(
+                slot["estimated_cost_usd"] + estimated, 10)
+            if isinstance(billed, (int, float)) and not isinstance(billed, bool):
+                slot["billed_cost_usd"] = round(
+                    slot["billed_cost_usd"] + float(billed), 10)
+            slot["cost_usd"] = round(slot["cost_usd"] + budgeted_cost(cost), 10)
+            if cost.get("cost_reconciliation"):
+                slot["cost_reconciliation_flags"] += 1
+            latency = int(signal.analysis_latency_ms or 0)
+            if latency > 0:
+                slot["latency_ms_total"] += latency
+                slot["latency_samples"] += 1
+        self.add_cost(name, budgeted_cost(cost))
+
         if signal.valid:
             self.incr("provider_success")
+            slot["success"] += 1
             return
         reason = signal.rejected_reason or ""
+        slot["last_reason"] = reason
         if reason in ("analysis_timeout", "provider_timeout"):
             self.incr("provider_timeout")
+            slot["timeouts"] += 1
         elif reason in ("stale", "late_response"):
             self.incr("provider_stale")
+            slot["stale"] += 1
         elif reason == "budget_exhausted":
             self.incr("provider_budget_refused")
-        elif reason == "pricing_unconfigured":
+            slot["budget_refused"] += 1
+        elif reason in ("pricing_unconfigured", "pricing_expired"):
             self.incr("provider_unpriced_refused")
+            slot["unpriced_refused"] += 1
         else:
             self.incr("provider_invalid")
+            slot["invalid"] += 1
 
     def snapshot(self, extra: dict = None) -> dict:
         with self._lock:
@@ -134,6 +178,16 @@ class Telemetry:
                 **{name: self.counters.get(name, 0) for name in COUNTERS},
                 "provider_cost_usd": dict(self.provider_cost_usd),
                 "provider_calls_by_provider": dict(self.provider_calls),
+                "by_provider": {
+                    name: {**slot,
+                           "average_latency_ms": (
+                               round(slot["latency_ms_total"]
+                                     / slot["latency_samples"], 1)
+                               if slot["latency_samples"] else None),
+                           "success_rate": (round(slot["success"]
+                                                  / slot["calls"], 4)
+                                            if slot["calls"] else None)}
+                    for name, slot in self.by_provider.items()},
                 "last_error": self.last_error,
             }
         payload["provider_cost_usd_total"] = round(

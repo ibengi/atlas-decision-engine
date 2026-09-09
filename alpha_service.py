@@ -38,7 +38,7 @@ import time
 from datetime import datetime, timezone
 
 from alpha_consumer import STATUS_ANALYZED, STATUS_DEFERRED, SpoolConsumer
-from alpha_cost import REASON_BUDGET, BudgetGuard
+from alpha_cost import REASON_BUDGET, REASON_EXPIRED, BudgetGuard
 from alpha_gateway import AlphaGateway
 from alpha_ledger import AlphaLedger
 from alpha_providers import default_providers, set_pricing_table
@@ -90,7 +90,7 @@ def assert_no_broker_credentials(env=None) -> list:
             f"the Alpha Shadow Service must not hold broker credentials or "
             f"write authority; found {offending} in its environment. Deploy "
             f"it as a separate service with only XAI_API_KEY, "
-            f"GOOGLE_GEMINI_API_KEY and OPENAI_API_KEY. "
+            f"GEMINI_API_KEY and OPENAI_API_KEY. "
             f"(Set ALPHA_REFUSE_BROKER_CREDENTIALS=false only to run both "
             f"in one environment for a local test.)")
     return offending
@@ -224,10 +224,19 @@ class AlphaShadowService:
         """One snapshot through the gateway, with the budget gate attached."""
         analysis_spend = {"usd": 0.0}
 
+        # The worst case is priced against the REAL prompt, so the refusal
+        # is made on the largest amount this call could actually cost.
+        from alpha_providers import build_prompt
+        try:
+            prompt_chars = len(build_prompt(snapshot))
+        except Exception:                                     # noqa: BLE001
+            prompt_chars = None
+
         def gate(provider):
             verdict = self.budget.check(
                 provider.name, provider.model,
-                analysis_spent_usd=analysis_spend["usd"])
+                analysis_spent_usd=analysis_spend["usd"],
+                prompt_chars=prompt_chars)
             if verdict["allowed"]:
                 analysis_spend["usd"] += verdict["estimated_cost_usd"]
             else:
@@ -252,7 +261,7 @@ class AlphaShadowService:
         refusals = {e.get("reason") for e in
                     opportunity["dispatch"]["excluded"]}
         if opportunity["p_meta"] is None and refusals and refusals.issubset(
-                {REASON_BUDGET, "pricing_unconfigured"}):
+                {REASON_BUDGET, "pricing_unconfigured", REASON_EXPIRED}):
             opportunity["state"] = STATE_BUDGET_EXHAUSTED
             opportunity["state_reason"] = (
                 "every provider was refused before being called: "

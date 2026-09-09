@@ -1,39 +1,80 @@
 {
- "schema": "atlas-alpha-pricing-v1",
- "version": "UNSET",
- "asof": "",
+ "schema": "atlas-alpha-pricing-v2",
+ "version": "2026-09-09-operator",
  "_readme": [
-  "Per-MILLION-token rates in USD, per provider/model.",
-  "Every rate ships as null, which means UNKNOWN, not free. This repository",
-  "cannot verify vendor pricing and pricing changes, so filling these in is",
-  "an operator action against each vendor's current pricing page.",
-  "While a rate is null the Alpha service REFUSES to call that model",
-  "(reason: pricing_unconfigured), because an unpriced call is costed at",
-  "zero and would make every cost cap unenforceable.",
-  "Set 'version' and 'asof' when you fill the rates: every cost row records",
-  "them, so historical spend can be recomputed under a later table instead",
-  "of being silently repriced."
+  "Rate cards for the Alpha Shadow Service, with provenance and validity",
+  "windows. Rates are USD per MILLION tokens unless the field says otherwise.",
+  "",
+  "A null rate means UNKNOWN, not free: the service REFUSES to call a model",
+  "it cannot price, because an unpriced call is costed at zero and would",
+  "make every cost cap unenforceable.",
+  "",
+  "effective_until is a HARD boundary. Once it passes, the card stops",
+  "applying and the model becomes unpriced until a successor entry is added.",
+  "That is deliberate: a rate whose window has closed is not the current",
+  "rate, and quietly pricing today at last year's numbers is exactly the",
+  "error this field exists to prevent.",
+  "",
+  "These figures were supplied by the operator on 2026-09-09 and are NOT",
+  "verified by this repository. Check them against each vendor's current",
+  "pricing page before relying on any cost-adjusted conclusion."
  ],
- "models": {
-  "grok/grok-4.6": {
-   "input_per_mtok": null,
-   "output_per_mtok": null,
-   "notes": "verify against the xAI pricing page"
+ "entries": [
+  {
+   "provider": "grok",
+   "model": "grok-4.6",
+   "input_per_mtok": 2.00,
+   "cached_input_per_mtok": 0.50,
+   "output_per_mtok": 6.00,
+   "tool_call_usd": null,
+   "search_query_usd": null,
+   "currency": "USD",
+   "effective_from": "2026-09-09T00:00:00+00:00",
+   "effective_until": null,
+   "source": "operator-supplied 2026-09-09 (xAI short-context reference)",
+   "notes": "short-context tier; xAI also returns usage.cost_in_usd_ticks, which is reconciled against this card when present"
   },
-  "gemini/gemini-3.7-flash": {
-   "input_per_mtok": null,
-   "output_per_mtok": null,
-   "notes": "verify against the Google AI pricing page"
+  {
+   "provider": "gemini",
+   "model": "gemini-3.7-flash",
+   "input_per_mtok": 0.75,
+   "cached_input_per_mtok": null,
+   "output_per_mtok": 3.75,
+   "tool_call_usd": null,
+   "search_query_usd": null,
+   "currency": "USD",
+   "effective_from": "2026-09-09T00:00:00+00:00",
+   "effective_until": "2026-12-31T23:59:59+00:00",
+   "source": "operator-supplied 2026-09-09 (paid tier, valid through 2026-12-31)",
+   "notes": "output rate covers thinking tokens. The window CLOSES on 2026-12-31: add the successor card rather than letting this one price 2027."
   },
-  "openai/gpt-5": {
-   "input_per_mtok": null,
-   "output_per_mtok": null,
-   "notes": "verify against the OpenAI pricing page"
+  {
+   "provider": "openai",
+   "model": "gpt-5.6-luna",
+   "input_per_mtok": 0.20,
+   "cached_input_per_mtok": null,
+   "output_per_mtok": 1.20,
+   "tool_call_usd": null,
+   "search_query_usd": null,
+   "currency": "USD",
+   "effective_from": "2026-09-09T00:00:00+00:00",
+   "effective_until": null,
+   "source": "operator-supplied 2026-09-09 (high-volume shadow model)",
+   "notes": "escalation to a stronger model is a config change; add its card here first or it will be refused as unpriced"
   },
-  "atlas_quant/atlas_quant": {
+  {
+   "provider": "atlas_quant",
+   "model": "atlas_quant",
    "input_per_mtok": 0.0,
+   "cached_input_per_mtok": 0.0,
    "output_per_mtok": 0.0,
-   "notes": "in-process, no vendor cost; genuinely zero, not unknown"
+   "tool_call_usd": 0.0,
+   "search_query_usd": 0.0,
+   "currency": "USD",
+   "effective_from": "2026-01-01T00:00:00+00:00",
+   "effective_until": null,
+   "source": "in-process; genuinely zero, which is a different statement from unknown",
+   "notes": "no vendor call is made for this provider"
   }
- }
+ ]
 }

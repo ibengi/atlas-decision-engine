@@ -43,11 +43,12 @@ from config import CFG, _p
 
 log = logging.getLogger("ALPHA")
 
-PRICING_SCHEMA = "atlas-alpha-pricing-v1"
+PRICING_SCHEMA = "atlas-alpha-pricing-v2"
 BUDGET_LEDGER_FILE = "alpha_budget_ledger.jsonl"
 
 REASON_UNPRICED = "pricing_unconfigured"
 REASON_BUDGET = "budget_exhausted"
+REASON_EXPIRED = "pricing_expired"
 
 
 def _now() -> float:
@@ -64,28 +65,122 @@ def _finite(value):
             and math.isfinite(float(value)))
 
 
+def _parse_utc(value):
+    """A UTC datetime, or None. A malformed date is None, which makes the
+    bound it was meant to express unenforceable -- so `PricingEntry.active`
+    treats an unparseable window as INVALID rather than unbounded."""
+    if not value:
+        return None
+    text = str(value).strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+class PricingEntry:
+    """One provider/model rate card with its provenance and validity window.
+
+    Section 2 asks for the full provenance because a cost figure without it
+    cannot be audited or recomputed: two entries for the same model with
+    different `effective_from` are the normal case when a vendor changes
+    prices, and the ledger has to be able to say which one produced a given
+    historical row.
+    """
+
+    FIELDS = ("provider", "model", "input_per_mtok", "cached_input_per_mtok",
+              "output_per_mtok", "tool_call_usd", "search_query_usd",
+              "currency", "effective_from", "effective_until", "source",
+              "notes")
+
+    def __init__(self, raw: dict, version: str):
+        self.raw = dict(raw or {})
+        self.version = version
+        self.provider = str(self.raw.get("provider") or "")
+        self.model = str(self.raw.get("model") or "")
+        self.currency = str(self.raw.get("currency") or "USD")
+        self.input_per_mtok = self.raw.get("input_per_mtok")
+        self.cached_input_per_mtok = self.raw.get("cached_input_per_mtok")
+        self.output_per_mtok = self.raw.get("output_per_mtok")
+        self.tool_call_usd = self.raw.get("tool_call_usd")
+        self.search_query_usd = self.raw.get("search_query_usd")
+        self.source = str(self.raw.get("source") or "")
+        self.effective_from_raw = self.raw.get("effective_from")
+        self.effective_until_raw = self.raw.get("effective_until")
+        self.effective_from = _parse_utc(self.effective_from_raw)
+        self.effective_until = _parse_utc(self.effective_until_raw)
+
+    @property
+    def key(self) -> str:
+        return f"{self.provider}/{self.model}"
+
+    @property
+    def rates_present(self) -> bool:
+        return _finite(self.input_per_mtok) and _finite(self.output_per_mtok)
+
+    def window_problem(self, at: datetime):
+        """Why this entry does not apply at `at`, or None."""
+        if self.effective_from_raw and self.effective_from is None:
+            return f"effective_from {self.effective_from_raw!r} is unreadable"
+        if self.effective_until_raw and self.effective_until is None:
+            return f"effective_until {self.effective_until_raw!r} is unreadable"
+        if self.effective_from and at < self.effective_from:
+            return (f"rate is not effective until "
+                    f"{self.effective_from.isoformat()}")
+        if self.effective_until and at > self.effective_until:
+            # Section 1: a rate whose window has closed is NOT the current
+            # rate. Using it would quietly price today at last year's
+            # numbers; refusing makes the operator add the next card.
+            return (f"rate expired on {self.effective_until.isoformat()}; "
+                    f"add the successor entry before calling this model")
+        return None
+
+    def active(self, at: datetime) -> bool:
+        return self.rates_present and self.window_problem(at) is None
+
+    def provenance(self) -> dict:
+        return {"pricing_version": self.version,
+                "pricing_source": self.source,
+                "currency": self.currency,
+                "input_per_mtok": self.input_per_mtok,
+                "cached_input_per_mtok": self.cached_input_per_mtok,
+                "output_per_mtok": self.output_per_mtok,
+                "tool_call_usd": self.tool_call_usd,
+                "search_query_usd": self.search_query_usd,
+                "effective_from": self.effective_from_raw,
+                "effective_until": self.effective_until_raw}
+
+    def cost(self, *, input_tokens: int, output_tokens: int,
+             cached_input_tokens: int = 0, tool_calls: int = 0,
+             search_queries: int = 0) -> float:
+        billable_input = max(0, int(input_tokens) - int(cached_input_tokens))
+        cached_rate = (float(self.cached_input_per_mtok)
+                       if _finite(self.cached_input_per_mtok)
+                       else float(self.input_per_mtok))
+        usd = ((billable_input / 1e6) * float(self.input_per_mtok)
+               + (int(cached_input_tokens) / 1e6) * cached_rate
+               + (int(output_tokens) / 1e6) * float(self.output_per_mtok))
+        if _finite(self.tool_call_usd):
+            usd += int(tool_calls) * float(self.tool_call_usd)
+        if _finite(self.search_query_usd):
+            usd += int(search_queries) * float(self.search_query_usd)
+        return round(usd, 10)
+
+
 class PricingTable:
-    """Per provider/model rates in USD per MILLION tokens.
+    """Time-aware rate cards with provenance (section 2).
 
-    File shape:
-
-        {"schema": "atlas-alpha-pricing-v1",
-         "version": "2026-09-vendor-list",
-         "asof": "2026-09-09T00:00:00+00:00",
-         "models": {
-           "grok/grok-4.6":   {"input_per_mtok": 3.0, "output_per_mtok": 15.0},
-           "openai/gpt-5":    {"input_per_mtok": null, "output_per_mtok": null}
-         }}
-
-    A `null` rate means UNKNOWN, not free. `price()` returns
-    `priced=False` for it and the caller refuses the call.
+    A model may have several entries; the one whose validity window contains
+    *now* is used. When none does -- because the rates are absent, or because
+    every card for that model has expired -- the model is UNPRICED and the
+    budget guard refuses to call it.
     """
 
     def __init__(self, path: str = None):
         self.path = path or self._default_path()
         self.version = ""
-        self.asof = ""
-        self.models = {}
+        self.entries = []
         self.loaded = False
         self.error = None
         self.load()
@@ -95,14 +190,12 @@ class PricingTable:
         configured = CFG.ALPHA_PRICING_FILE
         if os.path.isabs(configured):
             return configured
-        # Look beside the repository first (a versioned, reviewable file),
-        # then in DATA_DIR (an operator override on the volume).
         repo = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             configured)
         return repo if os.path.exists(repo) else _p(configured)
 
     def load(self) -> None:
-        self.models, self.loaded, self.error = {}, False, None
+        self.entries, self.loaded, self.error = [], False, None
         try:
             with open(self.path, encoding="utf-8") as fh:
                 payload = json.load(fh)
@@ -115,65 +208,165 @@ class PricingTable:
         if not isinstance(payload, dict) \
                 or payload.get("schema") != PRICING_SCHEMA:
             self.error = (f"unknown pricing schema "
-                          f"{(payload or {}).get('schema')!r}")
+                          f"{(payload or {}).get('schema')!r} "
+                          f"(expected {PRICING_SCHEMA})")
             return
-        models = payload.get("models")
-        if not isinstance(models, dict):
-            self.error = "pricing file has no 'models' object"
+        rows = payload.get("entries")
+        if not isinstance(rows, list):
+            self.error = "pricing file has no 'entries' list"
             return
         self.version = str(CFG.ALPHA_PRICING_VERSION
                            or payload.get("version") or "unversioned")
-        self.asof = str(payload.get("asof") or "")
-        for key, entry in models.items():
-            if not isinstance(entry, dict):
-                continue
-            self.models[str(key)] = {
-                "input_per_mtok": entry.get("input_per_mtok"),
-                "output_per_mtok": entry.get("output_per_mtok"),
-                "notes": str(entry.get("notes") or ""),
-            }
+        for row in rows:
+            if isinstance(row, dict):
+                self.entries.append(PricingEntry(row, self.version))
         self.loaded = True
 
     @staticmethod
     def key(provider: str, model: str) -> str:
         return f"{provider}/{model}"
 
+    def entries_for(self, provider: str, model: str) -> list:
+        return [e for e in self.entries
+                if e.provider == provider and e.model == model]
+
+    def active_entry(self, provider: str, model: str, at: datetime = None):
+        """(entry, problem). Exactly one of the two is None."""
+        at = at or datetime.now(timezone.utc)
+        candidates = self.entries_for(provider, model)
+        if not candidates:
+            return None, (self.error
+                          or f"no pricing entry for "
+                             f"{self.key(provider, model)}")
+        active = [e for e in candidates if e.active(at)]
+        if not active:
+            problems = []
+            for entry in candidates:
+                if not entry.rates_present:
+                    problems.append("rates are null (unknown, not free)")
+                else:
+                    problems.append(entry.window_problem(at) or "not active")
+            return None, (f"no active rate for {self.key(provider, model)}: "
+                          + "; ".join(sorted(set(problems))))
+        # Most recently effective card wins when several overlap.
+        active.sort(key=lambda e: (e.effective_from or datetime.min.replace(
+            tzinfo=timezone.utc)))
+        return active[-1], None
+
     def price(self, provider: str, model: str, input_tokens: int,
-              output_tokens: int) -> dict:
-        """Cost the usage. Always returns a row; `priced` says whether the
-        number means anything."""
-        key = self.key(provider, model)
-        entry = self.models.get(key) or {}
-        rate_in = entry.get("input_per_mtok")
-        rate_out = entry.get("output_per_mtok")
-        priced = _finite(rate_in) and _finite(rate_out)
-        usd = ((input_tokens / 1e6) * float(rate_in)
-               + (output_tokens / 1e6) * float(rate_out)) if priced else 0.0
-        return {
+              output_tokens: int, *, cached_input_tokens: int = 0,
+              tool_calls: int = 0, search_queries: int = 0,
+              at: datetime = None) -> dict:
+        """Cost the usage. Always returns a row; `cost_priced` says whether
+        the number means anything."""
+        entry, problem = self.active_entry(provider, model, at)
+        row = {
             "provider": provider, "model": model,
             "input_tokens": int(input_tokens),
+            "cached_input_tokens": int(cached_input_tokens),
             "output_tokens": int(output_tokens),
-            "input_per_mtok": rate_in, "output_per_mtok": rate_out,
-            "api_cost_usd": round(usd, 8),
-            "cost_priced": bool(priced),
-            "pricing_version": self.version if priced else "",
-            "pricing_asof": self.asof if priced else "",
-            "priced_at": _iso() if priced else "",
-            "pricing_missing_reason": None if priced else (
-                self.error or f"no rates configured for {key}"),
+            "tool_calls": int(tool_calls),
+            "search_queries": int(search_queries),
+            "api_cost_usd": 0.0,
+            "cost_priced": False,
+            "pricing_version": "",
+            "pricing_asof": "",
+            "priced_at": "",
+            "pricing_missing_reason": problem,
         }
+        if entry is None:
+            return row
+        row.update(entry.provenance())
+        row.update({
+            "api_cost_usd": round(entry.cost(
+                input_tokens=input_tokens, output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                tool_calls=tool_calls, search_queries=search_queries), 10),
+            "cost_priced": True,
+            "pricing_asof": entry.effective_from_raw or "",
+            "priced_at": _iso(),
+            "pricing_missing_reason": None,
+        })
+        return row
 
-    def estimate(self, provider: str, model: str) -> dict:
-        """The pre-call estimate budgets are checked against, since the true
-        token count is only known after the answer arrives."""
-        return self.price(provider, model,
-                          int(CFG.ALPHA_ESTIMATED_INPUT_TOKENS),
-                          int(CFG.ALPHA_ESTIMATED_OUTPUT_TOKENS))
+    def estimate(self, provider: str, model: str, *,
+                 prompt_chars: int = None) -> dict:
+        """The WORST-CASE pre-call estimate the budget is checked against.
 
-    def configured_models(self) -> dict:
-        return {k: v for k, v in self.models.items()
-                if _finite(v.get("input_per_mtok"))
-                and _finite(v.get("output_per_mtok"))}
+        Section 5 says a call whose worst-case cost exceeds the remaining
+        budget must be refused BEFORE dispatch, so this deliberately
+        over-estimates: the real prompt length when it is known (at four
+        characters per token, with a margin), and the configured maximum
+        output rather than a typical one. Under-estimating here would let a
+        cap be breached by exactly the calls it exists to stop.
+        """
+        if prompt_chars:
+            input_tokens = int(prompt_chars / 4 * 1.25) + 256
+        else:
+            input_tokens = int(CFG.ALPHA_ESTIMATED_INPUT_TOKENS)
+        row = self.price(provider, model, input_tokens,
+                         int(CFG.ALPHA_MAX_OUTPUT_TOKENS))
+        row["worst_case"] = True
+        return row
+
+    def configured_models(self, at: datetime = None) -> dict:
+        at = at or datetime.now(timezone.utc)
+        return {e.key: e.provenance() for e in self.entries if e.active(at)}
+
+    def expired_models(self, at: datetime = None) -> dict:
+        at = at or datetime.now(timezone.utc)
+        out = {}
+        for entry in self.entries:
+            if entry.rates_present and not entry.active(at):
+                out[entry.key] = entry.window_problem(at)
+        return out
+
+
+def reconcile_billed_cost(cost_row: dict, billed: dict) -> dict:
+    """Fold a provider-reported billed cost into a usage row.
+
+    Section 1: when a vendor supplies an authoritative billed amount, the
+    token estimate must not be the only figure of record. Both are kept --
+    `api_cost_usd` (ours, from the rate card) and `billed_cost_usd` (theirs)
+    -- and a disagreement beyond a small tolerance is FLAGGED rather than
+    resolved silently in either direction. Silently preferring theirs would
+    hide a rate-card error; silently preferring ours would hide a billing
+    surprise.
+    """
+    row = dict(cost_row)
+    row.update({k: v for k, v in billed.items() if v is not None})
+    ours = row.get("api_cost_usd")
+    theirs = row.get("billed_cost_usd")
+    row["cost_reconciled"] = False
+    row["cost_reconciliation"] = None
+    if not (_finite(ours) and _finite(theirs)):
+        return row
+    ours, theirs = float(ours), float(theirs)
+    row["cost_reconciled"] = True
+    if max(ours, theirs) <= 0:
+        return row
+    drift = abs(ours - theirs) / max(ours, theirs)
+    if drift > float(CFG.ALPHA_COST_RECONCILE_TOLERANCE):
+        row["cost_reconciliation"] = (
+            f"estimated ${ours:.8f} vs billed ${theirs:.8f} "
+            f"({drift * 100:.1f}% apart): the rate card and the vendor "
+            f"disagree; check the card before trusting either")
+        log.warning(f"[ALPHA_COST] {row.get('provider')}/{row.get('model')}: "
+                    f"{row['cost_reconciliation']}")
+    return row
+
+
+def budgeted_cost(cost_row: dict) -> float:
+    """The figure charged against the budget.
+
+    The vendor's own billed amount when it supplied one, because that is
+    what will appear on the invoice; our estimate otherwise.
+    """
+    billed = cost_row.get("billed_cost_usd")
+    if _finite(billed):
+        return float(billed)
+    value = cost_row.get("api_cost_usd")
+    return float(value) if _finite(value) else 0.0
 
 
 class BudgetLedger:
@@ -267,22 +460,27 @@ class BudgetGuard:
         self.ledger = ledger or BudgetLedger()
 
     def check(self, provider: str, model: str, *,
-              analysis_spent_usd: float = 0.0) -> dict:
+              analysis_spent_usd: float = 0.0,
+              prompt_chars: int = None) -> dict:
         """`{"allowed": bool, "reason": str|None, "estimate": {...}, ...}`.
 
         Every refusal names which cap was hit and what the numbers were, so
         an operator reading a day of BUDGET_EXHAUSTED signals can tell a
         misconfigured cap from a genuinely expensive day.
         """
-        estimate = self.pricing.estimate(provider, model)
+        estimate = self.pricing.estimate(provider, model,
+                                         prompt_chars=prompt_chars)
         result = {"allowed": True, "reason": None, "detail": "",
                   "estimate": estimate,
                   "estimated_cost_usd": estimate["api_cost_usd"]}
 
         if not estimate["cost_priced"]:
             if not CFG.ALPHA_ALLOW_UNPRICED_CALLS:
+                reason = (REASON_EXPIRED
+                          if "expired" in str(estimate["pricing_missing_reason"])
+                          else REASON_UNPRICED)
                 result.update(
-                    allowed=False, reason=REASON_UNPRICED,
+                    allowed=False, reason=reason,
                     detail=(f"{estimate['pricing_missing_reason']}; refusing "
                             f"to call an unpriced model because every cost cap "
                             f"would be unenforceable against a zero estimate. "
@@ -325,18 +523,34 @@ class BudgetGuard:
         return result
 
     def record_actual(self, cost_row: dict) -> None:
-        """Write what was really spent, after the answer arrived."""
+        """Charge what was really spent, after the answer arrived.
+
+        `api_cost_usd` on the ledger row is the BUDGETED figure -- the
+        vendor's billed amount when it supplied one, our estimate otherwise
+        -- so the cap is enforced against the money that will actually be
+        invoiced. The raw token and tool counts travel with it so any row
+        can be re-costed under a later rate card.
+        """
         try:
             self.ledger.record({
                 "provider": cost_row.get("provider"),
                 "model": cost_row.get("model"),
                 "input_tokens": cost_row.get("input_tokens", 0),
+                "cached_input_tokens": cost_row.get("cached_input_tokens", 0),
                 "output_tokens": cost_row.get("output_tokens", 0),
                 "tool_calls": cost_row.get("tool_calls", 0),
                 "search_queries": cost_row.get("search_queries", 0),
-                "api_cost_usd": cost_row.get("api_cost_usd", 0.0),
+                "api_cost_usd": budgeted_cost(cost_row),
+                "estimated_cost_usd": cost_row.get("api_cost_usd", 0.0),
+                "billed_cost_usd": cost_row.get("billed_cost_usd"),
+                "billed_cost_raw": cost_row.get("billed_cost_raw"),
+                "cost_source": ("vendor_billed"
+                                if cost_row.get("billed_cost_usd") is not None
+                                else "rate_card_estimate"),
+                "cost_reconciliation": cost_row.get("cost_reconciliation"),
                 "cost_priced": cost_row.get("cost_priced", False),
                 "pricing_version": cost_row.get("pricing_version", ""),
+                "pricing_source": cost_row.get("pricing_source", ""),
                 "pricing_asof": cost_row.get("pricing_asof", ""),
                 "latency_ms": cost_row.get("latency_ms", 0),
                 "outcome": cost_row.get("outcome", ""),
@@ -352,8 +566,8 @@ class BudgetGuard:
                         "provider_hourly_usd": float(CFG.ALPHA_MAX_PROVIDER_COST_PER_HOUR_USD),
                         "daily_usd": float(CFG.ALPHA_MAX_COST_PER_DAY_USD)},
                     "pricing_version": self.pricing.version,
-                    "pricing_asof": self.pricing.asof,
                     "priced_models": sorted(self.pricing.configured_models()),
+                    "expired_models": self.pricing.expired_models(),
                     "pricing_error": self.pricing.error}
         except RuntimeError as e:
             return {"error": str(e)}
@@ -368,15 +582,19 @@ def recost(rows, pricing: PricingTable) -> dict:
     """
     total, unpriced = 0.0, []
     for row in rows:
-        priced = pricing.price(row.get("provider", ""), row.get("model", ""),
-                               int(row.get("input_tokens") or 0),
-                               int(row.get("output_tokens") or 0))
+        priced = pricing.price(
+            row.get("provider", ""), row.get("model", ""),
+            int(row.get("input_tokens") or 0),
+            int(row.get("output_tokens") or 0),
+            cached_input_tokens=int(row.get("cached_input_tokens") or 0),
+            tool_calls=int(row.get("tool_calls") or 0),
+            search_queries=int(row.get("search_queries") or 0))
         if priced["cost_priced"]:
             total += priced["api_cost_usd"]
         else:
             unpriced.append(PricingTable.key(row.get("provider", ""),
                                              row.get("model", "")))
-    return {"pricing_version": pricing.version, "pricing_asof": pricing.asof,
+    return {"pricing_version": pricing.version,
             "total_usd": round(total, 8), "rows": len(rows),
             "unpriced_models": sorted(set(unpriced)),
             "complete": not unpriced}

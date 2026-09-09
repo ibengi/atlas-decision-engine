@@ -181,35 +181,27 @@ class CostsAreRecorded(LedgerCase):
     def test_priced_tokens_produce_a_cost(self):
         """Rates now come from the versioned pricing table, so the cost row
         also records WHICH version produced the figure."""
-        import json as _json
+        from _alpha import write_pricing
         from alpha_cost import PricingTable
-        path = os.path.join(self._tmp, "pricing.json")
-        with open(path, "w") as fh:
-            _json.dump({"schema": "atlas-alpha-pricing-v1",
-                        "version": "test-v1", "asof": "2026-09-09T00:00:00Z",
-                        "models": {"grok/grok-4.6": {
-                            "input_per_mtok": 3.0,
-                            "output_per_mtok": 15.0}}}, fh)
-        table = PricingTable(path)
-        row = table.price("grok", "grok-4.6", 1_000_000, 1_000_000)
+        table = PricingTable(write_pricing(
+            os.path.join(self._tmp, "pricing.json"), rates=(3.0, 15.0),
+            models=("grok",), version="test-v1"))
+        row = table.price("grok", "grok", 1_000_000, 1_000_000)
         self.assertTrue(row["cost_priced"])
         self.assertAlmostEqual(row["api_cost_usd"], 18.0, places=6)
         self.assertEqual(row["pricing_version"], "test-v1")
         self.assertTrue(row["priced_at"])
 
     def test_an_unpriced_model_is_marked_unpriced_not_free(self):
-        import json as _json
+        from _alpha import write_pricing
         from alpha_cost import PricingTable
-        path = os.path.join(self._tmp, "pricing.json")
-        with open(path, "w") as fh:
-            _json.dump({"schema": "atlas-alpha-pricing-v1", "version": "v",
-                        "models": {"grok/grok-4.6": {
-                            "input_per_mtok": None,
-                            "output_per_mtok": None}}}, fh)
-        row = PricingTable(path).price("grok", "grok-4.6", 1000, 1000)
+        table = PricingTable(write_pricing(
+            os.path.join(self._tmp, "pricing.json"), rates=(None, None),
+            models=("grok",)))
+        row = table.price("grok", "grok", 1000, 1000)
         self.assertFalse(row["cost_priced"])
         self.assertEqual(row["api_cost_usd"], 0.0)
-        self.assertIn("no rates configured", row["pricing_missing_reason"])
+        self.assertIn("null", row["pricing_missing_reason"])
 
 
 class MetricsAreDerived(LedgerCase):

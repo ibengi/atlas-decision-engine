@@ -40,9 +40,27 @@ environment.
     python tools/alpha_shadow_run.py analyze --input candidates.json
     python tools/alpha_shadow_run.py metrics
 
+Phase 3 points the adapters at the real vendor surfaces (`grok-4.6` and
+`gpt-5.6-luna` on the Responses API, `gemini-3.7-flash` on `generateContent`)
+and prices them in `alpha_pricing.json`, where every rate carries its source
+and its validity window. Before an automatic real-provider session may
+start, each provider must pass a one-call smoke test:
+
+    # requires XAI_API_KEY / GEMINI_API_KEY / OPENAI_API_KEY in the
+    # environment; makes exactly ONE bounded call per provider against a
+    # fixture market that does not exist, charged to the daily budget
+    python tools/alpha_smoke_test.py
+    python tools/alpha_smoke_test.py --provider grok --json
+
+A provider that fails is EXCLUDED. Nothing falls back to another model and
+no missing answer becomes a probability.
+
 Design: [`docs/design/alpha-gateway.md`](docs/design/alpha-gateway.md).
-Provider endpoints and model ids are **unverified defaults** — check them
-against each vendor's current API reference before enabling anything.
+The shipped endpoints, model ids and rates are **operator-supplied and
+unverified by this repository** — check them against each vendor's current
+API reference and pricing page before enabling anything. A model with no
+applicable rate is not called at all, because an uncosted call would make
+every spending cap unenforceable.
 
 ## Architecture
 

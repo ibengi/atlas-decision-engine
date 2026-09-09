@@ -410,8 +410,20 @@ class Config:
     #: gateway is enabled anywhere: this repository cannot confirm them.
     ALPHA_GROK_BASE_URL   = os.getenv("ALPHA_GROK_BASE_URL", "https://api.x.ai/v1")
     ALPHA_GROK_MODEL      = os.getenv("ALPHA_GROK_MODEL", "grok-4.6")
+    #: xAI is called through its Responses API, like OpenAI's.
+    ALPHA_GROK_RESPONSES_PATH = os.getenv("ALPHA_GROK_RESPONSES_PATH",
+                                          "/responses")
+    #: xAI reports an authoritative billed amount as `usage.cost_in_usd_ticks`.
+    #: A "tick" is a fixed fraction of a USD, but this repository cannot
+    #: verify WHICH fraction, and being wrong by a factor of ten would
+    #: misprice every call. So the raw tick count is always recorded, and a
+    #: USD figure is derived ONLY when an operator sets the scale here.
+    #: Leave it at 0 until one real call lets you compute it:
+    #:     ticks_per_usd = cost_in_usd_ticks / (our estimated cost in USD)
+    #: `tools/alpha_smoke_test.py` prints exactly that ratio.
+    ALPHA_XAI_COST_TICKS_PER_USD = _env_f("ALPHA_XAI_COST_TICKS_PER_USD", 0.0)
     ALPHA_OPENAI_BASE_URL = os.getenv("ALPHA_OPENAI_BASE_URL", "https://api.openai.com/v1")
-    ALPHA_OPENAI_MODEL    = os.getenv("ALPHA_OPENAI_MODEL", "gpt-5")
+    ALPHA_OPENAI_MODEL    = os.getenv("ALPHA_OPENAI_MODEL", "gpt-5.6-luna")
     #: OpenAI is called through the Responses API (`/responses`),
     #: not chat completions. The path is configurable so a future
     #: surface change does not need a code edit.
@@ -482,6 +494,16 @@ class Config:
     #: known afterwards. Budgets are checked against this BEFORE dispatch.
     ALPHA_ESTIMATED_INPUT_TOKENS  = _env_i("ALPHA_ESTIMATED_INPUT_TOKENS", 2000)
     ALPHA_ESTIMATED_OUTPUT_TOKENS = _env_i("ALPHA_ESTIMATED_OUTPUT_TOKENS", 800)
+    #: The WORST CASE the pre-dispatch budget check prices, and the ceiling
+    #: requested from every provider. Section 5 requires a call whose
+    #: worst-case cost exceeds the remaining budget to be refused BEFORE
+    #: dispatch, which needs a bound the provider is actually held to --
+    #: not an average.
+    ALPHA_MAX_OUTPUT_TOKENS = _env_i("ALPHA_MAX_OUTPUT_TOKENS", 2000)
+    #: Relative gap between our rate-card estimate and a vendor-reported
+    #: billed amount that is worth flagging. Neither figure silently wins.
+    ALPHA_COST_RECONCILE_TOLERANCE = _env_f("ALPHA_COST_RECONCILE_TOLERANCE",
+                                            0.25)
 
     # ── Provider health checks (section 3) ───────────────────────────────
     ALPHA_HEALTHCHECK_ENABLED = _env_gate("ALPHA_HEALTHCHECK_ENABLED",

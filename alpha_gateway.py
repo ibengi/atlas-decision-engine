@@ -152,7 +152,8 @@ class AlphaGateway:
         if not valid:
             reasons = {s.rejected_reason for s in result.excluded}
             if reasons and reasons.issubset({"budget_exhausted",
-                                             "pricing_unconfigured"}):
+                                             "pricing_unconfigured",
+                                             "pricing_expired"}):
                 # Nobody was asked. Reporting INSUFFICIENT_DATA here would
                 # blame the models for a spend limit.
                 return STATE_BUDGET_EXHAUSTED, (

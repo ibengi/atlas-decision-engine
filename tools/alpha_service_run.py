@@ -8,7 +8,7 @@
     python tools/alpha_service_run.py resolve --prediction-id ... --outcome 1
 
 DEPLOY THIS AS ITS OWN SERVICE (section 2)
-    It must receive XAI_API_KEY, GOOGLE_GEMINI_API_KEY and OPENAI_API_KEY,
+    It must receive XAI_API_KEY, GEMINI_API_KEY and OPENAI_API_KEY,
     and MUST NOT receive any broker credential. The process refuses to start
     if one is visible in its environment -- the separation is the point, so
     it is checked rather than assumed.

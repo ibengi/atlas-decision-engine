@@ -186,11 +186,13 @@ Every invocation records provider, model, input/output tokens, cost and
 latency — including the ones that failed, because asking costs something
 too.
 
-`ALPHA_PRICE_IN_PER_MTOK` / `_OUT_PER_MTOK` default to **0.0** and every row
-carries `cost_priced: false`. A plausible-looking per-token price would
-silently decide the one question this subsystem exists to answer, so
-`metrics()` **withholds** the net-of-inference-cost figure and says why
-until an operator sets the real rates.
+A model with no applicable rate is `cost_priced: false`, and `metrics()`
+**withholds** the net-of-inference-cost figure and says why rather than
+guessing a per-token price — that price would silently decide the one
+question this subsystem exists to answer. Since phase 4 the shipped card
+carries operator-supplied rates for the three live models (§20), so the
+withholding path is now the exception rather than the default; it still
+governs any model outside the card or outside its validity window.
 
 ## 9. Configuration
 
@@ -212,14 +214,30 @@ probability.
 
 ## 10. Secrets
 
-`XAI_API_KEY`, `GOOGLE_GEMINI_API_KEY`, `OPENAI_API_KEY` are read at call
-time and sent in one header. Gemini's key goes in `x-goog-api-key`, not a
+`XAI_API_KEY`, `GEMINI_API_KEY` (or the longer `GOOGLE_GEMINI_API_KEY`),
+`OPENAI_API_KEY` are read from the environment at call time and sent in one
+header. They are never written to a source file, a log line, a telemetry
+counter, an API response or a persisted row. Gemini's key goes in `x-goog-api-key`, not a
 query string, because a key in a URL ends up in every access log on the
 path. Error bodies are truncated and redacted before they can reach a log
 line — vendors echo request headers into error payloads often enough that
-printing one verbatim is a credible way to leak a key. Tests assert no
-secret appears in a log, an exception, returned metadata, a prompt or a
-persisted row.
+printing one verbatim is a credible way to leak a key.
+
+A response body is not the only route out. A transport, a proxy or a vendor
+SDK can raise an **exception whose message quotes the request**, headers
+included, and that message goes straight into `meta["error"]`, which is
+returned, logged and printed by the smoke test. So `redact()` strips every
+configured credential value — not just the current provider's, since a
+shared session or a proxy error can quote another vendor's header — from
+every string leaving the adapter on the failure path. Redaction is not
+silence: the failure is still reported, with `<redacted:XAI_API_KEY>` where
+the value was, so the diagnostic survives. A value shorter than 8 characters
+is not treated as a secret, because redacting a short string would destroy
+unrelated messages.
+
+Tests assert no secret appears in a log, an exception, returned metadata, a
+prompt, a persisted row, a telemetry counter or a smoke-test report, and
+positive controls assert the redaction is what makes that true.
 
 ## 11. Terminal states (§16)
 
@@ -328,15 +346,21 @@ mistake.
 
 ## 15. Pricing and budgets
 
-Rates live in `alpha_pricing.json` with a `version` and an `asof`. Every
-cost row records tokens, tool calls, search queries, latency, the rates
-applied, and which pricing version produced the figure — so a past cycle can
-be re-costed with `recost()` when prices change, instead of today's prices
-being silently baked into yesterday's conclusions.
+Rates live in `alpha_pricing.json` (`atlas-alpha-pricing-v2`) with a
+`version`, and each entry carries its own provenance and validity window
+(§20). Every cost row records tokens, tool calls, search queries, latency,
+the rates applied, and which pricing version produced the figure — so a past
+cycle can be re-costed with `recost()` when prices change, instead of
+today's prices being silently baked into yesterday's conclusions.
 
-**Every shipped rate is `null`, which means UNKNOWN, not free.** Filling
-them in is an operator action against each vendor's current pricing page;
-this repository cannot verify vendor pricing.
+The **raw usage counts are retained alongside the derived figure**, which is
+what makes that recosting possible: a cost row is evidence, not just a
+number.
+
+A rate this repository has not been given is `null`, which means UNKNOWN,
+not free. Verifying the shipped rates against each vendor's current pricing
+page remains an operator action; this repository cannot verify vendor
+pricing itself.
 
 **An unpriced model is not called** (`pricing_unconfigured`). This is not
 pedantry: an unpriced call is costed at zero, so every cap below would be
@@ -377,9 +401,9 @@ whole. An unavailable book is a missing sample, never a price of zero.
 
 | Provider | Base URL | Model | Surface |
 |---|---|---|---|
-| xAI | `https://api.x.ai/v1` | `grok-4.6` | chat completions |
+| xAI | `https://api.x.ai/v1` | `grok-4.6` | **Responses API** (`/responses`) |
 | Gemini | `https://generativelanguage.googleapis.com/v1beta` | `gemini-3.7-flash` | `generateContent` |
-| OpenAI | `https://api.openai.com/v1` | configurable | **Responses API** (`/responses`) |
+| OpenAI | `https://api.openai.com/v1` | `gpt-5.6-luna` | **Responses API** (`/responses`) |
 
 All configurable; none permanently bound. `health_check()` reports
 configured / priced / reachable per provider at startup. A provider that
@@ -397,3 +421,112 @@ Still unwired, still `INSUFFICIENT_EVIDENCE`, still measured separately in
 `by_model`. Its health report distinguishes *wired* from *reachable*: an
 unwired quant model is healthy and produces no opinion, which is the honest
 state rather than a failure.
+
+---
+
+# Phase 3 — real provider activation
+
+Everything above still holds. This phase makes the three adapters point at
+the real vendor surfaces, prices them, and adds a way to prove a provider is
+usable **before** a shadow session is allowed to start. It changes nothing
+about the safety boundary: Alpha still has no execution path, no broker
+client, no broker credential and no capital authority.
+
+## 20. Rate cards carry provenance and a validity window
+
+`alpha_pricing.json` is `atlas-alpha-pricing-v2`. Each entry is a
+`PricingEntry` and carries:
+
+| field | why it is there |
+|---|---|
+| `provider`, `model` | what the rate applies to — looked up by the model id the adapter actually reports, not by the provider name |
+| `input_per_mtok`, `cached_input_per_mtok`, `output_per_mtok` | cached input is cheaper and is charged at its own rate when the vendor reports it |
+| `tool_call_usd`, `search_query_usd` | per-call surcharges, when the vendor bills them |
+| `currency` | a number without a unit is not a price |
+| `effective_from`, `effective_until` | *when* this was the rate |
+| `source`, and the file's `version` | *who said so*, so a wrong figure is traceable to its origin |
+
+The shipped rates, all `source: "operator-supplied 2026-09-09"`:
+
+| provider | model | input /Mtok | cached input /Mtok | output /Mtok | window |
+|---|---|---|---|---|---|
+| xAI | `grok-4.6` | $2.00 | $0.50 | $6.00 | open |
+| Gemini | `gemini-3.7-flash` | $0.75 | — | $3.75 | **through 2026-12-31** |
+| OpenAI | `gpt-5.6-luna` | $0.20 | — | $1.20 | open |
+
+### An expired window is not a current rate
+
+Gemini's card is explicitly bounded. Past `2026-12-31T23:59:59Z` that entry
+stops applying, the model becomes **unpriced**, and an unpriced model is not
+called (§15). The alternative — carrying yesterday's rate forward silently —
+would mean the daily cap was being enforced against numbers nobody had
+checked since last year, which is indistinguishable from not enforcing it.
+A published future rate is a *different entry with its own window*, never an
+edit to this one.
+
+A window bound that cannot be parsed is treated as unenforceable, which is
+not the same as absent: it refuses too.
+
+## 21. Billed cost and estimated cost are both kept
+
+xAI reports `usage.cost_in_usd_ticks` — an authoritative billed figure.
+Where a vendor supplies one, `reconcile_billed_cost()` records **both** it
+and our rate-card estimate; neither silently overwrites the other, and a
+disagreement beyond `ALPHA_COST_RECONCILE_TOLERANCE` is flagged rather than
+averaged away. `budgeted_cost()` charges the budget the **vendor's** figure
+when one exists, because that is the number that will appear on the invoice.
+
+The tick denomination is **not** something this repository can verify, so
+`ALPHA_XAI_COST_TICKS_PER_USD` defaults to `0.0` (unconfigured) and the raw
+tick count is stored verbatim in `billed_cost_raw` until an operator sets
+the scale. `tools/alpha_smoke_test.py` prints the observed
+`ticks / estimated_usd` ratio from a real call, which is the only honest way
+to learn it. An unconvertible tick count never becomes a USD number by
+assumption.
+
+## 22. The smoke test (`tools/alpha_smoke_test.py`)
+
+Exactly **one** bounded call per provider against a fixed fixture —
+`ATLAS-SMOKE-TEST-0001`, a coin flip on a market that does not exist, so no
+vendor answer can be mistaken for a forecast and no real contract is
+described to a third party. It reports per provider: credential present,
+pricing configured, budget allowed, called, reachable, response parsable,
+schema valid, usage captured, latency captured, cost captured.
+
+It is charged against **the same** budget ledger the service uses, so it
+cannot be used to get around the daily cap.
+
+There is **no fake success**. Provider error, model unavailable, pricing
+unavailable, malformed response and timeout each produce their own verdict —
+`NOT_EXECUTED`, `REFUSED_*`, `FAIL`, `REACHABLE_BUT_INVALID` — and none of
+them is ever converted into a probability, a `0.5`, or a fallback to another
+model.
+
+## 23. Cost protection is enforced before dispatch
+
+`BudgetGuard.check(provider, model, prompt_chars=…)` estimates the
+**worst case** for the call it is about to authorise — prompt characters
+converted to tokens with headroom, plus a full `ALPHA_MAX_OUTPUT_TOKENS` of
+output — and refuses before dispatch if that exceeds what remains. Checking
+an *average* after the fact is not a cap; a single expensive call would
+already have been made.
+
+Caps: **$0.25** per analysis, **$2.00** per provider per hour, **$20.00**
+per day (`ALPHA_MAX_COST_PER_*`).
+
+## 24. Telemetry is per provider
+
+`Telemetry.snapshot()["by_provider"]` reports, for each of grok / gemini /
+openai independently: calls, success, timeouts, invalid, stale,
+budget-refused, unpriced-refused, input/output tokens, estimated cost,
+billed cost, charged cost, average latency and success rate. An aggregate
+would hide one vendor timing out while another answers, which is exactly the
+fact this phase exists to surface. No counter holds a secret.
+
+## 25. Activation is gated on the smoke test
+
+An automatic real-provider shadow session starts only once all three
+providers pass. A provider that has not been proven usable is EXCLUDED, not
+assumed working. AtlasQuant remains unwired and
+`INSUFFICIENT_EVIDENCE`, and carries **no** ensemble weight — an absent
+model contributes nothing rather than contributing a neutral opinion.

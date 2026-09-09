@@ -11,7 +11,6 @@ THE INVARIANTS
     3. Enough raw usage is stored to recompute costs when prices change, so
        today's prices are never baked into yesterday's conclusions.
 """
-import json
 import os
 import sys
 from unittest.mock import patch
@@ -28,16 +27,12 @@ from config import CFG                                        # noqa: E402
 
 class BudgetCase(AlphaCase):
 
-    def pricing(self, rates=(3.0, 15.0), models=None, version="test-1"):
-        path = os.path.join(self._tmp, "pricing.json")
-        models = models or ("grok", "gemini", "openai", "atlas_quant")
-        table = {f"{m}/{m}": {"input_per_mtok": rates[0],
-                              "output_per_mtok": rates[1]} for m in models}
-        with open(path, "w") as fh:
-            json.dump({"schema": "atlas-alpha-pricing-v1", "version": version,
-                       "asof": "2026-09-09T00:00:00+00:00",
-                       "models": table}, fh)
-        return PricingTable(path)
+    def pricing(self, rates=(3.0, 15.0), models=None, version="test-1", **kw):
+        from _alpha import write_pricing
+        return PricingTable(write_pricing(
+            os.path.join(self._tmp, "pricing.json"), rates=rates,
+            models=models or ("grok", "gemini", "openai", "atlas_quant"),
+            version=version, **kw))
 
     def guard(self, **kw):
         return BudgetGuard(pricing=kw.pop("pricing", None) or self.pricing(),
@@ -81,14 +76,33 @@ class UnpricedModelsAreNotCalled(BudgetCase):
 class CapsAreEnforcedBeforeTheCall(BudgetCase):
 
     def test_the_per_analysis_cap_stops_the_next_provider(self):
+        """Spend accumulates WITHIN one analysis: the fourth provider is
+        refused because the first three have already committed the budget."""
         guard = self.guard()
-        with patch.object(CFG, "ALPHA_MAX_COST_PER_ANALYSIS_USD", 0.02):
+        worst_case = guard.pricing.estimate("grok", "grok")["api_cost_usd"]
+        self.assertGreater(worst_case, 0.0)
+        with patch.object(CFG, "ALPHA_MAX_COST_PER_ANALYSIS_USD",
+                          worst_case * 1.5):
             first = guard.check("grok", "grok", analysis_spent_usd=0.0)
             self.assertTrue(first["allowed"])
-            later = guard.check("gemini", "gemini", analysis_spent_usd=0.019)
+            later = guard.check("gemini", "gemini",
+                                analysis_spent_usd=worst_case)
             self.assertFalse(later["allowed"])
             self.assertEqual(later["reason"], REASON_BUDGET)
             self.assertIn("per-analysis", later["detail"])
+
+    def test_the_estimate_is_the_worst_case_not_an_average(self):
+        """Section 5: the refusal must be made on the largest amount the
+        call could cost, or a cap is breached by exactly the calls it exists
+        to stop."""
+        guard = self.guard()
+        flat = guard.pricing.estimate("grok", "grok")
+        long_prompt = guard.pricing.estimate("grok", "grok",
+                                             prompt_chars=200_000)
+        self.assertGreater(long_prompt["api_cost_usd"], flat["api_cost_usd"])
+        self.assertTrue(flat["worst_case"])
+        self.assertEqual(flat["output_tokens"],
+                         int(CFG.ALPHA_MAX_OUTPUT_TOKENS))
 
     def test_the_provider_hourly_cap_is_per_provider(self):
         guard = self.guard()
@@ -202,7 +216,7 @@ class UsageIsStoredWellEnoughToRecompute(BudgetCase):
         self.assertTrue(row["cost_priced"])
         self.assertAlmostEqual(row["api_cost_usd"], 18.0, places=6)
         self.assertEqual(row["pricing_version"], "2026-09-a")
-        self.assertEqual(row["pricing_asof"], "2026-09-09T00:00:00+00:00")
+        self.assertEqual(row["pricing_asof"], "2026-01-01T00:00:00+00:00")
         self.assertTrue(row["priced_at"])
         self.assertEqual(row["input_per_mtok"], 3.0)
 

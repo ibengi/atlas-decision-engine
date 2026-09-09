@@ -42,12 +42,41 @@ log = logging.getLogger("ALPHA")
 
 #: Secrets, by name only. Their VALUES never appear in this module's output.
 ENV_GROK = "XAI_API_KEY"
-ENV_GEMINI = "GOOGLE_GEMINI_API_KEY"
+#: `GEMINI_API_KEY` is the name the deployment uses; the longer form is
+#: accepted as a fallback so an existing environment keeps working. Both are
+#: read at call time and neither value is ever logged or returned.
+ENV_GEMINI = "GEMINI_API_KEY"
+ENV_GEMINI_FALLBACK = "GOOGLE_GEMINI_API_KEY"
 ENV_OPENAI = "OPENAI_API_KEY"
 
 #: Header names whose values must never be logged or persisted.
 SECRET_HEADERS = frozenset({"authorization", "x-goog-api-key", "api-key",
                             "x-api-key"})
+
+#: Every environment variable whose VALUE is a credential.
+SECRET_ENV_VARS = (ENV_GROK, ENV_GEMINI, ENV_GEMINI_FALLBACK, ENV_OPENAI)
+
+
+def redact(text) -> str:
+    """Remove any live credential VALUE from a string.
+
+    `_safe_body` covers a vendor echoing our header back inside a response
+    body, but that is not the only way a key escapes: a transport, a proxy
+    or a vendor SDK can raise an exception whose message quotes the request
+    -- URL, headers and all -- and that message goes straight into
+    `meta["error"]`, which is returned, logged and printed by the smoke
+    test. Every string leaving this module on the failure path passes
+    through here, so the leak is closed once rather than at each call site.
+
+    Every configured key is stripped, not just this provider's: a shared
+    session or a proxy error can quote a different vendor's header.
+    """
+    out = str(text)
+    for name in SECRET_ENV_VARS:
+        value = os.getenv(name, "").strip()
+        if len(value) >= 8 and value in out:
+            out = out.replace(value, f"<redacted:{name}>")
+    return out
 
 
 class ProviderError(RuntimeError):
@@ -89,16 +118,48 @@ def set_pricing_table(table):
 
 
 def _cost_row(provider: str, model: str, input_tokens: int,
-              output_tokens: int, *, tool_calls: int = 0,
-              search_queries: int = 0, latency_ms: int = 0) -> dict:
-    """A complete section-4 usage row: what was used, what it cost, and
-    under WHICH pricing version -- so the figure can be recomputed later
-    instead of being silently re-priced."""
-    row = pricing_table().price(provider, model, input_tokens, output_tokens)
-    row.update({"tool_calls": int(tool_calls),
-                "search_queries": int(search_queries),
-                "latency_ms": int(latency_ms)})
-    return row
+              output_tokens: int, *, cached_input_tokens: int = 0,
+              tool_calls: int = 0, search_queries: int = 0,
+              latency_ms: int = 0, billed: dict = None) -> dict:
+    """A complete usage row: what was used, what it cost, under WHICH rate
+    card -- and, when the vendor supplied one, what it says it billed.
+
+    Both figures are kept. Preferring ours silently would hide a billing
+    surprise; preferring theirs silently would hide a rate-card error.
+    `reconcile_billed_cost` flags a disagreement instead of resolving it.
+    """
+    from alpha_cost import reconcile_billed_cost
+    row = pricing_table().price(
+        provider, model, input_tokens, output_tokens,
+        cached_input_tokens=cached_input_tokens, tool_calls=tool_calls,
+        search_queries=search_queries)
+    row["latency_ms"] = int(latency_ms)
+    return reconcile_billed_cost(row, billed or {})
+
+
+def _xai_billed(usage: dict) -> dict:
+    """xAI's authoritative billed amount, from `usage.cost_in_usd_ticks`.
+
+    The RAW tick count is always recorded. A USD figure is derived only when
+    `ALPHA_XAI_COST_TICKS_PER_USD` is configured, because the tick
+    denomination is not something this repository can verify and a factor-of
+    -ten error would misprice every call. Recording the raw value keeps the
+    evidence; refusing to convert keeps the arithmetic honest.
+    """
+    ticks = usage.get("cost_in_usd_ticks")
+    if not isinstance(ticks, (int, float)) or isinstance(ticks, bool):
+        return {}
+    out = {"billed_cost_raw": {"unit": "cost_in_usd_ticks", "value": ticks},
+           "billed_cost_source": "xai.usage.cost_in_usd_ticks"}
+    scale = float(CFG.ALPHA_XAI_COST_TICKS_PER_USD)
+    if scale > 0:
+        out["billed_cost_usd"] = round(float(ticks) / scale, 10)
+    else:
+        out["billed_cost_note"] = (
+            "ALPHA_XAI_COST_TICKS_PER_USD is unset, so the tick count is "
+            "recorded but not converted; set it once a real call lets you "
+            "compute ticks / estimated-USD")
+    return out
 
 
 def build_prompt(snapshot: MarketSnapshot) -> str:
@@ -204,7 +265,7 @@ class AlphaProvider:
         for marker in SECRET_HEADERS:
             if marker in lowered:
                 return "<redacted: body referenced an authorization header>"
-        return text[:200]
+        return redact(text[:200])
 
     def analyze(self, snapshot: MarketSnapshot, timeout: float) -> tuple:
         """(raw_text_or_None, meta). Measures latency and token cost.
@@ -224,20 +285,23 @@ class AlphaProvider:
             response = self._call(build_prompt(snapshot), timeout)
             text, usage = self._extract(response)
         except ProviderError as e:
-            meta["error"] = str(e)
+            meta["error"] = redact(e)
         except Exception as e:                                # noqa: BLE001
             # A vendor SDK or a transport can raise anything at all. The
-            # dispatcher's isolation guarantee is only as good as this line.
-            meta["error"] = f"{type(e).__name__}: {e}"
+            # dispatcher's isolation guarantee is only as good as this line,
+            # and the message can quote the request headers, so it is
+            # redacted rather than trusted.
+            meta["error"] = redact(f"{type(e).__name__}: {e}")
         else:
             latency = int(round((time.monotonic() - started) * 1000))
             meta["latency_ms"] = latency
             meta["cost"] = _cost_row(
                 self.name, self.model,
                 usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                cached_input_tokens=usage.get("cached_input_tokens", 0),
                 tool_calls=usage.get("tool_calls", 0),
                 search_queries=usage.get("search_queries", 0),
-                latency_ms=latency)
+                latency_ms=latency, billed=usage.get("billed"))
             return text, meta
         latency = int(round((time.monotonic() - started) * 1000))
         meta["latency_ms"] = latency
@@ -295,12 +359,13 @@ class AlphaProvider:
                     and report["reachable"] is not False)
 
 
-class _OpenAICompatible(AlphaProvider):
-    """Shared shape for the chat-completions style APIs.
+class _ChatCompletions(AlphaProvider):
+    """The chat-completions shape.
 
-    xAI publishes an OpenAI-compatible surface, so one implementation
-    covers both. If either vendor diverges, override `_call` in the
-    subclass rather than adding a flag here.
+    Kept as a ready fallback surface: both xAI and OpenAI still publish it,
+    and a vendor-side problem with the Responses API should be one
+    configuration change away from being routed around, not a rewrite. No
+    provider uses it by default.
     """
 
     base_url_attr = None
@@ -326,56 +391,51 @@ class _OpenAICompatible(AlphaProvider):
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("empty completion")
         usage = response.get("usage") or {}
+        details = usage.get("prompt_tokens_details") or {}
         return text, {
             "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "cached_input_tokens": int(details.get("cached_tokens") or 0),
             "output_tokens": int(usage.get("completion_tokens") or 0),
             "tool_calls": len(message.get("tool_calls") or []),
             "search_queries": int(
                 (usage.get("num_sources_used")
                  or usage.get("num_search_queries") or 0)),
+            "billed": _xai_billed(usage),
         }
 
 
-class GrokProvider(_OpenAICompatible):
-    name = "grok"
-    env_key = ENV_GROK
-    base_url_attr = "ALPHA_GROK_BASE_URL"
+class _ResponsesAPI(AlphaProvider):
+    """The Responses-API shape, shared by OpenAI and xAI.
 
-    def default_model(self) -> str:
-        return CFG.ALPHA_GROK_MODEL
+    Both publish `POST /responses` with an `input` field, an `output` array
+    whose message items carry `content[].text`, an `output_text`
+    convenience field, and usage named `input_tokens` / `output_tokens`.
+    One implementation covers both; the vendor-specific parts are the base
+    URL, the path, the model, and how billed cost is reported.
 
-
-class OpenAIProvider(AlphaProvider):
-    """OpenAI through the **Responses API** (`POST /responses`).
-
-    Section 3 asks for the Responses API specifically rather than chat
-    completions, so this is its own adapter rather than a flag on the
-    chat-completions one: the request body (`input`, not `messages`), the
-    output shape (`output[].content[].text`, with an `output_text`
-    convenience field) and the usage field names (`input_tokens` /
-    `output_tokens`, not `prompt_tokens` / `completion_tokens`) all differ.
-
-    The path is configuration (`ALPHA_OPENAI_RESPONSES_PATH`). As with every
-    endpoint in this module, the default is a starting point that must be
-    checked against the vendor's current API reference: this repository
-    cannot verify it, and a wrong shape shows up as a provider failure --
+    As everywhere in this module the defaults are STARTING POINTS this
+    repository cannot verify. A wrong shape produces a provider failure --
     an EXCLUDED signal, never a probability.
     """
 
-    name = "openai"
-    env_key = ENV_OPENAI
+    base_url_attr = None
+    path_attr = None
 
-    def default_model(self) -> str:
-        return CFG.ALPHA_OPENAI_MODEL
+    def _billed(self, usage: dict) -> dict:
+        return {}
 
     def _call(self, prompt: str, timeout: float) -> dict:
-        base = CFG.ALPHA_OPENAI_BASE_URL.rstrip("/")
-        path = CFG.ALPHA_OPENAI_RESPONSES_PATH
+        base = getattr(CFG, self.base_url_attr).rstrip("/")
+        path = getattr(CFG, self.path_attr)
         return self._post(
             f"{base}{path if path.startswith('/') else '/' + path}",
             headers={"Authorization": f"Bearer {self._api_key()}",
                      "Content-Type": "application/json"},
-            payload={"model": self.model, "input": prompt},
+            payload={"model": self.model, "input": prompt,
+                     # The budget was checked against this ceiling, so the
+                     # provider is held to it rather than trusted to be
+                     # typical.
+                     "max_output_tokens": int(CFG.ALPHA_MAX_OUTPUT_TOKENS)},
             timeout=timeout)
 
     def _extract(self, response: dict) -> tuple:
@@ -386,6 +446,14 @@ class OpenAIProvider(AlphaProvider):
             detail = ((response.get("error") or {}).get("message")
                       if isinstance(response.get("error"), dict) else "")
             raise ProviderError(f"response status {status}: {detail}"[:200])
+        if status == "incomplete":
+            reason = ((response.get("incomplete_details") or {}).get("reason")
+                      if isinstance(response.get("incomplete_details"), dict)
+                      else "")
+            # A truncated answer is not a partial probability: the JSON will
+            # not parse, and pretending otherwise is how half an opinion
+            # becomes a whole one.
+            raise ProviderError(f"response incomplete: {reason}"[:200])
         text = response.get("output_text")
         tool_calls = 0
         if not isinstance(text, str) or not text.strip():
@@ -396,8 +464,7 @@ class OpenAIProvider(AlphaProvider):
                 if not isinstance(item, dict):
                     continue
                 if item.get("type") and item.get("type") != "message":
-                    # reasoning items, tool calls, web searches
-                    tool_calls += 1
+                    tool_calls += 1          # reasoning, tool and search items
                     continue
                 for chunk in item.get("content") or []:
                     if isinstance(chunk, dict) and isinstance(
@@ -407,12 +474,47 @@ class OpenAIProvider(AlphaProvider):
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("empty completion")
         usage = response.get("usage") or {}
+        details = usage.get("input_tokens_details") or {}
         return text, {
             "input_tokens": int(usage.get("input_tokens") or 0),
+            "cached_input_tokens": int(details.get("cached_tokens") or 0),
             "output_tokens": int(usage.get("output_tokens") or 0),
             "tool_calls": tool_calls,
             "search_queries": 0,
+            "billed": self._billed(usage),
         }
+
+
+class OpenAIProvider(_ResponsesAPI):
+    """OpenAI through the Responses API."""
+
+    name = "openai"
+    env_key = ENV_OPENAI
+    base_url_attr = "ALPHA_OPENAI_BASE_URL"
+    path_attr = "ALPHA_OPENAI_RESPONSES_PATH"
+
+    def default_model(self) -> str:
+        return CFG.ALPHA_OPENAI_MODEL
+
+
+class GrokProvider(_ResponsesAPI):
+    """xAI through its Responses API.
+
+    Preferred over the chat-completions surface because it is where xAI
+    reports `usage.cost_in_usd_ticks` -- an authoritative billed amount,
+    which is better evidence than any token estimate of ours.
+    """
+
+    name = "grok"
+    env_key = ENV_GROK
+    base_url_attr = "ALPHA_GROK_BASE_URL"
+    path_attr = "ALPHA_GROK_RESPONSES_PATH"
+
+    def default_model(self) -> str:
+        return CFG.ALPHA_GROK_MODEL
+
+    def _billed(self, usage: dict) -> dict:
+        return _xai_billed(usage)
 
 
 class GeminiProvider(AlphaProvider):
@@ -426,6 +528,17 @@ class GeminiProvider(AlphaProvider):
     def default_model(self) -> str:
         return CFG.ALPHA_GEMINI_MODEL
 
+    def configured(self) -> bool:
+        return bool(os.getenv(ENV_GEMINI, "").strip()
+                    or os.getenv(ENV_GEMINI_FALLBACK, "").strip())
+
+    def _api_key(self) -> str:
+        key = (os.getenv(ENV_GEMINI, "").strip()
+               or os.getenv(ENV_GEMINI_FALLBACK, "").strip())
+        if not key:
+            raise ProviderError(f"{ENV_GEMINI} is not set")
+        return key
+
     def _call(self, prompt: str, timeout: float) -> dict:
         base = CFG.ALPHA_GEMINI_BASE_URL.rstrip("/")
         return self._post(
@@ -433,7 +546,10 @@ class GeminiProvider(AlphaProvider):
             headers={"x-goog-api-key": self._api_key(),
                      "Content-Type": "application/json"},
             payload={"contents": [{"parts": [{"text": prompt}]}],
-                     "generationConfig": {"responseMimeType": "application/json"}},
+                     "generationConfig": {
+                         "responseMimeType": "application/json",
+                         # Held to the ceiling the budget was checked against.
+                         "maxOutputTokens": int(CFG.ALPHA_MAX_OUTPUT_TOKENS)}},
             timeout=timeout)
 
     def _extract(self, response: dict) -> tuple:
@@ -450,9 +566,14 @@ class GeminiProvider(AlphaProvider):
         grounding = (candidates[0] or {}).get("groundingMetadata") or {}
         return text, {
             "input_tokens": int(usage.get("promptTokenCount") or 0),
-            "output_tokens": int(usage.get("candidatesTokenCount") or 0),
+            "cached_input_tokens": int(usage.get("cachedContentTokenCount") or 0),
+            # Thinking tokens are billed at the output rate, so they are
+            # counted as output rather than quietly omitted.
+            "output_tokens": int((usage.get("candidatesTokenCount") or 0)
+                                 + (usage.get("thoughtsTokenCount") or 0)),
             "tool_calls": len((candidates[0] or {}).get("toolCalls") or []),
             "search_queries": len(grounding.get("webSearchQueries") or []),
+            "billed": {},
         }
 
 
@@ -538,7 +659,9 @@ class AtlasQuantProvider(AlphaProvider):
                 "invalidation_triggers": [], "assumptions": [],
                 **body})
         except Exception as e:                                # noqa: BLE001
-            meta["error"] = f"{type(e).__name__}: {e}"
+            # In-process and credential-free, but the redaction is uniform
+            # so no failure path in this module is the exception.
+            meta["error"] = redact(f"{type(e).__name__}: {e}")
         latency = int(round((time.monotonic() - started) * 1000))
         meta["latency_ms"] = latency
         meta["cost"]["latency_ms"] = latency

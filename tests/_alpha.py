@@ -103,6 +103,35 @@ class FakeProvider(AlphaProvider):
         return (payload if isinstance(payload, str) else json.dumps(payload)), meta
 
 
+def write_pricing(path, *, rates=(3.0, 15.0), models=("grok", "gemini",
+                                                       "openai",
+                                                       "atlas_quant"),
+                  version="test-1", effective_from="2026-01-01T00:00:00+00:00",
+                  effective_until=None, cached=None):
+    """An `atlas-alpha-pricing-v2` rate card file for tests.
+
+    Each entry of `models` is either a provider name -- the model id then
+    defaults to that name, which is what the in-process doubles report -- or
+    an explicit ``(provider, model)`` pair, which is what a case driving a
+    REAL adapter needs, because a real adapter reports its configured model
+    id (`grok-4.6`) and the budget guard looks the card up by that id.
+    """
+    pairs = [(m, m) if isinstance(m, str) else tuple(m) for m in models]
+    entries = [{"provider": provider,
+                "model": model,
+                "input_per_mtok": rates[0], "output_per_mtok": rates[1],
+                "cached_input_per_mtok": cached,
+                "tool_call_usd": None, "search_query_usd": None,
+                "currency": "USD", "effective_from": effective_from,
+                "effective_until": effective_until,
+                "source": "test fixture", "notes": ""}
+               for provider, model in pairs]
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"schema": "atlas-alpha-pricing-v2", "version": version,
+                   "entries": entries}, fh)
+    return path
+
+
 def http_session(response_body, *, status=200, raises=None):
     """A synthetic `requests`-like session. Never opens a socket."""
 
@@ -139,8 +168,8 @@ def http_session(response_body, *, status=200, raises=None):
 class AlphaCase(unittest.TestCase):
     """Isolated DATA_DIR, deterministic config, no provider credentials."""
 
-    ENV_KEYS = ("XAI_API_KEY", "GOOGLE_GEMINI_API_KEY", "OPENAI_API_KEY",
-                "ALPHA_GATEWAY_ENABLED")
+    ENV_KEYS = ("XAI_API_KEY", "GEMINI_API_KEY", "GOOGLE_GEMINI_API_KEY",
+                "OPENAI_API_KEY", "ALPHA_GATEWAY_ENABLED")
 
     def setUp(self):
         self._saved_env = {k: os.environ.get(k) for k in self.ENV_KEYS}
