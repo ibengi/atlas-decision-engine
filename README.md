@@ -10,6 +10,27 @@ capital effectif, et exécution démo avec confirmation des fills par l'API.
 > constitue un conseil financier. Le mode LIVE est verrouillé par défaut
 > (`NO_LIVE_PROMOTION=1`) et exige des confirmations explicites multiples.
 
+## AI Alpha Gateway (shadow only)
+
+An optional subsystem that asks Grok, Gemini, OpenAI and an Atlas
+quantitative model for independent probability estimates, combines them
+through a Meta Alpha Engine, and measures whether the ensemble produces
+cost-adjusted edge against Kalshi prices.
+
+**It cannot trade.** It holds no broker client, no order manager and no risk
+manager; no `alpha_*` module imports the execution path and no execution
+module imports it, both enforced by AST inspection in
+`tests/test_alpha_safety_boundary.py`. None of its eight terminal states
+means TRADE. It is off by default (`ALPHA_GATEWAY_ENABLED`, strict
+fail-closed) because enabling it starts paid third-party API calls.
+
+    python tools/alpha_shadow_run.py analyze --input candidates.json
+    python tools/alpha_shadow_run.py metrics
+
+Design: [`docs/design/alpha-gateway.md`](docs/design/alpha-gateway.md).
+Provider endpoints and model ids are **unverified defaults** — check them
+against each vendor's current API reference before enabling anything.
+
 ## Architecture
 
 ```

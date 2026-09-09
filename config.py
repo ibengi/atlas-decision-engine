@@ -358,6 +358,71 @@ class Config:
     EQUITY_FLOW_EPS          = _env_f("EQUITY_FLOW_EPS", 0.01)
     EQUITY_FLOW_EPS_PER_TRADE = _env_f("EQUITY_FLOW_EPS_PER_TRADE", 0.005)
     EQUITY_LEDGER_FILE = "equity_ledger.json"
+
+    # ── AI Alpha Gateway v1 (docs/design/alpha-gateway.md) ───────────────
+    # SHADOW ONLY. Nothing under this heading can authorize a broker write,
+    # a size, a price or CAPITAL: the gateway has no execution path, and
+    # `tests/test_alpha_safety_boundary.py` proves it structurally.
+    #
+    # OFF by default. Enabling it starts READ-ONLY analysis and a shadow
+    # ledger; it never starts trading.
+    ALPHA_GATEWAY_ENABLED = _env_gate("ALPHA_GATEWAY_ENABLED", default=False)
+    #: Horizon boundaries that pick the latency class (seconds to expected
+    #: resolution). Configuration, not constants: section 5.
+    ALPHA_FAST_HORIZON_S   = _env_f("ALPHA_FAST_HORIZON_S", 900.0)      # 15 min
+    ALPHA_MEDIUM_HORIZON_S = _env_f("ALPHA_MEDIUM_HORIZON_S", 21600.0)  # 6 h
+    #: How long models may think, per class. A model answering after its
+    #: deadline is STALE and excluded -- never merged late.
+    ALPHA_DEADLINE_FAST_S   = _env_f("ALPHA_DEADLINE_FAST_S", 8.0)
+    ALPHA_DEADLINE_MEDIUM_S = _env_f("ALPHA_DEADLINE_MEDIUM_S", 45.0)
+    ALPHA_DEADLINE_DEEP_S   = _env_f("ALPHA_DEADLINE_DEEP_S", 240.0)
+    #: Safety margin before a known catalyst. A signal must not survive an
+    #: information event it did not see.
+    ALPHA_CATALYST_BUFFER_S = _env_f("ALPHA_CATALYST_BUFFER_S", 60.0)
+    #: Bootstrap ensemble policy. No single LLM may dominate before its
+    #: calibration history exists, and the floor keeps a provider that is
+    #: merely unlucky early from being weighted out of existence.
+    ALPHA_MAX_MODEL_WEIGHT  = _env_f("ALPHA_MAX_MODEL_WEIGHT", 0.40)
+    ALPHA_MIN_MODEL_WEIGHT  = _env_f("ALPHA_MIN_MODEL_WEIGHT", 0.05)
+    #: Below this many resolved predictions a model's own calibration is not
+    #: yet evidence; its weight stays at the bootstrap prior.
+    ALPHA_CALIBRATION_MIN_SAMPLES = _env_i("ALPHA_CALIBRATION_MIN_SAMPLES", 100)
+    #: At least this many valid model signals, or the opportunity is
+    #: INSUFFICIENT_DATA. Missing is never 0.5.
+    ALPHA_MIN_VALID_MODELS  = _env_i("ALPHA_MIN_VALID_MODELS", 2)
+    #: Dispersion (population stdev of valid p_yes) at or above which the
+    #: opportunity is reported as MODEL_DISAGREEMENT.
+    ALPHA_DISAGREEMENT_MAX  = _env_f("ALPHA_DISAGREEMENT_MAX", 0.15)
+    #: Ensemble confidence needed to call a positive edge HIGH_CONFIDENCE.
+    ALPHA_HIGH_CONFIDENCE   = _env_f("ALPHA_HIGH_CONFIDENCE", 0.60)
+    #: Shadow cost model. Every one of these is an ESTIMATE used only to
+    #: decide whether an edge would have survived costs; none of them prices
+    #: a real order, because no real order exists in v1.
+    ALPHA_FEE_RATE          = _env_f("ALPHA_FEE_RATE", 0.01)
+    ALPHA_SLIPPAGE_RATE     = _env_f("ALPHA_SLIPPAGE_RATE", 0.005)
+    ALPHA_UNCERTAINTY_K     = _env_f("ALPHA_UNCERTAINTY_K", 0.25)
+    ALPHA_LATENCY_PENALTY_K = _env_f("ALPHA_LATENCY_PENALTY_K", 0.02)
+    #: Notional used to turn a per-contract inference cost into a per-unit
+    #: edge penalty. Shadow accounting only.
+    ALPHA_SHADOW_NOTIONAL_USD = _env_f("ALPHA_SHADOW_NOTIONAL_USD", 10.0)
+    #: Provider endpoints and models. Defaults are STARTING POINTS and must
+    #: be verified against each provider's current documentation before the
+    #: gateway is enabled anywhere: this repository cannot confirm them.
+    ALPHA_GROK_BASE_URL   = os.getenv("ALPHA_GROK_BASE_URL", "https://api.x.ai/v1")
+    ALPHA_GROK_MODEL      = os.getenv("ALPHA_GROK_MODEL", "grok-4")
+    ALPHA_OPENAI_BASE_URL = os.getenv("ALPHA_OPENAI_BASE_URL", "https://api.openai.com/v1")
+    ALPHA_OPENAI_MODEL    = os.getenv("ALPHA_OPENAI_MODEL", "gpt-5")
+    ALPHA_GEMINI_BASE_URL = os.getenv("ALPHA_GEMINI_BASE_URL",
+                                      "https://generativelanguage.googleapis.com/v1beta")
+    ALPHA_GEMINI_MODEL    = os.getenv("ALPHA_GEMINI_MODEL", "gemini-2.5-pro")
+    #: Inference price per MILLION tokens. Left at 0.0 deliberately: a made-up
+    #: price is worse than a missing one, because it silently changes the
+    #: net-alpha verdict. Ledger rows carry `cost_priced=false` until an
+    #: operator sets the real rates, and the metrics report says so.
+    ALPHA_PRICE_IN_PER_MTOK  = _env_f("ALPHA_PRICE_IN_PER_MTOK", 0.0)
+    ALPHA_PRICE_OUT_PER_MTOK = _env_f("ALPHA_PRICE_OUT_PER_MTOK", 0.0)
+    ALPHA_LEDGER_FILE = "alpha_calibration_ledger.jsonl"
+    ALPHA_COST_FILE   = "alpha_cost_ledger.jsonl"
     # Portes edge/EV du pipeline (voir strategy_router.GateConfig)
     MIN_MODEL_CONFIDENCE  = _env_i("MIN_MODEL_CONFIDENCE", 6)
     MIN_GROSS_EDGE        = _env_f("MIN_GROSS_EDGE", 0.05)
