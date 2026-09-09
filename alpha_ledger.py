@@ -38,7 +38,16 @@ LEDGER_SCHEMA = "atlas-alpha-ledger-v1"
 ROW_PREDICTION = "PREDICTION"
 ROW_RESOLUTION = "RESOLUTION"
 ROW_COST = "COST"
-ROW_KINDS = (ROW_PREDICTION, ROW_RESOLUTION, ROW_COST)
+#: Phase 2, section 7. A probability estimated BEFORE a scheduled
+#: information event may not stay actionable in shadow scoring after it. The
+#: invalidation is a NEW row, like a resolution: the prediction itself is
+#: never edited, so "what we thought at the time" and "when it stopped
+#: counting" remain separately auditable.
+ROW_INVALIDATION = "INVALIDATION"
+#: Section 8. A follow-up price observation at a configured interval.
+ROW_OBSERVATION = "OBSERVATION"
+ROW_KINDS = (ROW_PREDICTION, ROW_RESOLUTION, ROW_COST, ROW_INVALIDATION,
+             ROW_OBSERVATION)
 
 
 class LedgerError(RuntimeError):
@@ -185,6 +194,90 @@ class AlphaLedger:
             "resolved_at": resolved_at or _now_iso(),
             "resolution_source": source})
 
+    # ── section 7: catalyst invalidation ────────────────────────────────
+    def invalidate(self, prediction_id: str, reason: str,
+                   detail: str = "") -> dict:
+        """Mark a prediction non-actionable from now on.
+
+        Idempotent: invalidating twice is a no-op returning the first row,
+        because the moment a signal stopped counting is a fact, not a
+        counter.
+        """
+        existing = self.find_invalidation(prediction_id)
+        if existing is not None:
+            return existing
+        if self.find_prediction(prediction_id) is None:
+            raise LedgerError(f"unknown prediction {prediction_id}")
+        return self.log.append({
+            "schema": LEDGER_SCHEMA, "kind": ROW_INVALIDATION,
+            "at": _now_iso(), "prediction_id": prediction_id,
+            "reason": str(reason), "detail": str(detail)[:300]})
+
+    def invalidations(self) -> dict:
+        out = {}
+        for row in self.rows():
+            if row.get("kind") == ROW_INVALIDATION:
+                out.setdefault(row.get("prediction_id"), row)
+        return out
+
+    def find_invalidation(self, prediction_id: str):
+        return self.invalidations().get(prediction_id)
+
+    def sweep_catalysts(self, now=None) -> list:
+        """Invalidate every open prediction whose catalyst has passed.
+
+        Called on each service cycle. Only predictions that are still
+        unresolved and not already invalidated are touched: a resolved
+        prediction is history, and history is not rewritten.
+        """
+        now = now or datetime.now(timezone.utc)
+        resolved = self.resolutions()
+        invalid = self.invalidations()
+        out = []
+        for prediction in self.predictions():
+            pid = prediction.get("prediction_id")
+            if pid in resolved or pid in invalid:
+                continue
+            catalyst = ((prediction.get("snapshot") or {})
+                        .get("next_known_catalyst") or {})
+            when = catalyst.get("time_utc")
+            if not when:
+                continue
+            try:
+                from alpha_snapshot import parse_utc
+                catalyst_at = parse_utc(when, field_name="catalyst time")
+            except Exception:                                 # noqa: BLE001
+                continue
+            if now >= catalyst_at:
+                out.append(self.invalidate(
+                    pid, "catalyst_occurred",
+                    f"{catalyst.get('name') or 'catalyst'} at {when} has "
+                    f"passed; the estimate did not see it"))
+        return out
+
+    # ── section 8: follow-up price observations ─────────────────────────
+    def record_observation(self, prediction_id: str, *, interval_s,
+                           quote: dict, at=None) -> dict:
+        """One post-analysis price sample. Append-only like everything else.
+
+        Idempotent per (prediction, interval): a service restart must not
+        record the same interval twice and skew the latency-decay series.
+        """
+        for row in self.observations(prediction_id):
+            if row.get("interval_s") == interval_s:
+                return row
+        return self.log.append({
+            "schema": LEDGER_SCHEMA, "kind": ROW_OBSERVATION,
+            "at": at or _now_iso(), "prediction_id": prediction_id,
+            "interval_s": interval_s,
+            "quote": dict(quote) if isinstance(quote, dict) else None})
+
+    def observations(self, prediction_id: str = None) -> list:
+        return [r for r in self.rows()
+                if r.get("kind") == ROW_OBSERVATION
+                and (prediction_id is None
+                     or r.get("prediction_id") == prediction_id)]
+
     # ── reading ─────────────────────────────────────────────────────────
     def rows(self) -> list:
         return self.log.rows()
@@ -217,6 +310,10 @@ class AlphaLedger:
         read time. Derived, never stored: a stored score is a score that can
         drift from the prediction it grades."""
         outcomes = self.resolutions()
+        invalidations = self.invalidations()
+        observations = {}
+        for row in self.observations():
+            observations.setdefault(row.get("prediction_id"), []).append(row)
         joined = []
         for prediction in self.predictions():
             resolution = outcomes.get(prediction.get("prediction_id"))
@@ -225,9 +322,26 @@ class AlphaLedger:
             row = dict(prediction)
             row["actual_outcome"] = int(resolution["actual_outcome"])
             row["resolved_at"] = resolution.get("resolved_at")
+            invalidation = invalidations.get(prediction.get("prediction_id"))
+            row["invalidated"] = bool(invalidation)
+            row["invalidation_reason"] = (invalidation or {}).get("reason")
+            row["observations"] = [
+                {"interval_s": o.get("interval_s"), "quote": o.get("quote")}
+                for o in observations.get(prediction.get("prediction_id"), [])]
             row.update(score_prediction(prediction, row["actual_outcome"]))
             joined.append(row)
         return joined
+
+    def actionable_resolved(self) -> list:
+        """Resolved predictions that were still valid when they resolved.
+
+        Section 7: an estimate made before a catalyst it never saw must not
+        be scored as though it were actionable. It stays in the ledger and in
+        `resolved()` -- it is evidence about the model -- but it is excluded
+        from the actionable series, and `metrics()` reports both so the gap
+        is visible rather than assumed away.
+        """
+        return [r for r in self.resolved() if not r.get("invalidated")]
 
     # ── calibration lookup used by the Meta engine (section 8) ──────────
     def calibration(self, model: str, category: str = None):
@@ -260,6 +374,13 @@ class AlphaLedger:
             "predictions_resolved": len(rows),
             "cost_priced": priced,
             "ensemble": _score_group(rows, lambda r: r.get("p_meta")),
+            # Section 7: the same series with catalyst-invalidated estimates
+            # removed. Reported ALONGSIDE, never instead: a large gap between
+            # the two is itself the finding about latency and event risk.
+            "ensemble_actionable": _score_group(
+                self.actionable_resolved(), lambda r: r.get("p_meta")),
+            "invalidated_predictions": len(self.invalidations()),
+            "observations_recorded": len(self.observations()),
             "by_model": {}, "by_category": {}, "by_horizon": {},
             "by_latency_class": {}, "by_confidence_bucket": {},
             "provider_failure_rate": _failure_rates(cost_rows),

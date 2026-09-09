@@ -30,6 +30,7 @@ NO STATE PRODUCED BY THE GATEWAY MEANS TRADE
 import ast
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _alpha import AlphaCase, FakeProvider                    # noqa: E402
@@ -148,6 +149,132 @@ class TheGatewayCannotReachTheBroker(AlphaCase):
                         offences.append(f"{name}:{node.lineno} imports "
                                         f"{imported}")
         self.assertEqual(offences, [], "\n".join(offences))
+
+
+class TheAutomaticFeedIntroducesNoPath(AlphaCase):
+    """Phase 2, section 12. The feed added a producer inside the engine and a
+    consumer inside the service; neither may create a path between them.
+
+    The boundary is one neutral module (`research_feed`) plus a directory.
+    These cases pin exactly that: the engine may reach the boundary module,
+    the boundary module may reach neither subsystem, and the Alpha side may
+    still reach nothing that trades.
+    """
+
+    def test_the_boundary_module_imports_neither_subsystem(self):
+        tree = ast.parse(open(os.path.join(REPO, "research_feed.py"),
+                              encoding="utf-8").read())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        self.assertEqual(imported,
+                         {"hashlib", "json", "logging", "os", "time", "config"})
+        self.assertFalse([m for m in imported if m.startswith("alpha_")])
+        self.assertFalse(imported & FORBIDDEN_MODULES)
+
+    def test_the_boundary_module_names_no_execution_function(self):
+        tree = ast.parse(open(os.path.join(REPO, "research_feed.py"),
+                              encoding="utf-8").read())
+        offences = [f"line {n.lineno}: .{n.attr}" for n in ast.walk(tree)
+                    if isinstance(n, ast.Attribute) and n.attr in FORBIDDEN_NAMES]
+        self.assertEqual(offences, [])
+
+    def test_the_new_alpha_modules_are_covered_by_the_deny_list(self):
+        """Discovery, not a list: `alpha_consumer`, `alpha_service`,
+        `alpha_cost` and `alpha_telemetry` are checked the moment they
+        exist."""
+        for name in ("alpha_consumer.py", "alpha_service.py",
+                     "alpha_cost.py", "alpha_telemetry.py"):
+            self.assertIn(name, ALPHA_MODULES)
+
+    def test_the_service_holds_no_broker_client_and_no_order_manager(self):
+        from alpha_service import AlphaShadowService
+        service = AlphaShadowService(providers=self.agreeing_providers(),
+                                     ledger=AlphaLedger())
+        for attribute in ("client", "orders", "order_manager", "posmgr",
+                          "risk", "engine", "equity", "broker"):
+            self.assertFalse(hasattr(service, attribute),
+                             f"AlphaShadowService holds a {attribute}")
+
+    def test_the_service_reaches_the_broker_zero_times(self):
+        """A full automatic cycle: emit, consume, analyse, observe."""
+        from alpha_service import AlphaShadowService
+        from research_feed import ResearchFeed, candidate_from_market
+        broker = _BrokerTripwire()
+        with patch.object(CFG, "RESEARCH_FEED_ENABLED", True):
+            now = datetime.now(timezone.utc)
+            ResearchFeed().emit_candidate(candidate_from_market(
+                {"ticker": "KX-SAFE", "title": "q", "volume": 1,
+                 "open_interest": 1,
+                 "close_time": (now + timedelta(hours=3)).isoformat(),
+                 "expiration_time": (now + timedelta(hours=4)).isoformat()},
+                {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}))
+            service = AlphaShadowService(
+                providers=self.agreeing_providers(), ledger=AlphaLedger(),
+                quote_fn=lambda: {"yes_bid": 0.44, "yes_ask": 0.46,
+                                  "no_bid": 0.54, "no_ask": 0.56})
+            summary = service.cycle()
+        self.assertEqual(len(summary["analyzed"]), 1)
+        self.assertEqual(broker.mutations, 0)
+        self.assertIn(summary["analyzed"][0]["state"], SHADOW_STATES)
+
+    def test_the_consumer_cannot_mutate_scanner_or_execution_state(self):
+        """It writes exactly one file: its own processed-status ledger."""
+        from alpha_consumer import STATUS_ANALYZED, SpoolConsumer
+        from research_feed import ResearchFeed, candidate_from_market, spool_dir
+        with patch.object(CFG, "RESEARCH_FEED_ENABLED", True):
+            now = datetime.now(timezone.utc)
+            ResearchFeed().emit_candidate(candidate_from_market(
+                {"ticker": "KX-RO", "title": "q", "volume": 1,
+                 "open_interest": 1,
+                 "close_time": (now + timedelta(hours=3)).isoformat(),
+                 "expiration_time": (now + timedelta(hours=4)).isoformat()},
+                {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}))
+            spool_before = {n: open(os.path.join(spool_dir(), n), "rb").read()
+                            for n in sorted(os.listdir(spool_dir()))}
+            before = set(os.listdir(self._tmp))
+            consumer = SpoolConsumer()
+            for snapshot, _ in consumer.pending():
+                consumer.store.mark(snapshot.market_snapshot_id,
+                                    STATUS_ANALYZED)
+            after = set(os.listdir(self._tmp))
+        spool_after = {n: open(os.path.join(spool_dir(), n), "rb").read()
+                       for n in sorted(os.listdir(spool_dir()))}
+        self.assertEqual(spool_after, spool_before)
+        self.assertEqual(after - before, {CFG.ALPHA_STATE_FILE})
+
+    def test_the_engine_side_imports_only_the_neutral_module(self):
+        tree = ast.parse(open(os.path.join(REPO, "execution_engine.py"),
+                              encoding="utf-8").read())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        self.assertIn("research_feed", imported)
+        self.assertEqual([m for m in imported if m.startswith("alpha_")], [])
+
+    def test_no_risk_or_order_module_imports_the_research_feed_either(self):
+        """The producer belongs to the cycle observer, not to risk or
+        execution decision-making."""
+        import ast as _ast
+        for name in ("order_manager.py", "risk_manager.py",
+                     "position_manager.py", "position_sizer.py"):
+            tree = _ast.parse(open(os.path.join(REPO, name),
+                                   encoding="utf-8").read())
+            imported = set()
+            for node in _ast.walk(tree):
+                if isinstance(node, _ast.Import):
+                    imported.update(a.name.split(".")[0] for a in node.names)
+                elif isinstance(node, _ast.ImportFrom):
+                    imported.add((node.module or "").split(".")[0])
+            self.assertNotIn("research_feed", imported, name)
+            self.assertFalse([m for m in imported if m.startswith("alpha_")],
+                             name)
 
 
 class NoStateMeansTrade(AlphaCase):

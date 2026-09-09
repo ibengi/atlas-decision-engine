@@ -409,12 +409,17 @@ class Config:
     #: be verified against each provider's current documentation before the
     #: gateway is enabled anywhere: this repository cannot confirm them.
     ALPHA_GROK_BASE_URL   = os.getenv("ALPHA_GROK_BASE_URL", "https://api.x.ai/v1")
-    ALPHA_GROK_MODEL      = os.getenv("ALPHA_GROK_MODEL", "grok-4")
+    ALPHA_GROK_MODEL      = os.getenv("ALPHA_GROK_MODEL", "grok-4.6")
     ALPHA_OPENAI_BASE_URL = os.getenv("ALPHA_OPENAI_BASE_URL", "https://api.openai.com/v1")
     ALPHA_OPENAI_MODEL    = os.getenv("ALPHA_OPENAI_MODEL", "gpt-5")
+    #: OpenAI is called through the Responses API (`/responses`),
+    #: not chat completions. The path is configurable so a future
+    #: surface change does not need a code edit.
+    ALPHA_OPENAI_RESPONSES_PATH = os.getenv(
+        "ALPHA_OPENAI_RESPONSES_PATH", "/responses")
     ALPHA_GEMINI_BASE_URL = os.getenv("ALPHA_GEMINI_BASE_URL",
                                       "https://generativelanguage.googleapis.com/v1beta")
-    ALPHA_GEMINI_MODEL    = os.getenv("ALPHA_GEMINI_MODEL", "gemini-2.5-pro")
+    ALPHA_GEMINI_MODEL    = os.getenv("ALPHA_GEMINI_MODEL", "gemini-3.7-flash")
     #: Inference price per MILLION tokens. Left at 0.0 deliberately: a made-up
     #: price is worse than a missing one, because it silently changes the
     #: net-alpha verdict. Ledger rows carry `cost_priced=false` until an
@@ -423,6 +428,65 @@ class Config:
     ALPHA_PRICE_OUT_PER_MTOK = _env_f("ALPHA_PRICE_OUT_PER_MTOK", 0.0)
     ALPHA_LEDGER_FILE = "alpha_calibration_ledger.jsonl"
     ALPHA_COST_FILE   = "alpha_cost_ledger.jsonl"
+
+    # ── Automatic research feed (producer side, ENGINE process) ──────────
+    # OFF by default. When on, the pipeline's existing read-only observer
+    # also writes a plain-JSON candidate record to DATA_DIR/research_spool.
+    # It never raises, never trips the persistence sentinel, and is bounded
+    # so a research spool can never fill the volume the money path needs.
+    RESEARCH_FEED_ENABLED   = _env_gate("RESEARCH_FEED_ENABLED", default=False)
+    RESEARCH_FEED_MAX_SPOOL = _env_i("RESEARCH_FEED_MAX_SPOOL", 500)
+    RESEARCH_FEED_MAX_AGE_S = _env_f("RESEARCH_FEED_MAX_AGE_S", 21600.0)
+    #: Emit at most one candidate per contract per this many seconds. A
+    #: scanner cycle re-evaluates the same tickers repeatedly; without this
+    #: the spool would be almost entirely duplicates and the consumer would
+    #: spend its budget deduplicating instead of analysing.
+    RESEARCH_FEED_MIN_INTERVAL_S = _env_f("RESEARCH_FEED_MIN_INTERVAL_S", 900.0)
+
+    # ── Alpha Shadow Service (consumer side, SEPARATE process) ───────────
+    ALPHA_SPOOL_POLL_S      = _env_f("ALPHA_SPOOL_POLL_S", 15.0)
+    ALPHA_STATE_FILE        = "alpha_processed.jsonl"
+    ALPHA_OBSERVATION_FILE  = "alpha_observations.jsonl"
+    ALPHA_TELEMETRY_FILE    = "alpha_telemetry.json"
+    #: Follow-up price observations after an analysis, in seconds. Measures
+    #: whether AI latency destroys the apparent edge.
+    ALPHA_OBSERVATION_INTERVALS_S = os.getenv(
+        "ALPHA_OBSERVATION_INTERVALS_S", "60,300,900")
+    #: Refuse to start the service if a broker write credential is visible
+    #: in its environment. The Alpha service has no business holding one.
+    ALPHA_REFUSE_BROKER_CREDENTIALS = _env_gate(
+        "ALPHA_REFUSE_BROKER_CREDENTIALS", default=True, on_invalid=True)
+
+    # ── Provider pricing (section 4) ─────────────────────────────────────
+    #: Per MILLION tokens, per provider/model, read from a JSON file so the
+    #: rates can change without a deploy and WITHOUT rewriting history: each
+    #: cost row records the pricing version and timestamp it was priced at,
+    #: and the raw token counts, so any past cycle can be re-costed later.
+    ALPHA_PRICING_FILE    = os.getenv("ALPHA_PRICING_FILE", "alpha_pricing.json")
+    ALPHA_PRICING_VERSION = os.getenv("ALPHA_PRICING_VERSION", "")
+    #: Fail-closed on spend: a provider/model with no configured price is
+    #: NOT called. Unpriced calls would make every budget below unenforceable
+    #: (an unpriced call costs 0, so no cap is ever reached), which is the
+    #: opposite of what a budget is for.
+    ALPHA_ALLOW_UNPRICED_CALLS = _env_gate("ALPHA_ALLOW_UNPRICED_CALLS",
+                                           default=False)
+
+    # ── Cost budgets (section 5) ─────────────────────────────────────────
+    #: 0 disables a cap. Exhaustion is BUDGET_EXHAUSTED and NO provider call:
+    #: a billing limit must never turn into a fabricated probability.
+    ALPHA_MAX_COST_PER_ANALYSIS_USD = _env_f("ALPHA_MAX_COST_PER_ANALYSIS_USD", 0.25)
+    ALPHA_MAX_PROVIDER_COST_PER_HOUR_USD = _env_f(
+        "ALPHA_MAX_PROVIDER_COST_PER_HOUR_USD", 2.00)
+    ALPHA_MAX_COST_PER_DAY_USD = _env_f("ALPHA_MAX_COST_PER_DAY_USD", 20.00)
+    #: Conservative pre-call estimate, since the true token count is only
+    #: known afterwards. Budgets are checked against this BEFORE dispatch.
+    ALPHA_ESTIMATED_INPUT_TOKENS  = _env_i("ALPHA_ESTIMATED_INPUT_TOKENS", 2000)
+    ALPHA_ESTIMATED_OUTPUT_TOKENS = _env_i("ALPHA_ESTIMATED_OUTPUT_TOKENS", 800)
+
+    # ── Provider health checks (section 3) ───────────────────────────────
+    ALPHA_HEALTHCHECK_ENABLED = _env_gate("ALPHA_HEALTHCHECK_ENABLED",
+                                          default=True, on_invalid=True)
+    ALPHA_HEALTHCHECK_TIMEOUT_S = _env_f("ALPHA_HEALTHCHECK_TIMEOUT_S", 10.0)
     # Portes edge/EV du pipeline (voir strategy_router.GateConfig)
     MIN_MODEL_CONFIDENCE  = _env_i("MIN_MODEL_CONFIDENCE", 6)
     MIN_GROSS_EDGE        = _env_f("MIN_GROSS_EDGE", 0.05)

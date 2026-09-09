@@ -54,9 +54,14 @@ STATE_INSUFFICIENT = "INSUFFICIENT_DATA"
 STATE_DISAGREEMENT = "MODEL_DISAGREEMENT"
 STATE_MARKET_MOVED = "MARKET_MOVED"
 STATE_TIMEOUT = "ANALYSIS_TIMEOUT"
+#: Phase 2, section 5. Every provider was refused BEFORE being called, on
+#: spend. Its own state because "we could not afford to ask" is a different
+#: fact from "the models had no opinion", and conflating them would make a
+#: billing problem look like a market observation.
+STATE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 SHADOW_STATES = (STATE_NO_EDGE, STATE_POSITIVE_LOW, STATE_POSITIVE_HIGH,
                  STATE_STALE, STATE_INSUFFICIENT, STATE_DISAGREEMENT,
-                 STATE_MARKET_MOVED, STATE_TIMEOUT)
+                 STATE_MARKET_MOVED, STATE_TIMEOUT, STATE_BUDGET_EXHAUSTED)
 
 #: Not one of these states authorizes anything. Kept as an explicit,
 #: assertable constant so a future state cannot be quietly added as
@@ -82,12 +87,16 @@ class AlphaGateway:
 
     # ── the one public entry point ──────────────────────────────────────
     def analyze(self, snapshot: MarketSnapshot, *, quote_fn=None,
-                record: bool = True) -> dict:
+                record: bool = True, gate=None, on_signal=None) -> dict:
         """Snapshot -> shadow opportunity record.
 
         Never raises for a provider problem and never returns an
         instruction. `record=False` runs the full analysis without touching
         the ledger, for dry runs and for tests that assert immutability.
+
+        `gate` and `on_signal` are passed straight to the dispatcher: the
+        gateway does not interpret spend policy, it only carries it to the
+        place where a provider is about to be called.
         """
         if not isinstance(snapshot, MarketSnapshot):
             raise TypeError("analyze() requires a MarketSnapshot built by "
@@ -98,7 +107,7 @@ class AlphaGateway:
         snapshot.verify()
 
         result = dispatch(snapshot, self.providers, quote_fn=quote_fn,
-                          now_fn=self.now_fn)
+                          now_fn=self.now_fn, gate=gate, on_signal=on_signal)
         now = self.now_fn()
         cost_usd = self.ledger.cycle_cost_usd(result)
         meta = ensemble(result.valid, snapshot, now)
@@ -141,11 +150,16 @@ class AlphaGateway:
         """
         valid = result.valid
         if not valid:
-            timed_out = any(s.rejected_reason in
-                            ("analysis_timeout", "provider_timeout", "stale",
-                             "late_response")
-                            for s in result.excluded)
-            if timed_out:
+            reasons = {s.rejected_reason for s in result.excluded}
+            if reasons and reasons.issubset({"budget_exhausted",
+                                             "pricing_unconfigured"}):
+                # Nobody was asked. Reporting INSUFFICIENT_DATA here would
+                # blame the models for a spend limit.
+                return STATE_BUDGET_EXHAUSTED, (
+                    "every provider was refused before being called: "
+                    + ", ".join(sorted(reasons)))
+            if reasons & {"analysis_timeout", "provider_timeout", "stale",
+                          "late_response"}:
                 return STATE_TIMEOUT, "no model answered before the deadline"
             return STATE_INSUFFICIENT, "no valid model signal"
         if snapshot.is_expired(at=now):

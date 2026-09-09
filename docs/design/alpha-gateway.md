@@ -256,3 +256,144 @@ Two things must be true before those numbers mean anything at all:
 Until both hold, the gateway measures the LLM ensemble against Kalshi
 prices, which is a narrower question than the one at the top of this
 document.
+
+---
+
+# Phase 2 — automatic shadow operation
+
+**Still SHADOW ONLY. CAPITAL AUTHORITY: NONE. BROKER WRITE AUTHORITY: NONE.**
+
+Phase 1 required an operator to hand the gateway a candidate file. Phase 2
+closes the loop: the scanner's own evaluation emits candidates, a separate
+service consumes them, and the calibration ledger fills itself.
+
+## 13. The producer/consumer boundary
+
+```
+ENGINE PROCESS                          ALPHA SHADOW SERVICE PROCESS
+  scanner → pipeline observer             poll research_spool/
+    → research_feed.emit_candidate()        → mint atlas-alpha-v2 snapshot
+      → DATA_DIR/research_spool/*.json      → dedup by market_snapshot_id
+                                            → dispatch / meta / ledger
+                                            → alpha_processed.jsonl
+```
+
+What crosses is plain JSON on a filesystem. The consumer cannot call back.
+
+**The engine does not import the Alpha subsystem.** It imports
+`research_feed`, a module whose entire import list is
+`{hashlib, json, logging, os, time, config}` — pinned by a test. Building
+the snapshot on the producer side would have required the engine to import
+`alpha_snapshot`, and the point of the isolation is that the money path has
+*no* dependency on the research path, not a small one. Provenance survives
+anyway: each record carries `record_sha256` over its own content.
+
+**Authority is a rule about directories.** The producer owns the spool: it
+writes and prunes. The consumer owns its own state file and never writes
+into the spool — asserted by comparing the spool's bytes before and after a
+full consume. The cost is that the consumer cannot delete what it processed,
+so the producer prunes by age and count instead. That is the right trade: a
+consumer that can delete producer files is a consumer that can destroy
+evidence the engine has not finished writing.
+
+**The feed cannot hurt the engine.** It is off by default;
+`emit_candidate` never raises; it never touches `PersistenceSentinel` (a
+failed research write is not a critical persistence failure and must not
+block an order the risk engine approved, nor unblock one); it writes only
+under its own subdirectory; and the spool is bounded by count and age,
+because an unbounded research spool on a shared volume is a slow way to take
+the engine down with ENOSPC.
+
+**Deduplication is by snapshot identity.** Two records describing the same
+market at the same prices at the same second mint the same content-derived
+id; one that differs in any bound field is a genuinely new observation and
+is analysed. The processed set is append-only, so a restart does not
+re-analyse — and re-pay for — work already done.
+
+## 14. The separate service
+
+`tools/alpha_service_run.py` (`health` / `once` / `run` / `telemetry` /
+`resolve`). Deploy it as its own service with `XAI_API_KEY`,
+`GOOGLE_GEMINI_API_KEY`, `OPENAI_API_KEY` and **no broker credential**.
+
+`assert_no_broker_credentials()` refuses to start if any broker key or write
+authority is visible in the environment. The separation is the entire
+argument for a separate process, so it is checked rather than assumed. The
+check reports variable NAMES, never values.
+
+The service holds no broker client, no order manager and no risk manager. It
+receives read-only market data as a *quote function* — a callable returning
+a price dict — so it never holds anything that could place an order even by
+mistake.
+
+## 15. Pricing and budgets
+
+Rates live in `alpha_pricing.json` with a `version` and an `asof`. Every
+cost row records tokens, tool calls, search queries, latency, the rates
+applied, and which pricing version produced the figure — so a past cycle can
+be re-costed with `recost()` when prices change, instead of today's prices
+being silently baked into yesterday's conclusions.
+
+**Every shipped rate is `null`, which means UNKNOWN, not free.** Filling
+them in is an operator action against each vendor's current pricing page;
+this repository cannot verify vendor pricing.
+
+**An unpriced model is not called** (`pricing_unconfigured`). This is not
+pedantry: an unpriced call is costed at zero, so every cap below would be
+unenforceable against it and "daily limit" would silently mean "unlimited".
+`ALPHA_ALLOW_UNPRICED_CALLS` exists for deliberate experiments and defaults
+to off.
+
+Caps: per analysis, per provider per hour, per day. Exhaustion means **no
+provider call** and its own terminal state, `BUDGET_EXHAUSTED` — because
+"we could not afford to ask" is a different fact from "the models had no
+opinion", and reporting the second would blame the models for a billing
+limit. Spend is recomputed from an append-only ledger on every check, so a
+restart cannot reset the daily cap. An unreadable ledger, or a budget gate
+that raises, counts as exhausted: we cannot prove we are under budget, so we
+are not.
+
+The budget guard and the adapters are bound to **one** pricing table per
+process, so the pre-call estimate and the post-call actual are never
+computed from different rates.
+
+## 16. Catalyst invalidation
+
+`sweep_catalysts()` runs every cycle. A prediction whose catalyst has passed
+gets an `INVALIDATION` row — a new row, never an edit — and leaves the
+actionable series. `metrics()` reports `ensemble` and `ensemble_actionable`
+side by side: a large gap between them is itself the finding about latency
+and event risk, and collapsing them would hide it.
+
+## 17. Market movement
+
+Prices are captured at dispatch, at the **first** response, at the **last
+valid** response, at completion, and at configured intervals afterwards
+(`ALPHA_OBSERVATION_INTERVALS_S`, default 60/300/900 s). The first/last
+split is what attributes decay to a slow model rather than to the cycle as a
+whole. An unavailable book is a missing sample, never a price of zero.
+
+## 18. Provider configuration
+
+| Provider | Base URL | Model | Surface |
+|---|---|---|---|
+| xAI | `https://api.x.ai/v1` | `grok-4.6` | chat completions |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta` | `gemini-3.7-flash` | `generateContent` |
+| OpenAI | `https://api.openai.com/v1` | configurable | **Responses API** (`/responses`) |
+
+All configurable; none permanently bound. `health_check()` reports
+configured / priced / reachable per provider at startup. A provider that
+fails is EXCLUDED — never silently substituted with another model — and the
+others carry on, because no single provider is mandatory.
+
+**These defaults remain unverified by this repository.** Model ids and API
+shapes change; check them against each vendor's current reference before
+enabling the service. A wrong endpoint or model produces a provider failure,
+which is an excluded signal, never a probability.
+
+## 19. AtlasQuant stays isolated
+
+Still unwired, still `INSUFFICIENT_EVIDENCE`, still measured separately in
+`by_model`. Its health report distinguishes *wired* from *reachable*: an
+unwired quant model is healthy and produces no opinion, which is the honest
+state rather than a failure.

@@ -1,0 +1,39 @@
+{
+ "schema": "atlas-alpha-pricing-v1",
+ "version": "UNSET",
+ "asof": "",
+ "_readme": [
+  "Per-MILLION-token rates in USD, per provider/model.",
+  "Every rate ships as null, which means UNKNOWN, not free. This repository",
+  "cannot verify vendor pricing and pricing changes, so filling these in is",
+  "an operator action against each vendor's current pricing page.",
+  "While a rate is null the Alpha service REFUSES to call that model",
+  "(reason: pricing_unconfigured), because an unpriced call is costed at",
+  "zero and would make every cost cap unenforceable.",
+  "Set 'version' and 'asof' when you fill the rates: every cost row records",
+  "them, so historical spend can be recomputed under a later table instead",
+  "of being silently repriced."
+ ],
+ "models": {
+  "grok/grok-4.6": {
+   "input_per_mtok": null,
+   "output_per_mtok": null,
+   "notes": "verify against the xAI pricing page"
+  },
+  "gemini/gemini-3.7-flash": {
+   "input_per_mtok": null,
+   "output_per_mtok": null,
+   "notes": "verify against the Google AI pricing page"
+  },
+  "openai/gpt-5": {
+   "input_per_mtok": null,
+   "output_per_mtok": null,
+   "notes": "verify against the OpenAI pricing page"
+  },
+  "atlas_quant/atlas_quant": {
+   "input_per_mtok": 0.0,
+   "output_per_mtok": 0.0,
+   "notes": "in-process, no vendor cost; genuinely zero, not unknown"
+  }
+ }
+}

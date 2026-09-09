@@ -57,12 +57,20 @@ class DispatchResult:
     """Signals plus the observable facts about how they were obtained."""
 
     def __init__(self, signals, dispatched_at, completed_at,
-                 quote_at_dispatch=None, quote_at_completion=None):
+                 quote_at_dispatch=None, quote_at_completion=None,
+                 quote_at_first_response=None,
+                 quote_at_last_valid_response=None):
         self.signals = list(signals)
         self.dispatched_at = dispatched_at
         self.completed_at = completed_at
         self.quote_at_dispatch = quote_at_dispatch
         self.quote_at_completion = quote_at_completion
+        #: Section 8: the price when the FIRST answer landed and when the
+        #: LAST VALID one did. The gap between them is what a slower model
+        #: costs in market movement, which the completion price alone cannot
+        #: attribute.
+        self.quote_at_first_response = quote_at_first_response
+        self.quote_at_last_valid_response = quote_at_last_valid_response
 
     @property
     def valid(self) -> list:
@@ -89,6 +97,8 @@ class DispatchResult:
                           "latency_ms": s.analysis_latency_ms}
                          for s in self.excluded],
             "quote_at_dispatch": self.quote_at_dispatch,
+            "quote_at_first_response": self.quote_at_first_response,
+            "quote_at_last_valid_response": self.quote_at_last_valid_response,
             "quote_at_completion": self.quote_at_completion,
         }
 
@@ -99,11 +109,24 @@ def _remaining_budget(snapshot: MarketSnapshot, now: datetime) -> float:
 
 
 def dispatch(snapshot: MarketSnapshot, providers, *, quote_fn=None,
-             now_fn=None, max_workers: int = None) -> DispatchResult:
+             now_fn=None, max_workers: int = None, gate=None,
+             on_signal=None) -> DispatchResult:
     """Ask every provider at once; collect what arrives before the deadline.
 
-    `quote_fn()` returns the live top-of-book as a dict (section 17). It is
-    a READ. Anything it returns is recorded, never acted on.
+    `quote_fn()` returns the live top-of-book as a dict (section 17/8). It
+    is a READ. Anything it returns is recorded, never acted on. It is
+    sampled at dispatch, at the FIRST response and at the LAST VALID
+    response, so latency decay can be attributed to the moment it happened
+    rather than to the cycle as a whole.
+
+    `gate(provider) -> {"allowed": bool, "reason": str, "detail": str}` is
+    consulted BEFORE each provider is called (phase 2, section 5). A refused
+    provider is never invoked and yields an EXCLUDED signal carrying the
+    refusal reason -- a spend limit must not become a fabricated
+    probability, and it must be distinguishable from a model that had no
+    opinion.
+
+    `on_signal(signal)` is called as each result lands, for telemetry.
     """
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))
     providers = list(providers)
@@ -126,6 +149,8 @@ def dispatch(snapshot: MarketSnapshot, providers, *, quote_fn=None,
                               quote_t0, _safe_quote(quote_fn, "completion"))
 
     signals = []
+    quote_first = {"quote": None}
+    quote_last = {"quote": None}
     workers = max_workers or max(1, len(providers))
     started = time.monotonic()
     # NOT a `with` block. `ThreadPoolExecutor.__exit__` calls
@@ -136,13 +161,37 @@ def dispatch(snapshot: MarketSnapshot, providers, *, quote_fn=None,
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="alpha")
     futures = {}
     try:
-        futures = {pool.submit(_run_one, provider, snapshot, budget, now_fn):
-                   provider for provider in providers}
+        futures = {}
+        for provider in providers:
+            verdict = _gate_verdict(gate, provider)
+            if verdict is not None:
+                # Refused before the call: no vendor is contacted, nothing is
+                # billed, and the signal says which limit stopped it.
+                signals.append(rejected(
+                    provider.name, provider.model, verdict["reason"],
+                    verdict.get("detail", ""),
+                    snapshot_id=snapshot.market_snapshot_id,
+                    contract_id=snapshot.contract_id))
+                continue
+            futures[pool.submit(_run_one, provider, snapshot, budget,
+                                now_fn)] = provider
         try:
             for future in as_completed(futures, timeout=budget):
                 provider = futures[future]
                 try:
-                    signals.append(future.result())
+                    signal = future.result()
+                    signals.append(signal)
+                    if quote_first["quote"] is None:
+                        quote_first["quote"] = _safe_quote(quote_fn,
+                                                           "first response")
+                    if signal.valid:
+                        quote_last["quote"] = _safe_quote(quote_fn,
+                                                          "valid response")
+                    if callable(on_signal):
+                        try:
+                            on_signal(signal)
+                        except Exception as e:                # noqa: BLE001
+                            log.debug(f"on_signal: {e}")
                 except Exception as e:                        # noqa: BLE001
                     # Belt and braces: `_run_one` already catches everything,
                     # so reaching here means the worker itself died. One dead
@@ -187,7 +236,32 @@ def dispatch(snapshot: MarketSnapshot, providers, *, quote_fn=None,
              f"valid={sum(1 for s in signals if s.valid)}/{len(signals)} "
              f"wall_ms={int(round((time.monotonic() - started) * 1000))}")
     return DispatchResult(signals, dispatched_at, completed_at,
-                          quote_t0, quote_t1)
+                          quote_t0, quote_t1,
+                          quote_at_first_response=quote_first["quote"],
+                          quote_at_last_valid_response=quote_last["quote"])
+
+
+def _gate_verdict(gate, provider):
+    """None when the provider may be called, else the refusal to record.
+
+    A gate that raises is itself a refusal: we cannot show the call is
+    within budget, so we do not make it. Failing open here would make every
+    cost cap advisory.
+    """
+    if gate is None:
+        return None
+    try:
+        verdict = gate(provider)
+    except Exception as e:                                    # noqa: BLE001
+        log.error(f"[ALPHA_DISPATCH] budget gate failed for "
+                  f"{provider.name}: {type(e).__name__}: {e}")
+        return {"reason": "budget_exhausted",
+                "detail": f"budget gate unavailable ({type(e).__name__}); "
+                          f"spend cannot be bounded, so no call is made"}
+    if not isinstance(verdict, dict) or verdict.get("allowed") is True:
+        return None
+    return {"reason": verdict.get("reason") or "budget_exhausted",
+            "detail": verdict.get("detail") or ""}
 
 
 def _run_one(provider, snapshot: MarketSnapshot, budget: float, now_fn):
@@ -275,15 +349,24 @@ CFG_MOVE_EPS = 0.005
 
 
 def quote_movement(result: DispatchResult) -> dict:
-    """What the book did during the analysis, for the ledger."""
+    """What the book did during the analysis, for the ledger (section 8)."""
     t0, t1 = result.quote_at_dispatch, result.quote_at_completion
     out = {"measured": bool(t0 and t1)}
+    stages = (("dispatch", t0),
+              ("first_response", result.quote_at_first_response),
+              ("last_valid_response", result.quote_at_last_valid_response),
+              ("completion", t1))
     for key in ("yes_bid", "yes_ask", "no_bid", "no_ask"):
+        for label, quote in stages:
+            out[f"{label}_{key}"] = (quote or {}).get(key)
         before = (t0 or {}).get(key)
         after = (t1 or {}).get(key)
-        out[f"dispatch_{key}"] = before
-        out[f"completion_{key}"] = after
         out[f"delta_{key}"] = (round(float(after) - float(before), 6)
                                if isinstance(before, (int, float))
                                and isinstance(after, (int, float)) else None)
+        first = (result.quote_at_first_response or {}).get(key)
+        out[f"delta_to_first_response_{key}"] = (
+            round(float(first) - float(before), 6)
+            if isinstance(before, (int, float))
+            and isinstance(first, (int, float)) else None)
     return out

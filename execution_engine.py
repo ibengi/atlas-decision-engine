@@ -18,6 +18,7 @@ from market_validator import MarketValidator
 from order_manager import OrderManager
 from persistence import JsonStore, PersistenceSentinel
 from position_manager import PositionManager
+from research_feed import ResearchFeed, candidate_from_market
 from position_sizer import PositionSizer
 from risk_manager import RiskManager
 from stats_engine import StatsEngine
@@ -346,6 +347,9 @@ class ExecutionEngine:
         # contaminate a 15-minute analysis. Nothing here can affect an order.
         from btc_daily_evidence import BtcDailyEvidenceStore
         self.btc_daily_evidence = BtcDailyEvidenceStore(CFG.DATA_DIR)
+        #: Producer side of the research boundary. Plain JSON to its own
+        #: spool directory; no consumer is reachable from here.
+        self.research_feed = ResearchFeed()
         # T7-K: evidence-only observation of markets the scanner rejects for
         # no_liquidity. OFF unless BTC_DAILY_SHADOW_ENABLED is set. It holds
         # no risk/order/position component and produces no Decision, so a
@@ -416,6 +420,20 @@ class ExecutionEngine:
         reglee. Aucun des deux chemins ne peut modifier une decision : dec est
         deja fige, et l'appelant absorbe toute exception.
         """
+        # Automatic research candidate feed (Alpha Gateway phase 2). This is
+        # a WRITE TO A SPOOL DIRECTORY and nothing else: the engine gains no
+        # dependency on the Alpha subsystem, learns nothing back from it, and
+        # cannot be delayed or failed by it (`emit_candidate` never raises,
+        # never trips the persistence sentinel, and is off by default). It
+        # lives here because `dec` is already frozen and the caller already
+        # absorbs exceptions -- this hook is the engine's existing
+        # record-never-decide boundary, not a new one.
+        try:
+            self.research_feed.emit_candidate(candidate_from_market(
+                getattr(snapshot, "raw_market", None) or {}, book,
+                cycle_id=(dec.decision_id or "").split("-", 1)[0] or ""))
+        except Exception as e:                                # noqa: BLE001
+            log.debug(f"research feed: {e}")
         try:
             if (dec.strategy or "").startswith("btc_daily"):
                 self.btc_daily_evidence.record(

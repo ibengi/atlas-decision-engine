@@ -79,14 +79,16 @@ class FakeProvider(AlphaProvider):
 
     def analyze(self, snapshot, timeout):
         import time
+
+        from alpha_providers import _cost_row
         self.calls += 1
+        # Costed through the REAL pricing path, so a test that configures
+        # rates sees the same cost row production would write.
         meta = {"provider": self.name, "model": self.model,
                 "latency_ms": self.latency_ms,
-                "cost": {"provider": self.name, "model": self.model,
-                         "input_tokens": self.tokens[0],
-                         "output_tokens": self.tokens[1],
-                         "api_cost_usd": 0.0, "cost_priced": False,
-                         "latency_ms": self.latency_ms},
+                "cost": _cost_row(self.name, self.model, self.tokens[0],
+                                  self.tokens[1],
+                                  latency_ms=self.latency_ms),
                 "error": None}
         if self.sleep_s:
             time.sleep(self.sleep_s)

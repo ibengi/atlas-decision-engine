@@ -54,20 +54,51 @@ class ProviderError(RuntimeError):
     """A provider could not answer. Carries no secret and no probability."""
 
 
-def _price_usd(input_tokens: int, output_tokens: int) -> tuple:
-    """(usd, priced). `priced` is False while the rates are unset.
+#: One shared pricing table per process. Reloaded explicitly by the service
+#: on demand, never silently re-read mid-cycle: two providers in the same
+#: analysis must be costed under the same version or the total means nothing.
+_PRICING = None
 
-    The rates default to 0.0 and the flag says so. Inventing a plausible
-    per-token price would silently decide the one question this subsystem
-    exists to answer -- whether the edge survives inference cost -- so the
-    ledger carries `cost_priced=false` and the metrics report refuses to
-    present a net-of-AI-cost figure until an operator sets real rates.
+
+def pricing_table():
+    global _PRICING
+    if _PRICING is None:
+        from alpha_cost import PricingTable
+        _PRICING = PricingTable()
+    return _PRICING
+
+
+def reload_pricing():
+    global _PRICING
+    _PRICING = None
+    return pricing_table()
+
+
+def set_pricing_table(table):
+    """Bind the process to ONE table.
+
+    The budget guard prices the pre-call ESTIMATE and the adapters price the
+    post-call ACTUAL. If those two read different tables, the arithmetic that
+    decides whether a call is affordable is not the arithmetic that records
+    what it cost -- so a cap could be enforced against rates nobody is being
+    billed at. The service binds both to the same object at construction.
     """
-    rate_in = float(CFG.ALPHA_PRICE_IN_PER_MTOK)
-    rate_out = float(CFG.ALPHA_PRICE_OUT_PER_MTOK)
-    priced = rate_in > 0.0 or rate_out > 0.0
-    usd = (input_tokens / 1e6) * rate_in + (output_tokens / 1e6) * rate_out
-    return round(usd, 8), priced
+    global _PRICING
+    _PRICING = table
+    return _PRICING
+
+
+def _cost_row(provider: str, model: str, input_tokens: int,
+              output_tokens: int, *, tool_calls: int = 0,
+              search_queries: int = 0, latency_ms: int = 0) -> dict:
+    """A complete section-4 usage row: what was used, what it cost, and
+    under WHICH pricing version -- so the figure can be recomputed later
+    instead of being silently re-priced."""
+    row = pricing_table().price(provider, model, input_tokens, output_tokens)
+    row.update({"tool_calls": int(tool_calls),
+                "search_queries": int(search_queries),
+                "latency_ms": int(latency_ms)})
+    return row
 
 
 def build_prompt(snapshot: MarketSnapshot) -> str:
@@ -180,21 +211,18 @@ class AlphaProvider:
 
         `meta` always carries `latency_ms` and a `cost` block, even on
         failure: a provider that times out still consumed a deadline, and
-        section 12 wants that recorded.
+        section 4 wants that recorded.
         """
         started = time.monotonic()
         meta = {"provider": self.name, "model": self.model,
                 "latency_ms": 0,
-                "cost": {"provider": self.name, "model": self.model,
-                         "input_tokens": 0, "output_tokens": 0,
-                         "api_cost_usd": 0.0, "cost_priced": False,
-                         "latency_ms": 0},
+                "cost": _cost_row(self.name, self.model, 0, 0),
                 "error": None}
         try:
             if not self.configured():
                 raise ProviderError(f"{self.env_key} is not set")
             response = self._call(build_prompt(snapshot), timeout)
-            text, tokens_in, tokens_out = self._extract(response)
+            text, usage = self._extract(response)
         except ProviderError as e:
             meta["error"] = str(e)
         except Exception as e:                                # noqa: BLE001
@@ -202,18 +230,69 @@ class AlphaProvider:
             # dispatcher's isolation guarantee is only as good as this line.
             meta["error"] = f"{type(e).__name__}: {e}"
         else:
-            usd, priced = _price_usd(tokens_in, tokens_out)
-            meta["cost"].update({"input_tokens": int(tokens_in),
-                                 "output_tokens": int(tokens_out),
-                                 "api_cost_usd": usd, "cost_priced": priced})
             latency = int(round((time.monotonic() - started) * 1000))
             meta["latency_ms"] = latency
-            meta["cost"]["latency_ms"] = latency
+            meta["cost"] = _cost_row(
+                self.name, self.model,
+                usage.get("input_tokens", 0), usage.get("output_tokens", 0),
+                tool_calls=usage.get("tool_calls", 0),
+                search_queries=usage.get("search_queries", 0),
+                latency_ms=latency)
             return text, meta
         latency = int(round((time.monotonic() - started) * 1000))
         meta["latency_ms"] = latency
         meta["cost"]["latency_ms"] = latency
         return None, meta
+
+    # ── startup validation (section 3) ──────────────────────────────────
+    def health_check(self, timeout: float = None) -> dict:
+        """Is this provider usable RIGHT NOW, with the model configured?
+
+        Returns a report; never raises. A provider that fails its health
+        check is not silently swapped for another model or another vendor --
+        section 3 is explicit that an unavailable provider/model is EXCLUDED.
+        The service logs the report at startup and keeps dispatching to the
+        healthy ones, because no single provider is mandatory (section 18).
+        """
+        report = {"provider": self.name, "model": self.model,
+                  "configured": False, "priced": False, "reachable": None,
+                  "detail": ""}
+        if not self.configured():
+            report["detail"] = f"{self.env_key} is not set"
+            return report
+        report["configured"] = True
+        estimate = pricing_table().estimate(self.name, self.model)
+        report["priced"] = estimate["cost_priced"]
+        if not report["priced"]:
+            report["detail"] = estimate["pricing_missing_reason"] or ""
+        if not CFG.ALPHA_HEALTHCHECK_ENABLED:
+            report["detail"] = (report["detail"] + "; reachability check "
+                                "disabled").strip("; ")
+            return report
+        try:
+            self._probe(float(timeout or CFG.ALPHA_HEALTHCHECK_TIMEOUT_S))
+            report["reachable"] = True
+        except ProviderError as e:
+            report["reachable"] = False
+            report["detail"] = (report["detail"] + f"; {e}").strip("; ")
+        except Exception as e:                                # noqa: BLE001
+            report["reachable"] = False
+            report["detail"] = (report["detail"]
+                                + f"; {type(e).__name__}: {e}").strip("; ")
+        return report
+
+    def _probe(self, timeout: float) -> None:
+        """A minimal round trip that proves the credential and the model id
+        are both accepted. Subclasses override; the default probes with the
+        real request shape and a trivial prompt, because a probe that uses a
+        different endpoint proves nothing about the one we will use."""
+        self._extract(self._call("Reply with the single character: 1", timeout))
+
+    def healthy(self, report: dict = None) -> bool:
+        report = report or self.health_check()
+        return bool(report["configured"]
+                    and (report["priced"] or CFG.ALPHA_ALLOW_UNPRICED_CALLS)
+                    and report["reachable"] is not False)
 
 
 class _OpenAICompatible(AlphaProvider):
@@ -247,9 +326,14 @@ class _OpenAICompatible(AlphaProvider):
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("empty completion")
         usage = response.get("usage") or {}
-        return (text,
-                int(usage.get("prompt_tokens") or 0),
-                int(usage.get("completion_tokens") or 0))
+        return text, {
+            "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("completion_tokens") or 0),
+            "tool_calls": len(message.get("tool_calls") or []),
+            "search_queries": int(
+                (usage.get("num_sources_used")
+                 or usage.get("num_search_queries") or 0)),
+        }
 
 
 class GrokProvider(_OpenAICompatible):
@@ -261,13 +345,74 @@ class GrokProvider(_OpenAICompatible):
         return CFG.ALPHA_GROK_MODEL
 
 
-class OpenAIProvider(_OpenAICompatible):
+class OpenAIProvider(AlphaProvider):
+    """OpenAI through the **Responses API** (`POST /responses`).
+
+    Section 3 asks for the Responses API specifically rather than chat
+    completions, so this is its own adapter rather than a flag on the
+    chat-completions one: the request body (`input`, not `messages`), the
+    output shape (`output[].content[].text`, with an `output_text`
+    convenience field) and the usage field names (`input_tokens` /
+    `output_tokens`, not `prompt_tokens` / `completion_tokens`) all differ.
+
+    The path is configuration (`ALPHA_OPENAI_RESPONSES_PATH`). As with every
+    endpoint in this module, the default is a starting point that must be
+    checked against the vendor's current API reference: this repository
+    cannot verify it, and a wrong shape shows up as a provider failure --
+    an EXCLUDED signal, never a probability.
+    """
+
     name = "openai"
     env_key = ENV_OPENAI
-    base_url_attr = "ALPHA_OPENAI_BASE_URL"
 
     def default_model(self) -> str:
         return CFG.ALPHA_OPENAI_MODEL
+
+    def _call(self, prompt: str, timeout: float) -> dict:
+        base = CFG.ALPHA_OPENAI_BASE_URL.rstrip("/")
+        path = CFG.ALPHA_OPENAI_RESPONSES_PATH
+        return self._post(
+            f"{base}{path if path.startswith('/') else '/' + path}",
+            headers={"Authorization": f"Bearer {self._api_key()}",
+                     "Content-Type": "application/json"},
+            payload={"model": self.model, "input": prompt},
+            timeout=timeout)
+
+    def _extract(self, response: dict) -> tuple:
+        if not isinstance(response, dict):
+            raise ProviderError(f"response is {type(response).__name__}")
+        status = response.get("status")
+        if status in ("failed", "cancelled"):
+            detail = ((response.get("error") or {}).get("message")
+                      if isinstance(response.get("error"), dict) else "")
+            raise ProviderError(f"response status {status}: {detail}"[:200])
+        text = response.get("output_text")
+        tool_calls = 0
+        if not isinstance(text, str) or not text.strip():
+            parts, output = [], response.get("output")
+            if not isinstance(output, list) or not output:
+                raise ProviderError("no output in response")
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") and item.get("type") != "message":
+                    # reasoning items, tool calls, web searches
+                    tool_calls += 1
+                    continue
+                for chunk in item.get("content") or []:
+                    if isinstance(chunk, dict) and isinstance(
+                            chunk.get("text"), str):
+                        parts.append(chunk["text"])
+            text = "".join(parts)
+        if not isinstance(text, str) or not text.strip():
+            raise ProviderError("empty completion")
+        usage = response.get("usage") or {}
+        return text, {
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "tool_calls": tool_calls,
+            "search_queries": 0,
+        }
 
 
 class GeminiProvider(AlphaProvider):
@@ -302,9 +447,13 @@ class GeminiProvider(AlphaProvider):
         if not text.strip():
             raise ProviderError("empty completion")
         usage = response.get("usageMetadata") or {}
-        return (text,
-                int(usage.get("promptTokenCount") or 0),
-                int(usage.get("candidatesTokenCount") or 0))
+        grounding = (candidates[0] or {}).get("groundingMetadata") or {}
+        return text, {
+            "input_tokens": int(usage.get("promptTokenCount") or 0),
+            "output_tokens": int(usage.get("candidatesTokenCount") or 0),
+            "tool_calls": len((candidates[0] or {}).get("toolCalls") or []),
+            "search_queries": len(grounding.get("webSearchQueries") or []),
+        }
 
 
 class AtlasQuantProvider(AlphaProvider):
@@ -338,13 +487,26 @@ class AtlasQuantProvider(AlphaProvider):
     def configured(self) -> bool:
         return True                     # no credential; always reachable
 
+    def _probe(self, timeout: float) -> None:
+        """In-process: reachable by construction. The health report still
+        distinguishes 'wired' from 'reachable' -- an unwired quant model is
+        healthy AND produces INSUFFICIENT_EVIDENCE, which is the honest
+        state, not a failure."""
+        return None
+
+    def health_check(self, timeout: float = None) -> dict:
+        report = super().health_check(timeout)
+        report["wired"] = self.estimator is not None
+        if not report["wired"]:
+            report["detail"] = (report["detail"] + "; no quantitative "
+                                "estimator wired: every signal will be "
+                                "INSUFFICIENT_EVIDENCE").strip("; ")
+        return report
+
     def analyze(self, snapshot: MarketSnapshot, timeout: float) -> tuple:
         started = time.monotonic()
         meta = {"provider": self.name, "model": self.model, "latency_ms": 0,
-                "cost": {"provider": self.name, "model": self.model,
-                         "input_tokens": 0, "output_tokens": 0,
-                         "api_cost_usd": 0.0, "cost_priced": True,
-                         "latency_ms": 0},
+                "cost": _cost_row(self.name, self.model, 0, 0),
                 "error": None}
         text = None
         try:

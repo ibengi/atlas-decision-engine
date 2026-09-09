@@ -24,6 +24,19 @@ module imports it, both enforced by AST inspection in
 means TRADE. It is off by default (`ALPHA_GATEWAY_ENABLED`, strict
 fail-closed) because enabling it starts paid third-party API calls.
 
+Phase 2 runs it automatically: the scanner's read-only observer emits
+candidates to a spool, and a **separate** Alpha Shadow Service consumes them.
+That service refuses to start if a broker credential is visible in its
+environment.
+
+    # engine process (feed off by default)
+    RESEARCH_FEED_ENABLED=true python kalshi_alpha_bot.py --loop --live-read-only
+
+    # alpha service process: AI keys only, no broker credential
+    python tools/alpha_service_run.py health
+    python tools/alpha_service_run.py run
+
+    # manual / one-off analysis and reporting
     python tools/alpha_shadow_run.py analyze --input candidates.json
     python tools/alpha_shadow_run.py metrics
 

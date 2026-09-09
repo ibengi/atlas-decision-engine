@@ -35,6 +35,17 @@ def chat_response(body_dict, tokens=(1000, 250)):
                       "completion_tokens": tokens[1]}}
 
 
+def responses_api_response(body_dict, tokens=(1000, 250), status="completed"):
+    """The OpenAI Responses API shape: `output[].content[].text`, and usage
+    named input_tokens/output_tokens rather than prompt/completion."""
+    return {"id": "resp_1", "object": "response", "status": status,
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text",
+                                     "text": json.dumps(body_dict)}]}],
+            "usage": {"input_tokens": tokens[0], "output_tokens": tokens[1],
+                      "total_tokens": sum(tokens)}}
+
+
 def gemini_response(body_dict, tokens=(1000, 250)):
     return {"candidates": [{"content": {"parts": [
                 {"text": json.dumps(body_dict)}]}}],
@@ -43,11 +54,11 @@ def gemini_response(body_dict, tokens=(1000, 250)):
 
 
 class ChatCompletionAdapters(AlphaCase):
-    """Grok and OpenAI share the chat-completions shape."""
+    """xAI publishes an OpenAI-compatible chat-completions surface. OpenAI
+    itself is called through the Responses API and has its own class below."""
 
     def cases(self):
-        return ((GrokProvider, "XAI_API_KEY", CFG.ALPHA_GROK_BASE_URL),
-                (OpenAIProvider, "OPENAI_API_KEY", CFG.ALPHA_OPENAI_BASE_URL))
+        return ((GrokProvider, "XAI_API_KEY", CFG.ALPHA_GROK_BASE_URL),)
 
     def test_a_well_formed_answer_round_trips(self):
         snapshot = self.snapshot()
@@ -79,9 +90,9 @@ class ChatCompletionAdapters(AlphaCase):
         """An adapter that issues an untimed request would hang a worker
         past the dispatcher's deadline."""
         snapshot = self.snapshot()
-        os.environ["OPENAI_API_KEY"] = SECRET
+        os.environ["XAI_API_KEY"] = SECRET
         session = http_session(chat_response(valid_payload(snapshot)))
-        OpenAIProvider(session=session).analyze(snapshot, 3.5)
+        GrokProvider(session=session).analyze(snapshot, 3.5)
         self.assertEqual(session.posts[0]["timeout"], 3.5)
 
     def test_an_http_error_is_a_provider_failure(self):
@@ -123,6 +134,88 @@ class ChatCompletionAdapters(AlphaCase):
         raw, meta = GrokProvider(session=session).analyze(snapshot, 5.0)
         self.assertIsNotNone(raw)
         self.assertEqual(meta["cost"]["input_tokens"], 0)
+
+
+class OpenAIResponsesAdapter(AlphaCase):
+    """Section 3: OpenAI is called through the Responses API."""
+
+    def test_the_request_uses_the_responses_endpoint_and_input_field(self):
+        snapshot = self.snapshot()
+        os.environ["OPENAI_API_KEY"] = SECRET
+        session = http_session(responses_api_response(valid_payload(snapshot)))
+        OpenAIProvider(session=session).analyze(snapshot, 4.0)
+        post = session.posts[0]
+        self.assertTrue(post["url"].endswith("/responses"), post["url"])
+        self.assertIn("input", post["json"])
+        self.assertNotIn("messages", post["json"])
+        self.assertEqual(post["timeout"], 4.0)
+
+    def test_a_well_formed_answer_round_trips(self):
+        snapshot = self.snapshot()
+        os.environ["OPENAI_API_KEY"] = SECRET
+        session = http_session(responses_api_response(valid_payload(snapshot)))
+        raw, meta = OpenAIProvider(session=session).analyze(snapshot, 5.0)
+        self.assertIsNone(meta["error"])
+        self.assertTrue(validate_signal(raw, snapshot, provider="openai",
+                                        model=meta["model"]).valid)
+        self.assertEqual(meta["cost"]["input_tokens"], 1000)
+        self.assertEqual(meta["cost"]["output_tokens"], 250)
+
+    def test_the_output_text_convenience_field_is_preferred(self):
+        snapshot = self.snapshot()
+        os.environ["OPENAI_API_KEY"] = SECRET
+        body = responses_api_response(valid_payload(snapshot))
+        body["output_text"] = json.dumps(valid_payload(snapshot, p_yes=0.42,
+                                                       low=0.40, high=0.44))
+        session = http_session(body)
+        raw, meta = OpenAIProvider(session=session).analyze(snapshot, 5.0)
+        signal = validate_signal(raw, snapshot, provider="openai", model="m")
+        self.assertAlmostEqual(signal.p_yes, 0.42, places=6)
+
+    def test_reasoning_and_tool_items_are_counted_not_parsed_as_text(self):
+        snapshot = self.snapshot()
+        os.environ["OPENAI_API_KEY"] = SECRET
+        body = responses_api_response(valid_payload(snapshot))
+        body["output"] = ([{"type": "reasoning", "summary": []},
+                           {"type": "web_search_call", "status": "completed"}]
+                          + body["output"])
+        session = http_session(body)
+        raw, meta = OpenAIProvider(session=session).analyze(snapshot, 5.0)
+        self.assertTrue(validate_signal(raw, snapshot, provider="openai",
+                                        model="m").valid)
+        self.assertEqual(meta["cost"]["tool_calls"], 2)
+
+    def test_a_failed_response_status_is_a_provider_failure(self):
+        snapshot = self.snapshot()
+        os.environ["OPENAI_API_KEY"] = SECRET
+        body = responses_api_response(valid_payload(snapshot), status="failed")
+        body["error"] = {"message": "model overloaded"}
+        raw, meta = OpenAIProvider(session=http_session(body)).analyze(
+            snapshot, 5.0)
+        self.assertIsNone(raw)
+        self.assertIn("model overloaded", meta["error"])
+
+    def test_an_empty_output_is_a_failure_not_a_probability(self):
+        snapshot = self.snapshot()
+        os.environ["OPENAI_API_KEY"] = SECRET
+        for body in ({"status": "completed", "output": []},
+                     {"status": "completed"},
+                     {"status": "completed", "output": [{"type": "message",
+                                                         "content": []}]}):
+            with self.subTest(body=str(body)[:40]):
+                raw, meta = OpenAIProvider(
+                    session=http_session(body)).analyze(snapshot, 5.0)
+                self.assertIsNone(raw)
+                self.assertIsNotNone(meta["error"])
+
+    def test_the_path_is_configurable(self):
+        snapshot = self.snapshot()
+        os.environ["OPENAI_API_KEY"] = SECRET
+        with patch.object(CFG, "ALPHA_OPENAI_RESPONSES_PATH", "/v2/answer"):
+            session = http_session(responses_api_response(
+                valid_payload(snapshot)))
+            OpenAIProvider(session=session).analyze(snapshot, 5.0)
+            self.assertTrue(session.posts[0]["url"].endswith("/v2/answer"))
 
 
 class GeminiAdapter(AlphaCase):
@@ -236,22 +329,25 @@ class ThePromptForbidsInstructions(AlphaCase):
 
     def test_every_provider_receives_the_identical_prompt(self):
         """A difference between two answers must be a difference of model,
-        not of prompt."""
+        not of prompt -- even though the three request shapes differ."""
         snapshot = self.snapshot()
         prompts = set()
+        bodies = {GrokProvider: chat_response,
+                  OpenAIProvider: responses_api_response,
+                  GeminiProvider: gemini_response}
         for cls, env in ((GrokProvider, "XAI_API_KEY"),
                          (OpenAIProvider, "OPENAI_API_KEY"),
                          (GeminiProvider, "GOOGLE_GEMINI_API_KEY")):
             os.environ[env] = SECRET
-            session = http_session(
-                chat_response(valid_payload(snapshot))
-                if cls is not GeminiProvider
-                else gemini_response(valid_payload(snapshot)))
+            session = http_session(bodies[cls](valid_payload(snapshot)))
             cls(session=session).analyze(snapshot, 5.0)
-            post = session.posts[0]
-            body = post["json"]
-            text = (body["messages"][0]["content"] if "messages" in body
-                    else body["contents"][0]["parts"][0]["text"])
+            body = session.posts[0]["json"]
+            if "messages" in body:
+                text = body["messages"][0]["content"]
+            elif "input" in body:
+                text = body["input"]
+            else:
+                text = body["contents"][0]["parts"][0]["text"]
             prompts.add(text)
         self.assertEqual(len(prompts), 1, "providers received different prompts")
 
