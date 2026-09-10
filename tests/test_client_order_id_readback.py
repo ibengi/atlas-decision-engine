@@ -49,7 +49,8 @@ def order_row(order_id="ord-found-1", client_order_id=CID, status="resting",
               **extra):
     row = {"order_id": order_id, "client_order_id": client_order_id,
            "ticker": TICKER, "side": SIDE, "status": status,
-           "fill_count": 0, "remaining_count": COUNT}
+           "fill_count": 0, "remaining_count": COUNT,
+           "initial_count": COUNT, "action": "buy", "yes_price": PRICE}
     row.update(extra)
     return row
 

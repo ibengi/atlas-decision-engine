@@ -293,13 +293,52 @@ class OrderManager:
     def resolve_intent(self, ticker: str, intent: dict) -> str:
         """Demande au broker si l'ordre porte par ce client_order_id existe.
 
-        Retourne l'un de: FOUND (adopte), NOT_FOUND, MULTIPLE, UNAVAILABLE,
-        MALFORMED. AUCUN de ces chemins ne re-soumet quoi que ce soit : la
-        resolution est une LECTURE. Seul FOUND leve l'incertitude, en
-        adoptant l'order_id et le statut reels.
+        Empty readings remain observations regardless of their count or age.
+        Absence closure requires a durable, independently resolved transport
+        outcome. A nonterminal transport row always retains this high-level
+        intent, even if a separate partial broker response looks successful.
         """
         cid = str(intent.get("client_order_id") or "")
         count = int(intent.get("count") or 0)
+        from transport_intent import (outcome_for_client_order, _order_matches,
+                                      _number, has_unresolved_transport)
+        wanted = {"client_order_id": cid, "ticker": ticker,
+                  "side": "bid" if intent["side"] == "yes" else "ask",
+                  "count": str(count),
+                  "price": f"{(intent['price'] if intent['side'] == 'yes' else 100 - intent['price']) / 100:.4f}"}
+        low = outcome_for_client_order(cid)
+        if low is None and has_unresolved_transport():
+            # Missing, duplicate, or unreadable low-level lookup cannot turn a
+            # surviving transport uncertainty into a legacy-adoption shortcut.
+            intent["resolution"] = "TRANSPORT_PENDING"
+            self._flush_pending_intents()
+            return "TRANSPORT_PENDING"
+        if low is not None:
+            body = low.get("request", {}).get("json", {})
+            try:
+                bound = (low.get("identity") == intent.get("identity") and
+                         low.get("operation") == "POST" and
+                         low.get("path") == "/portfolio/events/orders" and
+                         all(body.get(k) == wanted[k] for k in
+                             ("client_order_id", "ticker", "side")) and
+                         all(_number(body.get(k)) == _number(wanted[k])
+                             for k in ("count", "price")))
+            except (ValueError, TypeError):
+                bound = False
+            if not bound:
+                self._halt_resolution("TRANSPORT_INTENT_MISMATCH", f"{ticker}/{cid}")
+                intent["resolution"] = "MALFORMED"
+                self._flush_pending_intents()
+                return "MALFORMED"
+            if low["state"] in ("CONFIRMED_NOT_APPLIED", "TERMINAL_FAILED"):
+                intent["resolution"] = "CLOSED_ABSENT"
+                if not self._clear_intent(ticker):
+                    raise RuntimeError("proven transport closure was not durable")
+                return "CLOSED_ABSENT"
+            if low["state"] != "CONFIRMED_APPLIED":
+                intent["resolution"] = "TRANSPORT_PENDING"
+                self._flush_pending_intents()
+                return "TRANSPORT_PENDING"
         lookup = getattr(self.client, "find_orders_by_client_order_id", None)
         if not callable(lookup):
             # Client sans capacite de recherche (client ancien, double de
@@ -367,14 +406,8 @@ class OrderManager:
             return "MULTIPLE"
 
         if not matches:
-            # UNE lecture vide n'est pas une preuve d'absence: elle est
-            # prise juste apres le POST, au pire moment (un ordre accepte
-            # peut n'etre pas encore visible dans le listing). On exige
-            # AMBIGUOUS_NOT_FOUND_CONFIRMATIONS observations completes,
-            # espacees d'au moins AMBIGUOUS_NOT_FOUND_INTERVAL_S, avant de
-            # cloturer. Une observation trop rapprochee n'apporte aucune
-            # information nouvelle et n'est PAS comptee.
-            need = max(1, int(CFG.AMBIGUOUS_NOT_FOUND_CONFIRMATIONS))
+            # Complete but potentially delayed listings never prove absence.
+            # Keep spaced-read counts solely for diagnostics and alerting.
             gap = max(0.0, float(CFG.AMBIGUOUS_NOT_FOUND_INTERVAL_S))
             now = time.time()
             intent["unavailable_streak"] = 0      # une lecture a abouti
@@ -389,20 +422,9 @@ class OrderManager:
                     f"[AMBIGUOUS_RESOLUTION] {ticker} lecture vide ignoree "
                     f"({now - last:.0f}s < {gap:.0f}s depuis la precedente): "
                     "trop rapprochee pour constituer une confirmation.")
-            self._flush_pending_intents()
-            if seen >= need:
-                log_api.warning(
-                    f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
-                    f"-> CLOSED_ABSENT: {seen} lecture(s) completes et "
-                    f"espacees confirment qu'aucun ordre ne porte cet "
-                    "identifiant. Intention CLOTUREE; le ticker repasse sous "
-                    "les regles normales du verrou anti-doublon.")
-                intent["resolution"] = "CLOSED_ABSENT"
-                self._clear_intent(ticker)
-                return "CLOSED_ABSENT"
             log_api.warning(
                 f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
-                f"-> NOT_FOUND_PENDING ({seen}/{need} confirmation(s)): "
+                f"-> NOT_FOUND_PENDING ({seen} observation(s)): "
                 "absence NON concluante. Intention MAINTENUE ouverte, "
                 "aucune re-soumission possible sur ce ticker.")
             intent["resolution"] = "NOT_FOUND_PENDING"
@@ -411,10 +433,13 @@ class OrderManager:
 
         order = matches[0]
         order_id = str(pick(order, "order_id", "id", default="") or "")
-        if not order_id:
+        prior_order = ((low or {}).get("history") or [{}])[-1].get("evidence", {}).get("order")
+        expected_request = low or {"request": {"json": wanted}}
+        if (not order_id or not _order_matches(expected_request, order) or
+                (isinstance(prior_order, dict) and prior_order.get("order_id") != order_id)):
             self._halt_resolution(
                 "MALFORMED_ORDER_LISTING",
-                f"{ticker}/{cid}: ordre correspondant SANS order_id")
+                f"{ticker}/{cid}: immutable broker order identity/terms not proven")
             intent["resolution"] = "MALFORMED"
             self._flush_pending_intents()
             return "MALFORMED"
@@ -422,7 +447,7 @@ class OrderManager:
         # ADOPTION: l'ordre existe, on le reprend en suivi local comme s'il
         # venait d'etre place. Aucun ordre n'est cree ici.
         self.open_orders[order_id] = {
-            "ticker": ticker, "side": order.get("side") or order.get("action"),
+            "ticker": ticker, "side": intent["side"],
             "count": count, "price": int(intent.get("price") or 0),
             "placed_at": intent.get("at") or now_iso(),
             "adopted_from_client_order_id": cid,
@@ -675,7 +700,9 @@ class OrderManager:
         """Rejoue la resolution pour chaque intention non resolue. Appele au
         demarrage: apres un redemarrage, l'ambiguite se retranche a partir
         de l'etat persiste, pas de la memoire perdue."""
-        outcomes = {}
+        from transport_intent import reconcile_transport_intents
+        transport = reconcile_transport_intents(self.client)
+        outcomes = {"transport": transport}
         for ticker, intent in list(self.pending_intents.items()):
             if intent.get("resolution") in ("FOUND", "CLOSED_ABSENT"):
                 continue          # deja tranchee, rien a redemander
@@ -1211,8 +1238,7 @@ class OrderManager:
         # Un POST ambigu laisse une INTENTION persistee: apres redemarrage,
         # on retranche la meme question au broker (lecture seule) avant
         # toute autre action.
-        if self.pending_intents:
-            self.resolve_pending_intents()
+        self.resolve_pending_intents()
         if not self.open_orders:
             return
         log_api.warning(f"Recovery: {len(self.open_orders)} ordre(s) non conclu(s) "

@@ -157,13 +157,7 @@ def safety_restore(f,mode):
     elif mode=='evidence_return':
         P.JsonStore.save(_p(jp),[]); f.reload()
         check(not f.led.capital_eligible(),'Initial mismatch not blocked')
-        F.restore(current)
-        from state_authority import checkpoint
-        from recovery import complete_verified_recovery
-        current_proof = checkpoint(f.led.path, f.led.identity)
-        complete_verified_recovery(f.led.path, f.led.identity, f.led.authority,
-                                   current_proof.digest, 'restore-current-evidence')
-        f.reload()
+        F.restore(current); f.reload()
         D['restart']=snap(f)
         check(f.led.capital_eligible() and f.led.drawdown_pct()>=30-1e-8,
               'Restored valid evidence failed recovery')
@@ -314,14 +308,11 @@ def event_identity(f,mode):
     elif mode=='repeat_settlement':
         f.tlog.settle_trade(win['trade_id'],'yes',True,3,3)
     elif mode=='production_duplicate_order':
-        try:
-            row=f.tlog.open_trade(ticker=win['ticker'],market_title='synthetic',side='yes',
-                 req_price=50,avg_price=50,req_count=10,filled_count=10,spread=1,
-                 fees=0,edge=.1,ev=.1,confidence=8,grade='A',reason='synthetic',analysis={},
-                 order_id=win['order_id'],order_status='executed')
-            f.tlog.settle_trade(row['trade_id'],'yes',True,3,3)
-        except ValueError:
-            D['refused_at_ingestion'] = True
+        row=f.tlog.open_trade(ticker=win['ticker'],market_title='synthetic',side='yes',
+             req_price=50,avg_price=50,req_count=10,filled_count=10,spread=1,
+             fees=0,edge=.1,ev=.1,confidence=8,grade='A',reason='synthetic',analysis={},
+             order_id=win['order_id'],order_status='executed')
+        f.tlog.settle_trade(row['trade_id'],'yes',True,3,3)
     f.led.observe(10+f.led.realized_pnl_cum())
     D.update(before_dd=before,after=snap(f),duplicates=f.led.duplicate_events())
     check(f.led.drawdown_pct()>=before-1e-8,'Duplicate economic event improved drawdown')
@@ -415,8 +406,8 @@ for mode in ('extra_field','missing_field','mutated','future_schema','ordered_ke
 
 def gate_case(f,mode):
     ts=time.time()
-    mv={'approved':True,'generated_ts':ts,'model_version':'btc15m-baseline-0.1',
-        'criteria':[{'name': n, 'passed': True} for n in sorted(MG.MODEL_CRITERIA['btc15m-baseline-0.1'])]}
+    mv={'approved':True,'generated_ts':ts,'model_version':'synthetic-v1',
+        'criteria':[{'name':'synthetic-only','passed':True}]}
     tr={'generated_ts':ts,'ran':1,'failures':0,'errors':0,'skipped':0,
         'failed_tests':[],'code_identity':MG.code_identity()}
     if mode=='zero': tr['ran']=0
@@ -689,7 +680,7 @@ def intent_restart(f,mode):
     c,a=client(demo=True);om=OrderManager(c)
     P.JsonStore.save(_p('submission_guard.json'),{})
     if mode=='valid':
-        check(om._record_intent('KXBTC15M-REVIEW','previous',1,20,side='yes'),'Intent control failed')
+        check(om._record_intent('KXBTC15M-REVIEW','previous',1,20),'Intent control failed')
     elif mode=='missing_id':
         P.JsonStore.save(_p(OrderManager.PENDING_FILE),{'KXBTC15M-REVIEW':{'count':1,'price':20}})
     elif mode=='corrupt':
@@ -750,31 +741,7 @@ def crash_boundary(f,mode):
         trade=f.trade(None)
     else:
         f.trade(-3,observe=(mode!='chain_append'))
-    # The independent test host passes its already chosen public-key pins to
-    # the crash worker. This does not derive a checkpoint from restored local
-    # state: the provider retains the same independently held checkpoint/key.
-    from continuity_authority import TrustPolicy, configure_trust
-    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-    pinned_authorities = [(authority, TrustPolicy(authority.authority_id,
-        authority.signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw),
-        frozenset({authority.identity['fingerprint']}),
-        frozenset({authority.identity['environment']})))
-        for authority in (f.led.authority, f.broker.execution_freeze)]
     def child_work():
-        # Forked children inherit neither effective trust nor manager authority.
-        # Explicitly configure the test host's pins before loading child-owned
-        # objects and injecting a real crash at the same persistence boundary.
-        for provider, policy in pinned_authorities:
-            configure_trust(provider, policy)
-        external = f.led.authority
-        f.tlog = TradeLogger()
-        from position_manager import PositionManager
-        from risk_manager import RiskManager
-        f.pos = PositionManager(f.broker, f.tlog)
-        f.led = EL.EquityLedger(f.tlog, f.pos, env='prod', authority=external)
-        f.orders = OrderManager(f.broker)
-        f.risk = RiskManager(f.tlog, f.pos, 10.)
-        f.risk.equity = f.led
         original_replace=os.replace
         def replace(src,dst):
             original_replace(src,dst)

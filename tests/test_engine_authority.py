@@ -30,28 +30,11 @@ from strict_data import loads, dumps, finite_number
 from trade_logger import TradeLogger
 
 
-class IndependentCheckpoint:
-    """CAS test double with a fixed initial checkpoint, not an echo oracle."""
-    def __init__(self, initial):
-        self.current = self.key(initial)
-        self.lock = threading.Lock()
+from authority_fixtures import CheckpointStore, FrozenSyntheticBroker
 
-    @staticmethod
-    def key(value):
-        return value.account_fingerprint, value.generation, value.digest
 
-    def verify_current(self, request):
-        with self.lock:
-            return request if self.key(request) == self.current else None
-
-    def advance(self, before, after):
-        with self.lock:
-            if self.key(before) != self.current or after.generation <= before.generation:
-                return None
-            if before.account_fingerprint != after.account_fingerprint:
-                return None
-            self.current = self.key(after)
-            return after
+class IndependentCheckpoint(CheckpointStore):
+    """Independent CAS double using a separately pinned signing authority."""
 
 
 class ReadBroker:
@@ -68,13 +51,10 @@ class ReadBroker:
         return copy.deepcopy(self.orders)
 
 
-class SyntheticFreeze:
-    """The synthetic broker exposes an epoch; real adapters expose none."""
+class SyntheticFreeze(FrozenSyntheticBroker):
+    """The synthetic broker exposes a signed epoch; real adapters expose none."""
     def __init__(self, broker, identity):
-        self.broker, self.identity, self.epoch = broker, identity, broker.epoch
-    def verify(self, identity, _versions):
-        return (identity == self.identity and self.broker.epoch == self.epoch
-                and not self.broker.orders and not self.broker.positions)
+        super().__init__(broker, identity=identity)
 
 
 def writer_race(path, barrier, queue):

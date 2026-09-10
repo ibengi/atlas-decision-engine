@@ -1,0 +1,487 @@
+{
+  "schema": 1,
+  "baseline_sha": "3af848e6aebc8769ea59f878d68674f89e04af0d",
+  "claimed_unsafe_count": 59,
+  "suite_total": 304,
+  "suites": {
+    "original108": {
+      "before_script": "original108_contract_adapted.py",
+      "after_script": "original108_remediated.py",
+      "expected_case_count": 108
+    },
+    "reliability190": {
+      "before_script": "baseline_3af848e/reliability_review.py",
+      "after_script": "reliability_review.py",
+      "expected_case_count": 190
+    },
+    "global2": {
+      "before_script": "baseline_3af848e/confirm_global_guards.py",
+      "after_script": "confirm_global_guards.py",
+      "expected_case_count": 2
+    },
+    "interactions4": {
+      "before_script": "before_after_interactions.py",
+      "after_script": "before_after_interactions.py",
+      "expected_case_count": 4
+    }
+  },
+  "cases": [
+    {
+      "suite": "original108",
+      "id": "J_restore_both_journal_and_ledger",
+      "baseline_assertion": "Coherent old restore silently erased observed loss",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "J_restored_pair_plus_deposit_passes_global_guards",
+      "baseline_assertion": "Restored history plus deposit passed actual global risk gates with erased loss",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "CRASH_after_journal_before_watermark_then_restore",
+      "baseline_assertion": "Journal commit before watermark permits loss erasure after restore",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "R_none_listing",
+      "baseline_assertion": "Unsafe rebase was accepted",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "R_missing_local_file_orders_state.json",
+      "baseline_assertion": "Unsafe rebase was accepted",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "R_missing_local_file_positions_state.json",
+      "baseline_assertion": "Unsafe rebase was accepted",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "R_missing_local_file_pending_intents.json",
+      "baseline_assertion": "Unsafe rebase was accepted",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "R_malformed_pending_intent_disappears_on_restart",
+      "baseline_assertion": "Unsafe rebase was accepted",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "original108",
+      "id": "R_unknown_local_position_state",
+      "baseline_assertion": "Unsafe rebase was accepted",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "C_all_old",
+      "baseline_assertion": "Rollback or missing evidence remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "C_chain_corrupt_suffix",
+      "baseline_assertion": "Restart accepted uncertain economic state",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "P_duplicate_conflicting_ticker",
+      "baseline_assertion": "Incomplete or contradictory response became MATCH",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "P_cross_page_conflicting_ticker",
+      "baseline_assertion": "Incomplete or contradictory response became MATCH",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "P_bool_quantity",
+      "baseline_assertion": "Incomplete or contradictory response became MATCH",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "R_continuity_after_context",
+      "baseline_assertion": "Rebase accepted changed or stale evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "R_local_after_final_validation",
+      "baseline_assertion": "Rebase accepted changed or stale evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "R_broker_after_final_query",
+      "baseline_assertion": "Rebase accepted changed or stale evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "R_settlement_during_prepare",
+      "baseline_assertion": "Rebase accepted changed or stale evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "E_same_order_new_trade",
+      "baseline_assertion": "Duplicate economic event improved drawdown",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "E_same_order_new_trade_restart",
+      "baseline_assertion": "Duplicate economic event improved drawdown",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "E_production_duplicate_order",
+      "baseline_assertion": "Duplicate economic event improved drawdown",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "CASH_not_quiet",
+      "baseline_assertion": "Unexplained movement admission differs from required invariant",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "CASH_settlement_change",
+      "baseline_assertion": "Unexplained movement admission differs from required invariant",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "CASH_grown_tolerance",
+      "baseline_assertion": "Unexplained movement admission differs from required invariant",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "M_late_settlement",
+      "baseline_assertion": "Migration accepted a changed proposal or changed source state",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "M_failed_save",
+      "baseline_assertion": "Failed migration changed authoritative state",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "G_raw_failure",
+      "baseline_assertion": "Gatekeeper accepted invalid or inconsistent evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "G_count_collection_mismatch",
+      "baseline_assertion": "Gatekeeper accepted invalid or inconsistent evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "G_duplicate_model_key",
+      "baseline_assertion": "Gatekeeper accepted invalid or inconsistent evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "G_duplicate_test_key",
+      "baseline_assertion": "Gatekeeper accepted invalid or inconsistent evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "I_changed_fields",
+      "baseline_assertion": "Unconfirmed or changed durable intent reached synthetic transport",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "I_after_readback",
+      "baseline_assertion": "Unconfirmed or changed durable intent reached synthetic transport",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "F_two_equal",
+      "baseline_assertion": "Flow idempotency lost or duplicated a movement",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N13_two_process_generation_check_then_write",
+      "baseline_assertion": "Two processes both committed from the same generation",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N14_prepared_state_visible_during_commit",
+      "baseline_assertion": "Prepared HWM was visible before durable success",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N15_failed_hold_release",
+      "baseline_assertion": "Failed operator action mutated risk authority in memory",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N15_failed_attestation",
+      "baseline_assertion": "Failed operator action mutated risk authority in memory",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N15_failed_hold_release_stale_generation",
+      "baseline_assertion": "Failed operator action mutated risk authority in memory",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_cash_nan",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_cash_pos_inf",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_cash_neg_inf",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_persisted_pending_nan",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_hwm_nan",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_hwm_inf",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_unrecognized_flow",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N16_unknown_position_state",
+      "baseline_assertion": "Malformed numeric or unknown accounting state remained admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N17_restart_intent_missing_id",
+      "baseline_assertion": "Restart treated unresolved/unreadable intent state as empty",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N17_restart_intent_corrupt",
+      "baseline_assertion": "Restart treated unresolved/unreadable intent state as empty",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N17_restart_intent_missing",
+      "baseline_assertion": "Restart treated unresolved/unreadable intent state as empty",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N18_short_append_success",
+      "baseline_assertion": "Continuity append returned success after a short write",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N18_directory_fsync_failure",
+      "baseline_assertion": "Directory durability failure was reported as success",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N19_stale_reader_does_not_refresh_continuity",
+      "baseline_assertion": "Existing reader ignored newer continuity evidence",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "reliability190",
+      "id": "CRASH_journal_data_rename",
+      "baseline_assertion": "Torn journal/checksum commit recovered an older journal as admissible",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "global2",
+      "id": "CONFIRM_nan_balance_global_gates",
+      "baseline_assertion": "NaN balance passed balance and global accounting gates",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "global2",
+      "id": "CONFIRM_stale_hold_release_global_gates",
+      "baseline_assertion": "Failed fenced hold release passed actual global risk gates",
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "interactions4",
+      "id": "incomplete_settlement",
+      "baseline_assertion": null,
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "interactions4",
+      "id": "unknown_journal",
+      "baseline_assertion": null,
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "interactions4",
+      "id": "subcent_settlement",
+      "baseline_assertion": null,
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    },
+    {
+      "suite": "interactions4",
+      "id": "concurrent_risk_claims",
+      "baseline_assertion": null,
+      "expected_before": "FAIL",
+      "required_after": "PASS"
+    }
+  ],
+  "baseline_inconclusive": [
+    {
+      "suite": "original108",
+      "id": "J_digest",
+      "recorded_status": "ERROR"
+    },
+    {
+      "suite": "original108",
+      "id": "R_malformed",
+      "recorded_status": "ERROR"
+    },
+    {
+      "suite": "reliability190",
+      "id": "CASH_quiet_positive",
+      "recorded_status": "NEEDS_REVIEW"
+    },
+    {
+      "suite": "reliability190",
+      "id": "G_unknown_model_version",
+      "recorded_status": "NEEDS_REVIEW"
+    },
+    {
+      "suite": "reliability190",
+      "id": "G_missing_criteria",
+      "recorded_status": "NEEDS_REVIEW"
+    },
+    {
+      "suite": "reliability190",
+      "id": "G_malformed_criteria",
+      "recorded_status": "NEEDS_REVIEW"
+    },
+    {
+      "suite": "reliability190",
+      "id": "N20_environment_state_binding",
+      "recorded_status": "NEEDS_REVIEW"
+    }
+  ],
+  "frozen_source_sha256": {
+    "original108_contract_adapted.py": "726d9ce15a94e9a339b7454c09460622f72e0f014fabfd5e119afcbfed524a20",
+    "baseline_3af848e/reliability_review.py": "7951fa8f4432b49d4e20ba189e41a89bd4a7923bcdfa568a733060449f6212b8",
+    "baseline_3af848e/confirm_global_guards.py": "42a9a47f1b2246b5218e37cc7d6cf533e86788d089f7599123857b32601a277a",
+    "before_after_interactions.py": "98f56559735d3260c7a63f49e9865478dcbb4090e44674399e0b98c16337c365",
+    "baseline_3af848e/fixture.py": "96cec0229ae2ba3da8bcb7c7760d8d6cd95cf16c428029085e689e29e9538b34"
+  }
+}

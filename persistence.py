@@ -215,6 +215,13 @@ class JsonStore:
                     if expect_fingerprint is not None and file_fingerprint(path) != expect_fingerprint:
                         raise ValueError("STALE_INSTANCE: content fence refused")
                     payload = dumps(data, indent=1, ensure_ascii=False).encode()
+                    if os.path.basename(path) == "transport_intents.json":
+                        from transport_intent import validate_collection_update
+                        previous = {}
+                        if os.path.isfile(path):
+                            with open(path, "rb") as fh:
+                                previous = loads(fh.read())
+                        validate_collection_update(previous, data)
                     if os.path.basename(path) == "kalshi_trades.json" and os.path.isfile(path):
                         # A journal commit cannot erase or rewrite a completed
                         # economic event, even before the ledger has observed it.

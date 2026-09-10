@@ -23,7 +23,7 @@ _registry_lock = threading.Lock()
 _locks = {}
 _local = threading.local()
 _external = {}
-_leases = set()
+_leases = {}
 
 
 def _after_fork():
@@ -35,7 +35,7 @@ def _after_fork():
         except OSError:
             pass
     _registry_lock = threading.Lock()
-    _locks, _external, _leases = {}, {}, set()
+    _locks, _external, _leases = {}, {}, {}
     _local = threading.local()
 
 
@@ -126,29 +126,50 @@ def root_lock(path):
 
 
 class WriterLease:
-    """Exclusive process-lifetime engine authority, acquired before loading."""
+    """Exclusive engine authority held by an OS descriptor, never by a PID file.
+
+    Contents of the persistent lock inode have no authority: stale or reused
+    PIDs cannot block a new owner after process death. Never unlink this file
+    on release, as replacement would permit independent locks for one root.
+    """
     def __init__(self, path):
-        root = root_of(path)
-        os.makedirs(root, exist_ok=True)
+        self.root = root_of(path)
+        os.makedirs(self.root, exist_ok=True)
+        self.path = os.path.join(self.root, ".atlas-engine-writer.lock")
         self.pid = os.getpid()
-        self.fd = os.open(os.path.join(root, ".atlas-engine-writer.lock"),
-                          os.O_RDWR | os.O_CREAT, 0o600)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT |
+                          getattr(os, "O_CLOEXEC", 0), 0o600)
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            st = os.fstat(self.fd)
+            self._inode = (st.st_dev, st.st_ino)
         except OSError as exc:
             os.close(self.fd)
             self.fd = None
             raise AuthorityError("another engine owns this economic root") from exc
-        _leases.add(self.fd)
+        _leases[self.fd] = self
 
     def valid(self):
-        return self.fd is not None and self.pid == os.getpid()
+        if (self.fd is None or self.pid != os.getpid() or
+                _leases.get(self.fd) is not self):
+            return False
+        try:
+            held, current = os.fstat(self.fd), os.stat(self.path)
+            return ((held.st_dev, held.st_ino) == self._inode ==
+                    (current.st_dev, current.st_ino))
+        except OSError:
+            return False
 
     def close(self):
         if self.fd is not None:
-            if self.pid == os.getpid():
-                _leases.discard(self.fd)
-                os.close(self.fd)
+            if self.pid == os.getpid() and _leases.get(self.fd) is self:
+                _leases.pop(self.fd)
+                try:
+                    st = os.fstat(self.fd)
+                    if (st.st_dev, st.st_ino) == self._inode:
+                        os.close(self.fd)
+                except OSError:
+                    pass
             self.fd = None
 
 
@@ -263,7 +284,9 @@ class Transaction:
             if self.external:
                 identity, provider = self.external
                 self.previous = checkpoint(self.path, identity)
-                if provider.verify_current(self.previous) != self.previous:
+                from continuity_authority import verify_current, account_identity_proven
+                if (not account_identity_proven(provider, identity) or
+                        not verify_current(provider, self.previous)):
                     raise AuthorityError("external continuity unproven")
                 issue = recovery_problem(self.path)
                 if issue:
@@ -305,7 +328,8 @@ class Transaction:
                 if self.external:
                     identity, provider = self.external
                     candidate = checkpoint(self.path, identity)
-                    if provider.advance(self.previous, candidate) != candidate:
+                    from continuity_authority import advance
+                    if not advance(provider, self.previous, candidate):
                         raise AuthorityError("external checkpoint commit uncertain")
                 for validate in self.validators:
                     if validate() is not True:

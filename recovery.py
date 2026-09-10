@@ -7,7 +7,7 @@ that already recognizes that snapshot. No broker or network is used here.
 import hashlib
 import os
 
-from continuity_authority import account_identity
+from continuity_authority import account_identity, account_identity_proven, verify_current, advance
 from persistence import PersistenceSentinel
 from state_authority import (AuthorityError, root_lock, root_of, manifest,
     checkpoint, configure_authority, begin_write, durable_replace, remember_file,
@@ -58,7 +58,8 @@ def complete_verified_recovery(path, identity, provider, expected_digest, action
     with root_lock(path):
         _verify_files(path, identity)
         previous = checkpoint(path, identity)
-        if previous.digest != expected_digest or provider.verify_current(previous) != previous:
+        if (previous.digest != expected_digest or not account_identity_proven(provider, identity) or
+                not verify_current(provider, previous)):
             raise AuthorityError("independent continuity does not authorize this recovery")
         _verify_files(path, identity)
         configure_authority(path, identity, provider)
@@ -81,7 +82,7 @@ def complete_verified_recovery(path, identity, provider, expected_digest, action
             durable_replace(receipt + ".sha256", hashlib.sha256(payload).hexdigest().encode())
             remember_file(receipt, payload)
             candidate = checkpoint(path, identity)
-            if provider.advance(previous, candidate) != candidate:
+            if not advance(provider, previous, candidate):
                 raise AuthorityError("recovery checkpoint outcome uncertain")
             _verify_files(path, identity)
             finish_write(path)

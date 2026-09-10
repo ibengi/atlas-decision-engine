@@ -82,8 +82,10 @@ The existing broker adapter has no atomic account snapshot or verifiable broker
 execution-freeze provider. Rebase therefore **refuses** when `execution_freeze`
 is absent, expired, or fails verification. Sequential GETs remain diagnostic
 evidence; they do not produce a freeze certificate. A future provider must bind
-the account, a broker epoch, expiry and an execution exclusion scope; it must
-continue to validate at commit. Synthetic tests use a broker whose epoch and
+the account, broker watermark and all-writer execution exclusion scope; it must
+continue to validate at commit. Signed proof freshness is separate from the
+broker fence itself: that fence must remain HELD until explicit release after
+local commit, without automatic expiry during filesystem work. Synthetic tests use a broker whose epoch and
 writers are entirely controlled by the test harness.
 
 ## Three different rollback problems
@@ -96,11 +98,12 @@ writers are entirely controlled by the test harness.
   requires a source independent of that volume. No local hash provides this.
 
 `continuity_authority.ContinuityAuthority` is an interface, not deployed
-infrastructure. `verify_current(Checkpoint)` must authenticate a fresh nonce and
-match account fingerprint, monotonic generation and digest. `advance(before,
-candidate)` must perform a linearizable compare-and-swap and authenticate the
-candidate reply. Replayed, missing, stale, unavailable or ambiguous replies block.
-The caller may not attach a provider that simply echoes the request.
+infrastructure. Providers return signed evidence; Atlas verifies Ed25519 against
+separately configured host trust, not a provider-supplied key or verifier. Echoes
+are rejected. Signatures bind account/environment, generation/digest, nonce,
+authority identity, issuance/expiry and a monotonic checkpoint. Advancement is
+an authenticated compare-and-swap. See authenticated-authority-contract.md for
+account/credential attestation, independent trust and broker-freeze semantics.
 
 No provider is configured by default. Even an attested RECONCILED ledger is
 CAPITAL_BLOCKED without current independent continuity proof. Production needs
@@ -113,7 +116,9 @@ any capital promotion; this change does not fabricate either service.
 Identity is the canonical tuple `(kalshi, demo|prod, stable non-secret account
 identifier)` and its SHA-256 fingerprint. Key IDs and credential bytes are not
 account identity. Key rotation for the same account does not change the tuple.
-Unknown identity and persisted/runtime mismatch block. Existing unbound state
+Unknown identity and persisted/runtime mismatch block. A separately signed
+stable-account observation or attestation must bind the current nonsecret
+credential-ID fingerprint; an operator label alone is insufficient. Existing unbound state
 requires explicit reconciliation/migration; it cannot acquire provenance by
 changing an environment variable.
 
@@ -137,12 +142,12 @@ but cannot prevent arbitrary access to the backing volume.
 Broker completion is not part of the local filesystem transaction. A committed
 intent followed by a timeout is pending evidence, never evidence of absence.
 The external provider and verifiable broker freeze remain explicit integration
-requirements. A real HTTP mutation leaves `transport_intents.json` unresolved;
-this implementation blocks every subsequent mutation until independently
-reviewed outcome reconciliation is supplied. It does not infer completion from
-an HTTP response, retry a mutation automatically, or fabricate a broker history
-reconstruction service. This operational stop is intentional and is a remaining
-integration limitation, not approval for production execution.
+requirements. Transport intents now have a complete durable lifecycle, described
+in transport-intent-lifecycle.md. Independent exact broker evidence resolves
+presence; final absence/rejection needs independently authenticated evidence.
+Unresolved rows block; resolved rows remain immutable and allow later distinct
+mutations. Startup resumes reconciliation. No mutation is retried automatically,
+no empty listing proves absence, and no broker reconstruction service is fabricated.
 
 Only a current, complete independent snapshot can use `complete_verified_recovery`.
 General economic reconstruction, migration between accounts and restoration of

@@ -3,6 +3,22 @@
 All scenarios use temporary economic state and synthetic broker data. Do not use
 live credentials or endpoints. CAPITAL stays OFF and real broker writes stay 0.
 
+To reproduce all **59 historical unsafe BEFORE cases** and their AFTER assertions,
+use the preserved baseline fixtures and the comparison runner:
+
+```
+python tools/astra_regressions/reproduce_historical.py --before /path/to/local-3af848e-tree --after . --output /tmp/atlas-historical-reproduction
+```
+
+Both trees must already exist locally; the BEFORE tree must be a clean checkout
+of `3af848e6aebc8769ea59f878d68674f89e04af0d`. The runner executes all 304 scenarios
+on each selected tree, checks the exact 59 original failure assertions, verifies
+the loaded production source, and writes fresh logs and source hashes. It does
+not consume retained result JSON as proof. All AFTER scenarios must pass. See
+[`historical-reproduction.md`](../../docs/audits/historical-reproduction.md) for
+the complete identifier mapping, commands, seven original uncertainties, and
+fixture adaptations. Use `--phase before` or `--phase after` for a single side.
+
 Run from the repository root with installed test dependencies. The launcher
 starts Python in a credential-free environment, creates a fresh DATA_DIR and
 blocks external DNS/connect/sendto. The repository suite alone may use loopback
@@ -34,6 +50,13 @@ The 190-case reliability harness retains its scenarios. Its adaptations declare
 complete current intent fields and gatekeeper criteria, recognize a duplicate
 refused at ingestion while retaining the drawdown assertion, explicitly complete
 verified recovery, and rebuild manager authority in forked crash workers.
+Those workers explicitly install the test host's existing independent public-key
+pins in their own process before loading managers; they retain the original
+external checkpoint and never bootstrap it from the local economic files.
+The original baseline `reliability_review.py`, `fixture.py`, and global controls
+are separately preserved byte for byte in `baseline_3af848e/`; their hashes are
+recorded in `historical_cases.json`. Use those baseline files when reviewing the
+rejected commit, rather than importing the current contract fixture there.
 
 A process exit, a stale fixture or an unhandled exception is not evidence of a
 passing safety assertion. All controls must run to completion. The before/after

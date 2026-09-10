@@ -2,7 +2,7 @@
 
 import base64
 import json
-from transport_intent import durable_transport
+from transport_intent import durable_transport, BeforeSendFailure
 import math
 from strict_data import loads as strict_loads, validate_tree
 import logging
@@ -261,6 +261,8 @@ class KalshiClient:
                 0, f"methode HTTP inutilisable pour {path}: valeur non "
                    f"classable. Aucune requete emise.")
         if self._pk is None and path.startswith("/portfolio"):
+            if _is_mutating_method(method):
+                raise BeforeSendFailure("authentication key unavailable before dispatch")
             raise KalshiAPIError(
                 0, f"{method} {path}: requete authentifiee IMPOSSIBLE — cle "
                    f"RSA non chargee (cle absente/non-PEM ou dependance "
@@ -272,8 +274,14 @@ class KalshiClient:
         while True:
             attempt += 1
             try:
+                headers = self._sign_headers(method, url)
+            except Exception as exc:
+                if _is_mutating_method(method):
+                    raise BeforeSendFailure("request signing failed before dispatch") from exc
+                raise
+            try:
                 r = self.session.request(method, url,
-                                         headers=self._sign_headers(method, url),
+                                         headers=headers,
                                          timeout=15, **kw)
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt > retries:

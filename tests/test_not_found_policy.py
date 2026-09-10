@@ -7,15 +7,15 @@ decisive. NOT_FOUND is the treacherous one -- it is the answer that looks
 like permission to try again, and it is precisely the answer a lagging
 read replica gives about an order that DOES exist.
 
-Policy pinned here (NOT_FOUND_CONFIRMED_2x_60s_FULL_PAGINATION):
+Policy pinned here (AUTHENTICATED_TRANSPORT_OUTCOME_REQUIRED):
 
   * an empty read counts as evidence only if the listing was COMPLETE
     (pagination exhausted); a truncated listing is an absence fabricated
     by pagination and is refused as evidence
-  * N = AMBIGUOUS_NOT_FOUND_CONFIRMATIONS (2) such readings are required,
-    spaced by at least AMBIGUOUS_NOT_FOUND_INTERVAL_S (60 s); a reading
-    taken too soon carries no new information and is NOT counted
-  * until the count is reached the intent stays OPEN, and an open intent
+  * spaced complete readings are retained as diagnostics; no number of
+    potentially delayed empty readings proves final absence
+  * independently resolved durable transport evidence permits closure;
+    until that exists the intent stays OPEN, and an open intent
     blocks submission on that ticker INDEPENDENTLY of the duplicate
     guard's TTL -- the TTL measures elapsed time, never proof
   * an order appearing late (between two readings, or after a restart)
@@ -49,7 +49,8 @@ CID = bot.OrderManager._client_order_id(TICKER, SIDE, COUNT, PRICE)
 def order_row(order_id="ord-late-1"):
     return {"order_id": order_id, "client_order_id": CID, "ticker": TICKER,
             "side": SIDE, "status": "resting", "fill_count": 0,
-            "remaining_count": COUNT}
+            "remaining_count": COUNT, "initial_count": COUNT,
+            "action": "buy", "yes_price": PRICE}
 
 
 class _PolicyBase(unittest.TestCase):
@@ -110,6 +111,25 @@ class _PolicyBase(unittest.TestCase):
         om.pending_intents[TICKER]["last_not_found_at"] -= seconds
         om._flush_pending_intents()
 
+    def _prove_transport_absence(self):
+        """Real persisted lifecycle plus test-owned independent signing key."""
+        from authority_fixtures import provider_for
+        from continuity_authority import account_identity
+        from test_transport_lifecycle import MemoryBroker, FinalEvidence
+        from transport_intent import reconcile_transport_intents, outcome_for_client_order
+        authority = provider_for(env="demo")
+        broker = MemoryBroker(authority)
+        broker.env = "demo"
+        broker.mode = "timeout_absent"
+        with self.assertRaises(KalshiAPIError):
+            broker._req("POST", "/portfolio/events/orders", json={
+                "client_order_id": CID, "ticker": TICKER, "side": "bid",
+                "count": str(COUNT), "price": f"{PRICE / 100:.4f}"})
+        identity = account_identity("kalshi", "demo", CFG.BROKER_ACCOUNT_ID)
+        broker.transport_evidence_provider = FinalEvidence(identity, "CONFIRMED_NOT_APPLIED")
+        reconcile_transport_intents(broker)
+        self.assertEqual(outcome_for_client_order(CID)["state"], "CONFIRMED_NOT_APPLIED")
+
 
 class ConfirmationCountTest(_PolicyBase):
     """How many readings, and how far apart."""
@@ -135,7 +155,7 @@ class ConfirmationCountTest(_PolicyBase):
                          "a reading taken too soon was counted as evidence")
         self.assertEqual(self._intent(om)["resolution"], "NOT_FOUND_PENDING")
 
-    def test_a_second_reading_after_the_interval_closes_the_intent(self):
+    def test_a_second_reading_after_the_interval_keeps_the_intent(self):
         client = self._client()
         om = bot.OrderManager(client)
         self._submit(om)
@@ -143,9 +163,9 @@ class ConfirmationCountTest(_PolicyBase):
 
         outcomes = om.resolve_pending_intents()
 
-        self.assertEqual(outcomes[TICKER], "CLOSED_ABSENT")
-        self.assertIsNone(self._intent(om), "closed intent still open")
-        self.assertIsNone(self._intent(), "closed intent still on disk")
+        self.assertEqual(outcomes[TICKER], "NOT_FOUND_PENDING")
+        self.assertIsNotNone(self._intent(om), "empty reads must retain the intent")
+        self.assertIsNotNone(self._intent(), "pending intent must remain durable")
 
     def test_the_required_count_is_configurable_and_respected(self):
         CFG.AMBIGUOUS_NOT_FOUND_CONFIRMATIONS = 3
@@ -159,7 +179,8 @@ class ConfirmationCountTest(_PolicyBase):
             if expected < 3:
                 self.assertEqual(outcome, "NOT_FOUND_PENDING")
                 self.assertEqual(self._intent(om)["not_found_count"], expected)
-        self.assertEqual(outcome, "CLOSED_ABSENT")
+        self.assertEqual(outcome, "NOT_FOUND_PENDING")
+        self.assertEqual(self._intent(om)["not_found_count"], 3)
 
     def test_an_unavailable_reading_is_not_a_confirmation(self):
         """A lookup that failed proves nothing and must not advance the
@@ -250,16 +271,14 @@ class LateAppearingOrderTest(_PolicyBase):
         self.assertEqual(client.create_order.call_count, 1,
                          "a second order was created")
 
-    def test_a_late_order_after_closure_is_caught_by_the_guard_not_a_repost(self):
-        """Worst case: the order appears AFTER the intent was closed. The
-        duplicate guard still holds the ticker, so no second order is
-        created inside the TTL."""
+    def test_a_late_order_after_empty_readings_is_caught_without_a_repost(self):
+        """Empty readings retain the intent; the duplicate guard also holds."""
         client = self._client()
         om = bot.OrderManager(client)
         self._submit(om)
         self._age_the_last_reading(om, self.INTERVAL + 1)
         self.assertEqual(om.resolve_pending_intents()[TICKER],
-                         "CLOSED_ABSENT")
+                         "NOT_FOUND_PENDING")
 
         client2 = self._client(matches=[order_row()])
         client2.create_order.side_effect = None
@@ -267,7 +286,7 @@ class LateAppearingOrderTest(_PolicyBase):
         om2 = bot.OrderManager(client2)
         res = self._submit(om2, price=PRICE + 7)
 
-        self.assertEqual(res.status, "blocked:duplicate_submission_guard")
+        self.assertEqual(res.status, "blocked:ambiguous_intent_unresolved")
         self.assertEqual(client2.create_order.call_count, 0)
 
 
@@ -303,7 +322,8 @@ class TtlCannotSilentlyRepostTest(_PolicyBase):
         om = bot.OrderManager(client)
         self._submit(om)
         self._age_the_last_reading(om, self.INTERVAL + 1)
-        om.resolve_pending_intents()
+        self._prove_transport_absence()
+        self.assertEqual(om.resolve_pending_intents()[TICKER], "CLOSED_ABSENT")
 
         CFG.SUBMIT_DEDUP_TTL_S = 0.0001
         time.sleep(0.01)
@@ -337,8 +357,9 @@ class RestartDuringTheWindowTest(_PolicyBase):
         self.assertEqual(om2.pending_intents[TICKER]["not_found_count"], 1,
                          "the count did not survive the restart")
         outcome = om2.resolve_pending_intents()[TICKER]
-        self.assertEqual(outcome, "CLOSED_ABSENT",
-                         "the surviving count did not carry the decision")
+        self.assertEqual(outcome, "NOT_FOUND_PENDING",
+                         "surviving empty-read counts cannot prove absence")
+        self.assertEqual(om2.pending_intents[TICKER]["not_found_count"], 2)
 
     def test_restart_inside_the_window_blocks_any_submission(self):
         client = self._client()

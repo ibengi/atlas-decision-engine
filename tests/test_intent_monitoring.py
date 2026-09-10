@@ -54,7 +54,8 @@ SECRETS = [
 
 def order_row(order_id="ord-1"):
     return {"order_id": order_id, "client_order_id": CID, "ticker": TICKER,
-            "side": SIDE, "status": "resting", "fill_count": 0,
+            "side": SIDE, "action": "buy", "initial_count": COUNT,
+            "yes_price": PRICE, "status": "resting", "fill_count": 0,
             "remaining_count": COUNT}
 
 

@@ -872,10 +872,9 @@ class EquityLedger:
         if new == STATUS_RECONCILED:
             self.state["status_basis"]["unproven"] = []
 
-    def guards(self) -> list:
-        """CAPITAL guard names currently firing, in evaluation order."""
-        authority_guards = []
-        out = authority_guards
+    def _authority_guards(self) -> tuple:
+        """Immutable authority results, independent of accounting lists."""
+        out = []
         if self.owner_pid != os.getpid():
             out.append("stale_instance_reload_required")
         from persistence import PersistenceSentinel
@@ -897,12 +896,17 @@ class EquityLedger:
             out.append("account_identity_mismatch")
         if not self._external_continuity_proven():
             out.append("external_continuity_unproven")
-        from persistence import JsonStore
+        from transport_intent import has_unresolved_transport
         transport_path = os.path.join(os.path.dirname(self.path), "transport_intents.json")
-        if os.path.exists(transport_path) and JsonStore.load(transport_path, None) != {}:
+        if has_unresolved_transport(transport_path):
             out.append("transport_outcome_unresolved")
         if self._continuity_reason():
             out.append(GUARD_CONTINUITY)
+        return tuple(out)
+
+    def guards(self) -> list:
+        """CAPITAL guards; economic checks cannot rebind authority results."""
+        authority_guards = self._authority_guards()
         out = []
         # A01: continuity first. Everything below reasons about numbers; if
         # the state those numbers come from may have been rewound, no number
@@ -916,7 +920,7 @@ class EquityLedger:
             out.append(GUARD_ACCOUNTING_MODE)
         # A04: the same economic event counted twice flatters the drawdown.
         if getattr(self.tlog, "_fingerprint", None) != file_fingerprint(getattr(self.tlog, "path", os.path.join(os.path.dirname(self.path), "kalshi_trades.json"))):
-            authority_guards.append("stale_journal_reload_required")
+            authority_guards += ("stale_journal_reload_required",)
         if getattr(self.tlog, "integrity_error", None):
             out.append(GUARD_JOURNAL_INTEGRITY)
         if self.seeded and self.duplicate_events():
@@ -939,7 +943,7 @@ class EquityLedger:
             out.append(GUARD_RESIDUAL_UNEXPLAINED)
         if self.state.get("capital_hold"):
             out.append(GUARD_CAPITAL_HOLD)
-        return list(dict.fromkeys(out + authority_guards))
+        return list(dict.fromkeys(tuple(out) + authority_guards))
 
     def _unexplained_residual(self):
         """The adverse balance movement currently lacking an explanation, or
@@ -966,11 +970,49 @@ class EquityLedger:
         if self.identity is None or self.authority is None:
             return False
         try:
-            m = manifest(self.path)
-            request = challenge(self.identity, m["generation"], _sha(_canonical(m)))
-            return self.authority.verify_current(request) == request
+            from continuity_authority import (verify_current, account_identity_proven,
+                                              credential_fingerprint)
+            # Provider calls are an external boundary even when their answers
+            # are signed. A valid answer for the old account/checkpoint cannot
+            # authorize runtime state changed while obtaining that answer.
+            path, authority, posmgr = self.path, self.authority, self.posmgr
+            identity = copy.deepcopy(self.identity)
+            configured_account = copy.deepcopy(getattr(CFG, "BROKER_ACCOUNT_ID", None))
+            configured_root = copy.deepcopy(getattr(CFG, "DATA_DIR", None))
+            client = getattr(posmgr, "client", None)
+            credential = credential_fingerprint(client)
+            client_authority = getattr(client, "continuity_authority", None)
+            lease = getattr(client, "_engine_writer_lease", None)
+            m = manifest(path)
+            request = challenge(identity, m["generation"], _sha(_canonical(m)))
+
+            def unchanged():
+                return (self.owner_pid == os.getpid() and self.path == path and
+                        self.authority is authority and self.posmgr is posmgr and
+                        self.identity == identity and self.state.get("identity") == identity and
+                        self.env == identity["environment"] and
+                        getattr(CFG, "BROKER_ACCOUNT_ID", None) == configured_account and
+                        getattr(CFG, "DATA_DIR", None) == configured_root and
+                        getattr(posmgr, "client", None) is client and
+                        (client is None or getattr(client, "env", None) == identity["environment"]) and
+                        credential_fingerprint(client) == credential and
+                        getattr(client, "continuity_authority", None) is client_authority and
+                        getattr(client, "_engine_writer_lease", None) is lease and
+                        (lease is None or lease.valid()) and manifest(path) == m)
+
+            if not unchanged():
+                return False
+            if not account_identity_proven(authority, identity, credential_identity=credential):
+                return False
+            if not unchanged() or not verify_current(authority, request):
+                return False
+            return unchanged() and recovery_problem(path) is None
         except Exception:
             return False
+
+    def _broker_freeze_proven(self, freeze):
+        from continuity_authority import broker_freeze_proven
+        return broker_freeze_proven(freeze, self.identity, self.bound_state())
 
     def _epsilon(self) -> float:
         # Fixed measurement tolerance, never proportional to trading history.
@@ -1443,7 +1485,8 @@ class EquityLedger:
         if not PersistenceSentinel.healthy():
             failures.append("persistence recovery required")
         transport_path = os.path.join(os.path.dirname(self.path), "transport_intents.json")
-        if os.path.exists(transport_path) and JsonStore.load(transport_path, None) != {}:
+        from transport_intent import has_unresolved_transport
+        if has_unresolved_transport(transport_path):
             failures.append("transport outcome unresolved")
         for name in BOUND_STATE_FILES:
             raw = JsonStore.load(os.path.join(os.path.dirname(self.path), name), None)
@@ -1472,7 +1515,7 @@ class EquityLedger:
             return failures
         freeze = ctx.get("execution_freeze")
         try:
-            if freeze is None or freeze.verify(self.identity, self.bound_state()) is not True:
+            if freeze is None or not self._broker_freeze_proven(freeze):
                 failures.append("verifiable execution freeze absent or expired")
         except Exception:
             failures.append("execution freeze verification failed")
@@ -1607,7 +1650,7 @@ class EquityLedger:
         freeze = ctx.get("execution_freeze")
         if transaction is None or freeze is None:
             return False
-        transaction.validators.append(lambda: freeze.verify(self.identity, self.bound_state()) is True)
+        transaction.validators.append(lambda: self._broker_freeze_proven(freeze))
         # PREPARE the new state on a copy. Nothing below this line is visible
         # to any other reader until the durable write returns True.
         when = when or now_iso()

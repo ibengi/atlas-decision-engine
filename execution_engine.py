@@ -310,6 +310,35 @@ class ExecutionEngine:
     _capital_blocking_guard = None
 
     def __init__(self, client: KalshiClient, capital: float, continuity_authority=None):
+        # Acquire BEFORE any economic component is constructed or loaded. The
+        # OS lock, not a persisted PID, owns authority for this process.
+        from state_authority import WriterLease
+        self._writer_lease = WriterLease(_p("equity_ledger.json"))
+        self._authority_initialized = False
+        try:
+            client._engine_writer_lease = self._writer_lease
+            if continuity_authority is not None:
+                client.continuity_authority = continuity_authority
+            self._initialize(client, capital, continuity_authority)
+            self._authority_initialized = True
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        """Revoke this engine before releasing its process writer lease."""
+        self._authority_initialized = False
+        executor = getattr(self, "_executor", None)
+        lease = getattr(self, "_writer_lease", None)
+        try:
+            if executor is not None and lease is not None and lease.pid == os.getpid():
+                executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            self._executor = None
+            if lease is not None:
+                lease.close()
+
+    def _initialize(self, client: KalshiClient, capital: float, continuity_authority=None):
         from strategy_router import (GateConfig, build_default_registry,
                                      RegistryValidationError)
         from opportunity_pipeline import MarketOpportunityPipeline
@@ -613,7 +642,11 @@ class ExecutionEngine:
         except (ValueError, AttributeError):
             return False, "invalid_numeric_risk_configuration"
         lease = getattr(self, "_writer_lease", None)
-        if lease is not None and not lease.valid():
+        from state_authority import root_of
+        if ((hasattr(self, "_authority_initialized") and
+             (not self._authority_initialized or lease is None)) or
+                (lease is not None and (not lease.valid() or
+                 lease.root != root_of(_p("equity_ledger.json"))))):
             return False, "stale_engine_writer_lease"
         # Portes fail-closed structurelles AVANT les portes de risque :
         # une panne de persistance critique ou une divergence broker/local
