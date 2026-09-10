@@ -41,6 +41,7 @@ import json
 import math
 import os
 import time
+from strict_data import loads as strict_loads
 
 #: Fenetres de fraicheur (jours).
 MAX_TEST_REPORT_AGE_DAYS = 7.0
@@ -55,12 +56,27 @@ MAX_FUTURE_SKEW_S = 300.0
 #: manifeste date apres eux est donc incoherent, pas simplement recent.
 MAX_MODEL_AHEAD_OF_TESTS_S = MAX_FUTURE_SKEW_S
 
+# Release schema is reviewed with the code. A model cannot invent a new
+# validation policy by changing its own manifest.
+MODEL_CRITERIA = {"btc15m-baseline-0.1": frozenset({
+    "shadow_predictions_settled", "theoretical_trades", "calibration_fitted",
+    "brier_beats_market_baseline_out_of_sample", "real_settled_trades",
+    "rti_vs_consensus_spread_measured", "real_fill_slippage_calibrated"})}
+
+
+_load_errors = {}
 
 def _load(path):
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
+            result = strict_loads(f.read())
+            _load_errors.pop(path, None)
+            return result
+    except (OSError, ValueError) as exc:
+        detail = str(exc)
+        if "non-finite" in detail or "finite" in detail:
+            detail = "n'est pas un nombre fini: " + detail
+        _load_errors[path] = detail
         return None
 
 
@@ -124,7 +140,7 @@ def _check_test_report(now: float, failed: list):
     """-> le timestamp du rapport, ou None si le rapport est refuse."""
     tr = _load("test_report.json")
     if tr is None:
-        failed.append("test_report.json absent ou illisible")
+        failed.append("test_report.json absent ou illisible: " + _load_errors.get("test_report.json", ""))
         return None
     if not isinstance(tr, dict):
         failed.append(f"test_report.json: objet attendu, "
@@ -139,6 +155,14 @@ def _check_test_report(now: float, failed: list):
         failed.append("test_report.json: ZERO test execute -- zero echec sur "
                       "zero test ne prouve rien")
         return None
+    for field in ("failed_tests", "error_tests", "skipped_tests"):
+        if field in tr and (not isinstance(tr[field], list) or tr[field]):
+            failed.append("contradictory or malformed " + field)
+    for field in ("collected", "tests_run", "tests_passed", "passed"):
+        if field in tr and (type(tr[field]) is not int or tr[field] != ran):
+            failed.append("contradictory test count: " + field)
+    if "success" in tr and tr["success"] is not True:
+        failed.append("contradictory success status")
     counts = {}
     for field in ("failures", "errors", "skipped"):
         ok_f, value = _non_negative_int(tr.get(field))
@@ -182,7 +206,7 @@ def _check_test_report(now: float, failed: list):
 def _check_model_validation(now: float, test_ts, failed: list) -> None:
     mv = _load("model_validation.json")
     if mv is None:
-        failed.append("model_validation.json absent ou illisible")
+        failed.append("model_validation.json absent ou illisible: " + _load_errors.get("model_validation.json", ""))
         return
     if not isinstance(mv, dict):
         failed.append(f"model_validation.json: objet attendu, "
@@ -196,11 +220,22 @@ def _check_model_validation(now: float, test_ts, failed: list) -> None:
         failed.append("model_validation.json: 'model_version' absent ou vide "
                       "-- evidence non rattachable a un modele")
     criteria = mv.get("criteria")
+    if version not in MODEL_CRITERIA:
+        failed.append("model_validation.json: unknown model_version")
+    if not isinstance(criteria, list) or not criteria:
+        failed.append("model_validation.json: mandatory criteria missing")
+    elif any(not isinstance(c, dict) or not isinstance(c.get("name"), str)
+             or type(c.get("passed")) is not bool for c in criteria):
+        failed.append("model_validation.json: malformed criterion")
+    else:
+        names = [c["name"] for c in criteria]
+        if len(names) != len(set(names)) or set(names) != MODEL_CRITERIA.get(version):
+            failed.append("model_validation.json: contradictory or incomplete criteria set")
     if criteria is not None:
         if not isinstance(criteria, list):
             failed.append("model_validation.json: 'criteria' n'est pas une liste")
         else:
-            unmet = [c.get("name") for c in criteria
+            unmet = [c.get("name") if isinstance(c, dict) else "malformed criterion" for c in criteria
                      if not isinstance(c, dict) or c.get("passed") is not True]
             if unmet:
                 failed.append(f"criteres de validation non satisfaits: {unmet}")
@@ -248,7 +283,10 @@ def check_live_allowed():
                       "interdite tant que non levee explicitement")
     if os.getenv("MODEL_APPROVED_FOR_LIVE", "") != "YES":
         failed.append("MODEL_APPROVED_FOR_LIVE=YES absent")
-    test_ts = _check_test_report(now, failed)
-    _check_model_validation(now, test_ts, failed)
-    _check_artifact_binding(failed)
+    try:
+        test_ts = _check_test_report(now, failed)
+        _check_model_validation(now, test_ts, failed)
+        _check_artifact_binding(failed)
+    except Exception as exc:
+        failed.append("REJECTED: malformed validation evidence: " + type(exc).__name__)
     return (len(failed) == 0), failed

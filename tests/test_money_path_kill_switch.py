@@ -55,6 +55,18 @@ class MoneyPathReReadsTheKillSwitch(unittest.TestCase):
     """place_and_track must consult KILL_SWITCH on every single order."""
 
     def setUp(self):
+        import tempfile
+        from unittest.mock import patch
+        from persistence import PersistenceSentinel
+        from authority_fixtures import initialize_empty
+        tmp = tempfile.TemporaryDirectory(prefix="kill-switch-isolated-")
+        self.addCleanup(tmp.cleanup)
+        state = patch.object(CFG, "DATA_DIR", tmp.name)
+        state.start()
+        self.addCleanup(state.stop)
+        PersistenceSentinel.reset()
+        self.addCleanup(PersistenceSentinel.reset)
+        initialize_empty()
         self._saved = (CFG.ALLOW_ORDER_SUBMISSION, CFG.KILL_SWITCH,
                        CFG.DAILY_RESEARCH_ORACLE_APPROVED)
         CFG.ALLOW_ORDER_SUBMISSION = True

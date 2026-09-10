@@ -22,6 +22,10 @@ import json
 import hashlib
 import shutil
 import logging
+import contextlib
+from strict_data import loads, dumps
+from state_authority import (root_lock, durable_replace, fsync_dir, Transaction,
+    active_transaction, recovery_problem, remember_file)
 
 from config import CFG, _p
 
@@ -40,6 +44,9 @@ CRITICAL_BASENAMES = frozenset({
     "positions_state.json",    # open positions / slot accounting
     "state_epoch.json",        # persistent-state continuity marker
     "equity_ledger.json",      # F2 risk-equity baseline, flows, HWM, rebases
+    "seen_fill_ids.json",
+    "transport_intents.json",
+    "recovery_receipts.json",
     "pending_intents.json",    # A09: the proof a submission was intended
 })
 
@@ -99,25 +106,18 @@ def read_generation(path: str, key: str = "generation"):
     what this process remembers."""
     try:
         with open(path, "rb") as fh:
-            data = json.loads(fh.read().decode())
+            data = loads(fh.read().decode())
     except (OSError, ValueError):
         return None
     if isinstance(data, dict):
         gen = data.get(key)
-        if isinstance(gen, int) and gen >= 0:
+        if type(gen) is int and gen >= 0:
             return gen
     return None
 
 
 def _fsync_dir(parent: str) -> None:
-    try:
-        fd = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:                # pragma: no cover - platform dependent
-        pass
+    fsync_dir(parent)
 
 
 def verify_state_root() -> bool:
@@ -145,6 +145,20 @@ def verify_state_root() -> bool:
             return False
         return True
     if CFG.ALLOW_FRESH_STATE:
+        # Explicit first-volume initialization proves empty collections together.
+        # Existing economic files preclude this initialization path.
+        names = {"kalshi_trades.json": [], "positions_state.json": {},
+                 "orders_state.json": {}, "pending_intents.json": {},
+                 "submission_guard.json": {}, "seen_fill_ids.json": []}
+        if not any(os.path.exists(_p(name)) for name in names):
+            try:
+                with Transaction(marker, set(names) | {"state_epoch.json"}):
+                    for name, value in names.items():
+                        if not JsonStore.save(_p(name), value):
+                            return False
+            except Exception as exc:
+                PersistenceSentinel.record_failure(marker, str(exc))
+                return False
         import datetime
         ok = JsonStore.save(marker, {
             "initialized_at":
@@ -178,70 +192,99 @@ class JsonStore:
 
     @classmethod
     def save(cls, path: str, data, expect_generation=None,
-             generation_key: str = "generation") -> bool:
-        """Atomic, checksummed, optionally fenced write.
-
-        ``expect_generation`` is the generation this writer believes is on
-        disk. If the file has since moved on, another writer owns the state
-        and this one is stale: the write is REFUSED rather than applied.
-        Silently winning that race is how a stale process rewound the
-        evidence watermark (audit finding A01).
-        """
+             generation_key: str = "generation", expect_fingerprint=None) -> bool:
+        critical = os.path.basename(path) in CRITICAL_BASENAMES
+        tx = None
         try:
-            parent = os.path.dirname(os.path.abspath(path))
-            os.makedirs(parent, exist_ok=True)
-            if expect_generation is not None:
-                on_disk = read_generation(path, generation_key)
-                if on_disk is not None and int(on_disk) != int(expect_generation):
-                    log.critical(
-                        f"[FENCE_REFUSED] {path}: generation on disk "
-                        f"{on_disk} != {expect_generation} held by this "
-                        f"writer -- write REFUSED (stale writer).")
-                    return False
-                if isinstance(data, dict):
-                    data = dict(data)
-                    data[generation_key] = int(expect_generation) + 1
-            payload = json.dumps(data, indent=1, ensure_ascii=False).encode()
-            tmp = path + ".tmp"
-            with open(tmp, "wb") as f:
-                f.write(payload); f.flush(); os.fsync(f.fileno())
-            # rotation des backups AVANT remplacement
-            if os.path.exists(path):
-                for i in range(CFG.BACKUPS - 1, 0, -1):
-                    src, dst = f"{path}.bak{i}", f"{path}.bak{i+1}"
-                    if os.path.exists(src): shutil.copy2(src, dst)
-                shutil.copy2(path, f"{path}.bak1")
-            os.replace(tmp, path)
-            _fsync_dir(parent)
-            sha_tmp = path + ".sha256.tmp"
-            with open(sha_tmp, "w", encoding="utf-8") as f:
-                f.write(cls._sha(payload)); f.flush(); os.fsync(f.fileno())
-            os.replace(sha_tmp, path + ".sha256")
-            _fsync_dir(parent)
-            cls.recovered_from_backup.pop(os.path.abspath(path), None)
+            path = os.path.abspath(path)
+            with root_lock(path):
+                tx = active_transaction(path)
+                scope = (Transaction(path, {os.path.basename(path)})
+                         if critical and tx is None else contextlib.nullcontext(tx))
+                with scope as tx:
+                    if expect_generation is not None:
+                        on_disk = read_generation(path, generation_key)
+                        if tx and tx.stage_json:
+                            on_disk = tx.staged_generations.get(path, on_disk)
+                        if ((on_disk is None and (expect_generation != 0 or os.path.exists(path)))
+                                or (on_disk is not None and on_disk != expect_generation)):
+                            raise ValueError("STALE_INSTANCE: generation fence refused")
+                        if isinstance(data, dict):
+                            data = dict(data)
+                            data[generation_key] = expect_generation + 1
+                    if expect_fingerprint is not None and file_fingerprint(path) != expect_fingerprint:
+                        raise ValueError("STALE_INSTANCE: content fence refused")
+                    payload = dumps(data, indent=1, ensure_ascii=False).encode()
+                    if os.path.basename(path) == "kalshi_trades.json" and os.path.isfile(path):
+                        # A journal commit cannot erase or rewrite a completed
+                        # economic event, even before the ledger has observed it.
+                        # Corrections are new linked events, never replacements.
+                        with open(path, "rb") as fh:
+                            previous = loads(fh.read())
+                        if not isinstance(previous, list) or not isinstance(data, list):
+                            raise ValueError("journal must remain a collection")
+                        completed = [row for row in previous if isinstance(row, dict)
+                                     and (row.get("state") == "settled" or row.get("record_type") == "correction")]
+                        successor = iter(data)
+                        for row in completed:
+                            if not any(candidate == row for candidate in successor):
+                                raise ValueError("completed economic history is immutable")
+                    if tx is not None and tx.stage_json:
+                        tx.prepare_json(cls, path, loads(payload), expect_generation,
+                                        generation_key, expect_fingerprint)
+                        return True
+                    if tx is not None:
+                        tx.writing(path)
+                    # Backups are diagnostic evidence, never permission to rewind.
+                    if os.path.exists(path):
+                        for i in range(CFG.BACKUPS - 1, 0, -1):
+                            src, dst = f"{path}.bak{i}", f"{path}.bak{i+1}"
+                            if os.path.exists(src):
+                                shutil.copy2(src, dst)
+                        shutil.copy2(path, f"{path}.bak1")
+                    durable_replace(path, payload)
+                    _fsync_dir(os.path.dirname(path))
+                    durable_replace(path + ".sha256", cls._sha(payload).encode())
+                    _fsync_dir(os.path.dirname(path))
+                    with open(path, "rb") as fh:
+                        if fh.read() != payload:
+                            raise ValueError("durable payload readback mismatch")
+                    if critical:
+                        remember_file(path, payload)
+                    cls.recovered_from_backup.pop(path, None)
             return True
-        except Exception as e:
-            log.error(f"JsonStore.save({path}): {e}")
-            if os.path.basename(path) in CRITICAL_BASENAMES:
-                PersistenceSentinel.record_failure(path, str(e))
+        except Exception as exc:
+            if tx is not None:
+                tx.failed = True
+            log.error(f"JsonStore.save({path}): {exc}")
+            if critical:
+                PersistenceSentinel.record_failure(path, str(exc))
             return False
 
     @classmethod
     def load(cls, path: str, default):
+        critical = os.path.basename(path) in CRITICAL_BASENAMES
+        issue = None if active_transaction(path) else recovery_problem(path)
+        if critical and issue:
+            PersistenceSentinel.record_failure(path, issue)
         candidates = [path] + [f"{path}.bak{i}" for i in range(1, CFG.BACKUPS + 1)]
         for cand in candidates:
             if not os.path.exists(cand):
                 continue
             try:
-                raw = open(cand, "rb").read()
-                data = json.loads(raw.decode())
+                with open(cand, "rb") as fh:
+                    raw = fh.read()
+                data = loads(raw.decode())
                 if cand == path and os.path.exists(path + ".sha256"):
-                    want = open(path + ".sha256").read().strip()
+                    with open(path + ".sha256") as fh:
+                        want = fh.read().strip()
                     if want and want != cls._sha(raw):
                         log.warning(f"JsonStore: checksum invalide pour {path} "
                                     f"-- tentative sur backup.")
                         continue
                 if cand != path:
+                    if critical:
+                        PersistenceSentinel.record_failure(path, "RECOVERY_REQUIRED: backup is not current authority")
                     log.warning(f"JsonStore: {path} corrompu/absent -- "
                                 f"recupere depuis {cand}.")
                     cls.recovered_from_backup[os.path.abspath(path)] = cand
@@ -250,4 +293,6 @@ class JsonStore:
                 return data
             except Exception:
                 continue
+        if critical and (os.path.exists(path) or os.path.exists(path + ".sha256")):
+            PersistenceSentinel.record_failure(path, "RECOVERY_REQUIRED: unreadable state")
         return default

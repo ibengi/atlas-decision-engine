@@ -174,7 +174,8 @@ class State5RestoreSimulationTest(unittest.TestCase):
         # 8-10) Submissions disabled; zero broker writes end to end.
         om = bot.OrderManager(cli)
         res = om.place_and_track("KXBTCD-26AUG2817-T84999.99", "yes", 1, 40)
-        self.assertEqual(res.status, "blocked:submission_disabled")
+        # The legacy five-file restore has no proof of an empty intent store.
+        self.assertEqual(res.status, "blocked:persistence_failure")
         self.assertEqual(cli.create_order.call_count, 0)
         self.assertEqual(cli.cancel_order.call_count, 0)
         self.assertEqual(self._hashes(), golden)

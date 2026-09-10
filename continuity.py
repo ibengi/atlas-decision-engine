@@ -1,46 +1,7 @@
-"""Append-only continuity chain: the independent anti-rollback authority.
+"""Local append-only evidence. This is NOT independent rollback authority.
 
-Audit finding A01. Before this module the only record of "how much history
-has been durably observed" was the ``journal_watermark`` field *inside*
-``equity_ledger.json``. That made the evidence exactly as rewindable as the
-thing it protected: restoring the ledger restored the watermark, deleting
-the field read as "no history", and a zero counter disabled the check
-entirely. A checksum written beside the same bytes shares the same fate.
-
-The chain fixes that by putting the evidence somewhere the rewind does not
-reach and by making a rewind *structurally* detectable:
-
-  * **Separate file.** ``equity_continuity.log`` is not a ``JsonStore``
-    file: it has no ``.bak`` rotation and no sidecar checksum, so the
-    backup/restore machinery that rewinds the ledger does not rewind it.
-  * **Append-only.** Records are appended with ``O_APPEND`` and fsynced.
-    Nothing in the engine ever truncates or rewrites the file.
-  * **Hash-chained.** Every record carries the hash of its predecessor, so
-    a truncation, a reordering or an edited record breaks the chain and is
-    refused rather than believed.
-  * **Monotonic sequence.** ``seq`` increases by exactly one. A gap or a
-    repeat is a broken chain.
-  * **Strict schema.** A record missing a field, carrying a non-finite
-    number or an unknown kind invalidates the chain. Absence of a field is
-    never read as a benign default.
-
-The chain is a *floor*, never a source of truth for values: it says what
-was once durably true, so that anything claiming less is refused. The
-ledger must always be at or above the chain. Ledger below chain, journal
-below chain, or a consumed token missing from the ledger while the chain
-holds it, all mean the same thing: state was rolled back. That is a
-blocking recovery condition, not a number to keep computing with.
-
-Known limitation, stated rather than papered over: a restore that also
-removes or rewinds this file cannot be detected from inside the process,
-because no purely local artefact can outrank a wholesale rewind of the
-disk it lives on. What the chain guarantees is that any rollback which
-leaves it in place — the coordinated journal+ledger restore, the stale
-concurrent writer, the crash between two commits, the backup recovery of
-an older ledger — fails closed. Detecting the wholesale case needs an
-authority outside this filesystem (broker funding records, an append-only
-remote log); the ledger's ``UNRECONCILED``/attestation path is where such
-external evidence enters.
+Root transactions exclude competing writers and preserve unfinished commits.
+External continuity verification is required before capital eligibility.
 """
 
 import fcntl
@@ -49,6 +10,10 @@ import json
 import logging
 import math
 import os
+import contextlib
+from strict_data import loads, dumps, validate_tree
+from state_authority import (root_lock, write_all, fsync_dir, Transaction,
+    active_transaction, remember_file)
 
 log = logging.getLogger("CONTINUITY")
 
@@ -67,8 +32,8 @@ GENESIS = "0" * 64
 
 
 def _canonical(obj) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=False, default=str)
+    return dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
 
 
 def _sha(text: str) -> str:
@@ -128,6 +93,9 @@ class ContinuityChain:
             if field not in rec:
                 raise ChainError(f"record {expected_seq} misses '{field}' "
                                  f"(a missing field is never a default)")
+        validate_tree(rec)
+        if type(rec["seq"]) is not int or type(rec["version"]) is not int:
+            raise ChainError("non-integer chain sequence/version")
         if rec["version"] != CHAIN_VERSION:
             raise ChainError(f"record {expected_seq} has unknown chain version "
                              f"{rec['version']!r}")
@@ -167,21 +135,11 @@ class ContinuityChain:
         seq, prev = 1, GENESIS
         for i, line in enumerate(lines):
             if not line.strip():
-                # A torn tail (crash mid-append) is only tolerable as the
-                # very last line: anything else is a hole in the history.
-                if i == len(lines) - 1:
-                    break
-                self._error = ChainError(f"blank record at line {i + 1}")
-                raise self._error
+                raise ChainError(f"blank record at line {i + 1}")
             try:
-                rec = json.loads(line)
-            except ValueError:
-                if i == len(lines) - 1:
-                    log.warning("[CONTINUITY] torn last record ignored "
-                                "(crash during append); chain head unchanged")
-                    break
-                self._error = ChainError(f"unparsable record at line {i + 1}")
-                raise self._error
+                rec = loads(line)
+            except ValueError as exc:
+                raise ChainError(f"unparsable record at line {i + 1}") from exc
             try:
                 self._validate_record(rec, seq, prev)
             except ChainError as e:
@@ -218,56 +176,42 @@ class ContinuityChain:
         """Append one record durably. Raises ChainError on any failure so a
         caller can never mistake "not written" for "written"."""
         if kind not in KINDS:
-            raise ChainError(f"refusing to append unknown kind {kind!r}")
-        parent = os.path.dirname(os.path.abspath(self.path))
+            raise ChainError(f"unknown kind {kind!r}")
         try:
-            os.makedirs(parent, exist_ok=True)
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        except OSError as e:
-            raise ChainError(f"continuity record not durable: {e}")
-        try:
-            # Serialize appenders. Reading the tail and writing the next
-            # record must be one step: two writers that each read seq=3 and
-            # each write seq=4 leave a chain that validates as broken -- and
-            # a broken chain fails everything closed, which is safe but
-            # self-inflicted.
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            except OSError:            # pragma: no cover - platform dependent
-                pass
-            self._records, self._error, self._stat = None, None, None
-            try:
-                recs = self.records()
-            except ChainError as e:
-                raise ChainError(f"refusing to append onto a broken chain: {e}")
-            prev = recs[-1]["hash"] if recs else GENESIS
-            rec = {"version": CHAIN_VERSION, "seq": len(recs) + 1, "prev": prev,
-                   "kind": kind, "at": at, "payload": payload}
-            rec["hash"] = self.record_hash(rec)
-            line = json.dumps(rec, sort_keys=True, separators=(",", ":"),
-                              ensure_ascii=False) + "\n"
-            try:
-                os.write(fd, line.encode("utf-8"))
-                os.fsync(fd)
-            except OSError as e:
-                raise ChainError(f"continuity record not durable: {e}")
-            self._fsync_dir(parent)
-        finally:
-            os.close(fd)
-        self._records, self._error, self._stat = None, None, None
-        return rec
+            with root_lock(self.path):
+                current = active_transaction(self.path)
+                scope = (Transaction(self.path, {os.path.basename(self.path)})
+                         if current is None else contextlib.nullcontext(current))
+                with scope as tx:
+                    self._records, self._error, self._stat = None, None, None
+                    recs = self.records()
+                    prev = recs[-1]["hash"] if recs else GENESIS
+                    rec = {"version": CHAIN_VERSION, "seq": len(recs) + 1,
+                           "prev": prev, "kind": kind, "at": at, "payload": payload}
+                    rec["hash"] = self.record_hash(rec)
+                    line = (dumps(rec, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                    tx.writing(self.path)
+                    fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+                    try:
+                        write_all(fd, line)
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+                    self._fsync_dir(os.path.dirname(os.path.abspath(self.path)))
+                    self._records, self._error, self._stat = None, None, None
+                    if self.head() != rec:
+                        raise ChainError("continuity readback mismatch")
+                    with open(self.path, "rb") as fh:
+                        remember_file(self.path, fh.read())
+            return rec
+        except Exception as exc:
+            if active_transaction(self.path):
+                active_transaction(self.path).failed = True
+            raise ChainError(f"continuity record not durable: {exc}") from exc
 
     @staticmethod
-    def _fsync_dir(parent: str) -> None:
-        """Make the append visible after a crash, not just the bytes."""
-        try:
-            dfd = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:            # pragma: no cover - platform dependent
-            pass
+    def _fsync_dir(parent):
+        fsync_dir(parent)
 
     # ── derived views ───────────────────────────────────────────────────
     def evidence_floor(self):

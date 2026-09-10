@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,6 +26,7 @@ from continuity import CONTINUITY_FILE, ContinuityChain      # noqa: E402
 from equity_ledger import EquityLedger                       # noqa: E402
 from persistence import JsonStore, PersistenceSentinel       # noqa: E402
 from position_manager import PositionManager                 # noqa: E402
+from authority_fixtures import provider_for, FrozenSyntheticBroker, initialize_empty
 from trade_logger import TradeLogger                         # noqa: E402
 
 PRE_AT = "2026-09-07T18:01:19Z"
@@ -43,6 +45,7 @@ class Client:
         self.orders_error = orders_error
         self.positions_complete = positions_complete
         self.order_calls = 0
+        self.execution_freeze = FrozenSyntheticBroker(self)
 
     def list_orders(self, **kw):
         self.order_calls += 1
@@ -66,7 +69,7 @@ def trade(tlog, ticker="KXBTC15M-X", count=6, price=50, order_id=None):
         ticker=ticker, market_title="m", side="yes", req_price=price,
         avg_price=price, req_count=count, filled_count=count, spread=1,
         fees=0.0, edge=0.1, ev=0.1, confidence=8, grade="A", reason="r",
-        analysis={}, order_id=order_id or ("o-" + ticker),
+        analysis={}, order_id=order_id or ("o-" + uuid.uuid4().hex),
         order_status="executed")
 
 
@@ -84,9 +87,13 @@ class AstraCase(unittest.TestCase):
         self._tmp = tempfile.mkdtemp(prefix="astra-")
         self._data_dir = patch.object(CFG, "DATA_DIR", self._tmp)
         self._data_dir.start()
+        self._identity = patch.object(CFG, "BROKER_ACCOUNT_ID", "synthetic-account")
+        self._identity.start()
+        self.addCleanup(self._identity.stop)
         self._mode = patch.object(CFG, "RISK_EQUITY_MODE", "strategy")
         self._mode.start()
         PersistenceSentinel.reset()
+        initialize_empty()
         self.addCleanup(self._teardown)
 
     def _teardown(self):
@@ -108,7 +115,7 @@ class AstraCase(unittest.TestCase):
         return client, tlog, pos
 
     def reconciled_ledger(self, tlog, pos, env="prod", cash=10.0):
-        led = EquityLedger(tlog, pos, env=env)
+        led = EquityLedger(tlog, pos, env=env, authority=provider_for(env=env))
         prop = led.propose_seed(cash, PRE_AT, "evidence-ref", cash)
         self.assertTrue(led.apply_seed(prop, prop["sha256"]))
         att = led.propose_attestation("OPS-A", "a" * 64)
@@ -125,7 +132,7 @@ class AstraCase(unittest.TestCase):
 
     def reload(self, client=None):
         client, tlog, pos = self.stack(client)
-        return EquityLedger(tlog, pos, env="prod"), tlog, pos
+        return EquityLedger(tlog, pos, env="prod", authority=provider_for()), tlog, pos
 
     # ── raw file access (the rollback surface) ──────────────────────────
     def ledger_file(self):

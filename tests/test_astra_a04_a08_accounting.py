@@ -1,3 +1,4 @@
+from authority_fixtures import corrupt_json
 # -*- coding: utf-8 -*-
 """A04-A08 -- accounting and evidence defects.
 
@@ -103,6 +104,7 @@ class DuplicateEconomicEventsAreRefused(AstraCase):
         tlog.settle_trade(loss["trade_id"], "no", False, -4.0, -4.0)
         for i in range(3):
             led.observe(9.0, cycle_n=i + 1, quiet=True)
+        win = next(t for t in tlog.trades if t["trade_id"] == win["trade_id"])
         return client, tlog, pos, led, win
 
     def test_the_baseline_drawdown_is_what_astra_measured(self):
@@ -116,7 +118,7 @@ class DuplicateEconomicEventsAreRefused(AstraCase):
         before = led.drawdown_pct()
         raw = JsonStore.load(_p(CFG.TRADES_FILE), [])
         raw.append(json.loads(json.dumps(win)))            # same trade_id
-        JsonStore.save(_p(CFG.TRADES_FILE), raw)
+        corrupt_json(_p(CFG.TRADES_FILE), raw)
         led2, tlog2, pos2 = self.reload()
         self.assertTrue(tlog2.duplicate_ids)
         self.assertTrue(led2.duplicate_events())
@@ -130,7 +132,7 @@ class DuplicateEconomicEventsAreRefused(AstraCase):
         evidenced = dict(led.state["journal_watermark"])
         raw = JsonStore.load(_p(CFG.TRADES_FILE), [])
         raw.append(json.loads(json.dumps(win)))
-        JsonStore.save(_p(CFG.TRADES_FILE), raw)
+        corrupt_json(_p(CFG.TRADES_FILE), raw)
         led2, _, _ = self.reload()
         led2._advance_journal_watermark()
         self.assertEqual(led2.state["journal_watermark"]["settled_count"],
@@ -155,7 +157,7 @@ class DuplicateEconomicEventsAreRefused(AstraCase):
         raw = JsonStore.load(_p(CFG.TRADES_FILE), [])
         for r in raw:
             r["settlement_id"] = "stl-1"                    # same settlement
-        JsonStore.save(_p(CFG.TRADES_FILE), raw)
+        corrupt_json(_p(CFG.TRADES_FILE), raw)
         led2, _, _ = self.reload()
         self.assertTrue(led2.duplicate_events())
         self.assertIn(EL.GUARD_JOURNAL_INTEGRITY, led2.guards())
@@ -164,7 +166,7 @@ class DuplicateEconomicEventsAreRefused(AstraCase):
         client, tlog, pos, led, win = self.history()
         raw = JsonStore.load(_p(CFG.TRADES_FILE), [])
         raw.append(json.loads(json.dumps(win)))
-        JsonStore.save(_p(CFG.TRADES_FILE), raw)
+        corrupt_json(_p(CFG.TRADES_FILE), raw)
         for _ in range(3):
             led2, _, _ = self.reload()
             self.assertIn(EL.GUARD_JOURNAL_INTEGRITY, led2.guards())
@@ -178,7 +180,7 @@ class DuplicateEconomicEventsAreRefused(AstraCase):
                     "corrects_trade_id": win["trade_id"], "net_pnl": -0.5,
                     "gross_pnl": -0.5, "ticker": "KX-WIN", "state": "settled",
                     "timestamp": PRE_AT, "settled_at": PRE_AT})
-        JsonStore.save(_p(CFG.TRADES_FILE), raw)
+        corrupt_json(_p(CFG.TRADES_FILE), raw)
         led2, tlog2, _ = self.reload()
         self.assertFalse(led2.duplicate_events())
         self.assertNotIn(EL.GUARD_JOURNAL_INTEGRITY, led2.guards())
@@ -405,7 +407,9 @@ class GatekeeperRefusesInvalidEvidence(unittest.TestCase):
         self.addCleanup(self._restore)
         self.write("model_validation.json",
                    {"generated_ts": time.time(), "approved": True,
-                    "model_version": "btc15m-baseline-0.1"})
+                    "model_version": "btc15m-baseline-0.1",
+                    "criteria": [{"name": n, "passed": True} for n in sorted(
+                        gate.MODEL_CRITERIA["btc15m-baseline-0.1"])]})
         self.write("test_report.json", self.green())
 
     def _restore(self):

@@ -559,7 +559,10 @@ class IdempotencyAndRestartTest(_Base):
         tlog = self._tlog(production_journal())
         real_flush = tlog.flush
         tlog.flush = MagicMock()          # flush lost: simulated crash
-        apply_ledger_corrections(tlog)
+        with self.assertRaises(RuntimeError):
+            apply_ledger_corrections(tlog)
+        from persistence import PersistenceSentinel
+        PersistenceSentinel.reset()       # simulate a new process; no bytes changed
         tlog.flush = real_flush
         del tlog
 

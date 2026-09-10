@@ -60,7 +60,9 @@ def green_report(age_days=0.0, ran=618, bind_to=None):
 
 def approved_validation(age_days=0.0, approved=True):
     return {"generated_ts": time.time() - age_days * DAY,
-            "approved": approved, "model_version": "btc15m-baseline-0.1"}
+            "approved": approved, "model_version": "btc15m-baseline-0.1",
+            "criteria": [{"name": n, "passed": True} for n in sorted(
+                g.MODEL_CRITERIA["btc15m-baseline-0.1"])]}
 
 
 class _GateBase(unittest.TestCase):

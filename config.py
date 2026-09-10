@@ -2,11 +2,19 @@
 
 import logging
 import os
+import math
 import re
 
-def _env_f(name, default): 
-    try: return float(os.getenv(name, str(default)))
-    except ValueError: return default
+def _env_f(name, default):
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        if name == "BTC_CONTEXT_CYCLE_TTL_S":
+            return default
+        raise
+    if not math.isfinite(value):
+        raise ValueError(f"{name}: non-finite configuration refused")
+    return value
 def _env_i(name, default):
     try: return int(os.getenv(name, str(default)))
     except ValueError: return default
@@ -189,6 +197,8 @@ def daily_quarantine_blocks(ticker) -> bool:
 
 
 class Config:
+    # Stable non-secret account identifier; credentials and key IDs are not identity.
+    BROKER_ACCOUNT_ID = os.getenv("BROKER_ACCOUNT_ID")
     # Environnements
     PROD_URL  = "https://api.elections.kalshi.com/trade-api/v2"
     DEMO_URL  = "https://demo-api.kalshi.co/trade-api/v2"

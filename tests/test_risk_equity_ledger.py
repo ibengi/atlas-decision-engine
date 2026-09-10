@@ -1,3 +1,4 @@
+from authority_fixtures import freeze_for, provider_for, corrupt_json
 # -*- coding: utf-8 -*-
 """F2 risk-equity accounting: R1-R18 from docs/design/risk-equity-accounting.md.
 
@@ -42,6 +43,15 @@ class _Tlog:
                          for i, p in enumerate(pnls)]
         self._open = list(open_rows)
         self._corr = list(corrections)
+        self.path = _p(CFG.TRADES_FILE)
+        self._persist()
+
+    def _persist(self):
+        from persistence import file_fingerprint
+        if not JsonStore.save(self.path, self._settled + self._open + self._corr):
+            # This fixture also models a disk restored to an earlier journal.
+            corrupt_json(self.path, self._settled + self._open + self._corr)
+        self._fingerprint = file_fingerprint(self.path)
 
     def settled_trades(self):
         return list(self._settled)
@@ -55,6 +65,7 @@ class _Tlog:
     def settle(self, pnl, at="2026-09-08T00:00:00Z"):
         self._settled.append({"trade_id": f"t{len(self._settled)}", "net_pnl": pnl,
                               "state": "settled", "settled_at": at, "fees": 0.0})
+        self._persist()
 
 
 class _Pos:
@@ -73,7 +84,7 @@ class _Ledger(shadow_iso._IsolatedState, unittest.TestCase):
     """Own DATA_DIR per test; env vars saved/restored."""
 
     def ledger(self, tlog=None, pos=None, env="prod"):
-        return EquityLedger(tlog or _Tlog(), pos or _Pos(), env=env)
+        return EquityLedger(tlog or _Tlog(), pos or _Pos(), env=env, authority=provider_for(env=env))
 
     def seeded_after_loss(self, cash_now=0.04):
         """The production migration: journal -0.4839, pre-flow cash 0.04."""
@@ -333,13 +344,15 @@ class ManualClassificationIsStrict(_Ledger):
         self.assertFalse(led.classify_flow(dep["id"], "withdrawal"))
 
     def test_a_loss_classification_requires_the_correction_in_the_journal(self):
-        tlog = _Tlog(JOURNAL_DD, corrections=[{"event_type": "ledger_correction",
-                                               "correction_id": "CORR-1"}])
+        tlog = _Tlog(JOURNAL_DD)
         led = self.ledger(tlog)
         prop = led.propose_seed(5.04, PRE_AT, "x", 5.04)
         led.apply_seed(prop, prop["sha256"])
         self.quiet(led, 4.00)
         fid = led.unclassified_flows()[0]["id"]
+        tlog._corr.append({"event_type": "ledger_correction", "correction_id": "CORR-1",
+                           "corrects_trade_id": "t0", "net_pnl": -1.04})
+        tlog._persist()
         self.assertTrue(led.classify_flow(fid, "loss", correction_id="CORR-1", action_id="OPS-4"))
         row = self.file()["flows"][-1]
         self.assertEqual(row["kind"], "loss_by_correction")
@@ -384,7 +397,7 @@ class RebaseIsAuditedAndExceptional(_Ledger):
 
     def ok_ctx(self, led, **over):
         """OK_CTX bound to `led`'s current local evidence versions."""
-        ctx = {**self.OK_CTX, "bound_state": led.bound_state()}
+        ctx = {**self.OK_CTX, "bound_state": led.bound_state(), "execution_freeze": freeze_for(led)}
         ctx.update(over)
         return ctx
 
@@ -543,11 +556,14 @@ class TheRemainingScenarios(_Ledger):
         led.observe(12.00, cycle_n=13, quiet=False)         # in-flight order: not quiet
         tlog.settle(-0.05)                                  # settlement lands mid-observation
         led.observe(12.00, cycle_n=14, quiet=True)          # settled count changed -> not quiet
-        self.assertEqual(len(led.state["flows"]), n_flows)
-        self.assertEqual(led.derive_status(), EL.STATUS_CONSERVATIVE)
-        # a genuinely stable residual still classifies afterwards
-        self.quiet(led, 12.00, start=15)
         self.assertEqual(len(led.state["flows"]), n_flows + 1)
+        self.assertEqual(led.derive_status(), EL.STATUS_UNRECONCILED)
+        self.assertTrue(led.unclassified_flows())
+        self.assertFalse(led.capital_eligible())
+        # A later stable positive balance cannot explain the adverse event.
+        self.quiet(led, 12.00, start=15)
+        self.assertEqual(len(led.state["flows"]), n_flows + 2)
+        self.assertFalse(led.capital_eligible())
 
     def test_settlement_race_does_not_produce_a_flow(self):
         led, tlog, _ = self.seeded_after_loss()

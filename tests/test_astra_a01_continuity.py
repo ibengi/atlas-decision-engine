@@ -1,3 +1,5 @@
+from authority_fixtures import corrupt_json
+from authority_fixtures import freeze_for
 # -*- coding: utf-8 -*-
 """A01 (CRITICAL) -- monotonic loss evidence cannot be rewound.
 
@@ -68,7 +70,7 @@ class MissingEvidenceIsNeverNoHistory(AstraCase):
             state = self.ledger_file()
             state.pop("journal_watermark", None)
             JsonStore.save(_p(EL.LEDGER_FILE), state)
-            JsonStore.save(_p(CFG.TRADES_FILE), [])       # pre-loss journal
+            corrupt_json(_p(CFG.TRADES_FILE), [])       # pre-loss journal
         led2 = self.loss_then(mutate)
         self.assertIn(EL.GUARD_CONTINUITY, led2.guards())
         self.assert_loss_preserved(led2)
@@ -81,7 +83,7 @@ class MissingEvidenceIsNeverNoHistory(AstraCase):
             state = self.ledger_file()
             state["journal_watermark"]["settled_count"] = 0
             JsonStore.save(_p(EL.LEDGER_FILE), state)
-            JsonStore.save(_p(CFG.TRADES_FILE), [])
+            corrupt_json(_p(CFG.TRADES_FILE), [])
         led2 = self.loss_then(mutate)
         self.assertIn(EL.GUARD_CONTINUITY, led2.guards())
         self.assert_loss_preserved(led2)
@@ -225,7 +227,7 @@ class ConcurrentAndCrashRewinds(AstraCase):
         # crash: the ledger never writes, but its evidence is appended first
         led._advance_journal_watermark()
         led._append_evidence()
-        JsonStore.save(_p(CFG.TRADES_FILE), pre_loss_journal)   # the restore
+        corrupt_json(_p(CFG.TRADES_FILE), pre_loss_journal)   # the restore
         led2, _, _ = self.reload()
         self.assertIn(EL.GUARD_CONTINUITY, led2.guards())
         self.assert_loss_preserved(led2)
@@ -280,9 +282,8 @@ class ConcurrentAndCrashRewinds(AstraCase):
         self.assertIn(EL.GUARD_CONTINUITY, led2.guards())
         self.assertFalse(led2.capital_eligible())
 
-    def test_a_torn_last_append_is_tolerated_without_losing_the_chain(self):
-        """A crash mid-append leaves a partial last line. That is the ONE
-        shape a reader may skip, because it is provably the tail."""
+    def test_a_torn_last_append_requires_recovery_without_losing_the_chain(self):
+        """A malformed tail cannot prove a harmless crash; recovery is required."""
         client, tlog, pos = self.stack()
         led = self.reconciled_ledger(tlog, pos)
         self.lose(tlog, led)
@@ -290,9 +291,10 @@ class ConcurrentAndCrashRewinds(AstraCase):
         with open(path, "a") as fh:
             fh.write('{"seq": 99, "prev": "')             # torn
         ok, _ = self.chain().healthy()
-        self.assertTrue(ok)
+        self.assertFalse(ok)
         led2, _, _ = self.reload()
-        self.assertNotIn(EL.GUARD_CONTINUITY, led2.guards())
+        self.assertIn(EL.GUARD_CONTINUITY, led2.guards())
+        self.assertFalse(led2.capital_eligible())
 
 
 class ConsumedAuthorizationCannotBeReplayed(AstraCase):
@@ -301,7 +303,7 @@ class ConsumedAuthorizationCannotBeReplayed(AstraCase):
     def rebase_ctx(self, led):
         return {"drawdown_firing": True, "reconcile_status": "MATCH",
                 "open_positions": 0, "in_flight_orders": 0, "quiescent": True,
-                "evidence_unstable": None, "bound_state": led.bound_state(),
+                "evidence_unstable": None, "bound_state": led.bound_state(), "execution_freeze": freeze_for(led),
                 "orders": {"local_open": [], "pending_intents": [],
                            "resolution_halt": False, "broker_open": 0,
                            "broker_open_ids": [], "broker_error": None,
@@ -411,11 +413,11 @@ class ContinuityClearsOnlyWhenReconstructed(AstraCase):
         self.lose(tlog, led)
         full_journal = json.loads(json.dumps(
             JsonStore.load(_p(CFG.TRADES_FILE), [])))
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         for _ in range(3):                                 # survives restarts
             led2, _, _ = self.reload()
             self.assertIn(EL.GUARD_CONTINUITY, led2.guards())
-        JsonStore.save(_p(CFG.TRADES_FILE), full_journal)  # reconstructed
+        corrupt_json(_p(CFG.TRADES_FILE), full_journal)  # reconstructed
         led3, _, _ = self.reload()
         self.assertNotIn(EL.GUARD_CONTINUITY, led3.guards())
         self.assertAlmostEqual(led3.drawdown_pct(), 30.0, places=6)
@@ -424,7 +426,7 @@ class ContinuityClearsOnlyWhenReconstructed(AstraCase):
         client, tlog, pos = self.stack()
         led = self.reconciled_ledger(tlog, pos)
         self.lose(tlog, led)
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         led2, _, _ = self.reload()
         att = led2.propose_attestation("OPS-B", "b" * 64)
         self.assertFalse(led2.apply_attestation("OPS-B", "b" * 64, att["token"]))

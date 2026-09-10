@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config import CFG, _p
-from persistence import JsonStore
+from persistence import JsonStore, file_fingerprint
+from risk_transaction import risk_transaction
 from position_manager import PositionManager
 from trade_logger import TradeLogger, now_iso
 
@@ -23,14 +24,18 @@ class RiskManager:
         # the engine. None or unseeded -> the historical cash formulas.
         self.equity = None
         st = JsonStore.load(_p(CFG.RISK_FILE), {})
+        self._fingerprint = file_fingerprint(_p(CFG.RISK_FILE))
         today = datetime.now(timezone.utc).date().isoformat()
         if st.get("date") != today:
-            st = {"date": today}
+            st = {**st, "date": today}
         self.state = st
         self.flush()
 
     def flush(self):
-        JsonStore.save(_p(CFG.RISK_FILE), self.state)
+        ok = JsonStore.save(_p(CFG.RISK_FILE), self.state, expect_fingerprint=self._fingerprint)
+        if ok:
+            self._fingerprint = file_fingerprint(_p(CFG.RISK_FILE))
+        return ok
 
     # -- agregats jour (recalcules depuis le journal : source de verite unique)
     def _today_settled(self) -> list:
@@ -159,6 +164,7 @@ class RiskManager:
         elapsed = self.seconds_since_last_settlement()
         return elapsed is not None and elapsed >= CFG.CONSECUTIVE_LOSS_COOLDOWN_S
 
+    @risk_transaction
     def claim_half_open_attempt(self, ticker: str) -> (bool, str):
         """Reserve atomiquement l'unique essai demi-ouvert.
 
@@ -182,13 +188,15 @@ class RiskManager:
             "half_open_claimed_at": now_iso(),
             "half_open_ticker": ticker,
         })
-        self.flush()
+        if not self.flush():
+            return False, "risk_state_recovery_required"
         log_rsk.warning(
             f"[RISK] essai demi-ouvert RESERVE pour {ticker}; aucune autre "
             "soumission autorisee avant un nouveau reglement.",
             extra={"event": "half_open_reserved", "ticker": ticker})
         return True, ""
 
+    @risk_transaction
     def release_half_open_attempt(self, ticker: str, reason: str) -> bool:
         """Libere un claim demi-ouvert uniquement lorsqu'aucun ordre n'a ete
         accepte par Kalshi ou lorsqu'un ordre est confirme sans aucun fill.
@@ -206,7 +214,8 @@ class RiskManager:
             "half_open_released_at": now_iso(),
             "half_open_release_reason": reason,
         })
-        self.flush()
+        if not self.flush():
+            return False
         log_rsk.warning(f"[RISK] essai demi-ouvert LIBERE pour {ticker}: {reason}",
                         extra={"event": "half_open_released",
                                "ticker": ticker, "reason": reason})

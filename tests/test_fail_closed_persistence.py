@@ -71,7 +71,8 @@ class TestSentinelTrips(SentinelTestCase):
         with patch.object(persistence.os, "replace",
                           side_effect=OSError(errno.EROFS,
                                               "Read-only file system")):
-            om.flush()   # critical write fails -> latch
+            with self.assertRaises(RuntimeError):
+                om.flush()   # critical write fails -> latch
         self.assertFalse(PersistenceSentinel.healthy())
         self._assert_fail_closed(om, cli)
 
@@ -81,7 +82,8 @@ class TestSentinelTrips(SentinelTestCase):
         with patch.object(persistence.os, "replace",
                           side_effect=OSError(errno.ENOSPC,
                                               "No space left on device")):
-            om.flush()
+            with self.assertRaises(RuntimeError):
+                om.flush()
         self.assertFalse(PersistenceSentinel.healthy())
         self._assert_fail_closed(om, cli)
 
@@ -89,7 +91,8 @@ class TestSentinelTrips(SentinelTestCase):
         cli = _client()
         om = bot.OrderManager(cli)
         om.open_orders["bad"] = {"meta": object()}   # not JSON-serializable
-        om.flush()
+        with self.assertRaises(RuntimeError):
+            om.flush()
         self.assertFalse(PersistenceSentinel.healthy())
         om.open_orders.pop("bad")
         self._assert_fail_closed(om, cli)
@@ -104,7 +107,8 @@ class TestSentinelTrips(SentinelTestCase):
         self.assertEqual(res.state, "filled")
         with patch.object(persistence.os, "replace",
                           side_effect=OSError(errno.EROFS, "ro")):
-            om.flush()
+            with self.assertRaises(RuntimeError):
+                om.flush()
         cli.create_order.reset_mock()
         res2 = om.place_and_track("KXFC-HELD", "yes", 1, 40)
         self.assertIn(res2.status, ("blocked:persistence_failure",

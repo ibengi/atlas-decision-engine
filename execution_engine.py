@@ -166,8 +166,20 @@ def _broker_open_order_ids(client, orders):
         rows = client.list_orders()
     except Exception as e:                                # noqa: BLE001
         return None, f"{type(e).__name__}: {e}"
+    if not isinstance(rows, list):
+        return None, "broker orders incomplete: list required"
     ids = []
-    for r in rows or []:
+    seen = set()
+    for r in rows:
+        if not isinstance(r, dict) or not isinstance(r.get("status"), str):
+            return None, "malformed broker order"
+        ident = r.get("order_id") or r.get("id")
+        if not isinstance(ident, str) or not ident or ident in seen:
+            return None, "duplicate or absent broker order identity"
+        seen.add(ident)
+        remaining = r.get("remaining_count", 0)
+        if type(remaining) is not int or remaining < 0:
+            return None, "invalid remaining quantity"
         status = str((r or {}).get("status") or "").lower()
         remaining = int((r or {}).get("remaining_count") or 0)
         if status not in terminal or remaining > 0:
@@ -198,6 +210,7 @@ def equity_rebase_context(client, orders, posmgr, risk, equity=None,
     files are fingerprinted on both sides of the whole collection for the
     same reason, and re-checked by the ledger at commit.
     """
+    execution_freeze = getattr(client, "execution_freeze", None)
     bound_before = equity.bound_state() if equity is not None else None
     local_open = sorted(str(k) for k in (getattr(orders, "open_orders", None) or {}))
     pending = sorted(str(k) for k in (getattr(orders, "pending_intents", None) or {}))
@@ -242,7 +255,7 @@ def equity_rebase_context(client, orders, posmgr, risk, equity=None,
            "reconcile_detail": reconcile_detail,
            "open_positions": int(posmgr.open_count()),
            "in_flight_orders": len(local_open) + len(pending) + (broker_open or 0),
-           "quiescent": bool(quiescent),
+           "quiescent": bool(quiescent), "execution_freeze": execution_freeze,
            "evidence_unstable": unstable,
            "bound_state": bound_before,
            "orders": {"local_open": local_open, "pending_intents": pending,
@@ -296,7 +309,7 @@ class ExecutionEngine:
     #: next cycle.
     _capital_blocking_guard = None
 
-    def __init__(self, client: KalshiClient, capital: float):
+    def __init__(self, client: KalshiClient, capital: float, continuity_authority=None):
         from strategy_router import (GateConfig, build_default_registry,
                                      RegistryValidationError)
         from opportunity_pipeline import MarketOpportunityPipeline
@@ -317,7 +330,7 @@ class ExecutionEngine:
         # F2 risk-equity accounting: strategy equity, high-water mark,
         # external flows and baseline provenance, persisted under DATA_DIR.
         # Deposits raise affordability (self.capital) and never touch it.
-        self.equity   = EquityLedger(self.tlog, self.posmgr, env=client.env)
+        self.equity   = EquityLedger(self.tlog, self.posmgr, env=client.env, authority=continuity_authority)
         self.risk.equity = self.equity
         self._current_cycle = 0
         self.stats    = StatsEngine(self.tlog)
@@ -466,6 +479,12 @@ class ExecutionEngine:
             bal = self.client.get_balance()
         self.last_balance = bal
         if bal is not None:
+            from strict_data import finite_number
+            try:
+                finite_number(bal, "broker cash", minimum=0)
+                finite_number(self.configured_capital, "configured capital", minimum=0)
+            except ValueError:
+                return False, "non-finite or negative capital: CAPITAL_BLOCKED"
             self.capital = min(self.configured_capital, bal) \
                 if self.configured_capital else bal
             self.risk.capital = self.capital
@@ -586,6 +605,16 @@ class ExecutionEngine:
         VALEURS DE RETOUR SONT INCHANGES — seul le nom du bloqueur, jusqu'ici
         perdu, est desormais rendu au cycle pour etre journalise.
         """
+        from strict_data import finite_number
+        try:
+            for key in ("MAX_DAILY_LOSS", "MAX_DAILY_LOSS_PCT", "MAX_EQUITY_DRAWDOWN_PCT",
+                        "MAX_POS_PCT", "RISK_BUDGET_PCT", "DD_THROTTLE_PCT"):
+                finite_number(getattr(CFG, key), key, minimum=0)
+        except (ValueError, AttributeError):
+            return False, "invalid_numeric_risk_configuration"
+        lease = getattr(self, "_writer_lease", None)
+        if lease is not None and not lease.valid():
+            return False, "stale_engine_writer_lease"
         # Portes fail-closed structurelles AVANT les portes de risque :
         # une panne de persistance critique ou une divergence broker/local
         # non resolue interdit toute nouvelle soumission.
@@ -596,6 +625,13 @@ class ExecutionEngine:
                           extra={"event": "trading_blocked",
                                  "reason": "persistence_failure"})
             return False, "persistence_failure"
+        from persistence import file_fingerprint
+        for manager, attribute, filename in ((getattr(self, "orders", None), "_orders_fingerprint", CFG.ORDERS_FILE),
+                (getattr(self, "orders", None), "_pending_fingerprint", "pending_intents.json"),
+                (getattr(self, "risk", None), "_fingerprint", CFG.RISK_FILE)):
+            expected = getattr(manager, attribute, None)
+            if isinstance(expected, str) and file_fingerprint(_p(filename)) != expected:
+                return False, "stale_instance_reload_required"
         cap, cap_err = contract_cap_config()
         if cap is None:
             log_rsk.error(f"Trading bloque: {cap_err}",

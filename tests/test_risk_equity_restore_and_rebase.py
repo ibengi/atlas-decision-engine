@@ -1,3 +1,4 @@
+from authority_fixtures import corrupt_json, provider_for
 # -*- coding: utf-8 -*-
 """Astra's two defects on df85507, reproduced with the REAL journal, position,
 order and ledger classes, plus the adversarial restore and rebase neighbours.
@@ -25,6 +26,7 @@ from kalshi_client import KalshiAPIError                          # noqa: E402
 from order_manager import OrderManager                            # noqa: E402
 from persistence import JsonStore                                 # noqa: E402
 from position_manager import PositionManager                      # noqa: E402
+from authority_fixtures import provider_for, FrozenSyntheticBroker, initialize_empty
 from trade_logger import TradeLogger                              # noqa: E402
 
 PRE_AT = "2026-09-07T18:01:19Z"
@@ -38,6 +40,7 @@ class _Client:
 
     def __init__(self, orders=(), positions=(), orders_error=None):
         self.orders, self.positions, self.orders_error = list(orders), list(positions), orders_error
+        self.execution_freeze = FrozenSyntheticBroker(self)
 
     def list_orders(self, **kw):
         if self.orders_error:
@@ -66,12 +69,13 @@ class _Real(shadow_iso._IsolatedState, unittest.TestCase):
 
     def stack(self, client=None):
         client = client or _Client()
+        initialize_empty()
         tlog = TradeLogger()
         pos = PositionManager(client, tlog)
         return client, tlog, pos
 
     def reconciled_ledger(self, tlog, pos, env="prod"):
-        led = EquityLedger(tlog, pos, env=env)
+        led = EquityLedger(tlog, pos, env=env, authority=provider_for(env=env))
         prop = led.propose_seed(10.0, PRE_AT, "x", 10.0)
         self.assertTrue(led.apply_seed(prop, prop["sha256"]))
         att = led.propose_attestation("OPS-A", "a" * 64)
@@ -91,7 +95,7 @@ class _Real(shadow_iso._IsolatedState, unittest.TestCase):
 
     def reload(self, client=None):
         client, tlog, pos = self.stack(client)
-        return EquityLedger(tlog, pos, env="prod"), tlog, pos
+        return EquityLedger(tlog, pos, env="prod", authority=provider_for()), tlog, pos
 
 
 # --------------------------------------------------------------------------
@@ -109,7 +113,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         self.lose(tlog, led)
         self.assertAlmostEqual(led.drawdown_pct(), 30.0, places=6)
         hwm = led.risk_equity_reference()
-        JsonStore.save(_p(CFG.TRADES_FILE), [])             # the older journal
+        corrupt_json(_p(CFG.TRADES_FILE), [])             # the older journal
         led2, tlog2, pos2 = self.reload()
         led2.observe(7.0, cycle_n=10, quiet=True)
         self.assertEqual(led2.derive_status(), EL.STATUS_UNRECONCILED)
@@ -119,9 +123,12 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         self.assertGreaterEqual(led2.drawdown_pct(), 30.0 - 1e-9)             # loss kept
         self.assertLessEqual(led2.strategy_equity_conservative(), 7.0 + 1e-9)
         f = self.file()
-        self.assertEqual(f["risk_equity_status"], EL.STATUS_UNRECONCILED)
-        self.assertTrue(f.get("journal_mismatch"))
-        self.assertTrue(any("journal" in u for u in f["status_basis"]["unproven"]))
+        # A refused transaction preserves committed bytes. The runtime view
+        # and durable root mismatch block instead of rewriting corrupt authority.
+        self.assertTrue(led2.state.get("journal_mismatch"))
+        self.assertTrue(any("journal" in u for u in led2.state["status_basis"]["unproven"]))
+        from state_authority import recovery_problem
+        self.assertIsNotNone(recovery_problem(led2.path))
 
     def test_journal_shorter_than_previously_evidenced(self):
         client, tlog, pos = self.stack()
@@ -132,7 +139,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         for i in range(3):
             led.observe(7.5, cycle_n=20 + i, quiet=True)
         rows = JsonStore.load(_p(CFG.TRADES_FILE), [])
-        JsonStore.save(_p(CFG.TRADES_FILE), rows[:1])       # drop the last settled row
+        corrupt_json(_p(CFG.TRADES_FILE), rows[:1])       # drop the last settled row
         led2, _, _ = self.reload()
         self.assertEqual(led2.derive_status(), EL.STATUS_UNRECONCILED)
         self.assertFalse(led2.capital_eligible())
@@ -146,7 +153,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         rows[0]["net_pnl"] = 3.0                              # the loss became a win
         rows[0]["gross_pnl"] = 3.0
         rows[0]["won"] = True
-        JsonStore.save(_p(CFG.TRADES_FILE), rows)
+        corrupt_json(_p(CFG.TRADES_FILE), rows)
         led2, _, _ = self.reload()
         self.assertEqual(led2.derive_status(), EL.STATUS_UNRECONCILED)
         self.assertGreaterEqual(led2.drawdown_pct(), 30.0 - 1e-9)   # not improved
@@ -167,7 +174,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         self.lose(tlog, led)
         wm = self.file()["journal_watermark"]
         self.assertEqual(wm["settled_count"], 1)
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         led2, _, _ = self.reload()
         self.assertEqual(led2.derive_status(), EL.STATUS_UNRECONCILED)
         # the watermark is NOT lowered to the shorter journal
@@ -177,7 +184,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         client, tlog, pos = self.stack()
         led = self.reconciled_ledger(tlog, pos)
         self.lose(tlog, led)
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         for _ in range(3):                                    # three restarts
             led2, _, _ = self.reload()
             led2.observe(7.0, cycle_n=1, quiet=True)
@@ -188,7 +195,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         client, tlog, pos = self.stack()
         led = self.reconciled_ledger(tlog, pos)
         self.lose(tlog, led)
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         led2, _, _ = self.reload()
         for i in range(8):                                    # many quiet cycles at any cash
             led2.observe(10.0 if i % 2 else 7.0, cycle_n=i + 1, quiet=True)
@@ -200,7 +207,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         client, tlog, pos = self.stack()
         led = self.reconciled_ledger(tlog, pos)
         self.lose(tlog, led)
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         led2, _, _ = self.reload()
         before = json.dumps(self.file(), sort_keys=True)
         att = led2.propose_attestation("OPS-B", "b" * 64)
@@ -212,7 +219,7 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         client, tlog, pos = self.stack()
         led = self.reconciled_ledger(tlog, pos)
         self.lose(tlog, led)
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         led2, _, _ = self.reload()
         hwm = led2.risk_equity_reference()
         tokens = list(led2.state["consumed_tokens"])
@@ -228,10 +235,14 @@ class ARestoredJournalCannotEraseAnEvidencedLoss(_Real):
         led = self.reconciled_ledger(tlog, pos)
         self.lose(tlog, led)
         good = JsonStore.load(_p(CFG.TRADES_FILE), [])
-        JsonStore.save(_p(CFG.TRADES_FILE), [])
+        corrupt_json(_p(CFG.TRADES_FILE), [])
         led2, _, _ = self.reload()
         self.assertEqual(led2.derive_status(), EL.STATUS_UNRECONCILED)
-        JsonStore.save(_p(CFG.TRADES_FILE), good)
+        corrupt_json(_p(CFG.TRADES_FILE), good)
+        from recovery import complete_verified_recovery
+        from state_authority import checkpoint
+        complete_verified_recovery(led.path, led.identity, led.authority,
+                                   checkpoint(led.path, led.identity).digest, "restore-evidence")
         led3, _, _ = self.reload()
         self.assertEqual(led3.derive_status(), EL.STATUS_RECONCILED)
         self.assertAlmostEqual(led3.drawdown_pct(), 30.0, places=6)
@@ -293,7 +304,7 @@ class ARebaseIsRefusedWhileAnyOrderIsLive(_Real):
 
     def test_pending_submit_intent(self):
         client, tlog, pos, om, led, risk = self.blown()
-        om._record_intent("KXBTC15M-X", "cid-1", 1, 9)
+        om._record_intent("KXBTC15M-X", "cid-1", 1, 9, side="yes")
         self.assert_refused(led, self.ctx(client, om, pos, risk, led), "pending")
 
     def test_partial_fill_still_active(self):

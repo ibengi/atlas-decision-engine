@@ -2,6 +2,9 @@
 
 import base64
 import json
+from transport_intent import durable_transport
+import math
+from strict_data import loads as strict_loads, validate_tree
 import logging
 import time
 import uuid
@@ -239,6 +242,7 @@ class KalshiClient:
                    f"Aucune requete reseau mutante n'a ete emise.")
 
     # -- Requete avec retry/backoff ------------------------------------------
+    @durable_transport
     def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
         # BUTOIR DE TRANSPORT. Place AVANT tout le reste (y compris la
         # verification de cle) pour qu'une ecriture LIVE non autorisee soit
@@ -297,7 +301,7 @@ class KalshiClient:
                 raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
 
             try:
-                return r.json() if r.text.strip() else {}
+                return strict_loads(r.text) if r.text.strip() else {}
             except ValueError:
                 raise KalshiAPIError(r.status_code, f"{method} {path}: JSON invalide", r.text)
 
@@ -360,7 +364,7 @@ class KalshiClient:
             if dollars is not None:
                 try:
                     value = float(dollars)
-                    return value if value >= 0 else None
+                    return value if math.isfinite(value) and value >= 0 else None
                 except (TypeError, ValueError):
                     pass
             cents = pick_int(r, "balance", "available_balance", default=-1)
@@ -657,6 +661,7 @@ class KalshiClient:
         limit = int(limit or self.POSITIONS_PAGE_LIMIT)
         max_pages = int(max_pages or self.POSITIONS_MAX_PAGES)
         rows, cursor, pages, seen_cursors = [], "", 0, []
+        seen_tickers, seen_ids = set(), set()
         while pages < max_pages:
             pages += 1
             params = {"limit": limit}
@@ -704,6 +709,20 @@ class KalshiClient:
                     raise KalshiAPIError(
                         0, f"listing de positions incoherent: ligne sans "
                            f"ticker exploitable ({sorted(row)[:6]})")
+                tk = row.get("ticker")
+                if not isinstance(tk, str) or not tk.strip() or tk in seen_tickers:
+                    raise KalshiAPIError(0, "CONFLICTED: invalid or duplicate position ticker")
+                seen_tickers.add(tk)
+                for field in ("position_id", "id"):
+                    ident = row.get(field)
+                    if ident is not None:
+                        if not isinstance(ident, str) or not ident or (field, ident) in seen_ids:
+                            raise KalshiAPIError(0, "CONFLICTED: duplicate position identity")
+                        seen_ids.add((field, ident))
+                try:
+                    validate_tree(row)
+                except ValueError as exc:
+                    raise KalshiAPIError(0, str(exc)) from exc
             if pages == 1:
                 self._log_raw_once("positions", r)
             rows.extend(block)

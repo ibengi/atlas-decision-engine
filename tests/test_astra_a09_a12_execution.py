@@ -1,3 +1,4 @@
+from authority_fixtures import freeze_for
 # -*- coding: utf-8 -*-
 """A09-A12 -- execution, durable-transition, flow-identity and tooling.
 
@@ -137,12 +138,13 @@ class NoSubmissionWithoutADurableIntent(AstraCase):
         self.assertEqual(client.cancel_calls, 0)
         self.assertIsInstance(result, ExecutionResult)
         self.assertEqual(result.state, "rejected")
-        self.assertIn("intent_unwritable", str(result.status))
+        self.assertIn(str(result.status), ("blocked:intent_unwritable", "blocked:recovery_required"))
 
     def test_a_directory_in_place_of_the_file_blocks_the_post(self):
         """Astra PERSIST_failed_intent_write_reaches_simulated_order_transport,
         reproduced with a real filesystem error."""
         client, tlog, pos, om = self.order_manager()
+        os.unlink(_p(OrderManager.PENDING_FILE))
         os.makedirs(_p(OrderManager.PENDING_FILE), exist_ok=True)
         result = self.submit(om)
         self.assert_no_transport(client, result)
@@ -197,6 +199,7 @@ class NoSubmissionWithoutADurableIntent(AstraCase):
 
     def test_a_failed_intent_is_not_retried_to_the_broker(self):
         client, tlog, pos, om = self.order_manager()
+        os.unlink(_p(OrderManager.PENDING_FILE))
         os.makedirs(_p(OrderManager.PENDING_FILE), exist_ok=True)
         for _ in range(3):
             self.submit(om)
@@ -224,7 +227,7 @@ class NoSubmissionWithoutADurableIntent(AstraCase):
         intent is on disk, so the question stays askable."""
         client, tlog, pos, om = self.order_manager()
         cid = OrderManager._client_order_id(TICKER, "yes", 1, 40)
-        self.assertTrue(om._record_intent(TICKER, cid, 1, 40))
+        self.assertTrue(om._record_intent(TICKER, cid, 1, 40, side="yes"))
         om2 = OrderManager(client)                          # the restart
         self.assertIn(TICKER, om2.pending_intents)
         self.assertEqual(om2.pending_intents[TICKER]["client_order_id"], cid)
@@ -242,7 +245,7 @@ class AFailedCommitLeavesTheOldStateAuthoritative(AstraCase):
     def ctx(self, led):
         return {"drawdown_firing": True, "reconcile_status": "MATCH",
                 "open_positions": 0, "in_flight_orders": 0, "quiescent": True,
-                "evidence_unstable": None, "bound_state": led.bound_state(),
+                "evidence_unstable": None, "bound_state": led.bound_state(), "execution_freeze": freeze_for(led),
                 "orders": {"local_open": [], "pending_intents": [],
                            "resolution_halt": False, "broker_open": 0,
                            "broker_open_ids": [], "broker_error": None,

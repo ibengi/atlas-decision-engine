@@ -7,6 +7,10 @@ Covers: yes/no/void/void_unreadable/expired_stale settlement paths,
 import os
 import sys
 import unittest
+import tempfile
+from authority_fixtures import initialize_empty
+from persistence import PersistenceSentinel, file_fingerprint
+from config import _p
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -51,9 +55,21 @@ class TestSettlements(unittest.TestCase):
 
     def setUp(self):
         """Create a PositionManager with mocked client and trade logger."""
+        tmp = tempfile.TemporaryDirectory(prefix="atlas-settlement-unit-")
+        self.addCleanup(tmp.cleanup)
+        setting = patch.object(bot.CFG, "DATA_DIR", tmp.name)
+        setting.start()
+        self.addCleanup(setting.stop)
+        PersistenceSentinel.reset()
+        self.addCleanup(PersistenceSentinel.reset)
+        initialize_empty()
         self.mock_client = MagicMock()
         self.mock_tlog = MagicMock()
         self.mock_tlog.settle_trade.return_value = {"trade_id": "test-trade-1"}
+        self.mock_tlog.path = _p(bot.CFG.TRADES_FILE)
+        self.mock_tlog.trades = []
+        self.mock_tlog.duplicate_ids = set()
+        self.mock_tlog._fingerprint = file_fingerprint(self.mock_tlog.path)
         self.pm = bot.PositionManager(self.mock_client, self.mock_tlog)
         # Clear any pre-existing positions from file load
         self.pm.positions = {}
@@ -81,15 +97,7 @@ class TestSettlements(unittest.TestCase):
         self.assertTrue(call_args[0][2])  # won=True
 
     def test_missing_trade_log_entry_releases_slot_as_orphan(self):
-        """A missing trade-log entry settles as an orphan and frees the slot.
-
-        The previous contract kept the position "for retry" — but settle_trade
-        returns None for exactly one reason, an id absent from the journal,
-        and an absent id never becomes present. The retry could never succeed,
-        so a broker-rebuilt (brk-) position after a restart held its
-        MAX_OPEN_POSITIONS slot until the 30-day escape hatch even once the
-        broker had published a result.
-        """
+        """Missing entry evidence retains exposure until explicit recovery."""
         pos = _make_position(trade_id="t-settle-orphan")
         self.pm.positions["t-settle-orphan"] = pos
         self.mock_client.get_market.return_value = {
@@ -106,12 +114,12 @@ class TestSettlements(unittest.TestCase):
              self.assertLogs("POSITION", level="WARNING") as log_ctx:
             realized = self.pm.check_settlements()
 
-        self.assertEqual(realized, [orphan_row])
-        self.assertNotIn("t-settle-orphan", self.pm.positions)
+        self.assertEqual(realized, [])
+        self.assertIn("t-settle-orphan", self.pm.positions)
+        self.assertEqual(self.pm.reconcile_halt["status"], "UNKNOWN")
         settle.assert_called_once()
-        orphan.assert_called_once()
-        self.assertTrue(any("reglement" in msg and "orphelin" in msg
-                            for msg in log_ctx.output))
+        orphan.assert_not_called()
+        self.assertTrue(any("reglement bloque" in msg for msg in log_ctx.output))
 
     def test_settle_trade_success_pops_position(self):
         """A successful trade-log settlement permits removing the position."""
@@ -195,7 +203,7 @@ class TestSettlements(unittest.TestCase):
     # ── 4. test_settles_on_unreadable_settled ───────────────────────────
 
     def test_settles_on_unreadable_settled(self):
-        """status 'settled', result empty → popped as void_unreadable."""
+        """Incomplete settlement preserves the position and blocks."""
         pos = _make_position(trade_id="t-unread")
         self.pm.positions["t-unread"] = pos
 
@@ -206,12 +214,10 @@ class TestSettlements(unittest.TestCase):
         }
         realized = self.pm.check_settlements()
 
-        self.assertNotIn("t-unread", self.pm.positions)
-        self.mock_tlog.settle_trade.assert_called_once()
-        call_args = self.mock_tlog.settle_trade.call_args
-        self.assertEqual(call_args[0][0], "t-unread")
-        self.assertEqual(call_args[0][1], "void_unreadable")
-        self.assertFalse(call_args[0][2])
+        self.assertIn("t-unread", self.pm.positions)
+        self.assertEqual(realized, [])
+        self.assertEqual(self.pm.reconcile_halt["status"], "UNKNOWN")
+        self.mock_tlog.settle_trade.assert_not_called()
 
     # ── 5. test_skips_open_market ───────────────────────────────────────
 
@@ -234,7 +240,7 @@ class TestSettlements(unittest.TestCase):
     # ── 6. test_cleans_stale_position ───────────────────────────────────
 
     def test_cleans_stale_position(self):
-        """Position older than MAX_POSITION_AGE_DAYS, market not 'open' → popped as expired_stale."""
+        """Age does not prove settlement; retain all exposure."""
         old_opened = _iso_days_ago(bot.CFG.MAX_POSITION_AGE_DAYS + 5)
         pos = _make_position(trade_id="t-stale", opened_at=old_opened)
         self.pm.positions["t-stale"] = pos
@@ -246,15 +252,13 @@ class TestSettlements(unittest.TestCase):
         }
         realized = self.pm.check_settlements()
 
-        self.assertNotIn("t-stale", self.pm.positions)
-        self.mock_tlog.settle_trade.assert_called_once()
-        call_args = self.mock_tlog.settle_trade.call_args
-        self.assertEqual(call_args[0][0], "t-stale")
-        self.assertEqual(call_args[0][1], "expired_stale")
-        self.assertFalse(call_args[0][2])
+        self.assertIn("t-stale", self.pm.positions)
+        self.assertEqual(realized, [])
+        self.assertEqual(self.pm.reconcile_halt["status"], "UNKNOWN")
+        self.mock_tlog.settle_trade.assert_not_called()
 
     def test_cleans_stale_position_api_failure(self):
-        """Stale position + get_market returns None → still cleaned up."""
+        """An unavailable result cannot retire an old position."""
         old_opened = _iso_days_ago(bot.CFG.MAX_POSITION_AGE_DAYS + 5)
         pos = _make_position(trade_id="t-stale-nomkt", opened_at=old_opened)
         self.pm.positions["t-stale-nomkt"] = pos
@@ -262,10 +266,10 @@ class TestSettlements(unittest.TestCase):
         self.mock_client.get_market.return_value = None
         realized = self.pm.check_settlements()
 
-        self.assertNotIn("t-stale-nomkt", self.pm.positions)
-        self.mock_tlog.settle_trade.assert_called_once()
-        call_args = self.mock_tlog.settle_trade.call_args
-        self.assertEqual(call_args[0][1], "expired_stale")
+        self.assertIn("t-stale-nomkt", self.pm.positions)
+        self.assertEqual(realized, [])
+        self.assertEqual(self.pm.reconcile_halt["status"], "UNKNOWN")
+        self.mock_tlog.settle_trade.assert_not_called()
 
     def test_keeps_stale_but_open_market(self):
         """Stale position but market status is 'open' → NOT popped."""

@@ -123,7 +123,18 @@ class LiveWritesAreRefusedAtTheClientBoundary(unittest.TestCase):
         # tests/test_prod_access_mode.py.
         self._mode = os.environ.get("PROD_ACCESS_MODE")
         os.environ["PROD_ACCESS_MODE"] = "CAPITAL"
+        import tempfile
+        from unittest.mock import patch
+        from authority_fixtures import provider_for
+        from persistence import PersistenceSentinel
+        tmp = tempfile.TemporaryDirectory(prefix="write-guard-isolated-")
+        self.addCleanup(tmp.cleanup)
+        state = patch.object(CFG, "DATA_DIR", tmp.name)
+        state.start()
+        self.addCleanup(state.stop)
+        PersistenceSentinel.reset()
         self.client = _live_client()
+        self.client.continuity_authority = provider_for()
 
     def tearDown(self):
         for k, v in self._saved.items():

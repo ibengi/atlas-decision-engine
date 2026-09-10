@@ -125,6 +125,11 @@ class _IsolatedState:
         self._tmp = tempfile.mkdtemp(prefix="atlas-shadow-")
         self._data_dir = patch.object(CFG, "DATA_DIR", self._tmp)
         self._data_dir.start()
+        from persistence import PersistenceSentinel
+        from authority_fixtures import initialize_empty
+        PersistenceSentinel.reset()
+        self.addCleanup(PersistenceSentinel.reset)
+        initialize_empty()
         self.boundary = _Boundary()
 
     def tearDown(self):

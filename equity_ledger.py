@@ -40,12 +40,17 @@ import json
 import logging
 import math
 import os
+import copy
+from strict_data import finite_number, validate_tree, dumps
+from state_authority import recovery_problem, manifest, active_transaction, configure_authority
+from continuity_authority import account_identity, challenge
+from ledger_transaction import ledger_transaction
 
 from config import CFG, _p
 from continuity import (CONTINUITY_FILE, KIND_EVIDENCE, KIND_RECOVERY,
                         KIND_TOKEN, ChainError, ContinuityChain)
 from persistence import JsonStore, file_fingerprint, read_generation
-from trade_logger import now_iso
+from trade_logger import now_iso, TradeLogger
 
 log = logging.getLogger("EQUITY")
 
@@ -78,7 +83,11 @@ GUARD_JOURNAL_INTEGRITY = "journal_event_identity"
 ACCOUNTING_GUARDS = (GUARD_UNSEEDED, GUARD_FLOW_UNRESOLVED,
                      GUARD_UNRECONCILED, GUARD_CAPITAL_HOLD,
                      GUARD_CONTINUITY, GUARD_RESIDUAL_UNEXPLAINED,
-                     GUARD_ACCOUNTING_MODE, GUARD_JOURNAL_INTEGRITY)
+                     GUARD_ACCOUNTING_MODE, GUARD_JOURNAL_INTEGRITY,
+                     "persistence_recovery_required", "recovery_required",
+                     "stale_instance_reload_required", "stale_journal_reload_required",
+                     "account_identity_unknown", "account_identity_mismatch",
+                     "external_continuity_unproven")
 
 LEDGER_FILE = "equity_ledger.json"
 SCHEMA_VERSION = 1
@@ -152,11 +161,17 @@ class EquityLedger:
     """Persisted risk-equity state under DATA_DIR/equity_ledger.json."""
 
     def __init__(self, tlog, posmgr, env: str = "prod", path: str = None,
-                 readonly: bool = False):
+                 readonly: bool = False, account_id=None, authority=None):
+        self.owner_pid = os.getpid()
         self.tlog = tlog
         self.posmgr = posmgr
         self.env = env
+        self.identity = account_identity("kalshi", env, account_id if account_id is not None
+                                         else getattr(CFG, "BROKER_ACCOUNT_ID", None))
+        self.authority = authority
         self.path = path or _p(LEDGER_FILE)
+        if authority is not None:
+            configure_authority(self.path, self.identity, authority)
         #: A12: a genuinely non-mutating construction. Every durable write
         #: becomes a refusal that is LOGGED, not a silent no-op, so an
         #: inspection path can never be mistaken for an engine path.
@@ -182,7 +197,7 @@ class EquityLedger:
 
     # ── persistence ─────────────────────────────────────────────────────
     def _empty(self) -> dict:
-        return {"version": SCHEMA_VERSION, "seed": None,
+        return {"version": SCHEMA_VERSION, "identity": self.identity, "seed": None,
                 "risk_equity_status": STATUS_UNRECONCILED,
                 "status_basis": {"set_at": None, "set_by": None,
                                  "provenance_window": {"from": None, "to": None},
@@ -207,6 +222,10 @@ class EquityLedger:
     #: the defaults here ("no watermark", "no consumed token") all read as
     #: "nothing bad ever happened".
     def _schema_problem(self, raw):
+        try:
+            validate_tree(raw)
+        except ValueError as exc:
+            return str(exc)
         if not isinstance(raw, dict):
             return f"persisted ledger is {type(raw).__name__}, object expected"
         if raw.get("version") != SCHEMA_VERSION:
@@ -235,6 +254,18 @@ class EquityLedger:
                 v = seed.get(f)
                 if v is not None and not _finite(v):
                     return f"seed.{f} = {v!r} is not a finite number"
+        for flow in raw.get("flows", []):
+            if not isinstance(flow, dict) or flow.get("kind") not in (
+                    *FLOW_KINDS_COUNTED, FLOW_UNCLASSIFIED, "initial_stake", "loss_by_correction"):
+                return "invalid flow record"
+            if not _finite(flow.get("amount")):
+                return "non-finite flow amount"
+        for key in ("pending", "daily", "anchor", "capital_hold", "continuity"):
+            if raw.get(key) is not None and not isinstance(raw[key], dict):
+                return "invalid " + key
+        hwm = raw.get("hwm", {}).get("risk_equity_reference")
+        if hwm is not None and (not _finite(hwm) or hwm < 0):
+            return "invalid high-water mark"
         gen = raw.get("generation")
         if gen is not None and (not isinstance(gen, int) or isinstance(gen, bool)
                                 or gen < 0):
@@ -288,6 +319,7 @@ class EquityLedger:
                         if self.risk_equity_reference() is not None else None),
                 "ledger_generation": self.generation}
 
+    @ledger_transaction
     def save(self) -> bool:
         """Commit in a fixed order: EVIDENCE FIRST, then state.
 
@@ -378,7 +410,10 @@ class EquityLedger:
         return list(self.tlog.settled_trades())
 
     def realized_pnl_cum(self) -> float:
-        return float(sum(t.get("net_pnl") or 0.0 for t in self.settled()))
+        # An orphan lacks original entry evidence. Preserve any adverse value,
+        # but do not let an unproven positive estimate repair strategy risk.
+        return float(sum(min(0., t.get("net_pnl") or 0.) if t.get("orphan") else
+                         (t.get("net_pnl") or 0.) for t in self.settled()))
 
     def open_cost_basis(self) -> float:
         basis = float(self.posmgr.open_risk()) if self.posmgr is not None else 0.0
@@ -419,9 +454,7 @@ class EquityLedger:
         """
         seen, out = set(), []
         for t in self.settled():
-            keys = [k for k in (("trade_id", str(t.get("trade_id") or "")),
-                                ("settlement_id", str(t.get("settlement_id") or "")))
-                    if k[1]]
+            keys = TradeLogger.event_keys(t)
             if any(k in seen for k in keys):
                 continue
             seen.update(keys)
@@ -431,7 +464,9 @@ class EquityLedger:
     def strategy_equity_conservative(self):
         eq = self.strategy_equity()
         if eq is None:
-            return None
+            floor = self._chain_floor_safe() or {}
+            value = floor.get("strategy_equity")
+            return float(value) if _finite(value) else None
         if self.duplicate_events():
             # count the duplicated event once and keep the WORSE of the two
             # readings: a replay never improves history
@@ -513,7 +548,12 @@ class EquityLedger:
 
     def risk_equity_reference(self):
         if not self.seeded:
-            return None
+            try:
+                observed = [r["payload"].get("hwm") for r in self.chain.records()
+                            if r["kind"] == KIND_EVIDENCE]
+                return max((v for v in observed if _finite(v) and v >= 0), default=None)
+            except ChainError:
+                return None
         persisted = self.state["hwm"].get("risk_equity_reference")
         rec = self._recomputed_hwm()
         if persisted is None:
@@ -770,13 +810,7 @@ class EquityLedger:
         detect it (audit finding A04)."""
         seen, dupes = {}, []
         for t in self.settled():
-            keys = []
-            tid = t.get("trade_id")
-            if tid:
-                keys.append(("trade_id", str(tid)))
-            sid = t.get("settlement_id")
-            if sid:
-                keys.append(("settlement_id", str(sid)))
+            keys = TradeLogger.event_keys(t)
             for key in keys:
                 if key in seen:
                     dupes.append({"key": "%s=%s" % key, "first_index": seen[key],
@@ -787,12 +821,16 @@ class EquityLedger:
 
     def derive_status(self) -> str:
         """Re-derive; automatic moves are conservative only."""
+        from persistence import PersistenceSentinel
+        from state_authority import recovery_problem
+        uncertain = not PersistenceSentinel.healthy() or (not getattr(self, "_is_draft", False)
+                                                        and recovery_problem(self.path))
         if not self.seeded or self.schema_reject:
             return STATUS_UNRECONCILED
         # Every blocking reason is NOTED before any of them returns: an
         # operator reading `unproven` must see all of them, not only the one
         # that happened to be evaluated first.
-        blocked = bool(self.state.get("continuity_block"))
+        blocked = bool(self.state.get("continuity_block")) or bool(uncertain)
         if not self._seed_prefix_intact():
             self._note_unproven("journal does not contain the seed prefix "
                                 "(restored journal older than the ledger?)")
@@ -836,6 +874,35 @@ class EquityLedger:
 
     def guards(self) -> list:
         """CAPITAL guard names currently firing, in evaluation order."""
+        authority_guards = []
+        out = authority_guards
+        if self.owner_pid != os.getpid():
+            out.append("stale_instance_reload_required")
+        from persistence import PersistenceSentinel
+        if not PersistenceSentinel.healthy():
+            out.append("persistence_recovery_required")
+        if not getattr(self, "_is_draft", False):
+            issue = recovery_problem(self.path)
+            if issue:
+                out.append("recovery_required")
+            if read_generation(self.path) != self.generation and os.path.exists(self.path):
+                out.append("stale_instance_reload_required")
+            pos_fingerprint = getattr(self.posmgr, "_fingerprint", None)
+            if isinstance(pos_fingerprint, str) and pos_fingerprint != file_fingerprint(
+                    os.path.join(os.path.dirname(self.path), "positions_state.json")):
+                out.append("stale_instance_reload_required")
+        if self.identity is None:
+            out.append("account_identity_unknown")
+        elif self.state.get("identity") != self.identity:
+            out.append("account_identity_mismatch")
+        if not self._external_continuity_proven():
+            out.append("external_continuity_unproven")
+        from persistence import JsonStore
+        transport_path = os.path.join(os.path.dirname(self.path), "transport_intents.json")
+        if os.path.exists(transport_path) and JsonStore.load(transport_path, None) != {}:
+            out.append("transport_outcome_unresolved")
+        if self._continuity_reason():
+            out.append(GUARD_CONTINUITY)
         out = []
         # A01: continuity first. Everything below reasons about numbers; if
         # the state those numbers come from may have been rewound, no number
@@ -848,6 +915,10 @@ class EquityLedger:
         if not accounting_mode_capital_admissible():
             out.append(GUARD_ACCOUNTING_MODE)
         # A04: the same economic event counted twice flatters the drawdown.
+        if getattr(self.tlog, "_fingerprint", None) != file_fingerprint(getattr(self.tlog, "path", os.path.join(os.path.dirname(self.path), "kalshi_trades.json"))):
+            authority_guards.append("stale_journal_reload_required")
+        if getattr(self.tlog, "integrity_error", None):
+            out.append(GUARD_JOURNAL_INTEGRITY)
         if self.seeded and self.duplicate_events():
             out.append(GUARD_JOURNAL_INTEGRITY)
         if not self.seeded:
@@ -868,7 +939,7 @@ class EquityLedger:
             out.append(GUARD_RESIDUAL_UNEXPLAINED)
         if self.state.get("capital_hold"):
             out.append(GUARD_CAPITAL_HOLD)
-        return out
+        return list(dict.fromkeys(out + authority_guards))
 
     def _unexplained_residual(self):
         """The adverse balance movement currently lacking an explanation, or
@@ -880,22 +951,35 @@ class EquityLedger:
         r = pend.get("residual")
         if r is None or not _finite(r):
             return None
-        if float(r) < -abs(self.eps_base):
+        if abs(float(r)) > self._epsilon():
             return {"residual": _round(r), "since": pend.get("first_seen_at"),
                     "cycles": pend.get("consecutive")}
         return None
 
     def capital_eligible(self) -> bool:
+        if getattr(self.tlog, "integrity_error", None) or getattr(self.posmgr, "integrity_error", None):
+            return False
         return not self.guards()
 
     # ── the per-cycle observation (design §5) ───────────────────────────
+    def _external_continuity_proven(self):
+        if self.identity is None or self.authority is None:
+            return False
+        try:
+            m = manifest(self.path)
+            request = challenge(self.identity, m["generation"], _sha(_canonical(m)))
+            return self.authority.verify_current(request) == request
+        except Exception:
+            return False
+
     def _epsilon(self) -> float:
-        n = int(self.state.get("anchor", {}).get("settled_since_anchor") or 0)
-        return self.eps_base + self.eps_per_trade * n
+        # Fixed measurement tolerance, never proportional to trading history.
+        return min(abs(finite_number(self.eps_base, "measurement epsilon")), 0.01)
 
     def _next_flow_id(self) -> str:
         return "flow-%04d" % (len(self.state["flows"]) + 1)
 
+    @ledger_transaction
     def observe(self, cash, cycle_n: int = 0, quiet: bool = True,
                 when: str = None) -> dict:
         """One observation of broker cash. Returns a snapshot. Never raises
@@ -906,7 +990,7 @@ class EquityLedger:
         if self._check_journal_against_watermark():
             self._reconcile_status()
             self.save()
-        cash = float(cash)
+        cash = finite_number(cash, "broker cash", minimum=0)
         basis = self.open_cost_basis()
         settled = self.settled()
         settled_count = len(settled)
@@ -931,23 +1015,41 @@ class EquityLedger:
         r = (cash + basis) - expected
         eps = self._epsilon()
         pend = self.state.get("pending")
-        if abs(r) <= eps:
+        if pend and float(pend["residual"]) < -eps and r - float(pend["residual"]) > eps:
+            # A later balance recovery is not an explanation of the earlier
+            # adverse observation. Preserve it for explicit classification.
+            adverse = float(pend["residual"])
+            self._append_flow(adverse, FLOW_UNCLASSIFIED, None, when, cycle_n,
+                {"cash": cash, "open_cost_basis": basis,
+                 "realized_pnl_cum": pnl_cum, "prior_observation": dict(pend)})
+            r -= adverse
+            self.state["pending"] = None
+            pend = None
+        rounding_debits = -sum(min(0., f["amount"]) for f in self.state["flows"]
+                               if f.get("kind") == FLOW_ROUNDING)
+        if abs(r) <= eps and rounding_debits + max(0., -r) <= eps:
             if abs(r) > 1e-9:
                 self._append_flow(r, FLOW_ROUNDING, "auto", when, cycle_n, {
                     "cash": cash, "open_cost_basis": basis, "epsilon": eps})
             self.state["pending"] = None
             self.state["anchor"] = {"settled_since_anchor": 0, "at": when}
         elif not quiet:
-            pass                                   # a race can explain it
+            # In-flight observations may explain timing, never discard adverse evidence.
+            self.state["pending"] = {"residual": _round(r), "first_seen_cycle": cycle_n,
+                                     "consecutive": 0, "first_seen_at": when,
+                                     "known_corrections": [c.get("correction_id") for c in self.tlog.correction_rows()],
+                                     "observation_incomplete": True}
         elif pend is None or abs(float(pend["residual"]) - r) > eps:
             self.state["pending"] = {"residual": _round(r), "first_seen_cycle": cycle_n,
-                                     "consecutive": 1, "first_seen_at": when}
+                                     "consecutive": 1, "first_seen_at": when,
+                                     "known_corrections": [c.get("correction_id") for c in self.tlog.correction_rows()]}
         else:
             pend["consecutive"] = int(pend["consecutive"]) + 1
             if pend["consecutive"] >= self.k_quiet_cycles:
                 evidence = {"cash": cash, "open_cost_basis": basis,
                             "realized_pnl_cum": pnl_cum, "epsilon": eps,
                             "cycles_observed": pend["consecutive"],
+                            "known_corrections": pend.get("known_corrections"),
                             "first_seen_at": pend["first_seen_at"]}
                 if r > 0 and (self.risk_equity_reference() or 0.0) <= 0.0:
                     # No stake was ever recorded (reference 0): this is the
@@ -1004,7 +1106,13 @@ class EquityLedger:
         with it, so the residual it explains does not come back.
         """
         if kind == FLOW_UNCLASSIFIED:
-            existing = self._open_unclassified_like(amount)
+            existing = next((f for f in self.state["flows"]
+                if f.get("kind") == FLOW_UNCLASSIFIED and
+                f.get("movement_identity") == _sha(_canonical({
+                    "account": self.identity, "cash": (evidence or {}).get("cash"),
+                    "basis": (evidence or {}).get("open_cost_basis"),
+                    "pnl": (evidence or {}).get("realized_pnl_cum"),
+                    "classified_total": self.flows_cum()}))), None)
             if existing is not None:
                 existing["last_seen_at"] = when
                 existing["last_seen_cycle"] = cycle_n
@@ -1014,7 +1122,12 @@ class EquityLedger:
                             f"({existing['observations']}x, {existing['amount']:+.4f}$): "
                             f"same unresolved movement, NOT a new economic event")
                 return existing
-        row = {"id": self._next_flow_id(), "at": when, "amount": _round(amount),
+        row = {"movement_identity": _sha(_canonical({
+                   "account": self.identity, "cash": (evidence or {}).get("cash"),
+                   "basis": (evidence or {}).get("open_cost_basis"),
+                   "pnl": (evidence or {}).get("realized_pnl_cum"),
+                   "classified_total": self.flows_cum()})),
+               "id": self._next_flow_id(), "at": when, "amount": _round(amount),
                "kind": kind, "classified_by": classified_by, "cycle": cycle_n,
                "evidence": evidence, "note": "",
                "first_seen_at": when, "last_seen_at": when,
@@ -1098,7 +1211,9 @@ class EquityLedger:
         basis_now = self.open_cost_basis() if open_basis_now is None else float(open_basis_now)
         dd = self.rolling_drawdown_journal()
         pnl_cum = self.realized_pnl_cum()
-        pre_flow_cash = float(pre_flow_cash)
+        pre_flow_cash = finite_number(float(pre_flow_cash), "pre-flow cash", minimum=0)
+        finite_number(cash_now, "cash now", minimum=0)
+        finite_number(basis_now, "open basis", minimum=0)
         problems = []
         if any((t.get("settled_at") or "") > pre_flow_at for t in rows):
             problems.append("settlements after the pre-flow observation")
@@ -1157,6 +1272,7 @@ class EquityLedger:
         return _sha(_canonical({k: v for k, v in proposal.items()
                                 if k != "sha256"}))
 
+    @ledger_transaction
     def apply_seed(self, proposal: dict, expected_sha: str, when: str = None) -> bool:
         """Apply a migration seed, re-deriving and re-verifying everything.
 
@@ -1236,6 +1352,7 @@ class EquityLedger:
         return ok
 
     # ── operator: classification ────────────────────────────────────────
+    @ledger_transaction
     def classify_flow(self, flow_id: str, kind: str, action_id: str = None,
                       correction_id: str = None, when: str = None) -> bool:
         row = next((f for f in self.state["flows"] if f.get("id") == flow_id), None)
@@ -1247,10 +1364,20 @@ class EquityLedger:
             if float(row["amount"]) >= 0:
                 log.warning(f"[EQUITY_CLASSIFY] refused: {flow_id} is not negative"); return False
         elif kind == "loss":
-            ids = {c.get("correction_id") for c in self.tlog.correction_rows()}
-            if not correction_id or correction_id not in ids:
+            corrections = [c for c in self.tlog.correction_rows() if c.get("correction_id") == correction_id]
+            evidence = row.get("evidence") or {}
+            known = evidence.get("known_corrections", evidence.get("prior_observation", {}).get("known_corrections"))
+            targets = {t.get("trade_id") for t in self.settled()}
+            if (not correction_id or len(corrections) != 1 or not isinstance(known, list)
+                    or correction_id in known or any(f.get("resolved_by_correction") == correction_id
+                                                     for f in self.state["flows"])):
                 log.warning(f"[EQUITY_CLASSIFY] refused: loss needs a ledger correction "
                             f"present in the journal (got {correction_id!r})"); return False
+            correction = corrections[0]
+            delta = correction.get("net_pnl")
+            if (not _finite(delta) or delta >= 0 or abs(delta - row["amount"]) > 1e-6
+                    or correction.get("corrects_trade_id") not in targets):
+                return False
         else:
             log.warning(f"[EQUITY_CLASSIFY] refused: kind {kind!r} not allowed"); return False
         when = when or now_iso()
@@ -1285,9 +1412,14 @@ class EquityLedger:
         a concurrent writer to it is caught by the fencing generation, which
         is a stronger check than a hash (it refuses the write outright).
         """
-        out = {name: file_fingerprint(_p(name)) for name in BOUND_STATE_FILES
-               if name != LEDGER_FILE}
-        out["ledger_generation"] = self.generation
+        out = {name: file_fingerprint(os.path.join(os.path.dirname(self.path), name))
+               for name in BOUND_STATE_FILES}
+        out["continuity"] = file_fingerprint(self.chain.path)
+        out["ledger_generation"] = read_generation(self.path)
+        out["identity"] = self.identity
+        out["root_generation"] = manifest(self.path)["generation"]
+        out["transport_intents.json"] = file_fingerprint(os.path.join(
+            os.path.dirname(self.path), "transport_intents.json"))
         return out
 
     def evidence_sha256(self) -> str:
@@ -1307,6 +1439,20 @@ class EquityLedger:
     def rebase_preconditions(self, ctx: dict) -> list:
         """ctx: drawdown_firing, reconcile_status, open_positions, in_flight_orders."""
         failures = []
+        from persistence import PersistenceSentinel
+        if not PersistenceSentinel.healthy():
+            failures.append("persistence recovery required")
+        transport_path = os.path.join(os.path.dirname(self.path), "transport_intents.json")
+        if os.path.exists(transport_path) and JsonStore.load(transport_path, None) != {}:
+            failures.append("transport outcome unresolved")
+        for name in BOUND_STATE_FILES:
+            raw = JsonStore.load(os.path.join(os.path.dirname(self.path), name), None)
+            if raw is None:
+                failures.append("missing authoritative state: " + name)
+            if name == "pending_intents.json" and raw:
+                failures.append("pending durable submit intents")
+            if name in ("orders_state.json", "positions_state.json") and not isinstance(raw, dict):
+                failures.append("unknown execution state: " + name)
         if self.state.get("continuity_block"):
             failures.append("continuity rollback: "
                             f"{self.state['continuity_block'].get('reason')}")
@@ -1324,6 +1470,12 @@ class EquityLedger:
         if not isinstance(ctx, dict):
             failures.append("no rebase context provided")
             return failures
+        freeze = ctx.get("execution_freeze")
+        try:
+            if freeze is None or freeze.verify(self.identity, self.bound_state()) is not True:
+                failures.append("verifiable execution freeze absent or expired")
+        except Exception:
+            failures.append("execution freeze verification failed")
         if ctx.get("evidence_unstable"):
             failures.append(f"execution state moved while the rebase evidence "
                             f"was collected: {ctx.get('evidence_unstable')}")
@@ -1390,6 +1542,7 @@ class EquityLedger:
                                  + "|" + str(action_id) + "|" + ev)
         return proposal
 
+    @ledger_transaction
     def apply_rebase(self, reason, action_id, token, ctx: dict, when: str = None) -> bool:
         """PREPARE -> VALIDATE -> RE-VALIDATE -> COMMIT -> PUBLISH.
 
@@ -1450,6 +1603,11 @@ class EquityLedger:
                         f"changed: {drift}")
             return False
 
+        transaction = active_transaction(self.path)
+        freeze = ctx.get("execution_freeze")
+        if transaction is None or freeze is None:
+            return False
+        transaction.validators.append(lambda: freeze.verify(self.identity, self.bound_state()) is True)
         # PREPARE the new state on a copy. Nothing below this line is visible
         # to any other reader until the durable write returns True.
         when = when or now_iso()
@@ -1486,6 +1644,7 @@ class EquityLedger:
                     f"capital_hold=post_rebase_validation")
         return True
 
+    @ledger_transaction
     def _commit(self, prepared: dict) -> bool:
         """Durably commit a PREPARED state, then publish it. On failure the
         current state stays authoritative, unchanged, in memory and on disk
@@ -1528,6 +1687,7 @@ class EquityLedger:
         proposal["token"] = _sha("hold-release|" + _canonical({k: v for k, v in proposal.items() if k != "token"}))
         return proposal
 
+    @ledger_transaction
     def apply_hold_release(self, action_id, validation_ref, token, when: str = None) -> bool:
         try:
             proposal = self.propose_hold_release(action_id, validation_ref)
@@ -1564,6 +1724,7 @@ class EquityLedger:
         proposal["token"] = _sha("attest|" + _canonical({k: v for k, v in proposal.items() if k != "token"}))
         return proposal
 
+    @ledger_transaction
     def apply_attestation(self, action_id, funding_records_sha256, token, when: str = None) -> bool:
         try:
             proposal = self.propose_attestation(action_id, funding_records_sha256)

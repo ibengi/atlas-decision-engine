@@ -44,6 +44,9 @@ if _ROOT not in sys.path:
 # used to leave CFG.DEMO_KEY_ID empty when collected first, and every later
 # module that built a real KalshiClient then failed. Loading it from the two
 # RUNNERS makes collection order stop mattering. Dummy values, never secrets.
+# Stable NON-SECRET synthetic account identity for broker test fixtures.
+# Runtime code keeps an absent identity blocked; policy tests override explicitly.
+os.environ.setdefault("BROKER_ACCOUNT_ID", "synthetic-account")
 import _bootstrap  # noqa: F401,E402
 
 # Must run before any test module imports `config`, whose class attributes are

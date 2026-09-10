@@ -27,7 +27,9 @@ import uuid
 from datetime import datetime, timezone
 
 from config import CFG, _p
-from persistence import JsonStore
+from persistence import JsonStore, file_fingerprint, PersistenceSentinel
+from strict_data import finite_number, integer, validate_tree
+from journal_transaction import journal_transaction
 
 # Module-level logger (meme format que dans kalshi_alpha_bot.py)
 log_trd = logging.getLogger("TRADE")
@@ -103,8 +105,23 @@ class TradeLogger:
     def __init__(self):
         self.path = _p(CFG.TRADES_FILE)
         raw = JsonStore.load(self.path, [])
+        self._fingerprint = file_fingerprint(self.path)
+        self.integrity_error = None
+        if not isinstance(raw, list) or any(not isinstance(t, dict) for t in raw):
+            self.integrity_error = "journal has malformed rows"
+            raw = []
         legacy = [t for t in raw if t.get("schema") != self.SCHEMA]
-        self.trades = [t for t in raw if t.get("schema") == self.SCHEMA]
+        if legacy:
+            self.integrity_error = "unknown/legacy journal schema: explicit migration required"
+        try:
+            self.validate_rows(raw)
+        except (ValueError, TypeError) as exc:
+            self.integrity_error = str(exc)
+        if any(t.get("orphan") for t in raw):
+            self.integrity_error = "orphan execution evidence requires reconstruction"
+        self.trades = raw
+        if self.integrity_error:
+            PersistenceSentinel.record_failure(self.path, self.integrity_error)
         #: A04: economic identity, computed on load and maintained on every
         #: append. A journal holding the same trade twice reports a smaller
         #: loss while its count, its digest and its totals all stay
@@ -118,19 +135,38 @@ class TradeLogger:
                 f"{sorted(self.duplicate_ids)[:8]} -- l'historique n'est plus "
                 f"une suite d'evenements distincts; le ledger refuse "
                 f"d'etendre son watermark et bloque CAPITAL.")
-        if legacy:
-            legacy_path = _p("kalshi_trades_legacy.json")
-            old = JsonStore.load(legacy_path, [])
-            JsonStore.save(legacy_path, old + legacy)
-            JsonStore.save(self.path, self.trades)
-            log_trd.warning(f"{len(legacy)} enregistrement(s) heritee(s) "
-                            f"(dry-run/ancien schema) archives dans "
-                            f"kalshi_trades_legacy.json -- exclus des statistiques.")
+    @staticmethod
+    def validate_rows(rows):
+        validate_tree(rows)
+        for row in rows:
+            for field in ("gross_pnl", "net_pnl", "roi", "fees", "avg_fill_price", "requested_price"):
+                if row.get(field) is not None:
+                    finite_number(row[field], field, minimum=0 if not is_correction(row) and field in (
+                        "fees", "avg_fill_price", "requested_price") else None)
+            for field in ("filled_count", "requested_count"):
+                if row.get(field) is not None:
+                    integer(row[field], field, minimum=0 if not is_correction(row) else None)
+            if row.get("state") not in ("open", "settled", "expired"):
+                raise ValueError("unknown journal economic state")
 
     @staticmethod
     def event_keys(row: dict) -> list:
         """The identities that make a row a DISTINCT economic event."""
         keys = []
+        if not is_correction(row):
+            order_id = row.get("order_id")
+            if order_id:
+                keys.append(("broker_order_id", str(order_id)))
+        else:
+            # A correction is a revision of a target, not a second trade.
+            broker_digest = row.get("evidence_sha256") or row.get("broker_evidence_sha256")
+            if isinstance(row.get("broker_evidence"), dict) and row["broker_evidence"]:
+                import hashlib
+                from strict_data import dumps
+                broker_digest = hashlib.sha256(dumps(row["broker_evidence"],
+                    sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if broker_digest:
+                keys.append(("correction_evidence", str(row.get("corrects_trade_id")) + ":" + str(broker_digest)))
         tid = row.get("trade_id")
         if tid:
             keys.append(("trade_id", str(tid)))
@@ -177,6 +213,7 @@ class TradeLogger:
             f"une correction portant son propre correction_id.")
         return True
 
+    @journal_transaction
     def open_trade(self, *, ticker, market_title, side, req_price, avg_price,
                    req_count, filled_count, spread, fees, edge, ev, confidence,
                    grade, reason, analysis, order_id, order_status,
@@ -187,6 +224,13 @@ class TradeLogger:
         # Decision -> Trade -> Settlement lifecycle key; None means the trade
         # did not originate from a traceable decision (e.g. crash recovery)
         # and stays honestly unjoinable.
+        for label, value in (("price", avg_price), ("requested price", req_price),
+                             ("fees", fees)):
+            finite_number(value, label, minimum=0)
+        integer(filled_count, "filled count", minimum=1)
+        integer(req_count, "requested count", minimum=filled_count)
+        if side not in ("yes", "no") or not isinstance(order_id, str) or not order_id:
+            raise ValueError("verified broker order identity and side required")
         rec = {
             "schema": self.SCHEMA, "trade_id": uuid.uuid4().hex[:12],
             "decision_id": decision_id,
@@ -209,14 +253,22 @@ class TradeLogger:
                      f"@ {avg_price}c (frais {fees:.2f}$) ordre={order_id}")
         return rec
 
+    @journal_transaction
     def settle_trade(self, trade_id: str, result: str, won: bool,
                      gross_pnl: float, net_pnl: float):
+        finite_number(gross_pnl, "gross PnL")
+        finite_number(net_pnl, "net PnL")
         for t in self.trades:
             if t["trade_id"] == trade_id:
+                if t.get("state") == "settled":
+                    if (t.get("result"), t.get("won"), t.get("gross_pnl"), t.get("net_pnl")) == (
+                            result, won, round(gross_pnl, 6), round(net_pnl, 6)):
+                        return t
+                    raise ValueError("conflicting settlement requires explicit correction")
                 opened = datetime.fromisoformat(t["timestamp"])
                 t.update({
                     "state": "settled", "result": result, "won": won,
-                    "gross_pnl": round(gross_pnl, 2), "net_pnl": round(net_pnl, 2),
+                    "gross_pnl": round(gross_pnl, 6), "net_pnl": round(net_pnl, 6),
                     "roi": round(net_pnl / max(0.01, t["avg_fill_price"] / 100.0
                                                * t["filled_count"]), 4),
                     "settled_at": now_iso(),
@@ -230,6 +282,7 @@ class TradeLogger:
         log_trd.error(f"settle_trade: trade_id {trade_id} introuvable.")
         return None
 
+    @journal_transaction
     def settle_orphan(self, position: dict, result: str, won: bool,
                       gross_pnl: float, net_pnl: float) -> dict:
         """Regle une position dont le trade d'origine est absent du journal.
@@ -247,6 +300,7 @@ class TradeLogger:
         l'exclure ou l'auditer : ses champs d'entree (prix moyen, frais)
         viennent de la reconstruction broker, pas d'un fill observe.
         """
+        self.integrity_error = "orphan execution evidence requires reconstruction"
         rec = {
             "schema": self.SCHEMA,
             "trade_id": position.get("trade_id") or f"orphan-{uuid.uuid4().hex[:8]}",
@@ -266,7 +320,7 @@ class TradeLogger:
                          "du journal (disque ephemere)"),
             "order_id": None, "order_status": None,
             "state": "settled", "result": result, "won": won,
-            "gross_pnl": round(gross_pnl, 2), "net_pnl": round(net_pnl, 2),
+            "gross_pnl": round(gross_pnl, 6), "net_pnl": round(net_pnl, 6),
             "roi": None, "holding_seconds": None, "settled_at": now_iso(),
             "orphan": True,
         }
@@ -313,6 +367,18 @@ class TradeLogger:
     def settled_trades(self) -> list:
         return [t for t in self.effective_trades() if t["state"] == "settled"]
 
+    @journal_transaction
+    def append_correction(self, row):
+        if self._reject_duplicate(row):
+            raise ValueError("duplicate correction")
+        self.trades.append(row)
+        self.flush()
+        return row
+
     def flush(self):
+        self.validate_rows(self.trades)
         self.duplicate_ids = self._scan_duplicate_ids(self.trades)
-        JsonStore.save(self.path, self.trades)
+        if not JsonStore.save(self.path, self.trades, expect_fingerprint=self._fingerprint):
+            raise RuntimeError("journal not durably committed")
+        self._fingerprint = file_fingerprint(self.path)
+        return True

@@ -72,6 +72,17 @@ class _GuardCase(unittest.TestCase):
 
     def _client(self, env="prod", base_url="https://api.example.invalid"):
         c = kalshi_client.KalshiClient.__new__(kalshi_client.KalshiClient)
+        import tempfile
+        from config import CFG
+        from authority_fixtures import provider_for
+        from persistence import PersistenceSentinel
+        tmp = tempfile.TemporaryDirectory(prefix="broker-guard-isolated-")
+        self.addCleanup(tmp.cleanup)
+        state = patch.object(CFG, "DATA_DIR", tmp.name)
+        state.start()
+        self.addCleanup(state.stop)
+        PersistenceSentinel.reset()
+        c.continuity_authority = provider_for(env=env) if env in ("demo", "prod") else None
         c.env = env
         c.base_url = base_url
         c.key_id = "unit-test-not-a-credential"

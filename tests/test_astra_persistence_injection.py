@@ -76,7 +76,7 @@ class LedgerCommitFailureInjection(AstraCase):
             if str(path).endswith(EL.LEDGER_FILE + ".tmp"):
                 raise _Boom("temp write failed")
             return real_open(path, *a, **kw)
-        with patch("builtins.open", side_effect=boom):
+        with patch("state_authority.tempfile.mkstemp", side_effect=_Boom("temp create failed")):
             self.assertFalse(led.save())
         self.assertEqual(open(_p(EL.LEDGER_FILE), "rb").read(), before)
         self.assert_intact_after_restart()
@@ -120,10 +120,11 @@ class LedgerCommitFailureInjection(AstraCase):
         self.assertIsNotNone(led2.from_backup)
         self.assertIn(EL.GUARD_CONTINUITY, led2.guards())
         self.assertFalse(led2.capital_eligible())
-        # and the next boot, reading an authoritative primary again, clears
+        # A second restart is not a recovery authorization.
         led3, _, _ = self.reload()
-        self.assertIsNone(led3.from_backup)
-        self.assertNotIn(EL.GUARD_CONTINUITY, led3.guards())
+        self.assertIsNotNone(led3.from_backup)
+        self.assertIn(EL.GUARD_CONTINUITY, led3.guards())
+        self.assertFalse(led3.capital_eligible())
 
     def test_directory_fsync_failure_is_survivable(self):
         client, tlog, pos, led = self.seeded()
@@ -163,7 +164,8 @@ class LedgerCommitFailureInjection(AstraCase):
         client, tlog, pos, led = self.seeded()
         t = trade(tlog)
         with patch.object(JsonStore, "save", return_value=False):
-            tlog.settle_trade(t["trade_id"], "no", False, -3.0, -3.0)
+            with self.assertRaises(RuntimeError):
+                tlog.settle_trade(t["trade_id"], "no", False, -3.0, -3.0)
         led2, tlog2, _ = self.reload()
         # the settlement never became durable; nothing claims it did
         self.assertEqual(len(tlog2.settled_trades()), 0)
@@ -237,6 +239,7 @@ class IntentCommitFailureInjection(AstraCase):
 
     def test_a_directory_instead_of_the_file(self):
         client, om = self.om()
+        os.unlink(_p(OrderManager.PENDING_FILE))
         os.makedirs(_p(OrderManager.PENDING_FILE), exist_ok=True)
         result = om.place_and_track("KXBTCD-X", "yes", 1, 40)
         self.assertEqual(client.create_calls, 0)
@@ -246,13 +249,13 @@ class IntentCommitFailureInjection(AstraCase):
         client, om = self.om()
         om2 = OrderManager(client)
         cid = OrderManager._client_order_id("KXBTCD-X", "yes", 1, 40)
-        self.assertTrue(om._record_intent("KXBTCD-X", cid, 1, 40))
+        self.assertTrue(om._record_intent("KXBTCD-X", cid, 1, 40, side="yes"))
         om2.pending_intents.clear()
-        om2._flush_pending_intents()                    # the other process
+        self.assertFalse(om2._flush_pending_intents())   # stale writer must lose
         om3 = OrderManager(client)
-        self.assertNotIn("KXBTCD-X", om3.pending_intents)
-        # ...and a fresh record is written and read back cleanly
-        self.assertTrue(om3._record_intent("KXBTCD-X", cid, 1, 40))
+        self.assertIn("KXBTCD-X", om3.pending_intents)
+        self.assertEqual(om3.pending_intents["KXBTCD-X"]["client_order_id"], cid)
+        self.assertFalse(PersistenceSentinel.healthy())
         self.assertIn("KXBTCD-X",
                       JsonStore.load(_p(OrderManager.PENDING_FILE), {}))
 

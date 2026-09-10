@@ -10,7 +10,11 @@ from datetime import datetime, timezone
 
 from config import CFG, _p
 from kalshi_client import KalshiClient, pick, pick_int  # noqa: F401
-from persistence import JsonStore
+from persistence import JsonStore, PersistenceSentinel, file_fingerprint
+from strict_data import integer, finite_number, validate_tree
+from position_transaction import position_transaction
+from state_authority import Transaction, active_transaction
+import contextlib
 from trade_logger import TradeLogger, now_iso
 
 # Module-level logger (meme canal que dans kalshi_alpha_bot.py)
@@ -25,14 +29,39 @@ class PositionManager:
     def __init__(self, client: KalshiClient, trade_log: TradeLogger):
         self.client, self.tlog = client, trade_log
         raw = JsonStore.load(_p(CFG.POSITIONS_FILE), {})
-        self.positions = self._migrate(raw)          # trade_id -> pos
-        self.seen_fill_ids = set(
-            JsonStore.load(_p("seen_fill_ids.json"), []))
+        self.integrity_error = None
+        try:
+            if not isinstance(raw, dict) or any(not isinstance(v, dict) for v in raw.values()):
+                raise ValueError("malformed position collection")
+            validate_tree(raw)
+            for p in raw.values():
+                if p.get("state", "open") not in ("open", "settled", "expired", "closed"):
+                    raise ValueError("unknown local position state")
+                if p.get("side") not in ("yes", "no"):
+                    raise ValueError("unknown local position side")
+                integer(p.get("count"), "position count", minimum=0)
+                if "avg_price" in p:
+                    finite_number(p["avg_price"], "position price", minimum=0, maximum=100)
+            self.positions = self._migrate(raw)
+        except (ValueError, TypeError) as exc:
+            self.integrity_error = str(exc)
+            self.positions = raw if isinstance(raw, dict) else {}
+            PersistenceSentinel.record_failure(_p(CFG.POSITIONS_FILE), self.integrity_error)
+        self._fingerprint = file_fingerprint(_p(CFG.POSITIONS_FILE))
+        raw_fills = JsonStore.load(_p("seen_fill_ids.json"), [])
+        if (not isinstance(raw_fills, list) or any(not isinstance(v, str) or not v
+                for v in raw_fills) or len(raw_fills) != len(set(raw_fills))):
+            self.integrity_error = "malformed fill identity collection"
+            PersistenceSentinel.record_failure(_p("seen_fill_ids.json"), self.integrity_error)
+            raw_fills = []
+        self.seen_fill_ids = set(raw_fills)
+        self._fills_fingerprint = file_fingerprint(_p("seen_fill_ids.json"))
         # Verrou de reconciliation periodique (voir verify_against_broker) :
         # None = pas de divergence connue ; sinon dict {status, detail, at}.
         # Volontairement NON persiste : chaque redemarrage re-verifie contre
         # le broker au lieu d'heriter d'un verdict peut-etre perime.
-        self.reconcile_halt = None
+        self.reconcile_halt = ({"status": "RECOVERY_REQUIRED", "detail": self.integrity_error}
+                               if self.integrity_error else None)
 
     @staticmethod
     def _migrate(raw: dict) -> dict:
@@ -46,10 +75,20 @@ class PositionManager:
         return out
 
     def flush(self):
-        JsonStore.save(_p(CFG.POSITIONS_FILE), self.positions)
-        JsonStore.save(_p("seen_fill_ids.json"),
-                       sorted(self.seen_fill_ids)[-5000:])
+        path = _p(CFG.POSITIONS_FILE)
+        current = active_transaction(path)
+        scope = (contextlib.nullcontext(current) if current else
+                 Transaction(path, {CFG.POSITIONS_FILE, "seen_fill_ids.json"}))
+        with scope:
+            if not JsonStore.save(path, self.positions, expect_fingerprint=self._fingerprint):
+                raise RuntimeError("position commit failed")
+            if not JsonStore.save(_p("seen_fill_ids.json"), sorted(self.seen_fill_ids),
+                                  expect_fingerprint=self._fills_fingerprint):
+                raise RuntimeError("fill identity commit failed")
+            self._fingerprint = file_fingerprint(path)
+            self._fills_fingerprint = file_fingerprint(_p("seen_fill_ids.json"))
 
+    @position_transaction
     def open_position(self, trade: dict, extra: dict = None):
         pos = {
             "trade_id": trade["trade_id"], "ticker": trade["ticker"],
@@ -67,6 +106,12 @@ class PositionManager:
             "entry_edge": (extra or {}).get("entry_edge"),
             "entry_ev": (extra or {}).get("entry_ev"),
         }
+        if trade["trade_id"] in self.positions:
+            if self.positions[trade["trade_id"]] == pos:
+                return
+            raise ValueError("conflicting position replay")
+        if set(pos["fill_ids"]) & self.seen_fill_ids:
+            raise ValueError("previously ingested fill cannot create another position")
         self.positions[trade["trade_id"]] = pos
         for fid in pos["fill_ids"]:
             self.seen_fill_ids.add(fid)
@@ -75,7 +120,7 @@ class PositionManager:
                      f"x{trade['filled_count']} @ {trade['avg_fill_price']}c")
 
     def _active_positions(self):
-        return (p for p in self.positions.values() if p.get("state", "open") == "open")
+        return (p for p in self.positions.values() if isinstance(p, dict) and p.get("state", "open") == "open")
 
     def tickers_open(self) -> set:
         return {p["ticker"] for p in self._active_positions()}
@@ -126,47 +171,25 @@ class PositionManager:
             total += p["count"] * (mid - p["avg_price"]) / 100.0
         return total
 
+    @position_transaction
     def _settle_and_release(self, tid: str, p: dict, result: str,
                             won: bool, gross: float, net: float):
-        """Regle le trade et libere le slot ; retourne la ligne reglee.
+        """Settle a known journal entry and retire exposure in one transaction.
 
-        settle_trade ne retourne None que dans UN cas : le trade_id est absent
-        du journal (« introuvable »). Ce n'est pas une erreur transitoire — un
-        id inconnu du journal ne le deviendra jamais — donc « garder la
-        position pour reessayer » garantissait un slot occupe a vie. Le cas
-        concret est une position ``brk-...`` reconstruite depuis le broker
-        apres un redemarrage : le journal des trades vivait sur le disque
-        ephemere du conteneur precedent.
-
-        Pour ces positions, le reglement est ecrit comme ligne orpheline
-        (auditee, marquee ``orphan``) et le slot est libere quand meme : le
-        broker a publie un resultat, la position n'existe plus chez lui, la
-        garder localement ne protege rien et bloque MAX_OPEN_POSITIONS.
+        Missing original execution evidence requires explicit reconstruction;
+        a broker outcome alone does not establish the original premium/fees.
         """
         t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
         if t is None:
-            log_pos.warning(
-                f"{p['ticker']}: trade {p['trade_id']} absent du journal "
-                f"(position reconstruite apres redemarrage ?) — reglement "
-                f"orphelin, slot libere quand meme.")
-            t = self.tlog.settle_orphan(p, result, won, gross, net)
+            self.reconcile_halt = {"status": "UNKNOWN", "detail": "original trade evidence missing"}
+            log_pos.warning("%s: reglement bloque; journal d'origine absent", p["ticker"])
+            return None
         self.positions.pop(tid, None)
         self.flush()
         return t
 
     def check_settlements(self) -> list:
-        """Interroge l'API pour les marches regles ; realise le PnL.
-        Ecriture du reglement AVANT retrait de la position : un crash entre
-        les deux laisse au pire un doublon detecte (trade deja settled),
-        jamais un trade zombie.
-
-        Changements P2.1 (2026-07-31) :
-        - result "void" reconnu comme reglement valide (perte limitee aux frais)
-        - statut settled/finalized avec result illisible => void_unreadable
-        - max-age escape hatch : positions de plus de MAX_POSITION_AGE_DAYS
-          sur des marches non "open" nettoyees comme expired_stale
-        - echec get_market() : log WARNING + cleanup si position trop vieille
-        """
+        """Ingest complete broker outcomes; unknown outcomes retain exposure."""
         realized = []
         now_dt = datetime.now(timezone.utc)
         for tid, p in list(self.positions.items()):
@@ -174,39 +197,12 @@ class PositionManager:
                 continue
             m = self.client.get_market(p["ticker"])
 
-            # ── max-age escape hatch ──────────────────────────────────
-            opened_str = p.get("opened_at", "")
-            if opened_str:
-                try:
-                    opened = datetime.fromisoformat(opened_str)
-                    age_days = (now_dt - opened).total_seconds() / 86400.0
-                except (ValueError, TypeError):
-                    age_days = None
-            else:
-                age_days = None
-
-            if age_days is not None and age_days > CFG.MAX_POSITION_AGE_DAYS:
-                if not m or str(pick(m, "status", default="") or "").lower() != "open":
-                    gross = -p["fees"]   # conservative: lose fees on stale position
-                    net = gross - p["fees"]
-                    t = self._settle_and_release(tid, p, "expired_stale", False, gross, net)
-                    if t:
-                        realized.append(t)
-                    log_pos.warning(
-                        f"{p['ticker']}: position agee de {age_days:.0f}j > "
-                        f"{CFG.MAX_POSITION_AGE_DAYS}j, statut marche="
-                        f"{str(pick(m, 'status', default='N/A') or 'N/A').lower() if m else 'inaccessible'}"
-                        f" -- nettoyee comme expired_stale (gross={gross:+.2f}$)")
-                    continue
-
+            # Age is never settlement evidence. Unknown outcomes retain the
+            # full position until a complete broker result is available.
             # ── API failure (m is None / empty) ───────────────────────
             if not m:
-                if age_days is not None and age_days <= CFG.MAX_POSITION_AGE_DAYS:
-                    log_pos.warning(f"{p['ticker']}: get_market() a echoue -- "
-                                    f"position fraiche ({age_days:.0f}j), conservee.")
-                else:
-                    log_pos.warning(f"{p['ticker']}: get_market() a echoue, "
-                                    f"age={age_days}j -- conservee.")
+                self.reconcile_halt = {"status": "UNKNOWN", "detail": "settlement response unavailable"}
+                log_pos.warning("%s: get_market unavailable; position retained", p["ticker"])
                 continue
 
             result = str(pick(m, "result", default="") or "").lower()
@@ -226,15 +222,9 @@ class PositionManager:
             # ── settled/finalized with unreadable result ──────────────
             if result not in ("yes", "no"):
                 if status in ("settled", "finalized"):
-                    gross = -p["fees"]   # conservative: assume loss
-                    net = gross - p["fees"]
-                    t = self._settle_and_release(tid, p, "void_unreadable", False, gross, net)
-                    if t:
-                        realized.append(t)
-                    log_pos.warning(
-                        f"{p['ticker']}: statut '{status}' mais result illisible "
-                        f"(raw={repr(pick(m, 'result', default=None))}) -- "
-                        f"traite comme void_unreadable (gross={gross:+.2f}$)")
+                    self.reconcile_halt = {"status": "UNKNOWN",
+                                           "detail": "settlement result incomplete"}
+                    log_pos.warning("%s: incomplete settlement; position retained", p["ticker"])
                     continue
                 else:
                     # market still open or unknown → keep position
@@ -270,6 +260,8 @@ class PositionManager:
             v = bp.get(f)
             if v is None:
                 continue
+            if isinstance(v, bool):
+                return None, f"{f}: boolean quantity refused"
             try:
                 fv = float(v)
             except (TypeError, ValueError):
@@ -346,17 +338,25 @@ class PositionManager:
 
     def _broker_net_positions(self, broker):
         """(dict ticker->net signe, None) ou (None, raison UNKNOWN)."""
-        net = {}
+        net, seen_ids = {}, set()
         for bp in broker:
             if not isinstance(bp, dict):
                 return None, f"ligne broker inexploitable: {bp!r}"
             tk = bp.get("ticker")
-            if not tk:
-                return None, f"ligne broker sans ticker: {bp!r}"
+            if not isinstance(tk, str) or not tk.strip():
+                return None, "broker ticker must be a nonempty string"
+            if tk in net:
+                return None, "CONFLICTED: duplicate ticker " + tk
+            for field in ("position_id", "id"):
+                ident = bp.get(field)
+                if ident is not None:
+                    if not isinstance(ident, str) or not ident or (field, ident) in seen_ids:
+                        return None, "CONFLICTED: invalid or duplicate position identity"
+                    seen_ids.add((field, ident))
             qty, err = self.parse_broker_qty(bp)
             if err:
                 return None, f"{tk}: {err}"
-            net[tk] = net.get(tk, 0) + qty
+            net[tk] = qty
         return {tk: q for tk, q in net.items() if q != 0}, None
 
     def _local_net_positions(self):
@@ -403,7 +403,16 @@ class PositionManager:
         modifiees parce que le broker est indisponible ; les reglements et
         la recuperation en lecture seule continuent par ailleurs.
         """
+        problem = self.integrity_error
+        if any(not isinstance(p, dict) or p.get("state", "open") not in
+               ("open", "settled", "expired", "closed") for p in self.positions.values()):
+            problem = "unknown local position state"
+        if problem:
+            self.reconcile_halt = {"status": "UNKNOWN", "detail": problem}
+            return {"status": "UNKNOWN", "mismatches": [], "detail": problem}
         report = {"status": "MATCH", "mismatches": [], "detail": ""}
+        if self.integrity_error:
+            return {"status": "UNKNOWN", "mismatches": [], "detail": self.integrity_error}
         def _unavailable(detail):
             report["status"] = "BROKER_UNAVAILABLE"
             report["detail"] = detail
@@ -507,6 +516,13 @@ class PositionManager:
         moteur lisent pour bloquer les soumissions fail-closed ; seul un
         MATCH digne de confiance laisse le demarrage sans verrou.
         """
+        problem = self.integrity_error
+        if any(not isinstance(p, dict) or p.get("state", "open") not in
+               ("open", "settled", "expired", "closed") for p in self.positions.values()):
+            problem = "unknown local position state"
+        if problem:
+            self.reconcile_halt = {"status": "UNKNOWN", "detail": problem}
+            return {"status": "UNKNOWN", "mismatches": [], "detail": problem}
         report = {"status": "MATCH", "mismatches": [], "matched": [],
                   "detail": ""}
 
@@ -603,4 +619,3 @@ class PositionManager:
                     ": la reconciliation de demarrage bloquera les "
                     "soumissions (broker_only) au lieu de reconstruire.",
                     extra={"event": "state_empty_at_startup"})
-
