@@ -56,11 +56,54 @@ MAX_FUTURE_SKEW_S = 300.0
 MAX_MODEL_AHEAD_OF_TESTS_S = MAX_FUTURE_SKEW_S
 
 
+class _MalformedEvidence(Exception):
+    """Validation evidence that cannot be read as one unambiguous statement.
+    Carried as an exception so no caller can mistake it for a benign default
+    (audit finding A08)."""
+
+
+def _no_duplicate_keys(pairs):
+    """A duplicate key is a document that says two things.
+
+    ``json.load`` keeps the last occurrence, so ``{"approved": false,
+    "approved": true}`` parses as approved. That is not a formatting quirk in
+    an approval artefact: it is a way to state a refusal and have it read as
+    a permission. Refused at parse time (A08).
+    """
+    seen = {}
+    for k, v in pairs:
+        if k in seen:
+            raise _MalformedEvidence(
+                f"cle JSON dupliquee {k!r}: l'artefact enonce deux valeurs "
+                f"pour un meme champ")
+        seen[k] = v
+    return seen
+
+
+def _reject_non_finite(name):
+    raise _MalformedEvidence(
+        f"{name!r} n'est pas un nombre fini: l'evidence contient le litteral "
+        f"non fini {name!r}, qui traverse silencieusement toute comparaison")
+
+
 def _load(path):
+    """Parsed evidence, or None when absent/unreadable.
+
+    Raises ``_MalformedEvidence`` when the bytes exist but state something
+    contradictory. ``None`` and "contradictory" are different answers and
+    only one of them is merely missing evidence.
+    """
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        return json.loads(raw, object_pairs_hook=_no_duplicate_keys,
+                          parse_constant=_reject_non_finite)
+    except _MalformedEvidence:
+        raise
+    except ValueError:
         return None
 
 
@@ -179,6 +222,53 @@ def _check_test_report(now: float, failed: list):
     return ts
 
 
+_THRESHOLD_OPS = (">=", "<=", ">", "<", "==")
+
+
+def _criterion_self_consistent(c: dict) -> tuple:
+    """(ok, why). A criterion that publishes `required` and `observed` must
+    not claim `passed` against its own numbers (audit finding A08).
+
+    A threshold that cannot be parsed is NOT treated as satisfied: an
+    unreadable requirement is reported, so a typo cannot become a pass.
+    """
+    # Only a CLAIMED pass needs to be consistent with its own numbers. A
+    # criterion that honestly reports `passed: false` is already refused by
+    # the unmet-criteria check, and complaining that its unmeasured
+    # `observed` is not a number adds noise without adding safety.
+    if c.get("passed") is not True:
+        return True, None
+    required, observed = c.get("required"), c.get("observed")
+    if required is None or observed is None:
+        return True, None
+    if not isinstance(required, str):
+        return True, None
+    expr = required.strip()
+    op = next((o for o in _THRESHOLD_OPS if expr.startswith(o)), None)
+    if op is None:
+        return True, None
+    ok_obs, obs = _finite_number(observed)
+    if not ok_obs:
+        return False, (f"passed=true alors que observed={observed!r} n'est "
+                       f"pas un nombre fini: la mesure ne peut pas etayer "
+                       f"la reussite qu'elle declare")
+    try:
+        threshold = float(expr[len(op):].strip())
+    except ValueError:
+        return False, (f"passed=true contre un seuil {required!r} illisible "
+                       f"-- une exigence non evaluable n'est pas une "
+                       f"exigence satisfaite")
+    if not math.isfinite(threshold):
+        return False, f"seuil {required!r} non fini"
+    holds = {">=": obs >= threshold, "<=": obs <= threshold,
+             ">": obs > threshold, "<": obs < threshold,
+             "==": obs == threshold}[op]
+    if c.get("passed") is True and not holds:
+        return False, (f"passed=true alors que observed={obs} ne satisfait "
+                       f"pas {required!r}")
+    return True, None
+
+
 def _check_model_validation(now: float, test_ts, failed: list) -> None:
     mv = _load("model_validation.json")
     if mv is None:
@@ -195,15 +285,64 @@ def _check_model_validation(now: float, test_ts, failed: list) -> None:
     if not isinstance(version, str) or not version.strip():
         failed.append("model_validation.json: 'model_version' absent ou vide "
                       "-- evidence non rattachable a un modele")
+    # A08: a blocked approval that also says approved=true is a contradiction,
+    # and a contradiction is a refusal, never a coin toss.
+    blocked = mv.get("approval_blocked_reason")
+    if mv.get("approved") is True and blocked not in (None, "", False):
+        failed.append(f"model_validation.json: approved=true ALORS QUE "
+                      f"approval_blocked_reason={blocked!r} -- evidence "
+                      f"contradictoire")
     criteria = mv.get("criteria")
-    if criteria is not None:
-        if not isinstance(criteria, list):
-            failed.append("model_validation.json: 'criteria' n'est pas une liste")
-        else:
-            unmet = [c.get("name") for c in criteria
-                     if not isinstance(c, dict) or c.get("passed") is not True]
-            if unmet:
-                failed.append(f"criteres de validation non satisfaits: {unmet}")
+    if criteria is None:
+        # A08: an approval with no criteria at all is not an approval that
+        # met none; it is an approval whose evidence is absent. Deleting the
+        # failing criterion must not be a way to pass.
+        if mv.get("approved") is True:
+            failed.append("model_validation.json: approved=true sans aucun "
+                          "'criteria' -- une approbation sans critere n'est "
+                          "pas une approbation verifiee")
+    elif not isinstance(criteria, list):
+        failed.append("model_validation.json: 'criteria' n'est pas une liste")
+    else:
+        unmet, names, seen_names = [], {}, set()
+        for i, c in enumerate(criteria):
+            # A08: a malformed element is REFUSED, never dereferenced. The
+            # old comprehension filtered on `not isinstance(c, dict)` and
+            # then called `c.get(...)` on that same element, so a criteria
+            # list containing a string raised AttributeError out of the
+            # gatekeeper -- a crash where a decision was required.
+            if not isinstance(c, dict):
+                failed.append(f"model_validation.json: critere #{i} n'est pas "
+                              f"un objet ({type(c).__name__}) -- evidence "
+                              f"malformee, refus")
+                continue
+            name = c.get("name")
+            if not isinstance(name, str) or not name.strip():
+                failed.append(f"model_validation.json: critere #{i} sans nom "
+                              f"exploitable -- evidence malformee, refus")
+                continue
+            passed = c.get("passed")
+            if passed is not True:
+                unmet.append(name)
+            # A08: the same criterion stated twice with different verdicts is
+            # a contradiction; stated twice at all is ambiguous evidence.
+            if name in seen_names and names.get(name) != passed:
+                failed.append(f"model_validation.json: critere {name!r} "
+                              f"enonce deux fois avec des verdicts differents "
+                              f"-- evidence contradictoire")
+            elif name in seen_names:
+                failed.append(f"model_validation.json: critere {name!r} "
+                              f"enonce plusieurs fois -- evidence ambigue")
+            seen_names.add(name)
+            names[name] = passed
+            # A08: a criterion may not declare itself passed while its own
+            # measurement fails the threshold it declares.
+            ok_c, why = _criterion_self_consistent(c)
+            if not ok_c:
+                failed.append(f"model_validation.json: critere {name!r} "
+                              f"incoherent: {why}")
+        if unmet:
+            failed.append(f"criteres de validation non satisfaits: {unmet}")
     ok_ts, ts = _finite_number(mv.get("generated_ts"))
     if not ok_ts:
         failed.append(f"model_validation.json: 'generated_ts' = "
@@ -241,6 +380,22 @@ def _check_artifact_binding(failed: list) -> None:
 
 
 def check_live_allowed():
+    """(allowed, reasons). NEVER raises.
+
+    A08: an exception escaping this function reached the caller as a crash
+    rather than as a decision. A gatekeeper that cannot decide has exactly
+    one safe answer, and it is not "allowed".
+    """
+    try:
+        return _check_live_allowed()
+    except _MalformedEvidence as e:
+        return False, [f"evidence de validation malformee: {e}"]
+    except Exception as e:                                  # noqa: BLE001
+        return False, [f"gatekeeper indecidable ({type(e).__name__}: {e}) -- "
+                       f"refus fail-closed"]
+
+
+def _check_live_allowed():
     failed = []
     now = time.time()
     if os.getenv("NO_LIVE_PROMOTION", "1").strip() == "1":

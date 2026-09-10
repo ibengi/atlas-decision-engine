@@ -403,9 +403,14 @@ class GatekeeperRefusesInvalidEvidence(unittest.TestCase):
         os.environ.update(self.PROMOTION_OK)
         os.chdir(self.tmp)
         self.addCleanup(self._restore)
+        # A08: an approval must SHOW the criteria it met -- an approved
+        # manifest with no criteria at all is refused, because deleting the
+        # failing criterion would otherwise be a way to pass.
         self.write("model_validation.json",
                    {"generated_ts": time.time(), "approved": True,
-                    "model_version": "btc15m-baseline-0.1"})
+                    "model_version": "btc15m-baseline-0.1",
+                    "criteria": [{"name": "sample_size", "required": ">=300",
+                                  "observed": 512, "passed": True}]})
         self.write("test_report.json", self.green())
 
     def _restore(self):

@@ -345,8 +345,23 @@ class PositionManager:
                       "reason": "client offers no collection-complete proof"}, None
 
     def _broker_net_positions(self, broker):
-        """(dict ticker->net signe, None) ou (None, raison UNKNOWN)."""
+        """(dict ticker->net signe, None) ou (None, raison UNKNOWN).
+
+        Audit finding A02. This used to SUM the rows for a ticker and then
+        drop every ticker whose sum was zero. Two contradictory rows for the
+        same market -- ``+1`` and ``-1``, a page delivered twice, a renamed
+        quantity field read differently on each row -- therefore cancelled
+        out, the ticker disappeared from the returned mapping, and the
+        comparison that follows never saw it at all. A portfolio the broker
+        described contradictorily was read as a FLAT portfolio and answered
+        MATCH.
+
+        The broker reports one row per market. A ticker appearing twice is
+        not arithmetic to be performed, it is evidence that the listing
+        cannot be interpreted: it is reported as UNKNOWN, never netted.
+        """
         net = {}
+        seen_rows = {}
         for bp in broker:
             if not isinstance(bp, dict):
                 return None, f"ligne broker inexploitable: {bp!r}"
@@ -356,7 +371,14 @@ class PositionManager:
             qty, err = self.parse_broker_qty(bp)
             if err:
                 return None, f"{tk}: {err}"
-            net[tk] = net.get(tk, 0) + qty
+            if tk in seen_rows:
+                return None, (
+                    f"{tk}: le broker decrit ce marche PLUSIEURS fois "
+                    f"({seen_rows[tk]:+d} puis {qty:+d}) -- evidence "
+                    f"contradictoire, l'etat broker est INCONNU (jamais "
+                    f"compense a zero)")
+            seen_rows[tk] = qty
+            net[tk] = qty
         return {tk: q for tk, q in net.items() if q != 0}, None
 
     def _local_net_positions(self):

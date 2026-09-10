@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
+import account_binding
 from equity_ledger import EquityLedger, ACCOUNTING_GUARDS
 from config import (CFG, prod_is_read_only, GATE_PARSE_WARNINGS, _env_b, _p, contract_cap_config,
                     daily_oracle_approved, daily_quarantine_blocks,
@@ -318,7 +319,8 @@ class ExecutionEngine:
         # F2 risk-equity accounting: strategy equity, high-water mark,
         # external flows and baseline provenance, persisted under DATA_DIR.
         # Deposits raise affordability (self.capital) and never touch it.
-        self.equity   = EquityLedger(self.tlog, self.posmgr, env=client.env)
+        self.equity   = EquityLedger(self.tlog, self.posmgr, env=client.env,
+                                 binding=account_binding.from_client(client))
         self.risk.equity = self.equity
         self._current_cycle = 0
         self.stats    = StatsEngine(self.tlog)

@@ -50,6 +50,8 @@ import logging
 import math
 import os
 
+from state_tx import NonFiniteValue, durable_write_all, fsync_dir
+
 log = logging.getLogger("CONTINUITY")
 
 CONTINUITY_FILE = "equity_continuity.log"
@@ -80,8 +82,71 @@ def _finite(x) -> bool:
         and math.isfinite(float(x))
 
 
+def _reject_non_finite(name):
+    """A16: json.loads would otherwise turn the literals NaN/Infinity into
+    floats that compare False against every threshold."""
+    raise NonFiniteValue(f"continuity record contains non-finite {name!r}")
+
+
 class ChainError(Exception):
     """The chain on disk cannot be trusted. Never swallowed into a default."""
+
+
+#: A01, explicit classification of what this module does and does not close.
+#:
+#: ``CLOSED`` would mean: any rollback of durable economic state is detected
+#: from inside the process. That is NOT what the chain achieves and claiming
+#: it would be the exact failure this audit exists to prevent -- believing
+#: state is safer than the evidence proves.
+#:
+#: What IS closed, and tested: every rollback that leaves this file in
+#: place. A coordinated journal+ledger restore, a backup recovery of an
+#: older ledger, a stale concurrent writer, a crash between two durable
+#: steps, a deleted watermark field, a zeroed counter, a replayed consumed
+#: token. All of them fail closed because the chain is a separate,
+#: append-only, hash-chained FLOOR that the JsonStore backup/restore
+#: machinery never rewinds.
+#:
+#: What is NOT closed: a rollback of the WHOLE VOLUME, which takes the chain
+#: with it. No purely local artefact can outrank a wholesale rewind of the
+#: disk it lives on -- after such a restore, every local file agrees, and
+#: agreement is all a local check can measure. Detecting it requires an
+#: authority outside this filesystem.
+ROLLBACK_RESISTANCE = "MITIGATED_WITH_LIMITATION"
+
+#: The whole-volume case, classified on its own.
+WHOLE_VOLUME_ROLLBACK = "EXTERNAL_AUTHORITY_REQUIRED"
+
+#: The interface such an authority must satisfy, specified rather than
+#: built: building remote infrastructure now would add an unaudited network
+#: dependency to the very component whose job is to be trustworthy.
+#:
+#: An external authority is anything that can answer, for a point in time,
+#: "how much settled history and how much realized PnL existed?", and that
+#: the operator of THIS filesystem cannot rewrite. Candidates, in
+#: decreasing order of how much new infrastructure they need:
+#:
+#:   1. broker settled-trade history      (already reachable, read-only)
+#:   2. broker deposit/withdrawal history (already reachable, read-only)
+#:   3. a signed remote checkpoint        (needs a key and a store)
+#:   4. an append-only remote log         (needs a service)
+#:   5. an external monotonic sequence    (needs a service)
+#:
+#: The entry point already exists and is deliberately the only way an
+#: external claim can enter: ``EquityLedger.apply_attestation`` binds an
+#: operator action id to a hash of the funding records that justify it, and
+#: it refuses while any continuity block, journal mismatch or unresolved
+#: flow is open. An implementation of (1) or (2) would compute that hash
+#: from broker data instead of from an operator's file, and nothing else in
+#: the ledger would need to change.
+EXTERNAL_AUTHORITY_CONTRACT = {
+    "question": "settled_count and realized_pnl_cum at a given instant",
+    "properties": ("outside this filesystem",
+                   "not rewritable by the holder of this filesystem",
+                   "monotone in observed history"),
+    "entry_point": "EquityLedger.apply_attestation",
+    "implemented": False,
+}
 
 
 class ContinuityChain:
@@ -174,8 +239,8 @@ class ContinuityChain:
                 self._error = ChainError(f"blank record at line {i + 1}")
                 raise self._error
             try:
-                rec = json.loads(line)
-            except ValueError:
+                rec = json.loads(line, parse_constant=_reject_non_finite)
+            except (ValueError, NonFiniteValue):
                 if i == len(lines) - 1:
                     log.warning("[CONTINUITY] torn last record ignored "
                                 "(crash during append); chain head unchanged")
@@ -244,14 +309,27 @@ class ContinuityChain:
             rec = {"version": CHAIN_VERSION, "seq": len(recs) + 1, "prev": prev,
                    "kind": kind, "at": at, "payload": payload}
             rec["hash"] = self.record_hash(rec)
-            line = json.dumps(rec, sort_keys=True, separators=(",", ":"),
-                              ensure_ascii=False) + "\n"
             try:
-                os.write(fd, line.encode("utf-8"))
+                line = json.dumps(rec, sort_keys=True, separators=(",", ":"),
+                                  ensure_ascii=False, allow_nan=False) + "\n"
+            except ValueError as e:
+                # A16: NaN/Inf would be emitted as non-JSON literals that the
+                # reader must then refuse -- a record that can only be read
+                # as a broken chain. Refuse to write it.
+                raise ChainError(f"refusing to append a non-finite record: {e}")
+            try:
+                # A18: os.write is not promised to write the whole buffer.
+                # A record that was half appended is a broken chain, and a
+                # broken chain reported as "appended" is the worst of both.
+                durable_write_all(fd, line.encode("utf-8"))
                 os.fsync(fd)
             except OSError as e:
                 raise ChainError(f"continuity record not durable: {e}")
-            self._fsync_dir(parent)
+            try:
+                self._fsync_dir(parent)
+            except OSError as e:
+                raise ChainError(f"continuity record not durable "
+                                 f"(directory not synced): {e}")
         finally:
             os.close(fd)
         self._records, self._error, self._stat = None, None, None
@@ -259,15 +337,12 @@ class ContinuityChain:
 
     @staticmethod
     def _fsync_dir(parent: str) -> None:
-        """Make the append visible after a crash, not just the bytes."""
-        try:
-            dfd = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:            # pragma: no cover - platform dependent
-            pass
+        """Make the append visible after a crash, not just the bytes.
+
+        Raises OSError on a real failure (A18): an append whose directory
+        entry was never synced is not durably appended, and saying it was is
+        how a rewind becomes invisible."""
+        fsync_dir(parent)
 
     # ── derived views ───────────────────────────────────────────────────
     def evidence_floor(self):

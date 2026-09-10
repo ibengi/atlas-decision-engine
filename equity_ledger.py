@@ -45,6 +45,9 @@ from config import CFG, _p
 from continuity import (CONTINUITY_FILE, KIND_EVIDENCE, KIND_RECOVERY,
                         KIND_TOKEN, ChainError, ContinuityChain)
 from persistence import JsonStore, file_fingerprint, read_generation
+from state_tx import (NonFiniteValue, StaleAuthority, all_finite, check_finite,
+                      fence_for)
+import account_binding
 from trade_logger import now_iso
 
 log = logging.getLogger("EQUITY")
@@ -75,10 +78,24 @@ GUARD_RESIDUAL_UNEXPLAINED = "cash_residual_unexplained"
 GUARD_ACCOUNTING_MODE = "risk_accounting_mode_invalid"
 #: A04: the journal carries the same economic event twice.
 GUARD_JOURNAL_INTEGRITY = "journal_event_identity"
+#: A19: another writer has advanced the authoritative state past the
+#: generation this process holds. Everything computed from the local view
+#: describes a superseded world, so no CAPITAL decision may rest on it
+#: until the view is reloaded.
+GUARD_STALE_READER = "authority_stale_reader"
+#: A16: a non-finite number reached economic state. NaN compares False
+#: against every threshold, so a guard that merely compares would pass it.
+GUARD_NON_FINITE = "economic_value_non_finite"
+#: A20: this durable state was written under a different environment or a
+#: different account. Every number in it is self-consistent and about
+#: somebody else's money.
+GUARD_ACCOUNT_BINDING = "state_account_binding"
 ACCOUNTING_GUARDS = (GUARD_UNSEEDED, GUARD_FLOW_UNRESOLVED,
                      GUARD_UNRECONCILED, GUARD_CAPITAL_HOLD,
                      GUARD_CONTINUITY, GUARD_RESIDUAL_UNEXPLAINED,
-                     GUARD_ACCOUNTING_MODE, GUARD_JOURNAL_INTEGRITY)
+                     GUARD_ACCOUNTING_MODE, GUARD_JOURNAL_INTEGRITY,
+                     GUARD_STALE_READER, GUARD_NON_FINITE,
+                     GUARD_ACCOUNT_BINDING)
 
 LEDGER_FILE = "equity_ledger.json"
 SCHEMA_VERSION = 1
@@ -142,6 +159,20 @@ def _finite(x) -> bool:
         and math.isfinite(float(x))
 
 
+def _event_keys(row) -> list:
+    """The economic identity of a journal row (audit finding A04).
+
+    Delegates to the journal's own definition so the writer and every reader
+    agree on what "the same event" means. Falls back to the local id only if
+    the journal module is unavailable, which keeps this module importable in
+    isolation without silently weakening the check in production."""
+    try:
+        from trade_logger import TradeLogger
+        return list(TradeLogger.event_keys(row))
+    except Exception:                                       # noqa: BLE001
+        return [("trade_id", str(row.get("trade_id")))] if row.get("trade_id") else []
+
+
 def journal_digest(rows) -> str:
     """Order-preserving fingerprint of settled rows: identity, PnL, time."""
     return _sha(_canonical([(t.get("trade_id"), _round(t.get("net_pnl") or 0.0),
@@ -152,7 +183,7 @@ class EquityLedger:
     """Persisted risk-equity state under DATA_DIR/equity_ledger.json."""
 
     def __init__(self, tlog, posmgr, env: str = "prod", path: str = None,
-                 readonly: bool = False):
+                 readonly: bool = False, binding: dict = None):
         self.tlog = tlog
         self.posmgr = posmgr
         self.env = env
@@ -169,7 +200,20 @@ class EquityLedger:
         self.schema_reject = None      # why a persisted ledger was refused
         self.from_backup = None        # which rotation copy answered, if any
         self.generation = 0            # fencing generation held by THIS reader
+        self._durable = None           # last state proven to be on disk
+        # A20: the environment/account this PROCESS is talking to. Compared
+        # against the one stamped in the state on load.
+        self.binding = binding if binding is not None else \
+            account_binding.fingerprint(env=env)
+        self.binding_status = "unbound"
+        self.binding_reason = None
+        self._binding_checked = False
         self.state = self._load()
+        # A20: fresh state never reaches _load's binding check (there is no
+        # file yet), so bind it here too. Every path through the constructor
+        # leaves the state stamped with the account it belongs to.
+        if not self.state.get("binding"):
+            self._check_binding(self.state)
         self._last_obs = None          # (settled_count, open_count)
         self._reconcile_on_load()
 
@@ -200,6 +244,12 @@ class EquityLedger:
                 # this state was written against. Both are compared with the
                 # authority OUTSIDE this file before the state is believed.
                 "generation": 0, "continuity": {"seq": 0, "hash": None},
+                # A06: sticky record of the worst unexplained ADVERSE cash
+                # movement. Separate from `pending`, which any calm cycle
+                # clears.
+                "adverse_residual_floor": None,
+                # A20: which environment/account this history is about.
+                "binding": None,
                 "continuity_block": None}
 
     #: A01 rule 3: strict schema. A field that is present but of the wrong
@@ -275,7 +325,47 @@ class EquityLedger:
                             f"on-disk high-water generation {on_disk} so the "
                             f"next commit supersedes the unverifiable file")
                 self.generation = int(on_disk)
+        self._check_binding(base)
         return base
+
+    def _check_binding(self, state: dict) -> None:
+        """A20: whose history is this? Compared on every load, blocking on a
+        mismatch, adopted (and logged) when the state predates the check."""
+        stored = state.get("binding")
+        if not stored and not isinstance(state.get("seed"), dict):
+            # A ledger with no seed has no economic history yet: stamping it
+            # now binds it from birth, and there is nothing to misattribute.
+            state["binding"] = dict(self.binding)
+            self.binding_status, self.binding_reason = "match", None
+            return
+        status, reason = account_binding.compare(stored, self.binding)
+        if status == "credential_changed" and \
+                account_binding.rebind_acknowledged(self.binding):
+            log.warning("[EQUITY_BINDING] credential change ACKNOWLEDGED by "
+                        "the operator for this exact fingerprint "
+                        f"{account_binding.digest(self.binding)}: state "
+                        f"re-bound to the current credential")
+            state["binding"] = dict(self.binding)
+            status, reason = "match", None
+        self.binding_status, self.binding_reason = status, reason
+        if status == "unbound":
+            # Legacy state, written before the binding existed. It is
+            # adopted on the next durable write, and said out loud: adoption
+            # is not proof that the history belongs to this account, only a
+            # record of the account that is claiming it from now on.
+            state["binding"] = dict(self.binding)
+            log.info(f"[EQUITY_BINDING] state carried no account binding; "
+                     f"adopting {account_binding.digest(self.binding)} "
+                     f"({self.binding.get('environment')}) -- prior history "
+                     f"is claimed, not proven, for this account")
+        elif status == "match":
+            state["binding"] = dict(self.binding)
+        else:
+            log.critical(
+                f"[EQUITY_BINDING] MISMATCH ({status}): {reason} -- this "
+                f"ledger describes another account's economics; CAPITAL is "
+                f"INELIGIBLE and a migration is required. Nothing is "
+                f"rewritten and no history is discarded.")
 
     # ── the durable commit protocol (A01 rules 5, 6) ────────────────────
     def _continuity_payload(self) -> dict:
@@ -308,18 +398,85 @@ class EquityLedger:
             log.info("[EQUITY] readonly instance: durable write skipped "
                      "(inspection path, no state mutated)")
             return False
+        if not all_finite(self.state):
+            log.critical("[EQUITY] refusing to persist non-finite economic "
+                         "state (A16); nothing written")
+            return False
         self._advance_journal_watermark()
         if self.seeded and not self._append_evidence():
+            self._rollback_to_durable()
             return False
         ok = JsonStore.save(self.path, self.state,
                             expect_generation=self.generation)
         if ok:
             self.generation += 1
             self.state["generation"] = self.generation
+            self._mark_durable()
         else:
             log.error("[EQUITY] equity_ledger.json NOT saved "
                       "(persistence sentinel tripped or write fenced off)")
+            # A15: a refused write leaves NO authoritative side effect. The
+            # in-memory state goes back to the last state that is actually
+            # on disk, so "refused" and "applied" can never look the same to
+            # a later reader.
+            self._rollback_to_durable()
         return ok
+
+    def _mark_durable(self) -> None:
+        """Remember the exact state that is now on disk, so a later refused
+        write can restore it verbatim."""
+        try:
+            self._durable = json.loads(json.dumps(self.state))
+        except (TypeError, ValueError):                     # noqa: BLE001
+            self._durable = None
+
+    def _rollback_to_durable(self) -> None:
+        if getattr(self, "_durable", None) is None:
+            return
+        try:
+            self.state = json.loads(json.dumps(self._durable))
+        except (TypeError, ValueError):                     # noqa: BLE001
+            pass
+
+    def _source_versions(self) -> dict:
+        """The exact versions of every source a validated decision rests on.
+
+        Audit findings A03 and A07. Validating a migration or a rebase and
+        then writing it are two moments, and everything the validation
+        looked at can move in between: a settlement lands, another writer
+        commits, the continuity chain grows. Binding those versions and
+        re-checking them immediately before the durable write is what makes
+        the decision apply to the state it was actually taken on.
+        """
+        rows = self.settled()
+        try:
+            head = self.chain.head_pointer()
+        except ChainError as e:
+            head = {"seq": None, "hash": f"unreadable: {e}"}
+        return {"settled_count": len(rows),
+                "journal_digest": journal_digest(rows),
+                "continuity_seq": head.get("seq"),
+                "continuity_hash": head.get("hash"),
+                "ledger_generation": self.generation,
+                "durable_generation": read_generation(self.path),
+                "open_positions": (self.posmgr.open_count()
+                                   if self.posmgr is not None else 0)}
+
+    def _shadow(self, prepared: dict):
+        """A ledger view over a PREPARED state.
+
+        The commit path has to advance the watermark and compute continuity
+        evidence for the state it is about to write. Doing that by assigning
+        `self.state = prepared` is exactly the premature publication of
+        A14: every other reader in the process would see the new HWM, the
+        released hold and the consumed token while the durable state still
+        says otherwise. The shadow gives those helpers the prepared state to
+        work on without any of them becoming visible.
+        """
+        sh = object.__new__(EquityLedger)
+        sh.__dict__.update(self.__dict__)
+        sh.state = prepared
+        return sh
 
     def _append_evidence(self) -> bool:
         """Append this state's evidence to the chain. False = do not commit:
@@ -419,9 +576,7 @@ class EquityLedger:
         """
         seen, out = set(), []
         for t in self.settled():
-            keys = [k for k in (("trade_id", str(t.get("trade_id") or "")),
-                                ("settlement_id", str(t.get("settlement_id") or "")))
-                    if k[1]]
+            keys = _event_keys(t)
             if any(k in seen for k in keys):
                 continue
             seen.update(keys)
@@ -770,13 +925,10 @@ class EquityLedger:
         detect it (audit finding A04)."""
         seen, dupes = {}, []
         for t in self.settled():
-            keys = []
-            tid = t.get("trade_id")
-            if tid:
-                keys.append(("trade_id", str(tid)))
-            sid = t.get("settlement_id")
-            if sid:
-                keys.append(("settlement_id", str(sid)))
+            # A04: one definition of economic identity, shared with the
+            # journal that writes the rows. Local ids alone cannot detect a
+            # replay, because a replay mints a new one.
+            keys = _event_keys(t)
             for key in keys:
                 if key in seen:
                     dupes.append({"key": "%s=%s" % key, "first_index": seen[key],
@@ -837,6 +989,21 @@ class EquityLedger:
     def guards(self) -> list:
         """CAPITAL guard names currently firing, in evaluation order."""
         out = []
+        # A19: freshness before anything else. Every number below is derived
+        # from a view of authority; if another writer has already advanced
+        # that authority, this view describes a world that no longer exists
+        # and no amount of internal consistency makes it admissible.
+        if not self.authority_is_current()[0]:
+            out.append(GUARD_STALE_READER)
+        # A20: state that belongs to another account or environment is not
+        # this account's risk history, however internally consistent it is.
+        if self.binding_status in ("mismatch", "credential_changed"):
+            out.append(GUARD_ACCOUNT_BINDING)
+        # A16: a non-finite value anywhere in economic state. Checked
+        # explicitly rather than by comparison, because NaN > x and NaN < x
+        # are both False -- every threshold silently admits it.
+        if not self.economic_values_finite():
+            out.append(GUARD_NON_FINITE)
         # A01: continuity first. Everything below reasons about numbers; if
         # the state those numbers come from may have been rewound, no number
         # is admissible, whatever it says.
@@ -876,6 +1043,18 @@ class EquityLedger:
         ROUNDING tolerance: it is not allowed to grow into a tolerance for
         unexplained economic loss, so anything beyond it counts here from the
         FIRST observation, not after k quiet cycles."""
+        # A06: the FLOOR outranks the live pending row. `pending` is cleared
+        # by any cycle whose residual lands inside the (growing) epsilon and
+        # is never written at all on a non-quiet cycle, so reading only
+        # `pending` means a noisy account can drop adverse evidence for ever.
+        # The floor is a separate, sticky record of the worst adverse
+        # residual ever measured, cleared only by classification.
+        floor = self.state.get("adverse_residual_floor") or {}
+        fr = floor.get("residual")
+        if fr is not None and _finite(fr) and float(fr) < -abs(self.eps_base):
+            return {"residual": _round(fr), "since": floor.get("first_seen_at"),
+                    "cycles": floor.get("observations"),
+                    "source": "adverse_floor"}
         pend = self.state.get("pending") or {}
         r = pend.get("residual")
         if r is None or not _finite(r):
@@ -885,13 +1064,124 @@ class EquityLedger:
                     "cycles": pend.get("consecutive")}
         return None
 
+    def _record_adverse_floor(self, r, when, cycle_n) -> None:
+        """Remember the worst adverse residual ever measured (A06).
+
+        Measurement tolerance and economic admissibility are different
+        questions. Epsilon exists so the engine does not alert on API
+        rounding; it must not double as permission to forget a loss. Any
+        residual beyond the ROUNDING tolerance (`eps_base`, never the grown
+        per-trade epsilon) is recorded here the first time it is seen, on a
+        quiet cycle or not, and stays until something explains it.
+        """
+        try:
+            r = check_finite(r, "cash residual")
+        except NonFiniteValue:
+            return
+        if r >= -abs(self.eps_base):
+            return
+        floor = self.state.get("adverse_residual_floor") or None
+        if floor is None:
+            self.state["adverse_residual_floor"] = {
+                "residual": _round(r), "first_seen_at": when,
+                "first_seen_cycle": cycle_n, "worst_at": when,
+                "observations": 1}
+            log.error(f"[EQUITY] adverse cash residual {r:+.4f}$ recorded as "
+                      f"UNEXPLAINED (floor): tolerance is for rounding, not "
+                      f"for loss -- CAPITAL ineligible until classified")
+            return
+        floor["observations"] = int(floor.get("observations") or 1) + 1
+        if r < float(floor.get("residual", 0.0)):
+            floor["residual"] = _round(r)
+            floor["worst_at"] = when
+
+    def _clear_adverse_floor_if_explained(self) -> None:
+        """The floor clears only when nothing is unexplained any more: every
+        flow classified and no pending residual beyond the rounding
+        tolerance. It is never cleared by the tolerance growing."""
+        if self.unclassified_flows():
+            return
+        pend = self.state.get("pending") or {}
+        r = pend.get("residual")
+        if r is not None and _finite(r) and float(r) < -abs(self.eps_base):
+            return
+        if self.state.get("adverse_residual_floor"):
+            log.warning("[EQUITY] adverse residual floor cleared: every "
+                        "movement is classified and no adverse residual "
+                        "remains")
+        self.state["adverse_residual_floor"] = None
+
+    # ── freshness and finiteness (A19, A16) ─────────────────────────────
+    def authority_is_current(self) -> tuple:
+        """(ok, reason). False when the durable generation has moved past
+        the one this instance holds (A19).
+
+        A reader that loaded generation N and kept deciding while another
+        process committed N+1 is not "slightly behind": it is authoritative
+        about a state that has been superseded. Read directly from disk --
+        the point is to see what is there now, not what this process
+        remembers.
+        """
+        try:
+            on_disk = read_generation(self.path)
+        except Exception:                                   # noqa: BLE001
+            return False, "authority generation unreadable"
+        if on_disk is None:
+            return True, None
+        if int(on_disk) > int(self.generation):
+            return False, (f"STALE_READER: durable generation {on_disk} is "
+                           f"ahead of the {self.generation} held here")
+        return True, None
+
+    def require_current_authority(self, what: str) -> None:
+        """Raise StaleAuthority when this view is behind. Called before any
+        safety-critical transition, never after it."""
+        ok, reason = self.authority_is_current()
+        if not ok:
+            log.critical(f"[EQUITY_STALE_READER] {what} refused: {reason}")
+            raise StaleAuthority(reason)
+
+    def economic_values_finite(self) -> bool:
+        """A16: no NaN/Inf anywhere in persisted economic state or in the
+        journal-derived quantities the guards compare."""
+        # A16: a REFUSED input is itself the evidence. The balance that
+        # could not be read is not in the state (it was refused), so a scan
+        # of stored values alone would report everything finite and let
+        # CAPITAL stay eligible on an account whose balance is unknown.
+        if self.state.get("non_finite_input"):
+            return False
+        if not all_finite(self.state):
+            return False
+        for value in (self.realized_pnl_cum(), self.open_cost_basis()):
+            if not all_finite(value):
+                return False
+        if self.seeded and not all_finite(self.strategy_equity()):
+            return False
+        return True
+
     def capital_eligible(self) -> bool:
         return not self.guards()
 
     # ── the per-cycle observation (design §5) ───────────────────────────
+    #: A06: the per-trade term exists because each settlement can carry a
+    #: sub-cent rounding difference, so the acceptable rounding error grows
+    #: with the number of settlements since the last exact match. It is a
+    #: MEASUREMENT tolerance and it is capped: without a cap it grows by
+    #: $0.005 per settled trade for ever, and after a few hundred trades it
+    #: quietly becomes a tolerance for economic loss -- which is what Astra
+    #: measured. The cap is deliberately small relative to any real loss.
+    EPSILON_CAP = 0.25
+
+    #: A11: how many observation cycles an unclassified flow may go unseen
+    #: and still be considered "the same movement still being observed".
+    #: Beyond it, an equal amount is a DISTINCT economic event and gets its
+    #: own row, so two legitimate equal movements are never merged into one.
+    FLOW_CONTINUITY_CYCLES = 2
+
     def _epsilon(self) -> float:
         n = int(self.state.get("anchor", {}).get("settled_since_anchor") or 0)
-        return self.eps_base + self.eps_per_trade * n
+        grown = self.eps_base + self.eps_per_trade * n
+        return min(grown, max(abs(self.eps_base), self.EPSILON_CAP))
 
     def _next_flow_id(self) -> str:
         return "flow-%04d" % (len(self.state["flows"]) + 1)
@@ -906,7 +1196,18 @@ class EquityLedger:
         if self._check_journal_against_watermark():
             self._reconcile_status()
             self.save()
-        cash = float(cash)
+        # A16: a NaN balance must never enter the accounting. It cannot be
+        # caught downstream by comparison, because every comparison against
+        # NaN is False -- including the guard thresholds.
+        try:
+            cash = check_finite(cash, "broker cash balance")
+        except NonFiniteValue as e:
+            log.critical(f"[EQUITY] observation REFUSED: {e} -- the balance "
+                         f"is not a number, so no accounting is possible "
+                         f"and CAPITAL is ineligible")
+            self.state["non_finite_input"] = {"at": when, "what": str(e)}
+            return self.snapshot()
+        self.state.pop("non_finite_input", None)
         basis = self.open_cost_basis()
         settled = self.settled()
         settled_count = len(settled)
@@ -931,14 +1232,36 @@ class EquityLedger:
         r = (cash + basis) - expected
         eps = self._epsilon()
         pend = self.state.get("pending")
+        # A06: record adverse evidence BEFORE deciding what to do with the
+        # measurement. Whether the cycle is calm, and whether the tolerance
+        # has grown, are questions about measurement noise. Whether money
+        # went missing is not. The floor is written first so that no branch
+        # below can discard it.
+        self._record_adverse_floor(r, when, cycle_n)
         if abs(r) <= eps:
-            if abs(r) > 1e-9:
+            # An ADVERSE residual is never folded into `rounding` on the
+            # strength of a grown epsilon: rounding is symmetric noise, a
+            # one-sided loss is not. Only movements within the base rounding
+            # tolerance are auto-classified.
+            if abs(r) > 1e-9 and (r > 0 or abs(r) <= abs(self.eps_base)):
                 self._append_flow(r, FLOW_ROUNDING, "auto", when, cycle_n, {
                     "cash": cash, "open_cost_basis": basis, "epsilon": eps})
-            self.state["pending"] = None
-            self.state["anchor"] = {"settled_since_anchor": 0, "at": when}
+                self.state["pending"] = None
+                self.state["anchor"] = {"settled_since_anchor": 0, "at": when}
+            elif abs(r) <= 1e-9:
+                self.state["pending"] = None
+                self.state["anchor"] = {"settled_since_anchor": 0, "at": when}
+            else:
+                # adverse, inside the GROWN epsilon but outside the rounding
+                # tolerance: keep it visible instead of absorbing it.
+                self.state["pending"] = {"residual": _round(r), "first_seen_cycle": cycle_n,
+                                         "consecutive": 1, "first_seen_at": when}
         elif not quiet:
-            pass                                   # a race can explain it
+            # A race between the broker credit and the journal write can
+            # explain a residual, so no flow is recorded here -- but the
+            # adverse floor above has already remembered it, so a permanently
+            # noisy account can no longer drop the evidence for ever.
+            pass
         elif pend is None or abs(float(pend["residual"]) - r) > eps:
             self.state["pending"] = {"residual": _round(r), "first_seen_cycle": cycle_n,
                                      "consecutive": 1, "first_seen_at": when}
@@ -1004,7 +1327,7 @@ class EquityLedger:
         with it, so the residual it explains does not come back.
         """
         if kind == FLOW_UNCLASSIFIED:
-            existing = self._open_unclassified_like(amount)
+            existing = self._open_unclassified_like(amount, when, cycle_n)
             if existing is not None:
                 existing["last_seen_at"] = when
                 existing["last_seen_cycle"] = cycle_n
@@ -1026,7 +1349,7 @@ class EquityLedger:
                         f"classified_by={classified_by}; strategy_equity unchanged")
         return row
 
-    def _open_unclassified_like(self, amount):
+    def _open_unclassified_like(self, amount, when=None, cycle_n=None):
         """The still-unclassified row this movement is a re-observation of.
 
         Identity is the amount within the rounding tolerance: the broker
@@ -1041,8 +1364,23 @@ class EquityLedger:
         for f in self.state["flows"]:
             if f.get("kind") != FLOW_UNCLASSIFIED:
                 continue
-            if abs(float(f["amount"]) - _round(amount)) <= eps:
-                return f
+            if abs(float(f["amount"]) - _round(amount)) > eps:
+                continue
+            # A11: same amount is NOT the same event. Idempotency has to
+            # suppress the SAME movement observed repeatedly, without
+            # collapsing two genuinely distinct movements that happen to be
+            # equal -- two $25 withdrawals a week apart are two withdrawals.
+            # What distinguishes "still observing the one residual" from "a
+            # second movement of the same size" is continuity of
+            # observation: the open row is still being seen, cycle after
+            # cycle. A row that stopped being observed and is seen again
+            # later is a NEW event.
+            if cycle_n is not None:
+                last_cycle = f.get("last_seen_cycle")
+                if isinstance(last_cycle, int) and isinstance(cycle_n, int) \
+                        and cycle_n - last_cycle > self.FLOW_CONTINUITY_CYCLES:
+                    continue
+            return f
         return None
 
     def _roll_day(self, when: str) -> None:
@@ -1204,7 +1542,14 @@ class EquityLedger:
         proposal = fresh
         when = when or now_iso()
         status = proposal["risk_equity_status"]
-        self.state["seed"] = self._seed_dict(
+        # A07: the migration is prepared on a COPY and bound to the exact
+        # source versions it was validated against. An apply that fails --
+        # a full disk, a stale generation, a settlement at the boundary --
+        # leaves an UNSEEDED ledger, not a half-migrated one.
+        bind = self._source_versions()
+        prepared = json.loads(json.dumps(self.state))
+        sh = self._shadow(prepared)
+        prepared["seed"] = sh._seed_dict(
             when, proposal["source"], proposal["account_equity_0"],
             proposal["strategy_equity_0"], proposal["hwm_0"], status,
             {k: proposal[k] for k in ("pre_flow_cash", "pre_flow_at", "evidence_ref",
@@ -1212,24 +1557,28 @@ class EquityLedger:
                                       "realized_pnl_cum", "settled_rows",
                                       "rolling_drawdown")},
             "EQUITY_LEDGER_SEED_SHA256")
-        self.state["hwm"] = {"risk_equity_reference": proposal["hwm_0"], "at": when,
-                             "rebased_from": None, "floor_from_settled_index": 0}
-        self.state["risk_equity_status"] = status
-        self.state["status_basis"] = {
+        prepared["hwm"] = {"risk_equity_reference": proposal["hwm_0"], "at": when,
+                           "rebased_from": None, "floor_from_settled_index": 0}
+        prepared["risk_equity_status"] = status
+        prepared["status_basis"] = {
             "set_at": when, "set_by": "migration",
             "provenance_window": {"from": proposal["pre_flow_at"], "to": None},
             "unproven": list(proposal["unproven"]),
-            "evidence_sha256": self.state["seed"]["evidence_sha256"]}
+            "evidence_sha256": prepared["seed"]["evidence_sha256"]}
         mf = proposal.get("migration_flow")
         if mf:
-            self._append_flow(mf["amount"], mf["kind"],
-                              "migration" if mf["kind"] == FLOW_DEPOSIT else None,
-                              when, 0, {"pre_flow_cash": proposal["pre_flow_cash"],
-                                        "cash_now": proposal["cash_now"],
-                                        "evidence_ref": proposal["evidence_ref"]})
-        self._roll_day(when)
-        self._reconcile_status()
-        ok = self.save()
+            sh._append_flow(mf["amount"], mf["kind"],
+                            "migration" if mf["kind"] == FLOW_DEPOSIT else None,
+                            when, 0, {"pre_flow_cash": proposal["pre_flow_cash"],
+                                      "cash_now": proposal["cash_now"],
+                                      "evidence_ref": proposal["evidence_ref"]})
+        sh._roll_day(when)
+        sh._reconcile_status()
+        ok = self._commit(prepared, bind=bind)
+        if not ok:
+            log.error("[EQUITY_SEED] NOT applied: the ledger stays UNSEEDED "
+                      "(nothing partially migrated, in memory or on disk)")
+            return False
         log.warning(f"[EQUITY_SEED] applied sha={expected_sha[:12]} status={self.status()} "
                     f"strategy_equity={self.strategy_equity():.4f} hwm={self.risk_equity_reference():.4f} "
                     f"drawdown_pct={self.drawdown_pct():.2f}")
@@ -1417,6 +1766,12 @@ class EquityLedger:
         failures = self.rebase_preconditions(ctx)
         if failures:
             log.warning(f"[EQUITY_REBASE] refused: {failures}"); return False
+        # A19: authority freshness is a precondition like any other, and it
+        # is re-checked inside _commit immediately before the write.
+        try:
+            self.require_current_authority("rebase")
+        except StaleAuthority as e:
+            log.warning(f"[EQUITY_REBASE] refused: {e}"); return False
 
         # RE-VALIDATE. Two sequential broker GETs are not a transaction, and
         # neither is a check followed by a write. Whatever the caller can
@@ -1453,6 +1808,9 @@ class EquityLedger:
         # PREPARE the new state on a copy. Nothing below this line is visible
         # to any other reader until the durable write returns True.
         when = when or now_iso()
+        # A03: bind the sources at the moment the decision is taken, so the
+        # commit can prove they have not moved.
+        rebase_bind = self._source_versions()
         prior = dict(self.state["hwm"])
         entry = dict(proposal)
         entry.update({"applied_at": when, "token_sha256": _sha(token), "prior_hwm_row": prior,
@@ -1473,7 +1831,7 @@ class EquityLedger:
         # token that survives its own consumption.
         if not self._record_consumed_token(token, "rebase", when):
             return False
-        ok = self._commit(prepared)
+        ok = self._commit(prepared, bind=rebase_bind)
         if not ok:
             log.error(f"[EQUITY_REBASE] NOT applied: durable write failed; the "
                       f"previous baseline stays authoritative "
@@ -1486,30 +1844,64 @@ class EquityLedger:
                     f"capital_hold=post_rebase_validation")
         return True
 
-    def _commit(self, prepared: dict) -> bool:
+    def _commit(self, prepared: dict, bind: dict = None) -> bool:
         """Durably commit a PREPARED state, then publish it. On failure the
         current state stays authoritative, unchanged, in memory and on disk
         (audit finding A10)."""
         if self.readonly:
             log.info("[EQUITY] readonly instance: commit refused")
             return False
-        previous = self.state
-        self.state = prepared
+        # A16: validate the numbers before anything durable happens.
+        if not all_finite(prepared):
+            log.critical("[EQUITY] commit refused: prepared state carries a "
+                         "non-finite economic value (A16)")
+            return False
+        # A19: a commit computed from a superseded view must not overwrite
+        # the writer that superseded it. The fence below makes the check and
+        # the write one step; this makes the refusal explicit and logged.
+        ok_fresh, why = self.authority_is_current()
+        if not ok_fresh:
+            log.critical(f"[EQUITY] commit refused: {why}")
+            return False
+        # A14: the prepared state is worked on through a SHADOW view and is
+        # published to `self.state` only after the durable write returned
+        # True. Until then every reader -- guards, dashboard, sizing --
+        # keeps seeing the old HWM, the old hold and the old token set.
+        shadow = self._shadow(prepared)
         try:
-            self._advance_journal_watermark()
-            if self.seeded and not self._append_evidence():
-                self.state = previous
+            shadow._advance_journal_watermark()
+            if shadow.seeded and not shadow._append_evidence():
                 return False
-            ok = JsonStore.save(self.path, self.state,
+            # A03/A07 LINEARIZATION POINT. The last thing before the write is
+            # a re-check that every source this decision was validated
+            # against is still exactly what it was. A settlement that landed
+            # in the meantime does not get absorbed into an already-approved
+            # migration, and a rebase does not commit against exposure that
+            # has moved.
+            if bind is not None:
+                now_versions = self._source_versions()
+                drifted = [k for k in bind
+                           if k not in ("ledger_generation", "continuity_seq",
+                                        "continuity_hash")
+                           and now_versions.get(k) != bind.get(k)]
+                if drifted:
+                    log.critical(
+                        f"[EQUITY] commit REFUSED at the linearization point: "
+                        f"{drifted} changed since the decision was validated "
+                        f"-- the authorized state is not the state being "
+                        f"written; re-authorize against current evidence")
+                    return False
+            ok = JsonStore.save(self.path, prepared,
                                 expect_generation=self.generation)
         except Exception:                                  # noqa: BLE001
-            self.state = previous
+            # Nothing was published; self.state was never touched.
             raise
         if not ok:
-            self.state = previous
             return False
         self.generation += 1
-        self.state["generation"] = self.generation
+        prepared["generation"] = self.generation
+        self.state = prepared          # PUBLISH (single atomic rebind)
+        self._mark_durable()
         return True
 
     def propose_hold_release(self, action_id: str, validation_ref: str) -> dict:
@@ -1539,17 +1931,32 @@ class EquityLedger:
             log.warning("[EQUITY_HOLD_RELEASE] refused: token mismatch"); return False
         if self.state.get("continuity_block"):
             log.warning("[EQUITY_HOLD_RELEASE] refused: continuity rollback open"); return False
+        # A19: a release computed from a superseded view is not a release.
+        try:
+            self.require_current_authority("hold release")
+        except StaleAuthority as e:
+            log.warning(f"[EQUITY_HOLD_RELEASE] refused: {e}"); return False
         when = when or now_iso()
-        if not self._record_consumed_token(token, "hold_release", when):
-            return False
-        for r in self.state["rebases"]:
+        # A15: PREPARE on a copy. The old code dropped the hold and appended
+        # the token in `self.state` and only then tried to persist, so a
+        # refused release -- a stale generation, a full disk -- still left an
+        # in-memory ledger with no hold and CAPITAL eligible.
+        prepared = json.loads(json.dumps(self.state))
+        for r in prepared["rebases"]:
             if r.get("rebase_id") == proposal["rebase_id"]:
                 r["validation"] = {"operator_action_id": str(action_id),
                                    "validation_ref": str(validation_ref),
                                    "released_at": when, "token_sha256": _sha(token)}
-        self.state["capital_hold"] = None
-        self.state["consumed_tokens"].append(token)
-        ok = self.save()
+        prepared["capital_hold"] = None
+        prepared["consumed_tokens"].append(token)
+        if not self._record_consumed_token(token, "hold_release", when):
+            return False
+        ok = self._commit(prepared)
+        if not ok:
+            log.error(f"[EQUITY_HOLD_RELEASE] NOT applied: durable write "
+                      f"failed; the hold STAYS in force and CAPITAL stays "
+                      f"ineligible (token {_sha(token)[:12]} burned)")
+            return False
         log.warning(f"[EQUITY_HOLD_RELEASE] rebase {proposal['rebase_id']} hold released by "
                     f"operator action {action_id} (validation {validation_ref})")
         return ok
@@ -1581,19 +1988,32 @@ class EquityLedger:
             log.warning("[EQUITY_ATTEST] refused: continuity rollback open -- an "
                         "attestation cannot vouch for state that may be rewound")
             return False
+        # A19: an attestation computed from a superseded view attests to a
+        # state that is no longer authoritative.
+        try:
+            self.require_current_authority("attestation")
+        except StaleAuthority as e:
+            log.warning(f"[EQUITY_ATTEST] refused: {e}"); return False
         when = when or now_iso()
+        # A15: PREPARE on a copy; RECONCILED becomes visible only once the
+        # write that records it has succeeded.
+        prepared = json.loads(json.dumps(self.state))
+        prepared["risk_equity_status"] = STATUS_RECONCILED
+        prepared["seed"]["status_at_seed"] = STATUS_RECONCILED
+        prepared["status_basis"] = {"set_at": when, "set_by": "operator",
+                                    "provenance_window": (prepared.get("status_basis") or {}).get("provenance_window"),
+                                    "unproven": [], "evidence_sha256": proposal["evidence_sha256"],
+                                    "attestation": {"operator_action_id": str(action_id),
+                                                    "funding_records_sha256": str(funding_records_sha256),
+                                                    "token_sha256": _sha(token)}}
+        prepared["consumed_tokens"].append(token)
         if not self._record_consumed_token(token, "attest", when):
             return False
-        self.state["risk_equity_status"] = STATUS_RECONCILED
-        self.state["seed"]["status_at_seed"] = STATUS_RECONCILED
-        self.state["status_basis"] = {"set_at": when, "set_by": "operator",
-                                      "provenance_window": self.state["status_basis"].get("provenance_window"),
-                                      "unproven": [], "evidence_sha256": proposal["evidence_sha256"],
-                                      "attestation": {"operator_action_id": str(action_id),
-                                                      "funding_records_sha256": str(funding_records_sha256),
-                                                      "token_sha256": _sha(token)}}
-        self.state["consumed_tokens"].append(token)
-        ok = self.save()
+        ok = self._commit(prepared)
+        if not ok:
+            log.error("[EQUITY_ATTEST] NOT applied: durable write failed; the "
+                      "previous status stays authoritative")
+            return False
         log.warning(f"[EQUITY_ATTEST] risk_equity_status=RECONCILED by operator action {action_id}")
         return ok
 

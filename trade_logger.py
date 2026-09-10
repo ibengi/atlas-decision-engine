@@ -129,7 +129,35 @@ class TradeLogger:
 
     @staticmethod
     def event_keys(row: dict) -> list:
-        """The identities that make a row a DISTINCT economic event."""
+        """The identities that make a row a DISTINCT economic event.
+
+        Audit finding A04. Every identity here used to be LOCAL: `trade_id`
+        is a fresh ``uuid4`` minted by this process, and `settlement_id` is
+        never written by any producer in this repository. A duplicate could
+        therefore only ever be caught if the caller re-submitted the very
+        same dict -- and the same economic order recorded a second time
+        under a new local id was, by construction, invisible. That is how a
+        replayed profitable settlement could raise realized PnL and flatter
+        the historical drawdown while every integrity check stayed silent.
+
+        The broker's own identifiers are the ones a replay cannot change:
+
+        ``order_id``
+            The broker order id. This engine writes exactly one journal row
+            per order, so a second row carrying an order id already in the
+            journal is the same economic event arriving again.
+        ``fill_id``
+            The broker fill id, when the row carries one.
+        the economic tuple
+            ``(ticker, side, filled_count, avg_fill_price, settled_at,
+            result)`` for a SETTLED row with no broker id at all -- the
+            orphan-settlement path. It is deliberately the last resort and
+            deliberately includes the settlement timestamp, because two
+            genuinely distinct fills of identical size and price differ in
+            *when* they settled; without a timestamp this key would merge
+            legitimate repeat trades, which is the failure mode in the
+            opposite direction.
+        """
         keys = []
         tid = row.get("trade_id")
         if tid:
@@ -140,6 +168,33 @@ class TradeLogger:
         cid = row.get("correction_id")
         if cid:
             keys.append(("correction_id", str(cid)))
+        # A correction is a NEW economic event that deliberately restates an
+        # existing one, so it must not collide on the broker identity of the
+        # row it corrects.
+        if cid:
+            return keys
+        oid = row.get("order_id")
+        if oid:
+            keys.append(("order_id", str(oid)))
+        fid = row.get("fill_id")
+        if fid:
+            keys.append(("fill_id", str(fid)))
+        for f in (row.get("fill_ids") or []):
+            if f:
+                keys.append(("fill_id", str(f)))
+        if not oid and not fid and row.get("state") == "settled":
+            # Only when the tuple actually IDENTIFIES something. A row whose
+            # ticker, size and settlement time are all absent describes no
+            # particular event, and treating two such rows as the same event
+            # is over-deduplication -- it would merge distinct trades and
+            # under-report history, which is the same class of error in the
+            # opposite direction. Unidentifiable rows are left alone here;
+            # the broker-identity keys above are what a replay cannot dodge.
+            economic = [row.get(k) for k in ("ticker", "side", "filled_count",
+                                             "avg_fill_price", "settled_at",
+                                             "result")]
+            if all(v not in (None, "") for v in economic):
+                keys.append(("economic", "|".join(str(v) for v in economic)))
         return keys
 
     @classmethod

@@ -58,9 +58,19 @@ def green_report(age_days=0.0, ran=618, bind_to=None):
                 g.file_sha256(bind_to or "model_validation.json")}
 
 
-def approved_validation(age_days=0.0, approved=True):
+def approved_validation(age_days=0.0, approved=True, criteria=None):
+    """A manifest that claims approval must SHOW the criteria it met.
+
+    A08: the gatekeeper refuses `approved=true` with no `criteria` at all,
+    because deleting the failing criterion would otherwise be a way to pass.
+    The control fixture therefore carries a real, self-consistent criterion.
+    """
+    if criteria is None:
+        criteria = [{"name": "sample_size", "required": ">=300",
+                     "observed": 512, "passed": True}]
     return {"generated_ts": time.time() - age_days * DAY,
-            "approved": approved, "model_version": "btc15m-baseline-0.1"}
+            "approved": approved, "model_version": "btc15m-baseline-0.1",
+            "criteria": criteria}
 
 
 class _GateBase(unittest.TestCase):

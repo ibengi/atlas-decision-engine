@@ -89,11 +89,51 @@ class OrderManager:
         # demander au broker « cet ordre existe-t-il ? » au lieu de
         # deviner. Fichier SEPARE de submission_guard.json, dont le schema
         # (ticker -> epoch) est fige par la migration Phase 2A/2B.
-        raw_intents = JsonStore.load(_p(self.PENDING_FILE), {})
-        self.pending_intents = {
-            str(tk): dict(v) for tk, v in (raw_intents or {}).items()
-            if isinstance(v, dict) and v.get("client_order_id")
-        }
+        # A17: "no pending intents" and "I cannot read the pending intents"
+        # are different answers, and only one of them may lead to a POST.
+        # A corrupt, truncated or half-written file used to become an empty
+        # dict: recovery was then skipped, every unresolved-intent gate saw
+        # nothing, and the engine submitted as if nothing were in flight.
+        raw_intents, intent_problem = JsonStore.load_reporting(
+            _p(self.PENDING_FILE), {})
+        self.intent_recovery_required = None
+        if intent_problem:
+            self.intent_recovery_required = intent_problem
+            log_api.critical(
+                f"[PENDING_INTENTS_UNREADABLE] {_p(self.PENDING_FILE)}: "
+                f"{intent_problem} -- l'etat des intentions est INCONNU, "
+                f"pas vide: soumissions BLOQUEES jusqu'a reconciliation.")
+            PersistenceSentinel.record_failure(
+                _p(self.PENDING_FILE), f"intent state unreadable: {intent_problem}")
+            raw_intents = {}
+        elif not isinstance(raw_intents, dict) and raw_intents is not None:
+            self.intent_recovery_required = (
+                f"pending_intents.json is a {type(raw_intents).__name__}, "
+                f"not an object")
+            log_api.critical(f"[PENDING_INTENTS_UNREADABLE] "
+                             f"{self.intent_recovery_required} -- soumissions BLOQUEES.")
+            PersistenceSentinel.record_failure(
+                _p(self.PENDING_FILE), self.intent_recovery_required)
+            raw_intents = {}
+        self.pending_intents = {}
+        self.malformed_intents = []
+        for tk, v in (raw_intents or {}).items():
+            if isinstance(v, dict) and v.get("client_order_id"):
+                self.pending_intents[str(tk)] = dict(v)
+            else:
+                # A malformed row is EVIDENCE of an intent, not the absence
+                # of one. It is preserved and it blocks, never dropped.
+                self.malformed_intents.append({"ticker": str(tk), "row": v})
+        if self.malformed_intents:
+            self.intent_recovery_required = (
+                f"{len(self.malformed_intents)} malformed intent row(s): "
+                f"{[m['ticker'] for m in self.malformed_intents]}")
+            log_api.critical(
+                f"[PENDING_INTENTS_MALFORMED] {self.intent_recovery_required} "
+                f"-- une ligne illisible est la trace d'un ordre possible: "
+                f"soumissions BLOQUEES jusqu'a reconciliation.")
+            PersistenceSentinel.record_failure(
+                _p(self.PENDING_FILE), self.intent_recovery_required)
         # Verrou GLOBAL fail-closed: arme quand une resolution est
         # impossible a trancher (plusieurs ordres portent le meme
         # client_order_id, ou le broker repond n'importe quoi). Tant qu'il
@@ -168,31 +208,74 @@ class OrderManager:
         if not self._flush_pending_intents():
             self.pending_intents.pop(ticker, None)
             return False
-        if not self._verify_intent_durable(ticker, client_order_id):
+        if not self._verify_intent_durable(ticker, self.pending_intents[ticker]):
             self.pending_intents.pop(ticker, None)
             return False
         return True
 
-    def _verify_intent_durable(self, ticker: str, client_order_id: str) -> bool:
-        """Relit pending_intents.json et confirme que l'intention y est."""
+    #: A09: the fields whose value the broker call depends on. Reading back
+    #: only the client_order_id proved that A row was written, not that THE
+    #: intended row was written: an older row for the same ticker carries the
+    #: same deterministic id at a different size or price, and a recovery
+    #: driven by it asks the broker about the wrong order.
+    INTENT_BOUND_FIELDS = ("client_order_id", "count", "price", "resolution")
+
+    def _verify_intent_durable(self, ticker: str, intended) -> bool:
+        """Relit pending_intents.json et confirme que l'intention EXACTE y est.
+
+        La relecture compare TOUS les champs qui engagent l'appel broker,
+        pas seulement l'identifiant (audit finding A09), et refuse une
+        relecture servie par une SAUVEGARDE: un fichier .bak qui contient
+        par chance la bonne ligne ne prouve pas que l'ecriture primaire a
+        abouti.
+        """
+        if isinstance(intended, str):        # legacy call shape: id only
+            intended = {"client_order_id": intended}
         try:
+            # Deux signaux, le plus strict l'emporte: `load` est le chemin de
+            # lecture normal (et celui que la relecture doit refleter), et
+            # `load_reporting` dit en plus si la lecture a du se rabattre sur
+            # une SAUVEGARDE -- auquel cas l'ecriture primaire n'est pas
+            # prouvee, meme si la ligne relue est la bonne.
             raw = JsonStore.load(_p(self.PENDING_FILE), None)
+            _, problem = JsonStore.load_reporting(_p(self.PENDING_FILE), None)
         except Exception as e:                                # noqa: BLE001
             log_api.error(f"[PENDING_INTENTS] relecture impossible: {e}")
             PersistenceSentinel.record_failure(_p(self.PENDING_FILE), str(e))
             return False
+        if problem:
+            log_api.critical(f"[PENDING_INTENTS] relecture non concluante "
+                             f"pour {ticker}: {problem}")
+            PersistenceSentinel.record_failure(_p(self.PENDING_FILE), problem)
+            return False
         row = (raw or {}).get(ticker) if isinstance(raw, dict) else None
-        if not isinstance(row, dict) or \
-                str(row.get("client_order_id") or "") != str(client_order_id):
+        if not isinstance(row, dict):
             log_api.critical(
                 f"[PENDING_INTENTS] l'intention de {ticker} n'est PAS "
-                f"relisible apres ecriture (client_order_id attendu "
-                f"{client_order_id}) -- persistance non prouvee.")
+                f"relisible apres ecriture -- persistance non prouvee.")
             PersistenceSentinel.record_failure(
                 _p(self.PENDING_FILE),
                 f"intent for {ticker} not readable back after write")
             return False
+        for field in self.INTENT_BOUND_FIELDS:
+            if field not in intended:
+                continue
+            if str(row.get(field)) != str(intended.get(field)):
+                log_api.critical(
+                    f"[PENDING_INTENTS] l'intention relue pour {ticker} "
+                    f"differe de celle ecrite: {field}={row.get(field)!r} "
+                    f"au lieu de {intended.get(field)!r} -- persistance de "
+                    f"l'intention EXACTE non prouvee.")
+                PersistenceSentinel.record_failure(
+                    _p(self.PENDING_FILE),
+                    f"intent for {ticker} read back with {field} mismatch")
+                return False
         return True
+
+    def intent_state_trustworthy(self) -> bool:
+        """A17: False when the durable intent state could not be trusted at
+        load. No submission may proceed while this is False."""
+        return not getattr(self, "intent_recovery_required", None)
 
     def _clear_intent(self, ticker: str) -> None:
         if self.pending_intents.pop(ticker, None) is not None:
@@ -762,6 +845,20 @@ class OrderManager:
         # verrou anti-doublon. Sans cela, l'expiration du TTL rouvrirait
         # silencieusement un ticker dont on ignore toujours si un ordre
         # existe chez le broker -- le TTL mesure le temps, pas la preuve.
+        # A17: before consulting the per-ticker intent, establish that the
+        # intent state is knowable at all. An unreadable or malformed
+        # pending_intents.json means an order may be alive at the broker
+        # with no local trace; the empty dict that used to result made every
+        # gate below answer "nothing in flight".
+        if not self.intent_state_trustworthy():
+            log_api.critical(
+                f"[ORDER_SUBMIT_ABORTED] etat des intentions NON FIABLE "
+                f"({self.intent_recovery_required}) -- create_order NON "
+                f"appele: un etat d'intention illisible n'est pas un etat "
+                f"vide, il impose une reconciliation.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:intent_recovery_required",
+                                   "rejected")
         pending = self.pending_intents.get(ticker)
         if pending and pending.get("resolution") != "CLOSED_ABSENT":
             log_api.error(
@@ -846,6 +943,22 @@ class OrderManager:
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:submission_guard_unwritable",
                                    "rejected")
+        # A09 LINEARIZATION POINT. Between the durable intent and the POST
+        # sits another file write (the anti-duplicate guard) and, in a
+        # multi-threaded or multi-process deployment, any other writer of
+        # pending_intents.json: resolve_pending_intents, _clear_intent, a
+        # second engine instance. The intent is therefore re-confirmed HERE,
+        # as the last statement before transport, against the exact fields
+        # this call will use. Whatever happens after this line is the
+        # broker's ambiguity to resolve; whatever happened before it must
+        # not be assumed to still hold.
+        if not self._verify_intent_durable(ticker, self.pending_intents.get(ticker)):
+            log_api.critical(
+                f"[ORDER_SUBMIT_ABORTED] l'intention de {ticker} n'est plus "
+                f"exactement celle qui a ete persistee au moment d'appeler "
+                f"le broker -- create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:intent_invalidated", "rejected")
         try:
             order = self.client.create_order(ticker, side, count, limit_cents,
                                              client_order_id=client_order_id)
