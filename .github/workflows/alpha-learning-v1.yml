@@ -18,6 +18,7 @@ jobs:
           python -m unittest tests.test_alpha_learning -v
           python -m unittest tests.test_alpha_learning_runtime -v
           python -m unittest tests.test_alpha_resolution_ingest -v
+          python -m unittest tests.test_alpha_feed_readiness -v
 
       - name: Safety boundary
         run: |
@@ -27,6 +28,7 @@ jobs:
               pathlib.Path('alpha_learning.py'),
               pathlib.Path('alpha_learning_runtime.py'),
               pathlib.Path('alpha_resolution_ingest.py'),
+              pathlib.Path('alpha_feed_readiness.py'),
               pathlib.Path('tools/alpha_learning_report.py'),
               pathlib.Path('tools/alpha_resolution_ingest.py'),
           ]
