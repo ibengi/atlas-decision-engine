@@ -1,0 +1,45 @@
+name: Release validate ba60f697
+
+on:
+  push:
+    branches:
+      - release-engineering/validate-ba60f697
+
+jobs:
+  exact-candidate-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact audited candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ba60f69798788b1730da71c8a3841d614e58fb48
+          fetch-depth: 1
+
+      - name: Verify exact commit and clean tree
+        run: |
+          test "$(git rev-parse HEAD)" = "ba60f69798788b1730da71c8a3841d614e58fb48"
+          test "$(git rev-parse HEAD^{tree})" = "56ba4e6fd7745b92d18884dc25db9ddd7ddd9208"
+          test -z "$(git status --porcelain)"
+          echo "candidate_sha=$(git rev-parse HEAD)"
+          echo "candidate_tree=$(git rev-parse HEAD^{tree})"
+
+      - name: Build exact Docker image
+        run: docker build --no-cache -t atlas-release:ba60f697 .
+
+      - name: Verify shipped test report is green
+        run: |
+          docker run --rm atlas-release:ba60f697 python -c "import json; r=json.load(open('/app/test_report.json')); assert r.get('failures')==0 and r.get('errors')==0 and r.get('ran',0)>0, r; print(r)"
+
+      - name: Verify gatekeeper remains fail-closed
+        run: |
+          docker run --rm -e NO_LIVE_PROMOTION=0 -e MODEL_APPROVED_FOR_LIVE=YES atlas-release:ba60f697 python -c "import model_gatekeeper as g; ok, failed=g.check_live_allowed(); assert ok is False, (ok,failed); print('refus_attendu', failed)"
+
+      - name: Confirm no broker secrets injected by workflow
+        run: |
+          env | grep -Ei 'KALSHI|BROKER|PRIVATE_KEY|API_KEY' && exit 1 || true
+
+      - name: Final exact identity check
+        run: |
+          test "$(git rev-parse HEAD)" = "ba60f69798788b1730da71c8a3841d614e58fb48"
+          test "$(git rev-parse HEAD^{tree})" = "56ba4e6fd7745b92d18884dc25db9ddd7ddd9208"
+          test -z "$(git status --porcelain)"
