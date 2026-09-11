@@ -14,7 +14,19 @@ Exit codes:
 
 import argparse
 import json
+import os
 import sys
+
+# Running a file named alpha_feed_readiness.py from tools/ puts that directory
+# first on sys.path; without this explicit repository-root precedence Python
+# imports this CLI again instead of the pure readiness module. This is import
+# hygiene only and adds no runtime authority or network access.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+else:
+    sys.path.remove(_REPO)
+    sys.path.insert(0, _REPO)
 
 from alpha_feed_readiness import assess_records
 
