@@ -1,6 +1,7 @@
 # Astra v3 — the eleven findings the re-audit returned as REJECTED
 
 **Branch:** `alpha/astra-candidate-feed-v3-remediation`
+**Head:** `ed8108da5accb780f65f8c22a9264b571b665633`
 **Base:** `alpha/astra-candidate-feed-v2-remediation` @ `a304adbd03bb4e115ed5a86ca40cd45fce47204c` (untouched)
 **Verdict sought:** `SAFE_FOR_INDEPENDENT_REAUDIT` — **not** production-ready, **not** CAPITAL-ready.
 
@@ -260,6 +261,18 @@ regression reintroduces a named, dated counterexample.
 
 Mutations `M12`–`M25` were added, one per newly closed invariant, so the
 "zero survivors" claim covers the v3 fixes and not only the v2 ones.
+
+**Hosted CI, on the exact head SHA `ed8108d`:**
+[run 34642341069](https://github.com/ibengi/atlas-decision-engine/actions/runs/34642341069)
+— all 16 steps green, including the mutation probe, the crash/restart/
+mixed-writer/spool/settlement selection, the full repository suite, the
+safety-boundary AST scan, and every CLI smoke test.
+
+Two earlier runs on this branch failed and are left in the history rather
+than re-run away: [34641706037](https://github.com/ibengi/atlas-decision-engine/actions/runs/34641706037)
+(`67e0529`) and [34642014957](https://github.com/ibengi/atlas-decision-engine/actions/runs/34642014957)
+(`d4cd41d`), both on step 15 — the resolution-ingest CLI, for the reason
+recorded below.
 
 ```
 python tools/astra_mutation_probe.py     ->  26/26 killed, 0 survivor(s)
