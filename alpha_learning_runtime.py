@@ -20,7 +20,7 @@ def _now_iso():
 
 
 def learning_snapshot(ledger, *, astra_selector="astra",
-                      baseline_selector="atlasquant",
+                      baseline_selector="atlas_quant",
                       subscription_cost_usd=100.0,
                       memory_limit=8,
                       market_class=None) -> dict:
@@ -76,6 +76,7 @@ def memory_context(ledger, *, astra_selector="astra", market_class=None,
     execution instruction is generated here.
     """
     report = learning_report(ledger, astra_selector=astra_selector,
+                             baseline_selector="atlas_quant",
                              subscription_cost_usd=0.0)
     cases = similar_cases(report.get("memory") or [],
                           market_class=market_class, limit=limit)

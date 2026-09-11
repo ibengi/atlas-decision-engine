@@ -20,7 +20,7 @@ class FakeLedger:
                              "market_class": "macro"},
                 "per_model": {
                     "gpt-astra-pro-max": {"p_yes": .80},
-                    "atlasquant-v1": {"p_yes": .55},
+                    "atlas_quant": {"p_yes": .55},
                 },
             },
             {
@@ -33,7 +33,7 @@ class FakeLedger:
                              "market_class": "macro"},
                 "per_model": {
                     "gpt-astra-pro-max": {"p_yes": .82},
-                    "atlasquant-v1": {"p_yes": .52},
+                    "atlas_quant": {"p_yes": .52},
                 },
             },
         ]
@@ -46,6 +46,9 @@ class LearningRuntimeTests(unittest.TestCase):
         self.assertFalse(report["broker_authority"])
         self.assertEqual(report["astra"]["samples"], 2)
         self.assertEqual(report["learning_version"], "astra-alpha-learning-v1")
+        self.assertNotEqual(
+            report["astra_vs_baseline"]["baseline_pnl_usd"], 0.0,
+            "default baseline selector must match the real atlas_quant provider")
 
     def test_report_is_durable_json(self):
         with tempfile.TemporaryDirectory() as d:

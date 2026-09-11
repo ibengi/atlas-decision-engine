@@ -39,7 +39,7 @@ def main(argv=None):
         ledger,
         CFG.DATA_DIR,
         astra_selector=selector,
-        baseline_selector=os.getenv("ASTRA_BASELINE_SELECTOR", "atlasquant") or "atlasquant",
+        baseline_selector=os.getenv("ASTRA_BASELINE_SELECTOR", "atlas_quant") or "atlas_quant",
         subscription_cost_usd=_cost(),
         market_class=args.market_class,
     )
