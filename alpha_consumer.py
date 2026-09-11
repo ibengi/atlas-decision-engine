@@ -63,7 +63,7 @@ from candidate_contract import (ContractError, FEED_SCHEMA,
 from alpha_snapshot import SnapshotError, build_snapshot
 from config import CFG, _p
 from research_feed import spool_dir
-from research_spool import write_all
+from durable_append import serialized_append
 
 log = logging.getLogger("ALPHA")
 
@@ -88,14 +88,55 @@ def _iso() -> str:
 
 
 class ProcessedStore:
-    """Append-only record of which snapshots this service has handled."""
+    """Append-only record of which snapshots this service has handled.
+
+    AA-12 (re-audit) -- ONE DURABLE APPEND PROTOCOL, NOT TWO
+        `durable_append` exists because `os.write` may write short and
+        because a torn tail must be closed by SEPARATION rather than
+        truncation. The ledger was taught that; this store was not, and kept
+        its own `os.open` + `write_all` + `fsync`.
+
+        The gap was not cosmetic. With no torn-tail separation, a mark
+        written after an interrupted one was spliced onto the broken line and
+        BOTH were lost -- the fragment stopped being evidence that a write
+        had been attempted, and the new mark became unparseable. The store
+        then reported the snapshot as unprocessed and the service paid again
+        for an analysis it may already have committed.
+
+    AA-14 (re-audit) -- AND THE SAME LOCK
+        The torn-tail check is a read of the file's last byte, so append is
+        a check-then-act even when nothing else is. Every write goes through
+        `serialized_append`.
+
+    AA-14 -- A CACHE THAT NOTICES OTHER WRITERS
+        `_cache` was filled once and never invalidated, so a second writer's
+        marks were invisible to the first for the life of the process. The
+        cache is now keyed on a GENERATION (the file's size and mtime); when
+        the file moves under us the cache is rebuilt instead of lying.
+    """
 
     def __init__(self, path: str = None):
         self.path = path or _p(CFG.ALPHA_STATE_FILE)
         self._cache = None
+        self._generation = None
+
+    def _current_generation(self):
+        """What the file looks like from outside. Cheap, and enough.
+
+        `(size, mtime_ns, inode)` changes on every append, on truncation, and
+        on replacement. It is not a cryptographic identity and does not need
+        to be: the question it answers is "did anything happen to this file
+        since I last read it", and a false MISS only costs a re-read.
+        """
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return (st.st_size, st.st_mtime_ns, st.st_ino)
 
     def _load(self) -> dict:
-        if self._cache is not None:
+        generation = self._current_generation()
+        if self._cache is not None and generation == self._generation:
             return self._cache
         out = {}
         if os.path.exists(self.path):
@@ -110,10 +151,15 @@ class ProcessedStore:
                 try:
                     row = json.loads(line)
                 except ValueError:
-                    if i == len(lines) - 1:
-                        break              # torn tail, crash mid-append
-                    log.error(f"[ALPHA_CONSUMER] unparsable state row at line "
-                              f"{i + 1} -- skipped, NOT treated as end of file")
+                    # AA-12: REPORTED, never silently treated as the end of
+                    # the file. A torn last line is the durable trace of a
+                    # crash mid-append, and a store that swallows it cannot
+                    # tell "nothing more was written" from "something was
+                    # written and lost".
+                    where = "last" if i == len(lines) - 1 else f"line {i + 1}"
+                    log.error(f"[ALPHA_CONSUMER] torn or unparsable processed "
+                              f"row ({where}) in {self.path} -- PRESERVED and "
+                              f"skipped, NOT treated as end of file")
                     continue
                 if isinstance(row, dict) and row.get("market_snapshot_id"):
                     # Later rows supersede earlier ones for the same id: a
@@ -121,6 +167,7 @@ class ProcessedStore:
                     # analysed.
                     out[row["market_snapshot_id"]] = row
         self._cache = out
+        self._generation = generation
         return out
 
     def status(self, snapshot_id: str):
@@ -138,25 +185,18 @@ class ProcessedStore:
         line = json.dumps(row, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, default=str) + "\n"
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(self.path)),
-                        exist_ok=True)
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                         0o644)
-            try:
-                # AA-12: `os.write` may write fewer bytes than it was given.
-                # A short write here leaves a torn line that later reads as a
-                # crash-truncated tail, silently losing a processed mark.
-                write_all(fd, line.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        except OSError as e:
+            with serialized_append(self.path) as append:
+                append(line)
+        except (OSError, TimeoutError) as e:
             # If we cannot remember that we processed this, a restart will
             # process it again and pay for it again. Loud, and the caller
             # stops consuming this cycle.
             raise RuntimeError(f"processed status not durable: {e}")
         if self._cache is not None:
             self._cache[snapshot_id] = row
+            # The file changed; re-stamp the generation so the in-memory
+            # patch above is not mistaken for a stale cache on the next read.
+            self._generation = self._current_generation()
         return row
 
     def counts(self) -> dict:

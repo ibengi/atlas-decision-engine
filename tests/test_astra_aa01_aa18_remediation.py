@@ -242,12 +242,25 @@ class AA03_ContradictoryAliasesSilentlyChosen(RemediationCase):
         self.assertIn("EV-A", str(caught.exception))
         self.assertIn("EV-B", str(caught.exception))
 
-    def test_a_contradiction_makes_the_fact_absent_not_arbitrary(self):
+    def test_a_contradiction_is_preserved_as_a_contradiction(self):
+        """SUPERSEDES `..._makes_the_fact_absent_not_arbitrary`.
+
+        The v2 remediation stopped the producer CHOOSING between two
+        contradictory aliases, which was right, and then filed the fact in
+        `unavailable_fields`, which was not: Astra's re-audit named that a
+        downgrade of a contradiction to an ordinary absence. The assertion
+        below is strictly stronger than the one it replaces -- the fact is
+        still not chosen, and the disagreement is now preserved by name and
+        refuses the record instead of disappearing into "the exchange did not
+        publish this".
+        """
         raw = raw_market(event_ticker="EV-A", event_id="EV-B")
         candidate = candidate_from_market(raw, EXECUTION_BOOK, raw_book=raw)
         self.assertIsNone(candidate["event_id"])
-        self.assertIn("event_id", candidate["unavailable_fields"])
         self.assertNotIn("event_id", candidate["field_provenance"])
+        self.assertNotIn("event_id", candidate["unavailable_fields"])
+        self.assertEqual(candidate["contradictory_fields"]["event_id"],
+                         {"event_ticker": "EV-A", "event_id": "EV-B"})
 
     def test_control_agreeing_aliases_resolve_normally(self):
         value, key = contract.resolve_alias(
@@ -772,7 +785,11 @@ class AA10_ResearchIOBlockedTheEngineCycle(RemediationCase):
         self.assertTrue(feed.emit_candidate(valid_candidate()))
         self.assertTrue(feed.writer.drain(timeout=5.0))
         self.assertEqual(feed.writer.spool.stats["written"], 1)
-        self.assertEqual(len(os.listdir(feed.directory)), 1)
+        # `.json` only: the producer also keeps its capacity-reservation
+        # lock in this directory (AA-11 re-audit), and a lock is not a record.
+        self.assertEqual(
+            len([n for n in os.listdir(feed.directory)
+                 if n.endswith(".json")]), 1)
 
     def test_research_work_never_alters_financial_decision_state(self):
         before = {name: getattr(CFG, name) for name in (
@@ -1138,13 +1155,25 @@ class AA14_MultiWriterRaces(RemediationCase):
 
     def test_a_conflicting_resolution_is_surfaced_not_first_win_silently(self):
         ledger = self.ledger()
+        binding = {"contract_id": "KX-C", "market_snapshot_id": "snap-c",
+                   "record_sha256": "c" * 64}
         ledger.record_prediction({"prediction_id": "p1",
-                                  "market_snapshot_id": "snap-c"})
-        ingest_settlements(ledger, [{"prediction_id": "p1", "outcome": 1,
-                                     "source": "feed-a"}])
-        result = ingest_settlements(ledger, [{"prediction_id": "p1",
-                                              "outcome": 0,
-                                              "source": "feed-b"}])
+                                  "market_snapshot_id": "snap-c",
+                                  "contract_id": "KX-C",
+                                  "source_binding": dict(binding)})
+        # Complete binding and a qualified source: since the re-audit those
+        # are preconditions, and without them this would exercise the
+        # quarantine path instead of the conflict path it names.
+        settlement = {"prediction_id": "p1", "contract_id": "KX-C",
+                      "market_snapshot_id": "snap-c",
+                      "source_record_sha256": "c" * 64}
+        trusted = ["feed-a", "feed-b"]
+        ingest_settlements(ledger, [dict(settlement, outcome=1,
+                                         source="feed-a")],
+                           trusted_sources=trusted)
+        result = ingest_settlements(ledger, [dict(settlement, outcome=0,
+                                                  source="feed-b")],
+                                    trusted_sources=trusted)
         self.assertEqual(result["appended"], 0)
         self.assertEqual(len(result["conflicts"]), 1)
         self.assertEqual(result["conflicts"][0]["existing_outcome"], 1)
@@ -1208,10 +1237,23 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
         })
         return ledger
 
+    #: Since the re-audit a settlement must carry the COMPLETE required
+    #: binding and name a QUALIFIED source. The fixture carries both, because
+    #: production does; a test that omitted them would be exercising the
+    #: quarantine path rather than the mismatch path each case below names.
+    TRUSTED = ["trusted-feed"]
+
     def settlement(self, **over):
-        row = {"prediction_id": "p1", "outcome": 1, "source": "trusted-feed"}
+        row = {"prediction_id": "p1", "outcome": 1, "source": "trusted-feed",
+               "contract_id": "KXBTCD-26SEP1200-T60000",
+               "market_snapshot_id": "snap-15",
+               "source_record_sha256": self.record["record_sha256"]}
         row.update(over)
         return row
+
+    def ingest(self, ledger, rows, **kw):
+        kw.setdefault("trusted_sources", self.TRUSTED)
+        return ingest_settlements(ledger, rows, **kw)
 
     def test_the_verified_source_identity_reaches_the_prediction_row(self):
         ledger = self.ledger_with_binding()
@@ -1222,7 +1264,7 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
 
     def test_reproduce_a_settlement_for_a_different_contract_is_rejected(self):
         ledger = self.ledger_with_binding()
-        result = ingest_settlements(
+        result = self.ingest(
             ledger, [self.settlement(contract_id="SOME-OTHER-MARKET")])
         self.assertEqual(result["appended"], 0)
         self.assertEqual(len(result["binding_mismatches"]), 1)
@@ -1246,14 +1288,14 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
                         "market_snapshot_id": "snap-15",
                         "contract_schema": contract.FEED_SCHEMA,
                         "environment": "demo"}})
-                result = ingest_settlements(
+                result = self.ingest(
                     ledger, [self.settlement(**{field: wrong})])
                 self.assertEqual(result["appended"], 0)
                 self.assertTrue(result["binding_mismatches"])
 
     def test_conflicting_fields_are_reported_not_discarded(self):
         ledger = self.ledger_with_binding()
-        result = ingest_settlements(
+        result = self.ingest(
             ledger, [self.settlement(environment="prod")])
         mismatch = result["binding_mismatches"][0]["mismatches"][0]
         self.assertEqual(mismatch["field"], "environment")
@@ -1265,17 +1307,22 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
             with self.subTest(value=repr(bad)):
                 ledger = AlphaLedger(
                     path=os.path.join(self._tmp, f"l15t-{bad!r}.jsonl"))
-                ledger.record_prediction({"prediction_id": "p1",
-                                          "market_snapshot_id": "snap-15"})
-                result = ingest_settlements(
+                ledger.record_prediction({
+                    "prediction_id": "p1", "market_snapshot_id": "snap-15",
+                    "contract_id": "KXBTCD-26SEP1200-T60000",
+                    "source_binding": {
+                        "record_sha256": self.record["record_sha256"],
+                        "contract_id": "KXBTCD-26SEP1200-T60000",
+                        "market_snapshot_id": "snap-15"}})
+                result = self.ingest(
                     ledger, [self.settlement(resolved_at=bad)])
                 self.assertEqual(result["appended"], 0, bad)
                 self.assertIsNone(ledger.find_resolution("p1"))
 
     def test_an_untrusted_source_is_refused_when_an_allow_list_is_given(self):
         ledger = self.ledger_with_binding()
-        result = ingest_settlements(ledger, [self.settlement()],
-                                    trusted_sources=["the-only-real-oracle"])
+        result = self.ingest(ledger, [self.settlement()],
+                             trusted_sources=["the-only-real-oracle"])
         self.assertEqual(result["appended"], 0)
         self.assertTrue(result["trusted_sources_enforced"])
         self.assertIn("allow-list", result["rejected"][0]["reason"])
@@ -1284,7 +1331,7 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
         """Anti-vacuity: every refusal above must not simply be "ingestion is
         broken"."""
         ledger = self.ledger_with_binding()
-        result = ingest_settlements(ledger, [self.settlement(
+        result = self.ingest(ledger, [self.settlement(
             contract_id="KXBTCD-26SEP1200-T60000",
             market_snapshot_id="snap-15",
             source_record_sha256=self.record["record_sha256"],
@@ -1452,10 +1499,21 @@ class LiveSchemaAndAstraIdentityRemainUnproven(RemediationCase):
 class AA17_SurvivingSafetyMutations(RemediationCase):
     """Two mutations passed the candidate's full 1,670-test run."""
 
-    def test_the_reproducible_mutation_runner_exists_and_covers_all_eleven(self):
+    def test_the_reproducible_mutation_runner_covers_every_closed_finding(self):
+        """The original eleven, plus one per invariant the v3 re-audit closed.
+
+        Written as "every M01..M11 is still present, and nothing was removed"
+        rather than as an exact list, so adding a mutation for a NEW finding
+        is not a test failure while DELETING one still is. The v3 set is
+        enumerated in `docs/audits/ASTRA_V3_REMEDIATION_REPORT.md`.
+        """
         from tools.astra_mutation_probe import MUTATIONS
-        self.assertEqual(sorted(MUTATIONS),
-                         [f"M{i:02d}" for i in range(1, 12)])
+        original = [f"M{i:02d}" for i in range(1, 12)]
+        self.assertEqual(sorted(set(MUTATIONS) & set(original)), original)
+        # M07P is the re-audit's named addition: a COMPLETE record whose
+        # quotes are declared derived.
+        self.assertIn("M07P", MUTATIONS)
+        self.assertGreaterEqual(len(MUTATIONS), len(original) + 1)
 
     def test_every_mutation_names_the_tests_that_detect_it(self):
         from tools.astra_mutation_probe import MUTATIONS

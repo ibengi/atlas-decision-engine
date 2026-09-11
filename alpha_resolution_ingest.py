@@ -25,11 +25,29 @@ AA-15 -- R4 IS A VERIFIED JOIN, NOT A prediction_id LOOKUP
     conflicting values are reported rather than discarded -- an operator
     needs to see what disagreed with what.
 
-    Fields the settlement does NOT supply are simply not checked. That is a
-    deliberate limit and it is stated plainly: this module can prove the
-    settlement is consistent with the prediction it names, and it cannot prove
-    the settlement came from the exchange. Source authority remains an
-    external blocker (see `settlement_authority` in the report).
+    RE-AUDIT: "NOT SUPPLIED" IS NOT "NOT CHECKED"
+        The previous rule checked every binding field the settlement supplied
+        and left the rest alone. Written out, that means a settlement
+        supplying NO binding at all passed every check there was -- and a
+        `prediction_id` is an opaque token, so matching it proves somebody
+        quoted a token, not that this settlement describes that market.
+
+        `REQUIRED_BINDING` is therefore required. A settlement missing any of
+        it is QUARANTINED, with the missing names reported, and no resolution
+        is written. Partial agreement is not partial proof; it is no proof
+        with some corroboration attached.
+
+    RE-AUDIT: AN UNQUALIFIED AUTHORITY IS REFUSED, NOT TRUSTED
+        `trusted_sources` used to be off by default, and off meant accept
+        anything. The reason given for it being off -- no settlement
+        authority has been qualified for this deployment -- is an argument
+        for the opposite behaviour. The default is now REFUSE, and an
+        operator names the feed they actually verified.
+
+    What this module still cannot do is prove the settlement came from the
+    exchange. It proves the settlement is consistent with the prediction it
+    names and that its source is one an operator named. Source authority
+    remains an external blocker (see `settlement_authority` in the report).
 """
 
 from candidate_contract import ContractError, strict_text, strict_timestamp
@@ -43,6 +61,18 @@ BINDING_CHECKS = {
     "environment": "environment",
     "contract_schema": "contract_schema",
 }
+
+#: The binding a settlement MUST carry. Each one answers a different question,
+#: and dropping any of them leaves a join that cannot be defended:
+#:
+#:   contract_id           which market this outcome is about
+#:   market_snapshot_id    which observation of it the prediction was made on
+#:   source_record_sha256  which exact evidence bytes that observation was
+#:
+#: `environment` and `contract_schema` stay optional: they narrow a match when
+#: present and their absence does not make the join ambiguous.
+REQUIRED_BINDING = ("contract_id", "market_snapshot_id",
+                    "source_record_sha256")
 
 
 def _prediction_binding(prediction: dict) -> dict:
@@ -123,6 +153,18 @@ def _normalise(row, index):
     }
 
 
+def _missing_binding(supplied: dict, committed: dict) -> list:
+    """Required binding fields absent from EITHER side.
+
+    A field the prediction does not carry is just as disqualifying as one the
+    settlement omits: there is nothing to corroborate against, and "nothing
+    disagreed" is not the same as "they agreed".
+    """
+    return sorted(field for field in REQUIRED_BINDING
+                  if not str(supplied.get(field) or "").strip()
+                  or not str(committed.get(BINDING_CHECKS[field]) or "").strip())
+
+
 def _binding_mismatches(supplied: dict, committed: dict) -> list:
     """Every binding field the settlement and the prediction disagree on."""
     out = []
@@ -151,13 +193,15 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
     feed row can cause an existing resolution to be changed: conflicts and
     rejects are reported and left unwritten.
 
-    `trusted_sources`, when given, is an allow-list of settlement source
-    names. It is OFF by default because no settlement authority has been
-    qualified for this deployment yet; passing it is how an operator states
-    which feed they have actually verified.
+    `trusted_sources` is the allow-list of settlement source names. It is
+    REQUIRED: with none supplied, no source has been qualified for this
+    deployment and every row is refused. Passing it is how an operator states
+    which feed they have actually verified, and the statement is preserved
+    into the resolution row so a calibration number can be traced back to the
+    authority that produced its outcomes.
     """
     allowed = {str(s).strip() for s in trusted_sources} if trusted_sources \
-        else None
+        else set()
     result = {
         "mode": "SHADOW_ONLY",
         "broker_authority": False,
@@ -167,8 +211,14 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
         "rejected": [],
         "conflicts": [],
         "binding_mismatches": [],
+        # Re-audit: incomplete binding is its own outcome. It is not a
+        # malformed row and it is not a disagreement -- it is a settlement
+        # that cannot be tied to the prediction it names, and an operator
+        # needs to see those separately from rows that actively conflict.
+        "quarantined": [],
         "resolved_prediction_ids": [],
-        "trusted_sources_enforced": allowed is not None,
+        "trusted_sources_enforced": True,
+        "trusted_sources": sorted(allowed),
     }
 
     for index, raw in enumerate(settlements, start=1):
@@ -180,7 +230,16 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
             continue
 
         prediction_id = row["prediction_id"]
-        if allowed is not None and row["source"] not in allowed:
+        if not allowed:
+            # Re-audit: no allow-list means no authority has been qualified,
+            # which is a reason to accept NOTHING rather than everything.
+            result["rejected"].append({
+                "row": index, "prediction_id": prediction_id,
+                "reason": "no settlement authority has been qualified for "
+                          "this deployment; pass trusted_sources naming the "
+                          "feed you have verified"})
+            continue
+        if row["source"] not in allowed:
             result["rejected"].append({
                 "row": index, "prediction_id": prediction_id,
                 "reason": f"source {row['source']!r} is not in the trusted "
@@ -205,6 +264,16 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
 
         # AA-15. The join is verified here, not assumed from the id.
         committed = _prediction_binding(prediction)
+        missing = _missing_binding(row["supplied_binding"], committed)
+        if missing:
+            detail = {"row": index, "prediction_id": prediction_id,
+                      "missing_binding": missing,
+                      "reason": "settlement binding is incomplete; a "
+                                "prediction_id alone does not identify the "
+                                "market an outcome is about"}
+            result["quarantined"].append(detail)
+            result["rejected"].append(dict(detail))
+            continue
         mismatches = _binding_mismatches(row["supplied_binding"], committed)
         if mismatches:
             detail = {"row": index, "prediction_id": prediction_id,
@@ -239,7 +308,16 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
                 binding={
                     "settlement_binding": row["supplied_binding"],
                     "settlement_evidence_id": row["settlement_evidence_id"],
-                    "binding_verified": bool(row["supplied_binding"]),
+                    # Every REQUIRED field was present on both sides and every
+                    # supplied field agreed. That is what this flag now means;
+                    # previously it meant "some binding was supplied".
+                    "binding_verified": True,
+                    # Re-audit: the trust decision travels WITH the outcome.
+                    # A calibration number computed from these rows can then
+                    # be traced back to the authority an operator named,
+                    # rather than to an unqualified string.
+                    "source_trusted": True,
+                    "trusted_sources": sorted(allowed),
                 },
             )
         except Exception as exc:

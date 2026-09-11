@@ -284,7 +284,13 @@ class TheAutomaticFeedIntroducesNoPath(AlphaCase):
         spool_after = {n: open(os.path.join(spool_dir(), n), "rb").read()
                        for n in sorted(os.listdir(spool_dir()))}
         self.assertEqual(spool_after, spool_before)
-        self.assertEqual(after - before, {CFG.ALPHA_STATE_FILE})
+        # Its own processed ledger, and that ledger's writer lock (AA-14:
+        # every appender to a shared file is serialized on a sidecar). Both
+        # belong to the consumer; neither is scanner or execution state,
+        # which is the property this test exists to pin.
+        self.assertEqual(after - before,
+                         {CFG.ALPHA_STATE_FILE,
+                          CFG.ALPHA_STATE_FILE + ".lock"})
 
     def test_the_engine_side_imports_only_the_neutral_module(self):
         tree = ast.parse(open(os.path.join(REPO, "execution_engine.py"),

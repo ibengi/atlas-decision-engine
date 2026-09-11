@@ -31,6 +31,7 @@ WHY THIS IS A SEPARATE PROCESS
     records, the service reads them and writes its own ledgers.
 """
 
+import json
 import logging
 import os
 import sys
@@ -44,6 +45,7 @@ from alpha_gateway import AlphaGateway
 from alpha_ledger import AlphaLedger
 from alpha_providers import default_providers, set_pricing_table
 from alpha_telemetry import Telemetry
+from candidate_contract import canonical_content
 from config import CFG
 
 log = logging.getLogger("ALPHA")
@@ -132,6 +134,47 @@ def assert_no_broker_credentials(env=None) -> list:
             f"(Set ALPHA_REFUSE_BROKER_CREDENTIALS=false only to run both "
             f"in one environment for a local test.)")
     return offending
+
+
+def source_binding_for(record: dict, *, contract_id: str,
+                       market_snapshot_id: str,
+                       digest_verified: bool) -> dict:
+    """The source identity a prediction is committed with (AA-15).
+
+    `record_sha256` is copied from a record whose digest the CONSUMER already
+    recomputed and compared (AA-04). Nothing here computes or invents one: if
+    the consumer did not verify it, the value is absent and the binding says
+    so rather than carrying an unchecked digest.
+
+    RE-AUDIT -- THE EVIDENCE TRAVELS WITH THE DIGEST
+        A digest is a claim ABOUT some bytes, and those bytes lived in the
+        spool, which is BOUNDED and pruned by age and size on purpose. Six
+        hours after a prediction the evidence was gone and the digest was a
+        64-character string nothing could check -- which is exactly the
+        moment it was needed, because a settlement arriving days later is
+        compared against it. Comparing two copies of an unverifiable claim is
+        not verification.
+
+        So the canonical source content is persisted WITH the prediction, as
+        a deep copy, and `alpha_ledger.verify_source_evidence` recomputes the
+        digest from it. The evidence outlives the spool because the question
+        it answers does.
+    """
+    record = record if isinstance(record, dict) else {}
+    digest = str(record.get("record_sha256") or "")
+    evidence = canonical_content(record) if record else {}
+    return {
+        "record_sha256": digest if digest_verified else "",
+        "digest_verified": bool(digest_verified),
+        "contract_id": contract_id,
+        "market_snapshot_id": market_snapshot_id,
+        "contract_schema": str(record.get("schema") or ""),
+        "environment": str(CFG.ALPHA_ENVIRONMENT),
+        # A deep copy through JSON: the caller keeps its record and may do
+        # anything to it afterwards without reaching the ledger row.
+        "source_evidence": json.loads(json.dumps(evidence, default=str))
+        if evidence else {},
+    }
 
 
 def observation_intervals() -> list:
@@ -290,24 +333,14 @@ class AlphaShadowService:
                       "contract_schema", "environment")
 
     def _source_binding(self, snapshot, record) -> dict:
-        """The verified source identity for one analysed snapshot (AA-15).
-
-        `record_sha256` is copied from a record whose digest the CONSUMER
-        already recomputed and compared (AA-04). This method never computes or
-        invents one: if the consumer did not verify it, the value is absent
-        and the binding says so rather than carrying an unchecked digest.
-        """
+        """The verified source identity for one analysed snapshot (AA-15)."""
         record = record if isinstance(record, dict) else {}
         digest = str(record.get("record_sha256") or "")
         verified = digest in getattr(self.consumer, "verified_digests", {})
-        return {
-            "record_sha256": digest if verified else "",
-            "digest_verified": bool(verified),
-            "contract_id": snapshot.contract_id,
-            "market_snapshot_id": snapshot.market_snapshot_id,
-            "contract_schema": str(record.get("schema") or ""),
-            "environment": str(CFG.ALPHA_ENVIRONMENT),
-        }
+        return source_binding_for(
+            record, contract_id=snapshot.contract_id,
+            market_snapshot_id=snapshot.market_snapshot_id,
+            digest_verified=verified)
 
     def reconcile_processed(self) -> dict:
         """AA-13 restart reconciliation. Read-only; appends nothing.
@@ -358,6 +391,54 @@ class AlphaShadowService:
                 "analyzed_without_prediction": orphans,
                 "prepared_without_acknowledgement": unacknowledged}
 
+    def _acknowledge_recovered(self, snapshot, prediction) -> dict:
+        """A prediction that was already durably committed (correction 7).
+
+        The identity returned is the COMMITTED one. Reporting a freshly
+        generated `prediction_id` here -- which is what happened before --
+        acknowledges a row that does not exist and breaks every later join
+        from a settlement back to the prediction it settles.
+        """
+        prediction_id = str(prediction.get("prediction_id") or "")
+        self.telemetry.incr("predictions_recovered")
+        log.info(f"[ALPHA_SERVICE] {snapshot.contract_id} was already "
+                 f"committed as {prediction_id}; recovered without calling "
+                 f"any provider")
+        try:
+            self.consumer.store.mark(
+                snapshot.market_snapshot_id, STATUS_ANALYZED,
+                contract_id=snapshot.contract_id,
+                detail="recovered_committed_prediction",
+                prediction_id=prediction_id)
+        except RuntimeError as e:
+            self.telemetry.record_error(str(e))
+            log.error(f"[ALPHA_SERVICE] {e}")
+        return {"prediction_id": prediction_id,
+                "contract_id": snapshot.contract_id,
+                "state": str(prediction.get("state") or "RECOVERED"),
+                "p_meta": prediction.get("p_meta"),
+                "shadow_net_edge": prediction.get("shadow_net_edge"),
+                "recovered": True, "deferred": False}
+
+    def _defer_without_dispatch(self, snapshot, reason: str) -> dict:
+        """Nothing was asked and nothing was spent (correction 8).
+
+        `prediction_id` is deliberately EMPTY. There is no prediction, so
+        naming one would be an acknowledgement of something that does not
+        exist -- the exact failure correction 8 names in its second half.
+        """
+        try:
+            self.consumer.store.mark(
+                snapshot.market_snapshot_id, STATUS_DEFERRED,
+                contract_id=snapshot.contract_id, detail=reason,
+                prediction_id="")
+        except RuntimeError as e:
+            self.telemetry.record_error(str(e))
+            log.error(f"[ALPHA_SERVICE] {e}")
+        return {"prediction_id": "", "contract_id": snapshot.contract_id,
+                "state": "DEFERRED", "state_reason": reason, "p_meta": None,
+                "shadow_net_edge": None, "deferred": True}
+
     def _analyze_one(self, snapshot, record) -> dict:
         """One snapshot through the gateway, with the budget gate attached."""
         analysis_spend = {"usd": 0.0}
@@ -391,11 +472,38 @@ class AlphaShadowService:
                                            "outcome": "VALID" if sig.valid
                                            else (sig.rejected_reason or "")})
 
-        # AA-13 step 1, AA-15. PREPARE is durable BEFORE any provider is
-        # called, and it carries the verified source identity. A PREPARE with
-        # no matching PREDICTION is the on-disk trace of a crash mid-analysis,
-        # which a restart can tell apart from work that completed.
         source_binding = self._source_binding(snapshot, record)
+
+        # AA-13 (re-audit), correction 7 -- RECOVER BEFORE YOU RE-DISPATCH.
+        #
+        # A crash between the prediction commit and the processed mark is the
+        # ordinary case, not the exotic one: they are two files. On the next
+        # poll the snapshot was still unacknowledged, so the service minted
+        # it, called EVERY provider again, and only then asked the ledger to
+        # record it. The ledger refused correctly -- one analysis, one
+        # prediction -- but the money was already spent, and the
+        # `prediction_id` the service then reported named a prediction that
+        # was never written, so the acknowledgement pointed at nothing.
+        #
+        # The committed prediction is looked up FIRST, by the stable analysis
+        # identity, and returned as itself. No provider is called.
+        recovered = None
+        try:
+            recovered = self.ledger.committed_prediction(
+                snapshot.market_snapshot_id)
+        except Exception as e:                                # noqa: BLE001
+            self.telemetry.record_error(f"recover: {type(e).__name__}: {e}")
+        if recovered is not None:
+            return self._acknowledge_recovered(snapshot, recovered)
+
+        # AA-13 step 1, AA-15, correction 8 -- PREPARE IS A PRECONDITION.
+        #
+        # It was written, every exception was caught, the failure was called
+        # "not fatal", and dispatch went ahead. But the one case PREPARE
+        # exists for is "the ledger is not writable", and in that case the
+        # prediction that follows cannot be committed either -- so the spend
+        # on providers is guaranteed unrecoverable BEFORE it is incurred.
+        # Nothing is dispatched without a durable PREPARE.
         try:
             self.ledger.prepare(
                 snapshot.market_snapshot_id,
@@ -403,11 +511,13 @@ class AlphaShadowService:
                 source_record_sha256=source_binding.get("record_sha256", ""),
                 environment=source_binding.get("environment", ""))
         except Exception as e:                                # noqa: BLE001
-            # Not fatal: PREPARE is a recovery aid, not the commit. Losing it
-            # costs reconciliation precision, never correctness.
             self.telemetry.record_error(f"prepare: {type(e).__name__}: {e}")
+            self.telemetry.incr("prepare_not_durable")
             log.error(f"[ALPHA_SERVICE] PREPARE not durable for "
-                      f"{snapshot.contract_id}: {e}")
+                      f"{snapshot.contract_id}: {e} -- NOT dispatching; the "
+                      f"snapshot is DEFERRED so a later poll retries it")
+            return self._defer_without_dispatch(
+                snapshot, f"prepare_not_durable: {type(e).__name__}")
 
         opportunity = self.gateway.analyze(
             snapshot, quote_fn=self.quote_fn, gate=gate, on_signal=on_signal,
@@ -460,8 +570,13 @@ class AlphaShadowService:
                 STATUS_ANALYZED if terminal else STATUS_DEFERRED,
                 contract_id=snapshot.contract_id,
                 detail=opportunity["state"] if committed
-                else "prediction_not_committed",
-                prediction_id=opportunity["prediction_id"])
+                else f"prediction_not_committed: "
+                     f"{opportunity['prediction_id']}",
+                # Correction 8: an acknowledgement never NAMES a prediction
+                # that was not durably committed. The attempted id is kept in
+                # `detail`, where it reads as a diagnostic rather than as a
+                # row anyone can join to.
+                prediction_id=opportunity["prediction_id"] if committed else "")
         except RuntimeError as e:
             self.telemetry.record_error(str(e))
             log.error(f"[ALPHA_SERVICE] {e}")

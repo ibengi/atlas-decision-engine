@@ -72,6 +72,23 @@ class ContractError(ValueError):
     """A candidate violates the contract. Carries a field-tagged reason."""
 
 
+class AliasContradiction(ContractError):
+    """Two alias keys for ONE fact disagree.
+
+    AA-03 (re-audit): this is deliberately its own type, carrying `field` and
+    `values`, because the caller used to catch the generic `ContractError` and
+    file the fact as absent. "The exchange did not publish this" and "the
+    exchange published two incompatible answers" are different facts about
+    the source, and a producer that reports the second as the first has
+    thrown away the only one an operator could act on.
+    """
+
+    def __init__(self, message, *, field, values):
+        super().__init__(message)
+        self.field = field
+        self.values = dict(values)
+
+
 # ── AA-05: semantic source binding ───────────────────────────────────────
 #: field -> (namespace, allowed source keys). Provenance must name one of
 #: these EXACT paths. A non-empty string is not provenance: `yes_ask` sourced
@@ -254,10 +271,15 @@ def resolve_alias(source: dict, field: str, keys, *, comparator=None):
         reference = normalise(first_value)
         for key, value in present[1:]:
             if normalise(value) != reference:
-                raise ContractError(
+                raise AliasContradiction(
                     f"{field}: contradictory aliases -- {first_key}="
                     f"{first_value!r} and {key}={value!r} claim to be the "
-                    f"same fact; neither is chosen")
+                    f"same fact; neither is chosen",
+                    field=field,
+                    # EVERY present alias, not just the two that differ: an
+                    # operator resolving this needs to see the whole
+                    # disagreement, and a third agreeing key is evidence too.
+                    values={k: v for k, v in present})
     return first_value, first_key
 
 
@@ -307,8 +329,13 @@ def verify_checksum(record: dict) -> str:
         raise ContractError("record_sha256 is not hexadecimal")
     try:
         actual = compute_checksum(record)
-    except (TypeError, ValueError) as exc:
-        raise ContractError(f"record cannot be canonicalized: {exc}")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        # NEW-01: a value that cannot be canonicalized is a REFUSAL, not an
+        # exception for the caller to trip over. `OverflowError` in
+        # particular is what an oversized number raises, and it is neither a
+        # TypeError nor a ValueError.
+        raise ContractError(f"record cannot be canonicalized: "
+                            f"{type(exc).__name__}: {exc}")
     if actual != claimed.lower():
         raise ContractError(
             f"record_sha256 mismatch: content hashes to {actual}, record "
@@ -361,10 +388,21 @@ def _check_book(record, errors):
     Checked only once all four quotes have validated as numbers; otherwise the
     comparison would raise on the malformed value instead of reporting it.
     """
-    try:
-        quotes = {f: float(record[f]) for f in QUOTE_FIELDS}
-    except (KeyError, TypeError, ValueError):
-        return
+    # NEW-01: `float(10**500)` raises OverflowError, which the previous
+    # `except (KeyError, TypeError, ValueError)` did not catch -- so the one
+    # function whose whole contract is "return a structured refusal" raised
+    # instead, and the exception travelled out through `validate_record` and
+    # `SpoolConsumer.pending()`, stopping the batch. Reuse `strict_number`,
+    # which decides by explicit case and never converts a value it has not
+    # already classified; a quote it refuses is reported by its own field
+    # check above, so there is nothing to compare here.
+    quotes = {}
+    for field in QUOTE_FIELDS:
+        try:
+            quotes[field] = strict_number(record.get(field), field=field,
+                                          minimum=0.0, maximum=1.0)
+        except ContractError:
+            return
     if quotes["yes_ask"] < quotes["yes_bid"]:
         errors.append(
             f"book: crossed YES side (bid {quotes['yes_bid']} > ask "
@@ -373,6 +411,36 @@ def _check_book(record, errors):
         errors.append(
             f"book: crossed NO side (bid {quotes['no_bid']} > ask "
             f"{quotes['no_ask']})")
+
+
+def _check_contradictions(record, errors):
+    """AA-03: a source that contradicts itself is not evidence.
+
+    `contradictory_fields` maps a field to every alias value the source
+    supplied for it. Its ABSENCE means "no contradiction was observed"; its
+    presence with any entry means the producer saw one and preserved it. The
+    map is inside the digest, so neither adding nor stripping it can be done
+    without invalidating the record.
+
+    Refused whether the field is required or optional. An optional field is
+    one the source may stay SILENT about -- it is not one the source may
+    answer twice, differently.
+    """
+    clashes = record.get("contradictory_fields")
+    if clashes is None:
+        return
+    if not isinstance(clashes, dict):
+        errors.append("contradictory_fields: must be an object")
+        return
+    for field, values in sorted(clashes.items()):
+        if not isinstance(values, dict) or not values:
+            errors.append(f"contradictory_fields.{field}: must name the "
+                          f"conflicting source keys and their values")
+            continue
+        detail = ", ".join(f"{k}={v!r}" for k, v in sorted(values.items()))
+        errors.append(
+            f"{field}: the source contradicts itself ({detail}); neither "
+            f"value is chosen and the record is refused")
 
 
 def _check_quote_observation(record, errors):
@@ -399,7 +467,32 @@ def _check_quote_observation(record, errors):
 
 
 def validate_record(record, *, require_checksum=True) -> list:
-    """Every contract violation in `record`. Empty list means valid.
+    """Every contract violation in `record`. Empty list means valid. NEVER RAISES.
+
+    NEW-01 is the reason for the wrapper. Astra sent `yes_ask = 10**500`; the
+    crossed-book check called `float()` on it, `OverflowError` escaped every
+    `except` clause in the chain, and the one function whose entire contract
+    is "return a structured refusal" raised instead. Downstream that is not a
+    cosmetic difference: `SpoolConsumer.pending()` calls this per record, so
+    a single hostile row stopped the whole batch -- the AA-09 failure coming
+    back through a different door.
+
+    The invariant is therefore stated as code, not as care: an unexpected
+    exception anywhere inside the contract becomes a REFUSAL naming the
+    exception. Failing closed on a value we do not understand is the only
+    answer a validator is allowed to give.
+    """
+    try:
+        return _validate_record(record, require_checksum=require_checksum)
+    except ContractError as exc:                              # pragma: no cover
+        return [str(exc)]
+    except Exception as exc:                                  # noqa: BLE001
+        return [f"record could not be validated ({type(exc).__name__}: "
+                f"{exc}); a value the contract cannot classify is refused"]
+
+
+def _validate_record(record, *, require_checksum=True) -> list:
+    """The contract proper. `validate_record` is the total wrapper.
 
     Returns ALL errors rather than the first, because the operator question
     "what is this source still missing" is unanswerable one field per run.
@@ -451,6 +544,7 @@ def validate_record(record, *, require_checksum=True) -> list:
 
     _check_book(record, errors)
     _check_quote_observation(record, errors)
+    _check_contradictions(record, errors)
 
     if provenance is not None:
         for field in REQUIRED_FIELDS:

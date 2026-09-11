@@ -31,7 +31,8 @@ import os
 from datetime import datetime, timezone
 
 from config import CFG, _p
-from durable_append import append_line, exclusive_lock, tail_is_torn
+from durable_append import (append_line, exclusive_lock,
+                            serialized_append, tail_is_torn)
 
 log = logging.getLogger("ALPHA")
 
@@ -52,8 +53,26 @@ ROW_OBSERVATION = "OBSERVATION"
 #: analyse this" and "the analysis is safely on disk", and it is what lets a
 #: restart tell that apart from work that genuinely completed.
 ROW_PREPARE = "PREPARE"
-ROW_KINDS = (ROW_PREPARE, ROW_PREDICTION, ROW_RESOLUTION, ROW_COST,
-             ROW_INVALIDATION, ROW_OBSERVATION)
+#: AA-13 (re-audit). The RECEIPT for a prediction, appended and fsynced in
+#: its own right AFTER the prediction row.
+#:
+#: `prediction_is_committed()` used to answer by reading the ledger back and
+#: finding the PREDICTION row. That conflates two different facts: `write()`
+#: returning means the bytes are in the page cache, where they read back
+#: perfectly while still being one power cut from never having existed, and
+#: only a successful `fsync` means they reached the device. When the fsync
+#: failed, `record_prediction` raised -- and the same bytes still read back,
+#: so the commit check said "safe" about a prediction the caller had just
+#: been told was lost, and the service published a TERMINAL acknowledgement
+#: for it.
+#:
+#: A receipt cannot be produced by bytes existing. It is written only after
+#: the prediction's own append has completed AND been fsynced, so its
+#: presence is evidence of a completed durable sequence rather than of a
+#: readable page.
+ROW_COMMIT = "COMMIT"
+ROW_KINDS = (ROW_PREPARE, ROW_PREDICTION, ROW_COMMIT, ROW_RESOLUTION,
+             ROW_COST, ROW_INVALIDATION, ROW_OBSERVATION)
 
 
 def analysis_identity(market_snapshot_id: str) -> str:
@@ -66,6 +85,48 @@ def analysis_identity(market_snapshot_id: str) -> str:
     appended twice.
     """
     return "an-" + str(market_snapshot_id)
+
+
+def verify_source_evidence(prediction) -> dict:
+    """Recompute a prediction's source digest from the evidence it carries.
+
+    AA-15 (re-audit). The spool is bounded and pruned, so by the time a
+    settlement arrives the bytes the digest describes are usually gone. A
+    prediction row therefore carries the canonical source content itself, and
+    this recomputes the digest from it.
+
+    Returns a verdict rather than raising: "this prediction's evidence cannot
+    be re-verified" is a fact an auditor needs reported, not an exception to
+    be caught somewhere far from the row it concerns.
+    """
+    from candidate_contract import compute_checksum
+    binding = ((prediction or {}).get("source_binding") or {}) \
+        if isinstance(prediction, dict) else {}
+    claimed = str(binding.get("record_sha256") or "")
+    evidence = binding.get("source_evidence")
+    if not isinstance(evidence, dict) or not evidence:
+        return {"verified": False, "claimed": claimed, "recomputed": None,
+                "reason": "the prediction carries no source evidence, so its "
+                          "digest cannot be re-verified once the spool has "
+                          "been pruned"}
+    if not claimed:
+        return {"verified": False, "claimed": "", "recomputed": None,
+                "reason": "the prediction carries evidence but no verified "
+                          "digest to check it against"}
+    try:
+        recomputed = compute_checksum({**evidence, "record_sha256": claimed})
+    except Exception as exc:                                  # noqa: BLE001
+        return {"verified": False, "claimed": claimed, "recomputed": None,
+                "reason": f"evidence cannot be canonicalized: "
+                          f"{type(exc).__name__}: {exc}"}
+    if recomputed != claimed:
+        return {"verified": False, "claimed": claimed,
+                "recomputed": recomputed,
+                "reason": f"source evidence digest mismatch: the persisted "
+                          f"evidence hashes to {recomputed}, the prediction "
+                          f"claims {claimed}"}
+    return {"verified": True, "claimed": claimed, "recomputed": recomputed,
+            "reason": ""}
 
 
 class LedgerError(RuntimeError):
@@ -157,23 +218,29 @@ class AlphaLedger:
         succeeding.
         """
         rows = []
-        for signal in dispatch_result.signals:
-            cost = dict(signal.cost or {})
-            rows.append(self.cost_log.append({
-                "schema": LEDGER_SCHEMA, "kind": ROW_COST,
-                "at": _now_iso(),
-                "market_snapshot_id": snapshot.market_snapshot_id,
-                "contract_id": snapshot.contract_id,
-                "provider": signal.provider or cost.get("provider"),
-                "model": signal.model,
-                "input_tokens": int(cost.get("input_tokens") or 0),
-                "output_tokens": int(cost.get("output_tokens") or 0),
-                "api_cost_usd": float(cost.get("api_cost_usd") or 0.0),
-                "cost_priced": bool(cost.get("cost_priced", False)),
-                "latency_ms": int(signal.analysis_latency_ms or 0),
-                "outcome": "VALID" if signal.valid else "EXCLUDED",
-                "reason": signal.rejected_reason,
-            }))
+        # AA-14 (re-audit): one lock for the whole batch. Each append reads
+        # the file's last byte to decide whether a torn tail needs
+        # separating, so even a pure append is a check-then-act here; and a
+        # cost batch that interleaves with another writer's batch is a cost
+        # ledger nobody can attribute to a cycle afterwards.
+        with self.cost_log.lock():
+            for signal in dispatch_result.signals:
+                cost = dict(signal.cost or {})
+                rows.append(self.cost_log.append({
+                    "schema": LEDGER_SCHEMA, "kind": ROW_COST,
+                    "at": _now_iso(),
+                    "market_snapshot_id": snapshot.market_snapshot_id,
+                    "contract_id": snapshot.contract_id,
+                    "provider": signal.provider or cost.get("provider"),
+                    "model": signal.model,
+                    "input_tokens": int(cost.get("input_tokens") or 0),
+                    "output_tokens": int(cost.get("output_tokens") or 0),
+                    "api_cost_usd": float(cost.get("api_cost_usd") or 0.0),
+                    "cost_priced": bool(cost.get("cost_priced", False)),
+                    "latency_ms": int(signal.analysis_latency_ms or 0),
+                    "outcome": "VALID" if signal.valid else "EXCLUDED",
+                    "reason": signal.rejected_reason,
+                }))
         return rows
 
     def cycle_cost_usd(self, dispatch_result) -> float:
@@ -236,19 +303,62 @@ class AlphaLedger:
             # Without this, a crash between the prediction append and the
             # processed acknowledgement produced a SECOND prediction for the
             # same evidence on the next poll.
-            committed = (self.find_prediction_by_analysis(analysis_id)
-                         if analysis_id else None)
-            if committed is not None:
-                raise LedgerError(
-                    f"analysis {analysis_id} already has committed prediction "
-                    f"{committed.get('prediction_id')}; this snapshot is not "
-                    f"analysed twice")
-            return self.log.append({
+            existing = (self.find_prediction_by_analysis(analysis_id)
+                        if analysis_id else None)
+            if existing is not None:
+                if analysis_id in self.commits():
+                    raise LedgerError(
+                        f"analysis {analysis_id} already has committed "
+                        f"prediction {existing.get('prediction_id')}; this "
+                        f"snapshot is not analysed twice")
+                # A row with no receipt: the previous attempt's append landed
+                # but its fsync failed, so the caller was told it was lost.
+                # Refusing here would poison the snapshot permanently -- it
+                # could never be committed and never be retried.
+                #
+                # The right recovery is to FINISH the commit rather than
+                # start another. Appending the receipt fsyncs the file, and an
+                # fsync flushes the whole file, so the earlier row becomes
+                # durable at the same moment its receipt does. One prediction,
+                # one identity, and the original id is the one that survives.
+                log.warning(
+                    f"[ALPHA_LEDGER] {analysis_id} has an uncommitted "
+                    f"prediction row ({existing.get('prediction_id')}); "
+                    f"completing its commit instead of writing a second one")
+                self._commit(analysis_id, existing.get("prediction_id"),
+                             snapshot_id)
+                return existing
+            row = self.log.append({
                 "schema": LEDGER_SCHEMA, "kind": ROW_PREDICTION,
                 "at": _now_iso(), "analysis_id": analysis_id, **opportunity})
+            # AA-13 (re-audit): the RECEIPT. Written only because the append
+            # above returned, which happens only after its own fsync
+            # succeeded. If that fsync failed we never reach this line, the
+            # caller gets a LedgerError, and `prediction_is_committed` reads
+            # no receipt -- so the readable bytes of a failed write can no
+            # longer be mistaken for a durable commit.
+            self._commit(analysis_id, prediction_id, snapshot_id)
+            return row
+
+    def _commit(self, analysis_id: str, prediction_id: str,
+                snapshot_id: str) -> dict:
+        """Append the receipt that makes a prediction durably committed.
+
+        Caller holds the writer lock. Appending fsyncs the file, so the
+        prediction row this receipt names is durable by the time the receipt
+        itself is.
+        """
+        return self.log.append({
+            "schema": LEDGER_SCHEMA, "kind": ROW_COMMIT,
+            "at": _now_iso(), "analysis_id": analysis_id,
+            "prediction_id": prediction_id,
+            "market_snapshot_id": snapshot_id})
 
     def find_prediction_by_analysis(self, analysis_id: str):
-        """The committed prediction for a stable analysis identity, if any."""
+        """The prediction ROW for a stable analysis identity, if any.
+
+        Says nothing about durability -- see `committed_prediction`.
+        """
         if not analysis_id:
             return None
         for row in self.predictions():
@@ -256,15 +366,41 @@ class AlphaLedger:
                 return row
         return None
 
+    def commits(self) -> dict:
+        """analysis_id -> the first COMMIT receipt for it."""
+        out = {}
+        for row in self.rows():
+            if row.get("kind") == ROW_COMMIT and row.get("analysis_id"):
+                out.setdefault(row["analysis_id"], row)
+        return out
+
+    def committed_prediction(self, market_snapshot_id: str):
+        """The DURABLY COMMITTED prediction row for a snapshot, or None.
+
+        Both halves are required (AA-13 re-audit): the prediction row, and a
+        receipt proving the sequence that wrote it completed. A row without a
+        receipt is a write we are not entitled to call durable, and a receipt
+        without a row is a ledger somebody has edited.
+
+        This is also the recovery entry point (AA-13, correction 7): a
+        restart asks it BEFORE dispatching anything, so an analysis that was
+        already committed is recovered by identity instead of being paid for
+        a second time.
+        """
+        analysis_id = analysis_identity(market_snapshot_id)
+        if analysis_id not in self.commits():
+            return None
+        return self.find_prediction_by_analysis(analysis_id)
+
     def prediction_is_committed(self, market_snapshot_id: str) -> bool:
-        """AA-13: has this snapshot's prediction reached the disk?
+        """AA-13: has this snapshot's prediction been DURABLY committed?
 
         The terminal processed acknowledgement must be published only after
         this returns True, and a restart re-asks it rather than trusting the
-        processed file.
+        processed file. Since the re-audit it is answered by the RECEIPT, not
+        by the readability of the prediction row.
         """
-        return self.find_prediction_by_analysis(
-            analysis_identity(market_snapshot_id)) is not None
+        return self.committed_prediction(market_snapshot_id) is not None
 
     def resolve(self, prediction_id: str, outcome, *, resolved_at=None,
                 source: str = "", binding: dict = None) -> dict:
@@ -303,15 +439,21 @@ class AlphaLedger:
         because the moment a signal stopped counting is a fact, not a
         counter.
         """
-        existing = self.find_invalidation(prediction_id)
-        if existing is not None:
-            return existing
-        if self.find_prediction(prediction_id) is None:
-            raise LedgerError(f"unknown prediction {prediction_id}")
-        return self.log.append({
-            "schema": LEDGER_SCHEMA, "kind": ROW_INVALIDATION,
-            "at": _now_iso(), "prediction_id": prediction_id,
-            "reason": str(reason), "detail": str(detail)[:300]})
+        # AA-14 (re-audit): "is it already invalidated? no -> append" is a
+        # check-then-append like any other, and it was the only one of the
+        # three left outside the lock. Two writers both read "not yet" and
+        # both appended, and the moment a signal stopped counting became two
+        # different moments.
+        with self.log.lock():
+            existing = self.find_invalidation(prediction_id)
+            if existing is not None:
+                return existing
+            if self.find_prediction(prediction_id) is None:
+                raise LedgerError(f"unknown prediction {prediction_id}")
+            return self.log.append({
+                "schema": LEDGER_SCHEMA, "kind": ROW_INVALIDATION,
+                "at": _now_iso(), "prediction_id": prediction_id,
+                "reason": str(reason), "detail": str(detail)[:300]})
 
     def invalidations(self) -> dict:
         out = {}
@@ -363,14 +505,19 @@ class AlphaLedger:
         Idempotent per (prediction, interval): a service restart must not
         record the same interval twice and skew the latency-decay series.
         """
-        for row in self.observations(prediction_id):
-            if row.get("interval_s") == interval_s:
-                return row
-        return self.log.append({
-            "schema": LEDGER_SCHEMA, "kind": ROW_OBSERVATION,
-            "at": at or _now_iso(), "prediction_id": prediction_id,
-            "interval_s": interval_s,
-            "quote": dict(quote) if isinstance(quote, dict) else None})
+        # AA-14 (re-audit): the idempotence below is a read followed by a
+        # write that depends on it. Unserialized, two service threads both
+        # saw the interval unsampled and both appended, and the
+        # latency-decay series was computed from a duplicated sample.
+        with self.log.lock():
+            for row in self.observations(prediction_id):
+                if row.get("interval_s") == interval_s:
+                    return row
+            return self.log.append({
+                "schema": LEDGER_SCHEMA, "kind": ROW_OBSERVATION,
+                "at": at or _now_iso(), "prediction_id": prediction_id,
+                "interval_s": interval_s,
+                "quote": dict(quote) if isinstance(quote, dict) else None})
 
     def observations(self, prediction_id: str = None) -> list:
         return [r for r in self.rows()
@@ -422,6 +569,18 @@ class AlphaLedger:
             row = dict(prediction)
             row["actual_outcome"] = int(resolution["actual_outcome"])
             row["resolved_at"] = resolution.get("resolved_at")
+            # AA-15 (re-audit): the settlement's identity and trust decision
+            # travel WITH the outcome into learning. A calibration number is
+            # only as good as the authority that produced the outcomes it was
+            # computed from, and a learning row that cannot name that
+            # authority cannot be audited afterwards.
+            row["resolution_source"] = resolution.get("resolution_source", "")
+            row["settlement_binding"] = dict(
+                resolution.get("settlement_binding") or {})
+            row["settlement_evidence_id"] = resolution.get(
+                "settlement_evidence_id")
+            row["binding_verified"] = bool(resolution.get("binding_verified"))
+            row["source_trusted"] = bool(resolution.get("source_trusted"))
             invalidation = invalidations.get(prediction.get("prediction_id"))
             row["invalidated"] = bool(invalidation)
             row["invalidation_reason"] = (invalidation or {}).get("reason")

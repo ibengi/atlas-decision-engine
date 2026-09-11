@@ -28,8 +28,11 @@ import json
 import logging
 import os
 import queue
+import re
 import threading
 import time
+
+from durable_append import exclusive_lock
 
 log = logging.getLogger("RESEARCH_FEED")
 
@@ -37,6 +40,52 @@ log = logging.getLogger("RESEARCH_FEED")
 #: recognise files this producer owns and NEVER touch anything else (AA-11).
 TEMP_SUFFIX = ".partial"
 RECORD_SUFFIX = ".json"
+
+#: AA-11 (re-audit). A partial carries the PID of the process writing it, so
+#: recovery can tell three cases apart that the old age-only rule could not:
+#:
+#:   ours, owner dead     -> a crashed write. Reclaim it NOW.
+#:   ours, owner alive    -> a write in flight. Leave it; it holds a slot.
+#:   not ours at all      -> somebody else's file on a shared volume. Never
+#:                           touched, at any age, for any reason.
+#:
+#: Waiting for `max_age_s` (six hours by default) before reclaiming the first
+#: case meant a crash kept its slots through the window in which the next
+#: crash happens.
+OWNED_TEMP_RE = re.compile(r"\.(\d+)" + re.escape(TEMP_SUFFIX) + r"$")
+
+#: The sidecar the capacity reservation is serialized on, held across
+#: scan -> decide -> write so two writers cannot both spend the last slot.
+#:
+#: It lives INSIDE the spool directory, on purpose. "The producer writes only
+#: under its own spool directory, never anywhere else on the shared volume"
+#: is the AA-10/AA-11 containment property, asserted by
+#: `test_it_writes_only_inside_its_own_directory`, and a lock file placed
+#: beside the directory would have broken it to make a different test pass.
+#: It carries neither suffix the spool recognises, so `_scan` classifies it
+#: as neither a record nor a partial and it is never counted, pruned or
+#: recovered.
+RESERVATION_LOCK = ".capacity"
+
+
+def owner_is_alive(pid: int) -> bool:
+    """Is `pid` a live process on THIS host?
+
+    Answers conservatively: anything we cannot establish reads as ALIVE, so
+    an uncertain partial is kept rather than deleted. Reclaiming a slot is
+    worth less than destroying a write that is still happening.
+    """
+    if pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                 # exists, owned by someone else
+    except OSError:
+        return True
+    return True
 
 
 def write_all(fd, payload: bytes) -> int:
@@ -89,7 +138,20 @@ class BoundedSpool:
         self.stats = {"written": 0, "pruned": 0, "dropped_full": 0,
                       "dropped_oversize": 0, "capacity_unknown": 0,
                       "write_errors": 0, "temp_bytes": 0, "temp_files": 0,
-                      "temp_recovered": 0}
+                      "temp_recovered": 0, "reservation_timeouts": 0}
+        self._sequence = 0
+        # AA-11 (re-audit): recovery happens HERE, at construction, rather
+        # than in a method nothing called. A producer that starts with its
+        # own crashed partials still occupying the budget has inherited the
+        # previous run's failure as a smaller spool.
+        try:
+            self.recover_owned_partials()
+        except Exception as exc:                              # noqa: BLE001
+            # Startup recovery is an optimisation of capacity, never a
+            # precondition for running. A spool that cannot be recovered is
+            # still a spool that fails closed when it is full.
+            log.warning(f"[RESEARCH_SPOOL] startup partial recovery failed: "
+                        f"{type(exc).__name__}: {exc}")
 
     # ── enumeration that refuses to guess ───────────────────────────────
     def _scan(self):
@@ -127,6 +189,59 @@ class BoundedSpool:
         records.sort()
         temp.sort()
         return records, temp
+
+    def capacity(self) -> dict:
+        """What the directory actually holds, in every unit that bounds it.
+
+        AA-11 (re-audit): the old check asked `len(records) >= max_records`
+        and counted COMPLETE files only, while partials were counted in the
+        byte budget alone. So N interrupted writes let the spool hold
+        `max_records + N` files -- the bound developed a hole at exactly the
+        moment writes were being interrupted. `occupied` is the number this
+        class bounds: complete records PLUS partials, because a partial is a
+        file on the volume whether or not it ever becomes a record.
+        """
+        records, temp = self._scan()
+        record_bytes = sum(size for _n, size, _m in records)
+        partial_bytes = sum(size for _n, size, _m in temp)
+        return {"records": len(records), "partials": len(temp),
+                "occupied": len(records) + len(temp),
+                "record_bytes": record_bytes, "partial_bytes": partial_bytes,
+                "used_bytes": record_bytes + partial_bytes}
+
+    def recover_owned_partials(self) -> int:
+        """Reclaim slots held by partials whose owner is gone (AA-11).
+
+        Called at construction, so a restart begins with an accurate picture
+        of its own capacity instead of one inflated by the crash that caused
+        the restart.
+
+        The three-way test is in `OWNED_TEMP_RE` and `owner_is_alive`: a file
+        must carry OUR temp suffix AND a PID that is no longer running. A
+        file we cannot parse as ours is never removed here at any age -- this
+        directory sits on a volume the engine shares, and a research
+        component that deletes unrecognised files is a worse failure than a
+        full spool.
+        """
+        try:
+            _records, temp = self._scan()
+        except SpoolCapacityUnknown as exc:
+            log.warning(f"[RESEARCH_SPOOL] partial recovery skipped: {exc}")
+            return 0
+        removed = 0
+        for name, _size, _mtime in temp:
+            match = OWNED_TEMP_RE.search(name)
+            if match is None:
+                continue                       # not ours; not ours to remove
+            if owner_is_alive(int(match.group(1))):
+                continue                       # a write still in flight
+            if self._remove(name):
+                removed += 1
+        self.stats["temp_recovered"] += removed
+        if removed:
+            log.info(f"[RESEARCH_SPOOL] reclaimed {removed} partial write(s) "
+                     f"left by a crashed producer")
+        return removed
 
     def recover_temp_files(self) -> int:
         """Remove leftover partial writes from a previous crash.
@@ -211,8 +326,50 @@ class BoundedSpool:
             return False
         try:
             os.makedirs(self.directory, exist_ok=True)
+        except OSError as exc:
+            self.stats["capacity_unknown"] += 1
+            log.warning(f"[RESEARCH_SPOOL] spool directory unusable: {exc}")
+            return False
+
+        # AA-11 (re-audit) -- CAPACITY IS RESERVED, NOT MERELY CHECKED.
+        #
+        # `scan -> decide -> create` was three steps with nothing between
+        # them. Two writers both read "one slot free" and both took it, and
+        # the bound was exceeded by exactly the number of writers racing. A
+        # check whose result can go stale before it is acted on is not a
+        # bound, it is an observation.
+        #
+        # The whole sequence -- prune, scan, decide, create, write, fsync,
+        # rename -- happens under one advisory lock, so the slot a writer
+        # counts is the slot it takes. Holding the lock across the fsync is
+        # deliberate and it is safe HERE and only here: this runs on the
+        # research writer thread. AA-10 is what makes that true -- the engine
+        # hands its record to a queue and never waits for this function, so
+        # serializing writers costs research latency and nothing else.
+        try:
+            lock = exclusive_lock(
+                os.path.join(self.directory, RESERVATION_LOCK), timeout=5.0)
+        except OSError as exc:
+            self.stats["capacity_unknown"] += 1
+            log.warning(f"[RESEARCH_SPOOL] cannot open the reservation "
+                        f"lock: {exc}")
+            return False
+        try:
+            with lock:
+                return self._reserve_and_write(record, payload)
+        except TimeoutError:
+            # Another writer is holding the spool. Refuse rather than queue
+            # behind it: research is the thing that gives way.
+            self.stats["reservation_timeouts"] += 1
+            log.warning("[RESEARCH_SPOOL] another writer holds the spool; "
+                        "this record is NOT spooled")
+            return False
+
+    def _reserve_and_write(self, record: dict, payload: bytes) -> bool:
+        """Under the reservation lock: decide, take the slot, write it."""
+        try:
             self.prune()
-            records, temp = self._scan()
+            capacity = self.capacity()
         except SpoolCapacityUnknown as exc:
             # FAIL CLOSED. We do not know how full the spool is, so we do not
             # add to it.
@@ -224,24 +381,28 @@ class BoundedSpool:
             self.stats["capacity_unknown"] += 1
             log.warning(f"[RESEARCH_SPOOL] spool directory unusable: {exc}")
             return False
-        temp_bytes = sum(size for _n, size, _m in temp)
-        self.stats["temp_files"] = len(temp)
-        self.stats["temp_bytes"] = temp_bytes
-        used = sum(size for _n, size, _m in records) + temp_bytes
-        if len(records) >= self.max_records or \
-                used + len(payload) > self.max_bytes:
+        self.stats["temp_files"] = capacity["partials"]
+        self.stats["temp_bytes"] = capacity["partial_bytes"]
+        # AA-11: COMPLETE files, PARTIAL files and BYTES, all three.
+        if capacity["occupied"] >= self.max_records or \
+                capacity["used_bytes"] + len(payload) > self.max_bytes:
             self.stats["dropped_full"] += 1
             log.warning(
-                f"[RESEARCH_SPOOL] spool full ({len(records)}/"
-                f"{self.max_records} records, {used}/{self.max_bytes} bytes) "
-                f"-- {record.get('contract_id')} NOT spooled")
+                f"[RESEARCH_SPOOL] spool full ({capacity['records']} records "
+                f"+ {capacity['partials']} partial(s) against "
+                f"{self.max_records}, {capacity['used_bytes']}/"
+                f"{self.max_bytes} bytes) -- {record.get('contract_id')} NOT "
+                f"spooled")
             return False
         name = f"{str(record.get('emitted_at_utc', '')).replace(':', '')}-" \
                f"{str(record.get('record_sha256', ''))[:16]}{RECORD_SUFFIX}"
         path = os.path.join(self.directory, name)
         if os.path.exists(path):
             return False                    # identical observation, same second
-        tmp = path + TEMP_SUFFIX
+        # The temp name carries OUR pid, so a crash here leaves a partial that
+        # the next startup can recognise as ours and reclaim immediately.
+        self._sequence += 1
+        tmp = f"{path}.{os.getpid()}{TEMP_SUFFIX}"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
             try:
@@ -250,6 +411,7 @@ class BoundedSpool:
             finally:
                 os.close(fd)
             os.replace(tmp, path)
+            self._fsync_directory()
         except OSError as exc:
             self.stats["write_errors"] += 1
             log.warning(f"[RESEARCH_SPOOL] write failed: {exc}")
@@ -261,6 +423,32 @@ class BoundedSpool:
         self.stats["written"] += 1
         return True
 
+    def _fsync_directory(self) -> None:
+        """Make the RENAME durable, not just the bytes.
+
+        An fsync on the file persists its contents; the directory entry that
+        gives those contents a name is a separate write. Without this a crash
+        can leave a spool whose records are on the platter under no name at
+        all -- which reads, on restart, as evidence that was never produced.
+        """
+        try:
+            fd = os.open(self.directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
+#: Queue item kinds. A diagnostic travels the SAME bounded queue as a record,
+#: so the engine thread has exactly one non-blocking hand-off to make and one
+#: pressure policy to obey.
+ITEM_RECORD = "record"
+ITEM_NOTE = "note"
+
 
 class ResearchWriter:
     """Bounded queue plus one isolated writer thread.
@@ -269,6 +457,21 @@ class ResearchWriter:
     `put_nowait` on a bounded queue either succeeds immediately or raises
     `queue.Full`, which is recorded as a DROP. Research work is the thing that
     gives way under pressure -- never the decision cycle.
+
+    AA-10 (re-audit) -- DIAGNOSTICS TRAVEL THE SAME WAY AS DATA
+        The first remediation moved `write`, `fsync` and `prune` onto this
+        thread and left `log.info`/`log.warning` on the caller's. That is not
+        a smaller version of the same problem, it is the same problem:
+        `logging.Handler.emit` takes a lock and writes synchronously, and the
+        research logger's handler writes to the very volume the fsync was
+        moved off. A stalled volume therefore still stalled the decision
+        cycle -- through the diagnostics instead of through the data.
+
+        So `note()` is the only way the producer says anything, it is
+        `put_nowait` on this same bounded queue, and the `log` call happens on
+        the writer thread. Under pressure a diagnostic is DROPPED, counted,
+        and the drop itself is reported later -- the engine never waits to be
+        told something.
     """
 
     def __init__(self, spool: BoundedSpool, *, max_queue=256,
@@ -282,7 +485,11 @@ class ResearchWriter:
         self._thread = None
         self._stop = threading.Event()
         self.stats = {"offered": 0, "queued": 0, "dropped_queue_full": 0,
-                      "dropped_queue_bytes": 0, "drained": 0}
+                      "dropped_queue_bytes": 0, "drained": 0,
+                      # AA-10: diagnostics that never reached the writer.
+                      # Counted rather than logged, because logging a dropped
+                      # log on the engine thread would be the original bug.
+                      "notes": 0, "dropped_notes": 0}
         if start:
             self.start()
 
@@ -303,12 +510,37 @@ class ResearchWriter:
                 self.stats["dropped_queue_bytes"] += 1
                 return False
             try:
-                self._queue.put_nowait((record, size))
+                self._queue.put_nowait((ITEM_RECORD, record, size))
             except queue.Full:
                 self.stats["dropped_queue_full"] += 1
                 return False
             self._queued_bytes += size
             self.stats["queued"] += 1
+        return True
+
+    def note(self, level: int, message: str) -> bool:
+        """Say something, later, on the writer's thread (AA-10).
+
+        NEVER logs here. The message is a plain string built by the caller;
+        formatting it is cheap and in memory, emitting it is not, and only the
+        second one is allowed to touch a device the engine shares.
+
+        A dropped note is counted, never retried and never escalated: a
+        research subsystem that will not stay quiet under pressure is a
+        research subsystem that can stall the money path to be heard.
+        """
+        size = len(message) + 64
+        with self._lock:
+            if self._queued_bytes + size > self.max_queue_bytes:
+                self.stats["dropped_notes"] += 1
+                return False
+            try:
+                self._queue.put_nowait((ITEM_NOTE, (int(level), message), size))
+            except queue.Full:
+                self.stats["dropped_notes"] += 1
+                return False
+            self._queued_bytes += size
+            self.stats["notes"] += 1
         return True
 
     # ── writer side: owns every blocking operation ──────────────────────
@@ -329,12 +561,19 @@ class ResearchWriter:
             self._handle(item)
 
     def _handle(self, item) -> None:
-        record, size = item
+        kind, payload, size = item
         try:
-            self.spool.write(record)
+            if kind == ITEM_NOTE:
+                # AA-10: the ONLY place the producer's diagnostics are
+                # emitted. On the writer's thread, where a slow handler costs
+                # research latency and nothing else.
+                level, message = payload
+                log.log(level, message)
+            else:
+                self.spool.write(payload)
         except Exception as exc:                              # noqa: BLE001
             # The writer thread must outlive any single bad record.
-            log.warning(f"[RESEARCH_WRITER] record dropped: "
+            log.warning(f"[RESEARCH_WRITER] {kind} dropped: "
                         f"{type(exc).__name__}: {exc}")
         finally:
             with self._lock:

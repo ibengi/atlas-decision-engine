@@ -9,11 +9,13 @@ on:
     branches:
       - alpha/astra-learning-v1
       - alpha/astra-candidate-feed-v2-remediation
+      - alpha/astra-candidate-feed-v3-remediation
   pull_request:
     branches:
       - main
       - alpha/astra-learning-v1
       - alpha/astra-candidate-feed-v2-remediation
+      - alpha/astra-candidate-feed-v3-remediation
 
 jobs:
   test-learning:
@@ -44,10 +46,28 @@ jobs:
       - name: Astra AA-01..AA-18 regression suite
         run: python -m pytest tests/test_astra_aa01_aa18_remediation.py -q
 
+      # The re-audit's eleven remaining findings, each reproduced first.
+      # Its own step so a failure names the finding rather than being buried.
+      - name: Astra v3 re-audit regression suite
+        run: python -m pytest tests/test_astra_v3_remediation.py -q
+
+      # The specific classes the re-audit asked to see run: crash/restart,
+      # mixed writers, spool partials and capacity, settlement omission,
+      # and the M07P mutation.
+      - name: Crash, restart, mixed-writer, spool and settlement tests
+        run: |
+          python -m pytest tests/test_astra_v3_remediation.py -q \
+            -k "AA12 or AA13 or AA13b or AA13c or AA14 or AA11 or AA15 or M07P"
+
       # AA-17. Effect-based: these are the assertions the two surviving
       # mutations would have defeated.
       - name: Mutation regression (effect, not counters)
         run: python -m pytest tests/test_astra_mutation_regression.py -q
+
+      # Every mutation applied to a throwaway copy of the repo and asserted
+      # KILLED. Zero survivors is the claim; this is what backs it.
+      - name: Mutation probe (zero survivors)
+        run: python tools/astra_mutation_probe.py
 
       # AA-02. The strict shared contract, on its own.
       - name: Strict contract, crash and concurrency tests
@@ -72,6 +92,7 @@ jobs:
               pathlib.Path('alpha_feed_readiness.py'),
               pathlib.Path('alpha_consumer.py'),
               pathlib.Path('research_feed.py'),
+              pathlib.Path('alpha_service.py'),
               pathlib.Path('tools/alpha_learning_report.py'),
               pathlib.Path('tools/alpha_resolution_ingest.py'),
               pathlib.Path('tools/alpha_feed_readiness.py'),

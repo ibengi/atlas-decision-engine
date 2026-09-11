@@ -77,11 +77,31 @@ class FeedCase(AlphaCase):
         return accepted
 
     def spool_bytes(self) -> dict:
+        """Every spooled RECORD, by name.
+
+        Only `.json` files. The producer also keeps its capacity-reservation
+        lock inside this directory -- deliberately, so that "it writes only
+        under its own spool directory" stays true -- and that lock is not
+        evidence: it is never read by the consumer, never counted against the
+        bound and never pruned. `all_spool_bytes()` covers it where a test
+        needs the whole directory.
+        """
+        return {n: b for n, b in self.all_spool_bytes().items()
+                if n.endswith(".json")}
+
+    def all_spool_bytes(self) -> dict:
+        """Every byte in the spool directory, records and lock alike."""
         directory = spool_dir()
         if not os.path.isdir(directory):
             return {}
-        return {n: open(os.path.join(directory, n), "rb").read()
-                for n in sorted(os.listdir(directory))}
+        out = {}
+        for name in sorted(os.listdir(directory)):
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            with open(path, "rb") as fh:
+                out[name] = fh.read()
+        return out
 
 
 class TheProducerEmitsUsableCandidates(FeedCase):
@@ -171,7 +191,7 @@ class TheProducerCannotHurtTheEngine(FeedCase):
 
     def test_the_spool_is_bounded_by_age(self):
         self.emit("KX-OLD")
-        old = os.path.join(spool_dir(), sorted(os.listdir(spool_dir()))[0])
+        old = os.path.join(spool_dir(), sorted(self.spool_bytes())[0])
         os.utime(old, (0, 0))
         with patch.object(CFG, "RESEARCH_FEED_MAX_AGE_S", 60.0):
             self.emit("KX-NEW")
@@ -232,7 +252,7 @@ class TheConsumerMintsAndDeduplicates(FeedCase):
         self.emit()
         # a second identical record, written directly to simulate two
         # scanner cycles landing in the same second
-        name = sorted(os.listdir(spool_dir()))[0]
+        name = sorted(self.spool_bytes())[0]
         payload = open(os.path.join(spool_dir(), name), "rb").read()
         with open(os.path.join(spool_dir(), "zz-copy.json"), "wb") as fh:
             fh.write(payload)

@@ -134,13 +134,24 @@ def exclusive_lock(path: str, *, timeout: float = 10.0):
 def append_line(path: str, line: str) -> None:
     """Durably append one newline-terminated line. Never rewrites history.
 
+    RETURNS ONLY AFTER `fsync` HAS SUCCEEDED (AA-13 re-audit). `write()`
+    returning means the bytes are in the page cache, from which they read
+    back perfectly while still being one power cut away from never having
+    existed. Only a successful `fsync` makes a read-back meaningful, so this
+    function either completes the whole sequence or raises -- there is no
+    outcome in which a caller is told "written" without durability having
+    been attempted AND confirmed.
+
     Caller holds `exclusive_lock` when the append depends on a prior read.
+    The torn-tail check below is itself such a read, so `serialized_append`
+    is what every writer should actually call.
     """
     if not line.endswith("\n"):
         line += "\n"
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
+    created = not os.path.exists(path)
     separator = b"\n" if tail_is_torn(path) else b""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
@@ -153,3 +164,36 @@ def append_line(path: str, line: str) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
+    if created and parent:
+        # The bytes are durable; the NAME they live under is a separate
+        # write. Without this a crash can leave a fsynced file that no
+        # directory entry points at, which reads afterwards as a ledger that
+        # never existed.
+        _fsync_directory(parent)
+
+
+def _fsync_directory(parent: str) -> None:
+    try:
+        fd = os.open(parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def serialized_append(path: str, *, timeout: float = 10.0):
+    """Hold the writer lock for a check-then-append on `path` (AA-14).
+
+    Yields a callable that appends one line. Every appender to a shared file
+    goes through this, including the ones that "only append": the torn-tail
+    check inside `append_line` is a READ of the file's last byte, and two
+    unsynchronized writers can both observe an intact tail and then both
+    write, or observe a torn one and both separate it.
+    """
+    with exclusive_lock(path, timeout=timeout):
+        yield lambda line: append_line(path, line)

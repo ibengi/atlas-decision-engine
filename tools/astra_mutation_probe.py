@@ -114,6 +114,19 @@ MUTATIONS = {
         ["tests/test_astra_aa01_aa18_remediation.py::AA01_DerivedQuotesArePresentedAsObserved",
          "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts"],
     ),
+    # M07 deletes the quote-observation check entirely. M07P is the harder
+    # variant the re-audit asked for: leave the check in place and simply
+    # accept `derived` as admissible evidence. A complete, correctly
+    # checksummed, correctly attributed record that says its quotes were
+    # derived must still produce ZERO snapshots and ZERO durable predictions.
+    "M07P": (
+        "accept a complete record whose quotes are declared DERIVED",
+        "candidate_contract.py",
+        "        elif kind != QUOTE_OBSERVED:\n",
+        "        elif kind not in QUOTE_OBSERVATION_KINDS:\n",
+        ["tests/test_astra_v3_remediation.py::M07P_CompleteRecordWithDerivedQuotes",
+         "tests/test_astra_aa01_aa18_remediation.py::AA01_DerivedQuotesArePresentedAsObserved"],
+    ),
     "M08": (
         "add a forbidden execution import to the producer",
         "research_feed.py",
@@ -127,8 +140,12 @@ MUTATIONS = {
         "research_feed.py",
         "        except Exception as e:                                # noqa: BLE001\n"
         "            self.rejected += 1\n"
-        '            log.warning(f"[RESEARCH_FEED] candidate dropped: "\n'
-        '                        f"{type(e).__name__}: {e}")\n'
+        "            # AA-10 (re-audit): DEFERRED, not logged. `log.warning` here runs\n"
+        "            # the handler on the engine's thread, and the handler writes to\n"
+        "            # the same volume the fsync was moved off.\n"
+        "            self._note(logging.WARNING,\n"
+        '                       f"[RESEARCH_FEED] candidate dropped: "\n'
+        '                       f"{type(e).__name__}: {e}")\n'
         "            return False\n",
         "        except Exception:                                     # noqa: BLE001\n"
         "            raise\n",
@@ -163,6 +180,142 @@ MUTATIONS = {
         '            record["record_sha256"] = __import__(\n'
         '                "candidate_contract").compute_checksum(record)\n',
         ["tests/test_astra_mutation_regression.py::M11_AcceptLegacyWhileKeepingDiagnostics"],
+    ),
+    # ── v3 re-audit: one mutation per newly closed invariant ────────────
+    "M12": (
+        "coerce a numeric settlement-source member into a name (AA-02)",
+        "research_feed.py",
+        "            candidate = value[key]\n"
+        "            # The type check happens HERE, before any string conversion.\n"
+        "            if not isinstance(candidate, str):\n"
+        "                return None\n"
+        "            text = candidate.strip()\n",
+        "            candidate = value[key]\n"
+        "            text = str(candidate).strip()\n",
+        ["tests/test_astra_v3_remediation.py::AA02_NumericSettlementMembersAreCoercedToText"],
+    ),
+    "M13": (
+        "file a contradiction as an ordinary absence (AA-03)",
+        "research_feed.py",
+        "        except AliasContradiction as exc:\n"
+        "            contradictions[field] = {k: _diagnostic(v)\n"
+        "                                     for k, v in exc.values.items()}\n"
+        "            facts[field] = None\n"
+        "            # Deliberately NOT appended to `unavailable_fields`.\n"
+        "            continue\n",
+        "        except AliasContradiction:\n"
+        "            facts[field] = None\n"
+        "            unavailable.append(field)\n"
+        "            continue\n",
+        ["tests/test_astra_v3_remediation.py::AA03_ContradictionWasDowngradedToAbsence"],
+    ),
+    "M14": (
+        "count only complete files against the spool bound (AA-11)",
+        "research_spool.py",
+        '        if capacity["occupied"] >= self.max_records or \\\n',
+        '        if capacity["records"] >= self.max_records or \\\n',
+        ["tests/test_astra_v3_remediation.py::AA11_PartialWritesEscapedTheBound"],
+    ),
+    "M15": (
+        "treat readable bytes as proof of a durable commit (AA-13)",
+        "alpha_ledger.py",
+        "        return self.committed_prediction(market_snapshot_id) is not None\n",
+        "        return self.find_prediction_by_analysis(\n"
+        "            analysis_identity(market_snapshot_id)) is not None\n",
+        ["tests/test_astra_v3_remediation.py::AA13_ReadableBytesWereTreatedAsCommitted"],
+    ),
+    "M16": (
+        "accept a partial settlement binding as verified (AA-15)",
+        "alpha_resolution_ingest.py",
+        "        missing = _missing_binding(row[\"supplied_binding\"], committed)\n",
+        "        missing = []\n",
+        ["tests/test_astra_v3_remediation.py::AA15_PartialBindingWasAcceptedAsVerified"],
+    ),
+    "M17": (
+        "trust an unqualified settlement source by default (AA-15)",
+        "alpha_resolution_ingest.py",
+        "        if not allowed:\n",
+        "        if False:\n",
+        ["tests/test_astra_v3_remediation.py::AA15b_UnqualifiedSourcesWereTrustedByDefault"],
+    ),
+    "M18": (
+        "let the processed store skip the durable append protocol (AA-12)",
+        "alpha_consumer.py",
+        "            with serialized_append(self.path) as append:\n"
+        "                append(line)\n",
+        "            fd = os.open(self.path,\n"
+        "                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)\n"
+        "            try:\n"
+        "                os.write(fd, line.encode(\"utf-8\"))\n"
+        "                os.fsync(fd)\n"
+        "            finally:\n"
+        "                os.close(fd)\n",
+        ["tests/test_astra_v3_remediation.py::AA12_ProcessedStoreBypassedTheDurableProtocol"],
+    ),
+    "M19": (
+        "raise instead of failing closed on a malformed number (NEW-01)",
+        "candidate_contract.py",
+        "    except Exception as exc:                                  # noqa: BLE001\n"
+        "        return [f\"record could not be validated ({type(exc).__name__}: \"\n"
+        "                f\"{exc}); a value the contract cannot classify is refused\"]\n",
+        "    except Exception:                                         # noqa: BLE001\n"
+        "        raise\n",
+        ["tests/test_astra_v3_remediation.py::NEW01_MalformedNumbersRaiseInsteadOfFailingClosed"],
+    ),
+    "M20": (
+        "dispatch to providers without a durable PREPARE (AA-13)",
+        "alpha_service.py",
+        "            return self._defer_without_dispatch(\n"
+        "                snapshot, f\"prepare_not_durable: {type(e).__name__}\")\n",
+        "            pass\n",
+        ["tests/test_astra_v3_remediation.py::AA13c_PrepareFailureDidNotStopDispatch"],
+    ),
+    "M21": (
+        "re-dispatch an analysis that was already committed (AA-13)",
+        "alpha_service.py",
+        "        if recovered is not None:\n"
+        "            return self._acknowledge_recovered(snapshot, recovered)\n",
+        "        if False:\n"
+        "            return self._acknowledge_recovered(snapshot, recovered)\n",
+        ["tests/test_astra_v3_remediation.py::AA13b_RestartPaidTwiceForACommittedAnalysis"],
+    ),
+    "M22": (
+        "leave an unserialized appender on a shared file (AA-14)",
+        "alpha_ledger.py",
+        "        with self.log.lock():\n"
+        "            existing = self.find_invalidation(prediction_id)\n",
+        "        if True:\n"
+        "            existing = self.find_invalidation(prediction_id)\n",
+        ["tests/test_astra_v3_remediation.py::AA14_UnserializedAppendersAndStaleCaches"],
+    ),
+    "M23": (
+        "protect a guessed processed-state path instead of the real one (AA-16)",
+        "alpha_learning_runtime.py",
+        "    store_path = getattr(processed_store, \"path\", None)\n"
+        "    if store_path:\n"
+        "        paths.setdefault(os.path.realpath(store_path), \"processed ledger\")\n"
+        "    # The configured path, resolved exactly as `ProcessedStore` resolves it.\n"
+        "    paths.setdefault(os.path.realpath(_p(CFG.ALPHA_STATE_FILE)),\n"
+        "                     \"processed ledger\")\n",
+        "",
+        ["tests/test_astra_v3_remediation.py::AA16_ProtectionMissedTheConfiguredProcessedPath"],
+    ),
+    "M24": (
+        "drop the source evidence the digest describes (AA-15)",
+        "alpha_service.py",
+        "        \"source_evidence\": json.loads(json.dumps(evidence, default=str))\n"
+        "        if evidence else {},\n",
+        "        \"source_evidence\": {},\n",
+        ["tests/test_astra_v3_remediation.py::AA15c_SourceDigestCouldNotBeReverifiedAfterPruning"],
+    ),
+    "M25": (
+        "log synchronously on the engine's own thread (AA-10)",
+        "research_feed.py",
+        "        try:\n"
+        "            self.writer.note(level, message)\n",
+        "        try:\n"
+        "            log.log(level, message)\n",
+        ["tests/test_astra_v3_remediation.py::AA10_ResearchLoggingStillBlockedTheCycle"],
     ),
 }
 

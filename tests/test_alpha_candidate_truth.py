@@ -170,12 +170,29 @@ class TruthCase(AlphaCase):
         return accepted
 
     def spool_bytes(self) -> dict:
+        """Every spooled RECORD, by name.
+
+        Only `.json` files. The producer also keeps its capacity-reservation
+        lock inside this directory -- deliberately, so that "it writes only
+        under its own spool directory" stays true -- and that lock is not
+        evidence: it is never read by the consumer, never counted against the
+        bound and never pruned. `all_spool_bytes()` covers it where a test
+        needs the whole directory.
+        """
+        return {n: b for n, b in self.all_spool_bytes().items()
+                if n.endswith(".json")}
+
+    def all_spool_bytes(self) -> dict:
+        """Every byte in the spool directory, records and lock alike."""
         directory = spool_dir()
         if not os.path.isdir(directory):
             return {}
         out = {}
         for name in sorted(os.listdir(directory)):
-            with open(os.path.join(directory, name), "rb") as fh:
+            path = os.path.join(directory, name)
+            if not os.path.isfile(path):
+                continue
+            with open(path, "rb") as fh:
                 out[name] = fh.read()
         return out
 
@@ -474,7 +491,7 @@ class TheConsumerRefusesWhatItCannotAttribute(TruthCase):
         record.pop("field_provenance")
         self.write_raw(record, "noprov.json")
         os.remove(os.path.join(spool_dir(), sorted(
-            n for n in os.listdir(spool_dir()) if n != "noprov.json")[0]))
+            n for n in self.spool_bytes() if n != "noprov.json")[0]))
         consumer = self.consumer()
         self.assertEqual(consumer.pending(), [])
         # A record whose provenance container is gone also fails its checksum,
@@ -619,7 +636,11 @@ class ThePredictionLedgerIsAppendOnly(TruthCase):
             lines = fh.read()
         self.assertTrue(lines.startswith(first_line),
                         "the prediction row was rewritten by the resolution")
-        self.assertEqual(len(lines.splitlines()), 2)
+        # PREDICTION, its COMMIT receipt (AA-13 re-audit), then RESOLUTION.
+        # The count moved because a receipt is now written; the property
+        # under test -- the prediction row is not touched -- did not.
+        self.assertEqual([json.loads(x)["kind"] for x in lines.splitlines()],
+                         ["PREDICTION", "COMMIT", "RESOLUTION"])
 
     def test_an_outcome_is_written_once(self):
         ledger = self.ledger()
@@ -643,7 +664,7 @@ class ThePredictionLedgerIsAppendOnly(TruthCase):
         with open(ledger.log.path, "a", encoding="utf-8") as fh:
             fh.write('{"kind": "prediction", "predi')
         torn_bytes = open(ledger.log.path, "rb").read()
-        rows = ledger.rows()
+        rows = [r for r in ledger.rows() if r["kind"] == "PREDICTION"]
         self.assertEqual([r.get("prediction_id") for r in rows],
                          ["p-1", "p-2"])
         # AA-12: a later append must not splice itself onto the damaged
@@ -654,7 +675,8 @@ class ThePredictionLedgerIsAppendOnly(TruthCase):
         after = open(ledger.log.path, "rb").read()
         self.assertTrue(after.startswith(torn_bytes),
                         "the torn tail was rewritten or truncated")
-        self.assertEqual([r.get("prediction_id") for r in ledger.rows()],
+        self.assertEqual([r.get("prediction_id") for r in ledger.rows()
+                          if r["kind"] == "PREDICTION"],
                          ["p-1", "p-2", "p-3"])
 
     def test_a_corrupt_middle_row_is_not_read_as_end_of_file(self):
@@ -663,7 +685,8 @@ class ThePredictionLedgerIsAppendOnly(TruthCase):
         with open(ledger.log.path, "a", encoding="utf-8") as fh:
             fh.write("not json at all\n")
         ledger.record_prediction(self.prediction("p-2"))
-        self.assertEqual([r.get("prediction_id") for r in ledger.rows()],
+        self.assertEqual([r.get("prediction_id") for r in ledger.rows()
+                          if r["kind"] == "PREDICTION"],
                          ["p-1", "p-2"])
 
     def test_the_ledger_opens_its_file_only_to_append_or_to_read(self):
@@ -691,35 +714,52 @@ class ThePredictionLedgerIsAppendOnly(TruthCase):
 
 class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
 
+    #: Since the AA-15 re-audit a settlement must carry the complete
+    #: required binding and name a source an operator has qualified. The
+    #: fixture carries both because a real one does.
+    BINDING = {"contract_id": "KXBTCD-TRUTH",
+               "market_snapshot_id": "snap-truth",
+               "record_sha256": "e" * 64}
+    TRUSTED = ["kalshi feed"]
+
     def ledger_with_prediction(self, pid="p-1"):
         ledger = AlphaLedger(
             path=os.path.join(self._tmp, "alpha_ledger.jsonl"),
             cost_path=os.path.join(self._tmp, "alpha_cost.jsonl"))
         ledger.record_prediction({"prediction_id": pid,
                                   "contract_id": "KXBTCD-TRUTH",
+                                  "market_snapshot_id": "snap-truth",
+                                  "source_binding": dict(self.BINDING),
                                   "p_yes": 0.61, "executed": False})
         return ledger
 
     def settlement(self, **over):
-        row = {"prediction_id": "p-1", "outcome": 1, "source": "kalshi feed"}
+        row = {"prediction_id": "p-1", "outcome": 1, "source": "kalshi feed",
+               "contract_id": self.BINDING["contract_id"],
+               "market_snapshot_id": self.BINDING["market_snapshot_id"],
+               "source_record_sha256": self.BINDING["record_sha256"]}
         row.update(over)
         return row
 
+    def ingest(self, ledger, rows, **kw):
+        kw.setdefault("trusted_sources", self.TRUSTED)
+        return ingest_settlements(ledger, rows, **kw)
+
     def test_the_same_settlement_twice_appends_once(self):
         ledger = self.ledger_with_prediction()
-        first = ingest_settlements(ledger, [self.settlement()])
+        first = self.ingest(ledger, [self.settlement()])
         self.assertEqual(first["appended"], 1)
         rows_after_first = len(ledger.rows())
-        second = ingest_settlements(ledger, [self.settlement()])
+        second = self.ingest(ledger, [self.settlement()])
         self.assertEqual(second["appended"], 0)
         self.assertEqual(second["idempotent"], 1)
         self.assertEqual(len(ledger.rows()), rows_after_first)
 
     def test_a_contradictory_settlement_is_reported_and_not_written(self):
         ledger = self.ledger_with_prediction()
-        ingest_settlements(ledger, [self.settlement(outcome=1)])
+        self.ingest(ledger, [self.settlement(outcome=1)])
         before = len(ledger.rows())
-        result = ingest_settlements(ledger, [self.settlement(outcome=0)])
+        result = self.ingest(ledger, [self.settlement(outcome=0)])
         self.assertEqual(result["appended"], 0)
         self.assertEqual(len(result["conflicts"]), 1)
         self.assertEqual(len(ledger.rows()), before)
@@ -727,7 +767,7 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
 
     def test_an_unknown_prediction_is_rejected_rather_than_invented(self):
         ledger = self.ledger_with_prediction()
-        result = ingest_settlements(ledger, [self.settlement(
+        result = self.ingest(ledger, [self.settlement(
             prediction_id="p-does-not-exist")])
         self.assertEqual(result["appended"], 0)
         self.assertEqual(result["rejected"][0]["reason"],
@@ -736,7 +776,7 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
     def test_a_settlement_without_a_source_is_rejected(self):
         """An outcome with no stated source is not evidence, however true."""
         ledger = self.ledger_with_prediction()
-        result = ingest_settlements(ledger, [self.settlement(source="")])
+        result = self.ingest(ledger, [self.settlement(source="")])
         self.assertEqual(result["appended"], 0)
         # The message now comes from the shared contract's `strict_text`,
         # which refuses a whitespace-only source as well as an empty one.
@@ -917,7 +957,7 @@ class EveryFailurePathLeavesTheEngineUntouched(TruthCase):
 
     def test_aged_out_evidence_is_pruned_by_the_owner_of_the_bytes(self):
         self.emit(market(ticker="KX-OLD"))
-        old = os.path.join(spool_dir(), sorted(os.listdir(spool_dir()))[0])
+        old = os.path.join(spool_dir(), sorted(self.spool_bytes())[0])
         stale = time.time() - float(CFG.RESEARCH_FEED_MAX_AGE_S) - 60
         os.utime(old, (stale, stale))
         self.emit(market(ticker="KX-NEW"))

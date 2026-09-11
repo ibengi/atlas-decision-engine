@@ -53,8 +53,14 @@ ALLOWED_IMPORTS = frozenset({"datetime", "hashlib", "json", "logging", "os",
 #: transitively without touching `research_feed.py` at all.
 NEUTRAL_MODULES = {
     "candidate_contract.py": frozenset({"hashlib", "json", "math", "datetime"}),
+    # `re` parses the owner pid out of a partial's name; `durable_append`
+    # supplies the advisory lock the capacity RESERVATION is serialized on
+    # (AA-11 re-audit). `durable_append` is itself pinned below, so reaching
+    # it widens nothing: it imports contextlib, errno, os, fcntl and time,
+    # and no repository module at all.
     "research_spool.py": frozenset({"errno", "json", "logging", "os", "queue",
-                                    "threading", "time"}),
+                                    "re", "threading", "time",
+                                    "durable_append"}),
     "durable_append.py": frozenset({"contextlib", "errno", "os", "fcntl",
                                     "time"}),
 }

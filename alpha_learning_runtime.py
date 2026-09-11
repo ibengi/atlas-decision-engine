@@ -42,8 +42,29 @@ def learning_snapshot(ledger, *, astra_selector="astra",
 #: report is a VIEW; an `os.replace` onto a source ledger would destroy the
 #: append-only history the whole subsystem rests on, in one syscall, with no
 #: trace and no recovery.
-def _protected_source_paths(ledger, directory) -> dict:
-    from config import CFG
+def _protected_source_paths(ledger, directory, processed_store=None) -> dict:
+    """Every append-only source file a derived report must never replace.
+
+    AA-16 (re-audit) -- PROTECT THE PATH THE STORE ACTUALLY USES.
+        The two ledgers were protected by their REAL paths, read off the
+        ledger object. The processed store was protected by a reconstruction:
+        `os.path.join(directory, CFG.ALPHA_STATE_FILE)`.
+
+        `ProcessedStore` resolves its path as `_p(CFG.ALPHA_STATE_FILE)` --
+        against `CFG.DATA_DIR` -- and `directory` here is wherever the report
+        is being published, which need not be `DATA_DIR`. Configure a
+        nondefault relative state file, or publish a report outside the data
+        directory, and the guarded path was a file nobody writes while the
+        file the service appends every processed mark to was left open. A
+        report published over it destroys the record of every analysis
+        already paid for, in one `os.replace`, with no trace.
+
+        So: the store's own path when a store is supplied, the configured
+        path resolved the way the store resolves it, and the old
+        report-directory guess kept as well -- a superset is free, and each
+        entry is a path something in this system genuinely opens for writing.
+    """
+    from config import CFG, _p
     paths = {}
     for label, attr in (("prediction ledger", "log"),
                         ("cost ledger", "cost_log")):
@@ -51,12 +72,23 @@ def _protected_source_paths(ledger, directory) -> dict:
         path = getattr(source, "path", None)
         if path:
             paths[os.path.realpath(path)] = label
-    processed = os.path.join(directory, CFG.ALPHA_STATE_FILE)
-    paths.setdefault(os.path.realpath(processed), "processed ledger")
+    # The store's ACTUAL path, when the caller has one to hand.
+    store_path = getattr(processed_store, "path", None)
+    if store_path:
+        paths.setdefault(os.path.realpath(store_path), "processed ledger")
+    # The configured path, resolved exactly as `ProcessedStore` resolves it.
+    paths.setdefault(os.path.realpath(_p(CFG.ALPHA_STATE_FILE)),
+                     "processed ledger")
+    # And the report directory reading, which is what a co-located
+    # deployment produces.
+    paths.setdefault(
+        os.path.realpath(os.path.join(directory, CFG.ALPHA_STATE_FILE)),
+        "processed ledger")
     return paths
 
 
-def _assert_not_a_source_ledger(target, ledger, directory) -> None:
+def _assert_not_a_source_ledger(target, ledger, directory,
+                                processed_store=None) -> None:
     """Refuse to publish a report over a ledger (AA-16).
 
     Both paths are canonicalised with `realpath` first, so a symlink, a `..`
@@ -65,7 +97,8 @@ def _assert_not_a_source_ledger(target, ledger, directory) -> None:
     repeated on INODE identity, which catches a hard link -- the one alias
     `realpath` cannot see through.
     """
-    protected = _protected_source_paths(ledger, directory)
+    protected = _protected_source_paths(ledger, directory,
+                                        processed_store)
     resolved = os.path.realpath(target)
     if resolved in protected:
         raise ValueError(
@@ -89,12 +122,12 @@ def _assert_not_a_source_ledger(target, ledger, directory) -> None:
 
 
 def write_learning_report(ledger, directory, *, filename=DEFAULT_REPORT_FILE,
-                          **kwargs) -> dict:
+                          processed_store=None, **kwargs) -> dict:
     """Atomically publish a derived report without editing ledger history."""
     report = learning_snapshot(ledger, **kwargs)
     os.makedirs(directory, exist_ok=True)
     target = os.path.join(directory, filename)
-    _assert_not_a_source_ledger(target, ledger, directory)
+    _assert_not_a_source_ledger(target, ledger, directory, processed_store)
     fd, tmp = tempfile.mkstemp(prefix=".alpha-learning-", suffix=".tmp",
                                dir=directory, text=True)
     try:

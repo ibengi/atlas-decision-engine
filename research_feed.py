@@ -50,7 +50,8 @@ import logging
 import os
 from datetime import datetime, timezone
 
-from candidate_contract import (ContractError, FEED_SCHEMA, QUOTE_DERIVED,
+from candidate_contract import (AliasContradiction, ContractError,
+                                FEED_SCHEMA, QUOTE_DERIVED,
                                 QUOTE_FIELDS, QUOTE_OBSERVED, SOURCE_BINDING,
                                 compute_checksum, iso_second, provenance_path,
                                 resolve_alias, strict_number, validate_record)
@@ -79,25 +80,64 @@ def spool_dir() -> str:
     return os.path.join(CFG.DATA_DIR, SPOOL_DIRNAME)
 
 
-def _settlement_source_name(value):
-    """Kalshi records settlement sources as a list of objects.
+def _diagnostic(value) -> str:
+    """A conflicting alias value, rendered for a human to read.
 
-    Reads the name the exchange published. Never invents one, and never falls
-    back to the exchange's own name just because the market is listed there.
-    Returns None when the collection is malformed (AA-02: "malformed
-    settlement-source collections"), which reports the fact as ABSENT rather
-    than as a plausible string.
+    This is the ONE place in the producer where a non-string becomes a
+    string, and it is safe precisely because the result is never a fact: it
+    lands in `contradictory_fields`, which the contract treats as a reason to
+    REFUSE the record. Nothing downstream can mistake it for an observation,
+    because a record carrying it never becomes a snapshot.
+
+    A non-string keeps its type in the rendering (`int:12345`) so the AA-02
+    lesson survives here too: the integer `12345` and the string `"12345"`
+    are different claims, and a diagnostic that flattens them would leave an
+    operator unable to see which the exchange actually sent.
+    """
+    text = value if isinstance(value, str) \
+        else f"{type(value).__name__}:{value!r}"
+    return text if len(text) <= 200 else text[:197] + "..."
+
+
+def _settlement_source_name(value):
+    """The settlement authority the exchange PUBLISHED, as text, or None.
+
+    Kalshi records settlement sources as a list of objects. This reads the
+    name it published; it never invents one, and it never falls back to the
+    exchange's own name just because the market is listed there.
+
+    AA-02 (re-audit): TYPE FIRST, NEVER COERCE FIRST.
+        The previous version reached `str(name).strip()` after excluding only
+        dicts, lists and booleans, so `{"name": 12345}` became the settlement
+        source `"12345"`. An integer is a plausible internal identifier and a
+        wholly implausible settlement authority; once it is a string nothing
+        downstream can tell it apart from a name somebody published. The same
+        held for `{"url": 8080}`.
+
+        A member whose name is not TEXT is malformed, and one malformed member
+        taints the whole collection: a settlement source list that is half
+        readable is not half true.
+
+    The `name or url` fallback is also gone. `or` fires on the empty string,
+    so a member carrying `{"name": "", "url": ...}` silently reported the URL
+    as the authority's name -- "published an empty name" and "published no
+    name at all" are different facts and neither of them is the URL.
     """
     if isinstance(value, bool):
         return None
     if isinstance(value, str):
         return value.strip() or None
     if isinstance(value, dict):
-        name = value.get("name") or value.get("url")
-        if name is None or isinstance(name, (dict, list, bool)):
-            return None
-        text = str(name).strip()
-        return text or None
+        for key in ("name", "url"):
+            if key not in value:
+                continue
+            candidate = value[key]
+            # The type check happens HERE, before any string conversion.
+            if not isinstance(candidate, str):
+                return None
+            text = candidate.strip()
+            return text or None
+        return None
     if isinstance(value, (list, tuple)):
         names = []
         for item in value:
@@ -175,9 +215,28 @@ class ResearchFeed:
             return self.writer.offer(record, approx_bytes=self._size(record))
         except Exception as e:                                # noqa: BLE001
             self.rejected += 1
-            log.warning(f"[RESEARCH_FEED] candidate dropped: "
-                        f"{type(e).__name__}: {e}")
+            # AA-10 (re-audit): DEFERRED, not logged. `log.warning` here runs
+            # the handler on the engine's thread, and the handler writes to
+            # the same volume the fsync was moved off.
+            self._note(logging.WARNING,
+                       f"[RESEARCH_FEED] candidate dropped: "
+                       f"{type(e).__name__}: {e}")
             return False
+
+    def _note(self, level: int, message: str) -> None:
+        """Say something WITHOUT touching a device (AA-10).
+
+        Everything the producer has to report is handed to the writer and
+        emitted on its thread. `note()` is `put_nowait` on a bounded queue:
+        it cannot block, and under pressure the diagnostic is dropped and
+        counted rather than allowed to slow the cycle down.
+        """
+        try:
+            self.writer.note(level, message)
+        except Exception:                                     # noqa: BLE001
+            # A failure to say something is never allowed to become a failure
+            # of the thing that was trying to speak.
+            pass
 
     @staticmethod
     def _size(record: dict) -> int:
@@ -206,11 +265,14 @@ class ResearchFeed:
         provenance = candidate.get("field_provenance")
         unavailable = candidate.get("unavailable_fields")
         observation = candidate.get("quote_observation")
+        contradictions = candidate.get("contradictory_fields") or {}
         if not isinstance(provenance, dict) or not isinstance(unavailable, list) \
-                or not isinstance(observation, dict):
+                or not isinstance(observation, dict) \
+                or not isinstance(contradictions, dict):
             self.rejected += 1
-            log.debug("[RESEARCH_FEED] candidate carries no provenance "
-                      "container")
+            self._note(logging.DEBUG,
+                       "[RESEARCH_FEED] candidate carries no provenance "
+                       "container")
             return None
 
         content = {
@@ -242,6 +304,11 @@ class ResearchFeed:
             "unavailable_fields": sorted({str(f) for f in unavailable}),
             "quote_observation": {str(k): str(v)
                                   for k, v in sorted(observation.items())},
+            # AA-03: inside the digest, so a contradiction cannot be edited
+            # out of a record without invalidating it.
+            "contradictory_fields": {
+                str(f): {str(k): _diagnostic(v) for k, v in sorted(vals.items())}
+                for f, vals in sorted(contradictions.items())},
             **{f: candidate.get(f) for f in QUOTE_FIELDS},
         }
         content["record_sha256"] = compute_checksum(content)
@@ -253,17 +320,22 @@ class ResearchFeed:
             derived = [e for e in errors if "not directly observed" in e]
             if derived:
                 self.refused_derived += 1
-                log.info(f"[RESEARCH_FEED] {content.get('contract_id')} NOT "
-                         f"emitted -- {len(derived)} quote(s) were DERIVED by "
-                         f"execution normalization, not observed: {derived}")
+                self._note(logging.INFO,
+                           f"[RESEARCH_FEED] {content.get('contract_id')} NOT "
+                           f"emitted -- {len(derived)} quote(s) were DERIVED "
+                           f"by execution normalization, not observed: "
+                           f"{derived}")
             else:
                 self.refused_incomplete += 1
                 # Named, at INFO, because this is the visible research signal
                 # that the source is not yet carrying the facts Alpha needs.
                 # It is a research failure and nothing else: no sentinel, no
-                # decision.
-                log.info(f"[RESEARCH_FEED] {content.get('contract_id')} NOT "
-                         f"emitted -- {errors}; these are never reconstructed")
+                # decision -- and, since AA-10, not a log call on the caller's
+                # thread either.
+                self._note(logging.INFO,
+                           f"[RESEARCH_FEED] {content.get('contract_id')} NOT "
+                           f"emitted -- {errors}; these are never "
+                           f"reconstructed")
             return None
         return content
 
@@ -300,6 +372,12 @@ def candidate_from_market(market: dict, book: dict, *, raw_book: dict = None,
     book = book if isinstance(book, dict) else {}
     raw = raw_book if isinstance(raw_book, dict) else market
     facts, provenance, unavailable, observation = {}, {}, [], {}
+    #: AA-03 (re-audit). field -> every alias value the source supplied.
+    #: A contradiction is PRESERVED here and refused by the contract; it is
+    #: never written into `unavailable_fields`, because filing "the source
+    #: answered twice, differently" as "the source said nothing" is how a
+    #: self-contradicting feed came to look like a quiet market.
+    contradictions = {}
 
     for field in MARKET_FIELDS:
         keys = SOURCE_BINDING[field][1]
@@ -308,9 +386,13 @@ def candidate_from_market(market: dict, book: dict, *, raw_book: dict = None,
         try:
             value, key = resolve_alias(market, field, keys,
                                        comparator=comparator)
-        except ContractError as exc:
-            # AA-03: contradictory aliases are a refusal, never a silent pick.
-            log.info(f"[RESEARCH_FEED] {exc}")
+        except AliasContradiction as exc:
+            contradictions[field] = {k: _diagnostic(v)
+                                     for k, v in exc.values.items()}
+            facts[field] = None
+            # Deliberately NOT appended to `unavailable_fields`.
+            continue
+        except ContractError:
             value, key = None, None
         if field == "resolution_source" and value is not None:
             value = _settlement_source_name(value)
@@ -379,4 +461,5 @@ def candidate_from_market(market: dict, book: dict, *, raw_book: dict = None,
     return {**facts, "source": "scanner", "cycle_id": cycle_id,
             "field_provenance": provenance,
             "quote_observation": observation,
+            "contradictory_fields": contradictions,
             "unavailable_fields": sorted(set(unavailable))}
