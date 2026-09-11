@@ -7,10 +7,11 @@ record at decision time.
 
 A source is READY only when every field required by ``alpha_snapshot`` is
 available directly. We deliberately do not derive a missing order-book side
-from ``entry_ask``/``spread`` and do not derive an expiry from
-``recorded_at + minutes_remaining``. Those transformations would create facts
-that were never persisted by the producer and would make later calibration
-look more certain than the evidence permits.
+from ``entry_ask``/``spread`` and do not derive an expiry from a timestamp plus
+``minutes_remaining``. We also do not turn a ticker/strike into a question or
+rename a generic liquidity score into exchange volume/open interest. Those
+transformations would create facts that were never persisted by the producer
+and would make later calibration look more certain than the evidence permits.
 """
 
 from __future__ import annotations
@@ -26,7 +27,9 @@ DIRECT_PATHS = {
     "question": ("question", "title", "decision.question", "decision.title"),
     "resolution_rules": ("resolution_rules", "decision.resolution_rules"),
     "resolution_source": ("resolution_source", "decision.resolution_source"),
-    "snapshot_time_utc": ("snapshot_time_utc", "emitted_at_utc", "recorded_at"),
+    "snapshot_time_utc": (
+        "snapshot_time_utc", "emitted_at_utc", "recorded_at", "ts",
+    ),
     "yes_bid": ("yes_bid", "decision.yes_bid"),
     "yes_ask": ("yes_ask", "decision.yes_ask"),
     "no_bid": ("no_bid", "decision.no_bid"),
@@ -57,6 +60,10 @@ def _present(value: Any) -> bool:
     return value is not None and value != ""
 
 
+def _has_any(row: dict, paths: tuple[str, ...]) -> bool:
+    return any(_present(_get_path(row, path)) for path in paths)
+
+
 def assess_record(row: dict) -> dict:
     """Return a machine-readable, fail-closed source-compatibility verdict."""
     if not isinstance(row, dict):
@@ -79,10 +86,10 @@ def assess_record(row: dict) -> dict:
             direct[target] = {"source_path": hit[0], "value_present": True}
 
     prohibited = []
+
     # Common temptation in the currently deployed /decisions surface:
     # reconstruct a book from one chosen-side ask plus spread. Refuse it.
-    if any(_present(_get_path(row, p)) for p in
-           ("entry_ask", "decision.entry_ask", "spread", "decision.spread")):
+    if _has_any(row, ("entry_ask", "decision.entry_ask", "spread", "decision.spread")):
         absent_book = [f for f in ("yes_bid", "yes_ask", "no_bid", "no_ask")
                        if f in missing]
         if absent_book:
@@ -92,15 +99,59 @@ def assess_record(row: dict) -> dict:
                 "reason": "one chosen-side quote cannot prove the full contemporaneous book",
             })
 
-    # Another tempting reconstruction: recorded_at + model minutes_remaining.
-    if "expected_resolution_time_utc" in missing and (
-            _present(_get_path(row, "recorded_at")) and
-            _present(_get_path(row, "decision.model_output.features.minutes_remaining"))):
+    # A relative horizon is useful model evidence, but it is not the
+    # producer-persisted absolute close/resolution timestamp the immutable
+    # snapshot binds. This covers both /decisions and shadow_predictions.
+    has_relative_horizon = _has_any(row, (
+        "minutes_remaining",
+        "features.minutes_remaining",
+        "model_output.features.minutes_remaining",
+        "decision.model_output.features.minutes_remaining",
+    ))
+    has_observation_time = _has_any(row, (
+        "recorded_at", "ts", "snapshot_time_utc", "emitted_at_utc",
+    ))
+    if has_relative_horizon and has_observation_time:
+        absent_times = [f for f in (
+            "market_close_time_utc", "expected_resolution_time_utc") if f in missing]
+        if absent_times:
+            prohibited.append({
+                "would_infer": absent_times,
+                "from": ["observation timestamp", "minutes_remaining"],
+                "reason": "derived market timing is not producer-persisted decision-time evidence",
+            })
+
+    # Historical settlement time is known only after the outcome. It cannot
+    # be repurposed as the decision-time expected resolution timestamp.
+    if _present(_get_path(row, "settled_at")) and (
+            "market_close_time_utc" in missing or
+            "expected_resolution_time_utc" in missing):
         prohibited.append({
-            "would_infer": ["expected_resolution_time_utc"],
-            "from": ["recorded_at", "decision.model_output.features.minutes_remaining"],
-            "reason": "derived expiry is not producer-persisted resolution evidence",
+            "would_infer": [f for f in (
+                "market_close_time_utc", "expected_resolution_time_utc") if f in missing],
+            "from": ["settled_at"],
+            "reason": "post-outcome settlement evidence cannot define a pre-outcome snapshot deadline",
         })
+
+    # Ticker/strike may let a human describe a contract, but parsing them into
+    # a canonical question or event id would be reconstruction, not a rename.
+    if "question" in missing and _has_any(row, (
+            "ticker", "contract_id", "strike", "features.strike")):
+        prohibited.append({
+            "would_infer": ["question"],
+            "from": ["ticker", "strike"],
+            "reason": "contract text must come from the producer/exchange, not ticker parsing",
+        })
+
+    # A ranker/liquidity score is not exchange volume or open interest.
+    if _has_any(row, ("liquidity", "decision.liquidity", "ranker_score")):
+        absent_sizes = [f for f in ("volume", "open_interest") if f in missing]
+        if absent_sizes:
+            prohibited.append({
+                "would_infer": absent_sizes,
+                "from": ["liquidity/ranker score"],
+                "reason": "a generic liquidity metric is not observed exchange volume/open interest",
+            })
 
     return {
         "ready": not missing,
