@@ -2,7 +2,18 @@ name: Alpha Learning v1 validation
 
 on:
   push:
-    branches: [alpha/astra-learning-v1]
+    # AA-18: the workflow only ever ran on the learning branch, so the
+    # candidate branch was never exercised by hosted CI and "CI-proven" was a
+    # claim about a different commit. The remediation branch is added and the
+    # learning branch is PRESERVED.
+    branches:
+      - alpha/astra-learning-v1
+      - alpha/astra-candidate-feed-v2-remediation
+  pull_request:
+    branches:
+      - main
+      - alpha/astra-learning-v1
+      - alpha/astra-candidate-feed-v2-remediation
 
 jobs:
   test-learning:
@@ -13,7 +24,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Unit tests
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Alpha Learning tests
         run: |
           python -m unittest tests.test_alpha_learning -v
           python -m unittest tests.test_alpha_learning_runtime -v
@@ -22,11 +38,34 @@ jobs:
           python -m unittest tests.test_alpha_candidate_truth -v
           python -m unittest tests.test_research_feed_boundary -v
 
+      # AA-01..AA-18. Every finding reproduced, then closed. Run as its own
+      # step so a failure names the remediation rather than being buried in
+      # the full-suite output.
+      - name: Astra AA-01..AA-18 regression suite
+        run: python -m pytest tests/test_astra_aa01_aa18_remediation.py -q
+
+      # AA-17. Effect-based: these are the assertions the two surviving
+      # mutations would have defeated.
+      - name: Mutation regression (effect, not counters)
+        run: python -m pytest tests/test_astra_mutation_regression.py -q
+
+      # AA-02. The strict shared contract, on its own.
+      - name: Strict contract, crash and concurrency tests
+        run: |
+          python -m pytest tests/test_astra_aa01_aa18_remediation.py -q \
+            -k "AA02 or AA12 or AA13 or AA14"
+
+      - name: Full repository test suite
+        run: python -m pytest tests/ -q
+
       - name: Safety boundary
         run: |
           python - <<'PY'
           import ast, pathlib
           files = [
+              pathlib.Path('candidate_contract.py'),
+              pathlib.Path('research_spool.py'),
+              pathlib.Path('durable_append.py'),
               pathlib.Path('alpha_learning.py'),
               pathlib.Path('alpha_learning_runtime.py'),
               pathlib.Path('alpha_resolution_ingest.py'),

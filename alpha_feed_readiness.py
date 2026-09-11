@@ -5,6 +5,23 @@ imports no execution/broker code. Its purpose is to prevent an integration
 from inventing immutable snapshot facts that the source did not actually
 record at decision time.
 
+AA-07: READY NOW MEANS THE WHOLE CONTRACT, NOT A SHAPE
+    The previous version reported ``ready: true`` for any row in which the
+    required field NAMES were present. That is a shape check, and a shape
+    check is exactly what a substituted default passes: ``resolution_source:
+    "kalshi"``, ``volume: 0.0`` and a NO quote derived from the YES quote are
+    all syntactically present. A row is now READY only when
+    ``candidate_contract.validate_record`` accepts it in full --
+    schema, recomputed checksum, strict field types, provenance container,
+    semantic source binding, per-quote observed/derived verdict,
+    ``unavailable_fields`` container and valid timestamps. There is no
+    fallback path that can report readiness on less than that.
+
+    The shape and prohibited-inference diagnostics below are KEPT, because
+    they answer the operator's real question -- "what is this candidate
+    source still missing, and what would I be tempted to invent" -- but they
+    can no longer produce a READY verdict on their own.
+
 A source is READY only when every field required by ``alpha_snapshot`` is
 available directly. We deliberately do not derive a missing order-book side
 from ``entry_ask``/``spread`` and do not derive an expiry from a timestamp plus
@@ -17,6 +34,17 @@ and would make later calibration look more certain than the evidence permits.
 from __future__ import annotations
 
 from typing import Any
+
+from candidate_contract import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS,
+                                      OPTIONAL_FIELDS, validate_record)
+
+#: AA-08. `event_id` is OPTIONAL in the contract and in the producer, so it is
+#: optional here too. Previously readiness counted it as missing and therefore
+#: refused a source the producer and the consumer would both have accepted --
+#: three components, two different answers to "is this record complete".
+#: Absence is fine; a SUPPLIED value must still validate and carry provenance,
+#: which `validate_record` enforces.
+READINESS_OPTIONAL = frozenset(OPTIONAL_FIELDS)
 
 
 # Target snapshot field -> literal source paths that can supply it without
@@ -70,8 +98,9 @@ def assess_record(row: dict) -> dict:
         return {
             "ready": False,
             "direct_fields": {},
-            "missing_fields": sorted(DIRECT_PATHS),
+            "missing_fields": sorted(set(DIRECT_PATHS) - READINESS_OPTIONAL),
             "prohibited_inferences": [],
+            "contract_errors": ["record is not an object"],
             "reason": "record is not an object",
         }
 
@@ -81,7 +110,8 @@ def assess_record(row: dict) -> dict:
         hit = next(((path, _get_path(row, path)) for path in paths
                     if _present(_get_path(row, path))), None)
         if hit is None:
-            missing.append(target)
+            if target not in READINESS_OPTIONAL:      # AA-08
+                missing.append(target)
         else:
             direct[target] = {"source_path": hit[0], "value_present": True}
 
@@ -100,6 +130,8 @@ def assess_record(row: dict) -> dict:
         for target in DIRECT_PATHS:
             if target == "snapshot_time_utc":
                 continue          # supplied by the producer's emission clock
+            if target in READINESS_OPTIONAL and not _present(row.get(target)):
+                continue          # AA-08: absent optional field is not a gap
             attributed = str(provenance.get(target) or "").strip()
             if target in unavailable or not attributed:
                 unattributed.append(target)
@@ -181,12 +213,37 @@ def assess_record(row: dict) -> dict:
                 "reason": "a generic liquidity metric is not observed exchange volume/open interest",
             })
 
+    # AA-07. The verdict. `ready` is decided by the SHARED contract and by
+    # nothing else; the shape analysis above only explains WHY.
+    contract_errors = validate_record(row)
+    schema = row.get("schema")
+    if schema in LEGACY_FEED_SCHEMAS:
+        contract_reason = (f"{schema!r} is a refused legacy schema; its facts "
+                           f"may be substituted and must be re-observed")
+    elif schema != FEED_SCHEMA:
+        contract_reason = (f"record does not carry the {FEED_SCHEMA!r} "
+                           f"contract (schema, recomputed checksum, "
+                           f"provenance and per-quote observation are all "
+                           f"required before Alpha may ingest it)")
+    elif contract_errors:
+        contract_reason = "; ".join(contract_errors)
+    else:
+        contract_reason = ""
+
+    ready = not missing and not contract_errors
+    if ready:
+        reason = "ready"
+    elif contract_errors:
+        reason = contract_reason
+    else:
+        reason = "source lacks immutable snapshot facts"
     return {
-        "ready": not missing,
+        "ready": ready,
         "direct_fields": direct,
         "missing_fields": sorted(missing),
         "prohibited_inferences": prohibited,
-        "reason": "ready" if not missing else "source lacks immutable snapshot facts",
+        "contract_errors": contract_errors,
+        "reason": reason,
     }
 
 
@@ -196,7 +253,7 @@ def assess_records(rows: list[dict]) -> dict:
     missing_counts = {field: 0 for field in DIRECT_PATHS}
     for result in results:
         for field in result["missing_fields"]:
-            missing_counts[field] += 1
+            missing_counts[field] = missing_counts.get(field, 0) + 1
     return {
         "mode": "SHADOW_ONLY",
         "broker_authority": False,
@@ -204,5 +261,9 @@ def assess_records(rows: list[dict]) -> dict:
         "ready_records": sum(1 for r in results if r["ready"]),
         "all_records_ready": bool(results) and all(r["ready"] for r in results),
         "missing_counts": {k: v for k, v in missing_counts.items() if v},
+        # AA-07: a contract violation anywhere is visible in the aggregate,
+        # so a caller reading only the summary cannot miss it.
+        "contract_violations": sum(1 for r in results
+                                   if r.get("contract_errors")),
         "results": results,
     }

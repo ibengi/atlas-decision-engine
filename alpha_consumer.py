@@ -57,10 +57,13 @@ import os
 import time
 from datetime import datetime, timezone
 
+from candidate_contract import (ContractError, FEED_SCHEMA,
+                                      LEGACY_FEED_SCHEMAS, REQUIRED_FIELDS,
+                                      validate_record, verify_checksum)
 from alpha_snapshot import SnapshotError, build_snapshot
 from config import CFG, _p
-from research_feed import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS,
-                           REQUIRED_FIELDS, spool_dir)
+from research_feed import spool_dir
+from research_spool import write_all
 
 log = logging.getLogger("ALPHA")
 
@@ -140,7 +143,10 @@ class ProcessedStore:
             fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
                          0o644)
             try:
-                os.write(fd, line.encode("utf-8"))
+                # AA-12: `os.write` may write fewer bytes than it was given.
+                # A short write here leaves a torn line that later reads as a
+                # crash-truncated tail, silently losing a processed mark.
+                write_all(fd, line.encode("utf-8"))
                 os.fsync(fd)
             finally:
                 os.close(fd)
@@ -313,51 +319,78 @@ class SpoolConsumer:
                       "minted": 0, "feed_errors": 0,
                       # A record refused because the SOURCE was incomplete or
                       # unattributed, told apart from one that was malformed.
-                      "unattributed": 0, "legacy_schema": 0}
+                      "unattributed": 0, "legacy_schema": 0,
+                      # AA-04 / AA-01 / AA-09: each refusal reason is its own
+                      # counter, because "the feed is quiet", "the feed is
+                      # corrupt" and "the feed is deriving quotes" call for
+                      # three different operator responses.
+                      "checksum_failures": 0, "derived_quotes": 0,
+                      "record_errors": 0}
         self.feed_error = None
+        #: Why the most recent record was refused, so the caller can record it
+        #: instead of silently re-reading the same bad bytes forever.
+        self.last_refusal = ""
+        #: digest -> contract_id for every record whose checksum this
+        #: consumer verified itself this session (AA-15).
+        self.verified_digests = {}
 
     def _valid(self, record):
         """A record this consumer is allowed to mint a snapshot from.
 
-        Strict on three counts, and each one is a fact Alpha would otherwise
-        have to invent:
+        Delegates to the SHARED contract (`candidate_contract`). AA-02
+        found three diverging validators; there is now one, and this method's
+        job is to classify the refusal for telemetry, not to re-decide it.
 
-        SCHEMA      only the current feed schema. A legacy v1 record was
+        The contract checks, among the rest:
+
+        SCHEMA      only the current feed schema. A legacy record was
                     permitted to carry a substituted settlement source, a
-                    question parsed from a ticker and a "0.0" that meant
-                    absent; it cannot be re-labelled truthful, so it is
-                    refused and counted rather than migrated.
-        COMPLETE    every required fact present. This consumer no longer
-                    supplies a default for any of them -- `.get(x, "kalshi")`
-                    and `.get(x, 0.0)` were how an unobserved market fact
-                    entered the ledger looking like an observed one.
-        ATTRIBUTED  the producer's provenance names a real source key for
-                    every required fact, and none of them is listed as
-                    unavailable. A record that cannot say where a fact came
-                    from is not evidence.
+                    question parsed from a ticker, a "0.0" that meant absent,
+                    or a NO side derived from the YES side; it cannot be
+                    re-labelled truthful, so it is refused and counted rather
+                    than migrated.
+        CHECKSUM    AA-04: the digest is RECOMPUTED here and compared. The
+                    producer is not trusted, the transport is not trusted, and
+                    the bytes on the spool are not trusted.
+        OBSERVED    AA-01: every quote must be flagged as directly observed.
+                    A quote derived by execution normalization is refused.
+        ATTRIBUTED  AA-05: provenance must name an ALLOWED EXACT source path
+                    for every required fact -- not merely be a non-empty
+                    string.
+        TIMED       AA-06: `emitted_at_utc` must be present and valid. This
+                    consumer never substitutes its own clock.
         """
+        self.last_refusal = ""
         if not isinstance(record, dict):
+            self.last_refusal = "record is not an object"
             return None
         if record.get("schema") in LEGACY_FEED_SCHEMAS:
             self.stats["legacy_schema"] += 1
+            self.last_refusal = f"legacy schema {record.get('schema')!r}"
             log.warning("[ALPHA_CONSUMER] refusing legacy feed record "
                         f"{record.get('schema')!r}: it may carry substituted "
                         f"market facts and must be re-observed")
             return None
-        if record.get("schema") != FEED_SCHEMA:
-            return None
-        provenance = record.get("field_provenance")
-        unavailable = record.get("unavailable_fields")
-        if not isinstance(provenance, dict) or not isinstance(unavailable, list):
-            self.stats["unattributed"] += 1
-            return None
-        for field in REQUIRED_FIELDS:
-            if record.get(field) in (None, "") or field in unavailable \
-                    or not str(provenance.get(field) or "").strip():
+        errors = validate_record(record)
+        if errors:
+            self.last_refusal = "; ".join(errors)[:300]
+            if any("record_sha256" in e for e in errors):
+                self.stats["checksum_failures"] += 1
+                log.warning(f"[ALPHA_CONSUMER] refusing "
+                            f"{record.get('contract_id')}: {errors[0]}")
+            elif any("not directly observed" in e for e in errors):
+                self.stats["derived_quotes"] += 1
+                log.warning(f"[ALPHA_CONSUMER] refusing "
+                            f"{record.get('contract_id')}: a quote was "
+                            f"derived, not observed -- {errors}")
+            else:
                 self.stats["unattributed"] += 1
-                log.warning(f"[ALPHA_CONSUMER] refusing {record.get('contract_id')}: "
-                            f"{field} is not an attributed observation")
-                return None
+                log.warning(f"[ALPHA_CONSUMER] refusing "
+                            f"{record.get('contract_id')}: {errors}")
+            return None
+        # AA-04 / AA-15: retain the VERIFIED digest so it can be carried into
+        # the prediction row and re-checked at settlement.
+        self.verified_digests[record["record_sha256"]] = record["contract_id"]
         return record
 
     def mint(self, record: dict):
@@ -381,7 +414,11 @@ class SpoolConsumer:
             no_bid=record["no_bid"], no_ask=record["no_ask"],
             volume=record["volume"],
             open_interest=record["open_interest"],
-            snapshot_time_utc=record.get("emitted_at_utc"),
+            # AA-06: passed explicitly and already proved present and
+            # well-formed by the contract. `build_snapshot` would otherwise
+            # fall back to `datetime.now()`, which makes the SAME evidence
+            # mint a DIFFERENT snapshot identity every time it is replayed.
+            snapshot_time_utc=record["emitted_at_utc"],
             market_close_time_utc=record["market_close_time_utc"],
             expected_resolution_time_utc=record["expected_resolution_time_utc"],
             catalyst_name=record.get("catalyst_name", ""),
@@ -407,29 +444,68 @@ class SpoolConsumer:
             log.warning(f"[ALPHA_CONSUMER] research feed unavailable: {e}")
             return []
         for raw in raw_records:
-            record = self._valid(raw)
-            if record is None:
-                self.stats["malformed"] += 1
-                continue
-            self.stats["records_read"] += 1
+            # AA-09: ONE malformed row must not starve the batch. Every
+            # anticipated per-record failure -- a contract violation, an
+            # unparseable timestamp, a number that overflows, a snapshot that
+            # cannot be built -- is counted, logged and stepped over. The poll
+            # continues to the next record.
+            #
+            # Deliberately NOT a bare `except Exception`: a programmer error
+            # (an AttributeError, a name that does not exist) is not a data
+            # problem and must still fail loudly rather than be logged once
+            # per record forever.
             try:
-                snapshot = self.mint(record)
-            except SnapshotError as e:
-                # A candidate we cannot turn into a valid snapshot is
-                # recorded as rejected so it is not retried every poll.
+                processed = self._consume_one(raw, seen_now)
+            except (ContractError, SnapshotError, ValueError, TypeError,
+                    OverflowError, ArithmeticError, KeyError) as e:
+                self.stats["record_errors"] += 1
                 self.stats["malformed"] += 1
-                self._safe_mark(record, STATUS_REJECTED, str(e))
+                log.warning(f"[ALPHA_CONSUMER] record skipped: "
+                            f"{type(e).__name__}: {e}")
                 continue
-            sid = snapshot.market_snapshot_id
-            if sid in seen_now or self.store.seen(sid):
-                self.stats["duplicates"] += 1
+            if processed is None:
                 continue
-            seen_now.add(sid)
-            self.stats["minted"] += 1
-            out.append((snapshot, record))
+            out.append(processed)
             if limit and len(out) >= limit:
                 break
         return out
+
+    def _consume_one(self, raw, seen_now: set):
+        """`(snapshot, record)` for one raw row, or None when it is refused.
+
+        Split out of `pending()` so that the per-record containment above has
+        exactly one expression to guard, rather than a loop body in which a
+        new statement could later be added outside the protected region.
+        """
+        record = self._valid(raw)
+        if record is None:
+            self.stats["malformed"] += 1
+            # Mark it REJECTED so a permanently invalid record is not re-read,
+            # re-validated and re-logged on every poll for the life of the
+            # spool. The id is derived from the record's CLAIMED digest, which
+            # is fine as a dedup key even though it failed verification -- it
+            # identifies the bytes we refused, which is exactly what we want
+            # not to look at again.
+            if isinstance(raw, dict):
+                self._safe_mark(raw, STATUS_REJECTED,
+                                getattr(self, "last_refusal", "refused"))
+            return None
+        self.stats["records_read"] += 1
+        try:
+            snapshot = self.mint(record)
+        except SnapshotError as e:
+            # A candidate we cannot turn into a valid snapshot is recorded as
+            # rejected so it is not retried every poll.
+            self.stats["malformed"] += 1
+            self._safe_mark(record, STATUS_REJECTED, str(e))
+            return None
+        sid = snapshot.market_snapshot_id
+        if sid in seen_now or self.store.seen(sid):
+            self.stats["duplicates"] += 1
+            return None
+        seen_now.add(sid)
+        self.stats["minted"] += 1
+        return (snapshot, record)
 
     def _safe_mark(self, record: dict, status: str, detail: str) -> None:
         """Mark a record we could not mint. Its id is derived from the

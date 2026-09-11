@@ -44,7 +44,11 @@ def market(ticker="KXBTCD-1", hours=4):
             "settlement_sources": [{"name": "CF Benchmarks RTI"}],
             "volume": 1200, "open_interest": 3400,
             "close_time": (now + timedelta(hours=hours - 1)).isoformat(),
-            "expiration_time": (now + timedelta(hours=hours)).isoformat()}
+            "expiration_time": (now + timedelta(hours=hours)).isoformat(),
+            # AA-01: the exchange publishes its quotes ON the market object,
+            # and that RAW observation is the only book the research feed may
+            # read. `BOOK` below stands for the EXECUTION-normalized structure.
+            **BOOK}
 
 
 BOOK = {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}
@@ -59,8 +63,15 @@ class FeedCase(AlphaCase):
         self.feed = ResearchFeed()
 
     def emit(self, ticker="KXBTCD-1", **kw):
-        return self.feed.emit_candidate(
-            candidate_from_market(market(ticker, **kw), BOOK, cycle_id="c1"))
+        """Emit and WAIT. AA-10 made the spool write asynchronous, so a test
+        that reads the spool afterwards has to drain the writer explicitly;
+        the engine never does, and must never."""
+        payload = market(ticker, **kw)
+        accepted = self.feed.emit_candidate(
+            candidate_from_market(payload, BOOK, raw_book=payload,
+                                  cycle_id="c1"))
+        self.feed.writer.drain(timeout=5.0)
+        return accepted
 
     def spool_bytes(self) -> dict:
         directory = spool_dir()
@@ -118,9 +129,20 @@ class TheProducerEmitsUsableCandidates(FeedCase):
 class TheProducerCannotHurtTheEngine(FeedCase):
 
     def test_emit_never_raises(self):
-        with patch("research_feed.os.makedirs",
+        """Neither a dead filesystem nor a bug in the producer may reach the
+        caller, which is a decision cycle.
+
+        AA-10 moved the filesystem out of `emit_candidate`, so the two halves
+        are now asserted separately: a `_build` failure is still visible to the
+        caller as a refusal, while a filesystem failure happens on the writer
+        thread and shows up as "nothing was spooled" rather than as a False
+        return. The engine never learns about the disk -- by design.
+        """
+        with patch("research_spool.os.makedirs",
                    side_effect=PermissionError("read-only volume")):
-            self.assertFalse(self.emit())
+            self.emit()                      # must not raise
+        self.assertEqual(self.spool_bytes(), {})
+        self.assertEqual(self.feed.writer.spool.stats["written"], 0)
         with patch.object(ResearchFeed, "_build",
                           side_effect=RuntimeError("boom")):
             self.assertFalse(self.emit())
@@ -130,7 +152,7 @@ class TheProducerCannotHurtTheEngine(FeedCase):
         must never block an order the risk engine approved -- nor unblock
         one."""
         PersistenceSentinel.reset()
-        with patch("research_feed.os.makedirs",
+        with patch("research_spool.os.makedirs",
                    side_effect=OSError("disk full")):
             self.emit()
         self.assertTrue(PersistenceSentinel.healthy())
@@ -222,12 +244,14 @@ class TheConsumerMintsAndDeduplicates(FeedCase):
         consumer = SpoolConsumer()
         first = consumer.pending()[0][0]
         consumer.store.mark(first.market_snapshot_id, STATUS_ANALYZED)
-        moved = dict(candidate_from_market(market(), BOOK))
+        payload = market()
+        moved = dict(candidate_from_market(payload, BOOK, raw_book=payload))
         moved["yes_ask"] = 0.55
         moved["emitted_at_utc"] = (datetime.now(timezone.utc)
                                    + timedelta(seconds=30)
                                    ).isoformat(timespec="seconds")
         self.feed.emit_candidate(moved)
+        self.feed.writer.drain(timeout=5.0)
         second = SpoolConsumer().pending()
         self.assertEqual(len(second), 1)
         self.assertNotEqual(second[0][0].market_snapshot_id,
@@ -235,9 +259,14 @@ class TheConsumerMintsAndDeduplicates(FeedCase):
 
     def test_an_unmintable_record_is_recorded_rejected_not_retried_forever(self):
         os.makedirs(spool_dir(), exist_ok=True)
-        broken = dict(candidate_from_market(market(), BOOK))
+        payload = market()
+        broken = dict(candidate_from_market(payload, BOOK, raw_book=payload))
         broken["expected_resolution_time_utc"] = "not-a-timestamp"
         broken["schema"] = research_feed.FEED_SCHEMA
+        # AA-04: the digest is recomputed and compared, so a hand-edited
+        # record is now refused at the checksum before anything tries to mint
+        # it. Either way it must end up marked REJECTED rather than re-read on
+        # every poll -- that is what this case is really about.
         broken["record_sha256"] = "f" * 64
         with open(os.path.join(spool_dir(), "broken.json"), "w") as fh:
             json.dump(broken, fh)
@@ -295,8 +324,12 @@ class TheEngineHookIsInert(FeedCase):
                 imported.update(a.name.split(".")[0] for a in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
+        # Widened deliberately for AA-01/AA-10; see the per-module pins in
+        # `tests/test_research_feed_boundary.py`. None of these is an Alpha
+        # module, and none of them reaches execution.
         self.assertEqual(imported,
-                         {"hashlib", "json", "logging", "os", "time", "config"})
+                         {"datetime", "logging", "os", "config",
+                          "candidate_contract", "research_spool"})
 
 
 if __name__ == "__main__":

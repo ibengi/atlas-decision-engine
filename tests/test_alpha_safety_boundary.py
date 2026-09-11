@@ -179,8 +179,13 @@ class TheAutomaticFeedIntroducesNoPath(AlphaCase):
                 imported.update(a.name.split(".")[0] for a in node.names)
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
+        # Widened deliberately for AA-01/AA-10: the shared contract, the
+        # isolated spool writer and the observation clock. Every one of them
+        # is a neutral module pinned to its own allow-list in
+        # `tests/test_research_feed_boundary.py`; none is an Alpha module.
         self.assertEqual(imported,
-                         {"hashlib", "json", "logging", "os", "time", "config"})
+                         {"datetime", "logging", "os", "config",
+                          "candidate_contract", "research_spool"})
         self.assertFalse([m for m in imported if m.startswith("alpha_")])
         self.assertFalse(imported & FORBIDDEN_MODULES)
 
@@ -215,17 +220,25 @@ class TheAutomaticFeedIntroducesNoPath(AlphaCase):
         broker = _BrokerTripwire()
         with patch.object(CFG, "RESEARCH_FEED_ENABLED", True):
             now = datetime.now(timezone.utc)
-            ResearchFeed().emit_candidate(candidate_from_market(
-                {"ticker": "KX-SAFE", "title": "q", "volume": 1,
-                 "open_interest": 1,
-                 # A complete market payload: the producer now
-                 # refuses to substitute rules or a settlement
-                 # source it never observed.
-                 "rules_primary": "as published",
-                 "settlement_sources": [{"name": "CF Benchmarks RTI"}],
-                 "close_time": (now + timedelta(hours=3)).isoformat(),
-                 "expiration_time": (now + timedelta(hours=4)).isoformat()},
-                {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}))
+            # AA-01: quotes come from the RAW observation, so the payload
+            # carries them. AA-10: the spool write is on the writer thread, so
+            # the test drains it before reading the directory.
+            raw = {"ticker": "KX-SAFE", "title": "q", "volume": 1,
+                   "open_interest": 1,
+                   # A complete market payload: the producer now
+                   # refuses to substitute rules or a settlement
+                   # source it never observed.
+                   "rules_primary": "as published",
+                   "settlement_sources": [{"name": "CF Benchmarks RTI"}],
+                   "close_time": (now + timedelta(hours=3)).isoformat(),
+                   "expiration_time": (now + timedelta(hours=4)).isoformat(),
+                   "yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}
+            _feed = ResearchFeed()
+            _feed.emit_candidate(candidate_from_market(
+                raw, {"yes_bid": 44, "yes_ask": 46, "no_bid": 54,
+                      "no_ask": 56}, raw_book=raw))
+            _feed.writer.drain(timeout=5.0)
+            _feed.writer.stop()
             service = AlphaShadowService(
                 providers=self.agreeing_providers(), ledger=AlphaLedger(),
                 quote_fn=lambda: {"yes_bid": 0.44, "yes_ask": 0.46,
@@ -241,17 +254,25 @@ class TheAutomaticFeedIntroducesNoPath(AlphaCase):
         from research_feed import ResearchFeed, candidate_from_market, spool_dir
         with patch.object(CFG, "RESEARCH_FEED_ENABLED", True):
             now = datetime.now(timezone.utc)
-            ResearchFeed().emit_candidate(candidate_from_market(
-                {"ticker": "KX-RO", "title": "q", "volume": 1,
-                 "open_interest": 1,
-                 # A complete market payload: the producer now
-                 # refuses to substitute rules or a settlement
-                 # source it never observed.
-                 "rules_primary": "as published",
-                 "settlement_sources": [{"name": "CF Benchmarks RTI"}],
-                 "close_time": (now + timedelta(hours=3)).isoformat(),
-                 "expiration_time": (now + timedelta(hours=4)).isoformat()},
-                {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}))
+            # AA-01: quotes come from the RAW observation, so the payload
+            # carries them. AA-10: the spool write is on the writer thread, so
+            # the test drains it before reading the directory.
+            raw = {"ticker": "KX-RO", "title": "q", "volume": 1,
+                   "open_interest": 1,
+                   # A complete market payload: the producer now
+                   # refuses to substitute rules or a settlement
+                   # source it never observed.
+                   "rules_primary": "as published",
+                   "settlement_sources": [{"name": "CF Benchmarks RTI"}],
+                   "close_time": (now + timedelta(hours=3)).isoformat(),
+                   "expiration_time": (now + timedelta(hours=4)).isoformat(),
+                   "yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}
+            _feed = ResearchFeed()
+            _feed.emit_candidate(candidate_from_market(
+                raw, {"yes_bid": 44, "yes_ask": 46, "no_bid": 54,
+                      "no_ask": 56}, raw_book=raw))
+            _feed.writer.drain(timeout=5.0)
+            _feed.writer.stop()
             spool_before = {n: open(os.path.join(spool_dir(), n), "rb").read()
                             for n in sorted(os.listdir(spool_dir()))}
             before = set(os.listdir(self._tmp))

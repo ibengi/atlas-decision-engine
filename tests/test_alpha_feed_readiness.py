@@ -1,6 +1,11 @@
+import os
+import sys
 import unittest
 
-from alpha_feed_readiness import assess_record, assess_records
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _candidate import valid_record                            # noqa: E402
+
+from alpha_feed_readiness import assess_record, assess_records  # noqa: E402
 
 
 class AlphaFeedReadinessTests(unittest.TestCase):
@@ -37,9 +42,39 @@ class AlphaFeedReadinessTests(unittest.TestCase):
         }
 
     def test_complete_record_is_ready(self):
-        result = assess_record(self.complete())
-        self.assertTrue(result["ready"])
+        """READY means the WHOLE contract, built by the real producer."""
+        result = assess_record(valid_record())
+        self.assertTrue(result["ready"], result["reason"])
         self.assertEqual(result["missing_fields"], [])
+        self.assertEqual(result["contract_errors"], [])
+
+    def test_a_shape_complete_row_without_the_contract_is_not_ready(self):
+        """AA-07. This is the regression the finding names.
+
+        `self.complete()` carries every required field NAME and nothing else:
+        no schema, no checksum, no provenance, no per-quote observation. The
+        previous readiness gate called that READY, which is precisely what a
+        substituted default passes -- `resolution_source: "kalshi"` and
+        `volume: 0.0` are syntactically present too. A shape can no longer
+        produce a READY verdict on its own.
+        """
+        result = assess_record(self.complete())
+        self.assertFalse(result["ready"])
+        self.assertTrue(result["contract_errors"])
+        self.assertIn("does not carry", result["reason"])
+        # ...and the shape analysis still says the names were all there, so
+        # the refusal is demonstrably about the CONTRACT, not about a missing
+        # field. Without this the test could pass for the wrong reason.
+        self.assertEqual(result["missing_fields"], [])
+
+    def test_a_legacy_schema_row_is_refused_by_name(self):
+        """A v1/v2 record cannot be re-labelled truthful; it must be
+        re-observed. Reported as a legacy refusal rather than as a generic
+        contract failure, so the operator knows which it is."""
+        row = dict(valid_record(), schema="atlas-research-candidate-v2")
+        result = assess_record(row)
+        self.assertFalse(result["ready"])
+        self.assertIn("legacy schema", result["reason"])
 
     def test_partial_record_fails_closed(self):
         result = assess_record({
@@ -58,7 +93,12 @@ class AlphaFeedReadinessTests(unittest.TestCase):
     def test_shadow_prediction_still_fails_without_contract_metadata(self):
         result = assess_record(self.shadow_prediction())
         self.assertFalse(result["ready"])
-        for field in ("event_id", "question", "resolution_rules",
+        # AA-08: `event_id` is OPTIONAL in the contract, in the producer and in
+        # the consumer, so readiness no longer counts its absence as a gap.
+        # Listing it here was the three-component disagreement the finding
+        # names -- readiness refused a source the other two would have taken.
+        self.assertNotIn("event_id", result["missing_fields"])
+        for field in ("question", "resolution_rules",
                       "resolution_source", "volume", "open_interest",
                       "market_close_time_utc", "expected_resolution_time_utc"):
             self.assertIn(field, result["missing_fields"])
@@ -96,9 +136,10 @@ class AlphaFeedReadinessTests(unittest.TestCase):
         self.assertEqual(result["mode"], "SHADOW_ONLY")
 
     def test_incomplete_row_cannot_be_masked(self):
-        result = assess_records([self.complete(), {"contract_id": "C-2"}])
+        result = assess_records([valid_record(), {"contract_id": "C-2"}])
         self.assertFalse(result["all_records_ready"])
         self.assertEqual(result["ready_records"], 1)
+        self.assertEqual(result["contract_violations"], 1)
 
 
 if __name__ == "__main__":

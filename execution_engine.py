@@ -431,8 +431,16 @@ class ExecutionEngine:
         # absorbs exceptions -- this hook is the engine's existing
         # record-never-decide boundary, not a new one.
         try:
+            raw_market = getattr(snapshot, "raw_market", None) or {}
+            # AA-01. `raw_market` is the exchange's own observation; `book` is
+            # the EXECUTION-normalized structure, in which a missing side may
+            # already have been derived (`no_bid = 100 - yes_ask`, or a bare
+            # 50). Both are passed so the producer can tell an unobserved
+            # quote from a computed one -- and REFUSE the computed one. The
+            # order path keeps using `book` exactly as before; nothing about
+            # execution changes here.
             self.research_feed.emit_candidate(candidate_from_market(
-                getattr(snapshot, "raw_market", None) or {}, book,
+                raw_market, book, raw_book=raw_market,
                 cycle_id=(dec.decision_id or "").split("-", 1)[0] or ""))
         except Exception as e:                                # noqa: BLE001
             log.debug(f"research feed: {e}")

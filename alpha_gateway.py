@@ -87,7 +87,8 @@ class AlphaGateway:
 
     # ── the one public entry point ──────────────────────────────────────
     def analyze(self, snapshot: MarketSnapshot, *, quote_fn=None,
-                record: bool = True, gate=None, on_signal=None) -> dict:
+                record: bool = True, gate=None, on_signal=None,
+                source_binding: dict = None) -> dict:
         """Snapshot -> shadow opportunity record.
 
         Never raises for a provider problem and never returns an
@@ -117,7 +118,8 @@ class AlphaGateway:
                                        now)
 
         opportunity = self._record(snapshot, result, meta, edge, movement,
-                                   state, reason, cost_usd, now)
+                                   state, reason, cost_usd, now,
+                                   source_binding=source_binding)
         if record:
             try:
                 self.ledger.record_costs(snapshot, result)
@@ -210,7 +212,7 @@ class AlphaGateway:
 
     # ── the shadow record (section 13 field list) ───────────────────────
     def _record(self, snapshot, result, meta, edge, movement, state, reason,
-                cost_usd, now) -> dict:
+                cost_usd, now, *, source_binding: dict = None) -> dict:
         prediction_id = "pred-" + hashlib.sha256(
             f"{snapshot.market_snapshot_id}|{now.isoformat()}".encode()
         ).hexdigest()[:20]
@@ -226,6 +228,13 @@ class AlphaGateway:
             "market_snapshot_id": snapshot.market_snapshot_id,
             "contract_id": snapshot.contract_id,
             "event_id": snapshot.event_id,
+            # AA-15. The VERIFIED identity of the source record this
+            # prediction was made from, carried so that a settlement arriving
+            # months later can be checked against the evidence rather than
+            # merely against a prediction_id. `source_binding` is built by the
+            # consumer AFTER it recomputed the digest itself; the gateway
+            # copies it and never invents one.
+            "source_binding": dict(source_binding or {}),
             "snapshot": snapshot.as_dict(),
             "prediction_time": now.isoformat(timespec="seconds"),
             "market_class": snapshot.market_class,

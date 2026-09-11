@@ -31,6 +31,7 @@ import os
 from datetime import datetime, timezone
 
 from config import CFG, _p
+from durable_append import append_line, exclusive_lock, tail_is_torn
 
 log = logging.getLogger("ALPHA")
 
@@ -46,8 +47,25 @@ ROW_COST = "COST"
 ROW_INVALIDATION = "INVALIDATION"
 #: Section 8. A follow-up price observation at a configured interval.
 ROW_OBSERVATION = "OBSERVATION"
-ROW_KINDS = (ROW_PREDICTION, ROW_RESOLUTION, ROW_COST, ROW_INVALIDATION,
-             ROW_OBSERVATION)
+#: AA-13. Written BEFORE the prediction it announces. A PREPARE with no
+#: matching PREDICTION is the durable trace of a crash between "we decided to
+#: analyse this" and "the analysis is safely on disk", and it is what lets a
+#: restart tell that apart from work that genuinely completed.
+ROW_PREPARE = "PREPARE"
+ROW_KINDS = (ROW_PREPARE, ROW_PREDICTION, ROW_RESOLUTION, ROW_COST,
+             ROW_INVALIDATION, ROW_OBSERVATION)
+
+
+def analysis_identity(market_snapshot_id: str) -> str:
+    """The STABLE identity of one analysis of one snapshot (AA-13).
+
+    Derived from the snapshot id alone, so a retry after a crash computes the
+    SAME value and the duplicate check can actually fire. `prediction_id`
+    cannot serve this purpose: it mixes in the wall clock, so the same
+    evidence retried a second later produces a different id and the row is
+    appended twice.
+    """
+    return "an-" + str(market_snapshot_id)
 
 
 class LedgerError(RuntimeError):
@@ -70,21 +88,28 @@ class _AppendOnlyLog:
         self.path = path
 
     def append(self, row: dict) -> dict:
+        """Append one row, completely and durably (AA-12).
+
+        `durable_append.append_line` loops until every byte is written, closes
+        a torn tail by SEPARATION rather than truncation, and fsyncs. The
+        previous single `os.write` could write fewer bytes than it was given
+        and lose a ledger row that then read as a clean crash.
+        """
         line = json.dumps(row, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, default=str) + "\n"
+        if tail_is_torn(self.path):
+            log.error(f"[ALPHA_LEDGER] torn tail detected in {self.path}; the "
+                      f"damaged fragment is PRESERVED and separated, not "
+                      f"truncated -- it will be reported as an unparsable row")
         try:
-            parent = os.path.dirname(os.path.abspath(self.path))
-            os.makedirs(parent, exist_ok=True)
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                         0o644)
-            try:
-                os.write(fd, line.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
+            append_line(self.path, line)
         except OSError as e:
             raise LedgerError(f"alpha ledger row not durable: {e}")
         return row
+
+    def lock(self, *, timeout: float = 10.0):
+        """Serialize a check-then-append critical section (AA-14)."""
+        return exclusive_lock(self.path, timeout=timeout)
 
     def rows(self) -> list:
         """Every parseable row. A torn LAST line is a crash mid-append and
@@ -155,23 +180,94 @@ class AlphaLedger:
         return round(sum(float((s.cost or {}).get("api_cost_usd") or 0.0)
                          for s in dispatch_result.signals), 8)
 
+    def prepare(self, market_snapshot_id: str, *, contract_id: str = "",
+                source_record_sha256: str = "", environment: str = "") -> dict:
+        """Announce an analysis BEFORE it is attempted (AA-13, step 1).
+
+        Idempotent per snapshot: a retry after a crash re-announces the SAME
+        `analysis_id`, because that identity is derived from the snapshot's
+        content and not from the clock.
+        """
+        analysis_id = analysis_identity(market_snapshot_id)
+        with self.log.lock():
+            existing = self.find_prepare(analysis_id)
+            if existing is not None:
+                return existing
+            return self.log.append({
+                "schema": LEDGER_SCHEMA, "kind": ROW_PREPARE,
+                "at": _now_iso(), "analysis_id": analysis_id,
+                "market_snapshot_id": market_snapshot_id,
+                "contract_id": contract_id,
+                "source_record_sha256": source_record_sha256,
+                "environment": environment})
+
+    def find_prepare(self, analysis_id: str):
+        for row in self.rows():
+            if row.get("kind") == ROW_PREPARE \
+                    and row.get("analysis_id") == analysis_id:
+                return row
+        return None
+
     def record_prediction(self, opportunity: dict) -> dict:
-        """Persist one prediction BEFORE resolution (section 13).
+        """Persist one prediction BEFORE resolution (section 13; AA-13 step 2).
 
         The row carries the full snapshot so the prediction can be audited
         against the exact market state it was made on, without trusting a
         later lookup.
+
+        AA-14: the uniqueness check and the append happen under ONE exclusive
+        lock. Previously they were two separate operations, so two Alpha
+        writers could both read "not recorded" and both append, producing two
+        predictions for one snapshot and double-counting it in every
+        calibration number afterwards.
         """
         prediction_id = opportunity["prediction_id"]
-        if self.find_prediction(prediction_id) is not None:
-            raise LedgerError(f"prediction {prediction_id} already recorded; "
-                              f"a prediction is written once")
-        return self.log.append({
-            "schema": LEDGER_SCHEMA, "kind": ROW_PREDICTION,
-            "at": _now_iso(), **opportunity})
+        snapshot_id = str(opportunity.get("market_snapshot_id") or "")
+        # A prediction with no snapshot id has no ANALYSIS identity to be
+        # unique on. Deriving one from the empty string would make every such
+        # row collide with every other, so the analysis-level check below is
+        # skipped and only the prediction_id uniqueness rule applies.
+        analysis_id = analysis_identity(snapshot_id) if snapshot_id else ""
+        with self.log.lock():
+            if self.find_prediction(prediction_id) is not None:
+                raise LedgerError(f"prediction {prediction_id} already "
+                                  f"recorded; a prediction is written once")
+            # AA-13: one snapshot yields at most ONE committed prediction.
+            # Without this, a crash between the prediction append and the
+            # processed acknowledgement produced a SECOND prediction for the
+            # same evidence on the next poll.
+            committed = (self.find_prediction_by_analysis(analysis_id)
+                         if analysis_id else None)
+            if committed is not None:
+                raise LedgerError(
+                    f"analysis {analysis_id} already has committed prediction "
+                    f"{committed.get('prediction_id')}; this snapshot is not "
+                    f"analysed twice")
+            return self.log.append({
+                "schema": LEDGER_SCHEMA, "kind": ROW_PREDICTION,
+                "at": _now_iso(), "analysis_id": analysis_id, **opportunity})
+
+    def find_prediction_by_analysis(self, analysis_id: str):
+        """The committed prediction for a stable analysis identity, if any."""
+        if not analysis_id:
+            return None
+        for row in self.predictions():
+            if row.get("analysis_id") == analysis_id:
+                return row
+        return None
+
+    def prediction_is_committed(self, market_snapshot_id: str) -> bool:
+        """AA-13: has this snapshot's prediction reached the disk?
+
+        The terminal processed acknowledgement must be published only after
+        this returns True, and a restart re-asks it rather than trusting the
+        processed file.
+        """
+        return self.find_prediction_by_analysis(
+            analysis_identity(market_snapshot_id)) is not None
 
     def resolve(self, prediction_id: str, outcome, *, resolved_at=None,
-                source: str = "") -> dict:
+                source: str = "", binding: dict = None) -> dict:
         """Record the outcome as a NEW row.
 
         `outcome` is 1 for YES, 0 for NO. The prediction row is not touched:
@@ -179,20 +275,24 @@ class AlphaLedger:
         predict" and "what happened" can never be conflated into one
         editable record.
         """
-        prediction = self.find_prediction(prediction_id)
-        if prediction is None:
-            raise LedgerError(f"unknown prediction {prediction_id}")
-        if self.find_resolution(prediction_id) is not None:
-            raise LedgerError(f"prediction {prediction_id} is already "
-                              f"resolved; outcomes are written once")
         if outcome not in (0, 1, True, False):
             raise LedgerError(f"outcome {outcome!r} must be 0 or 1")
-        return self.log.append({
-            "schema": LEDGER_SCHEMA, "kind": ROW_RESOLUTION,
-            "at": _now_iso(), "prediction_id": prediction_id,
-            "actual_outcome": int(bool(outcome)),
-            "resolved_at": resolved_at or _now_iso(),
-            "resolution_source": source})
+        # AA-14: check and append under one lock, so two ingesters cannot both
+        # observe "unresolved" and both append a resolution.
+        with self.log.lock():
+            prediction = self.find_prediction(prediction_id)
+            if prediction is None:
+                raise LedgerError(f"unknown prediction {prediction_id}")
+            if self.find_resolution(prediction_id) is not None:
+                raise LedgerError(f"prediction {prediction_id} is already "
+                                  f"resolved; outcomes are written once")
+            return self.log.append({
+                "schema": LEDGER_SCHEMA, "kind": ROW_RESOLUTION,
+                "at": _now_iso(), "prediction_id": prediction_id,
+                "actual_outcome": int(bool(outcome)),
+                "resolved_at": resolved_at or _now_iso(),
+                "resolution_source": source,
+                **{k: v for k, v in (binding or {}).items()}})
 
     # ── section 7: catalyst invalidation ────────────────────────────────
     def invalidate(self, prediction_id: str, reason: str,

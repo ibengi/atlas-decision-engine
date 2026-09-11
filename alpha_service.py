@@ -283,6 +283,81 @@ class AlphaShadowService:
                               "providers": self.health})
         return summary
 
+    #: AA-15. The identity fields a settlement must later agree with. Named
+    #: once here so the producer of the binding and its validator cannot
+    #: drift apart.
+    BINDING_FIELDS = ("record_sha256", "contract_id", "market_snapshot_id",
+                      "contract_schema", "environment")
+
+    def _source_binding(self, snapshot, record) -> dict:
+        """The verified source identity for one analysed snapshot (AA-15).
+
+        `record_sha256` is copied from a record whose digest the CONSUMER
+        already recomputed and compared (AA-04). This method never computes or
+        invents one: if the consumer did not verify it, the value is absent
+        and the binding says so rather than carrying an unchecked digest.
+        """
+        record = record if isinstance(record, dict) else {}
+        digest = str(record.get("record_sha256") or "")
+        verified = digest in getattr(self.consumer, "verified_digests", {})
+        return {
+            "record_sha256": digest if verified else "",
+            "digest_verified": bool(verified),
+            "contract_id": snapshot.contract_id,
+            "market_snapshot_id": snapshot.market_snapshot_id,
+            "contract_schema": str(record.get("schema") or ""),
+            "environment": str(CFG.ALPHA_ENVIRONMENT),
+        }
+
+    def reconcile_processed(self) -> dict:
+        """AA-13 restart reconciliation. Read-only; appends nothing.
+
+        A processed row saying ANALYZED is only believable if the prediction
+        it names is actually in the ledger. A crash between the prediction
+        append and the acknowledgement -- or the reverse order on a filesystem
+        that reordered them -- leaves the two disagreeing, and the disagreement
+        is the thing worth surfacing: it is the difference between "we already
+        paid for this analysis" and "we lost it".
+
+        Returns the mismatches instead of repairing them. Rewriting either
+        ledger to make them agree is exactly the retroactive edit this
+        subsystem forbids; an operator decides what to do.
+        """
+        orphans, unacknowledged = [], []
+        try:
+            rows = self.consumer.store._load()
+        except Exception as e:                                # noqa: BLE001
+            return {"checked": 0, "error": f"{type(e).__name__}: {e}",
+                    "analyzed_without_prediction": [],
+                    "prepared_without_acknowledgement": []}
+        for snapshot_id, row in rows.items():
+            if row.get("status") != STATUS_ANALYZED:
+                continue
+            try:
+                if not self.ledger.prediction_is_committed(snapshot_id):
+                    orphans.append({"market_snapshot_id": snapshot_id,
+                                    "prediction_id": row.get("prediction_id")})
+            except Exception:                                 # noqa: BLE001
+                continue
+        try:
+            for prepared in self.ledger.rows():
+                if prepared.get("kind") != "PREPARE":
+                    continue
+                sid = prepared.get("market_snapshot_id")
+                if self.ledger.prediction_is_committed(sid):
+                    continue
+                unacknowledged.append({"market_snapshot_id": sid,
+                                       "contract_id": prepared.get("contract_id")})
+        except Exception:                                     # noqa: BLE001
+            pass
+        if orphans:
+            self.telemetry.record_error(
+                f"reconcile: {len(orphans)} snapshot(s) marked ANALYZED with "
+                f"no committed prediction")
+        return {"checked": len(rows),
+                "analyzed_without_prediction": orphans,
+                "prepared_without_acknowledgement": unacknowledged}
+
     def _analyze_one(self, snapshot, record) -> dict:
         """One snapshot through the gateway, with the budget gate attached."""
         analysis_spend = {"usd": 0.0}
@@ -316,8 +391,27 @@ class AlphaShadowService:
                                            "outcome": "VALID" if sig.valid
                                            else (sig.rejected_reason or "")})
 
+        # AA-13 step 1, AA-15. PREPARE is durable BEFORE any provider is
+        # called, and it carries the verified source identity. A PREPARE with
+        # no matching PREDICTION is the on-disk trace of a crash mid-analysis,
+        # which a restart can tell apart from work that completed.
+        source_binding = self._source_binding(snapshot, record)
+        try:
+            self.ledger.prepare(
+                snapshot.market_snapshot_id,
+                contract_id=snapshot.contract_id,
+                source_record_sha256=source_binding.get("record_sha256", ""),
+                environment=source_binding.get("environment", ""))
+        except Exception as e:                                # noqa: BLE001
+            # Not fatal: PREPARE is a recovery aid, not the commit. Losing it
+            # costs reconciliation precision, never correctness.
+            self.telemetry.record_error(f"prepare: {type(e).__name__}: {e}")
+            log.error(f"[ALPHA_SERVICE] PREPARE not durable for "
+                      f"{snapshot.contract_id}: {e}")
+
         opportunity = self.gateway.analyze(
-            snapshot, quote_fn=self.quote_fn, gate=gate, on_signal=on_signal)
+            snapshot, quote_fn=self.quote_fn, gate=gate, on_signal=on_signal,
+            source_binding=source_binding)
 
         # Every provider refused on spend is its own terminal state: the
         # models were never asked, so "no valid signal" would be misleading.
@@ -334,19 +428,47 @@ class AlphaShadowService:
             self.telemetry.incr("p_meta_generated")
 
         deferred = opportunity["state"] == STATE_BUDGET_EXHAUSTED
+
+        # AA-13 step 3. The TERMINAL acknowledgement is published only after
+        # the prediction is confirmed durable, and the confirmation is a fresh
+        # read of the ledger rather than the in-process "persisted" flag --
+        # the flag says the append call returned, the read says the bytes are
+        # findable. If the prediction is NOT committed, the snapshot is marked
+        # DEFERRED (non-terminal) so a later poll retries it, instead of
+        # ANALYZED, which would lose the observation permanently.
+        committed = False
+        try:
+            committed = self.ledger.prediction_is_committed(
+                snapshot.market_snapshot_id)
+        except Exception as e:                                # noqa: BLE001
+            self.telemetry.record_error(
+                f"commit_check: {type(e).__name__}: {e}")
+            log.error(f"[ALPHA_SERVICE] could not confirm the prediction for "
+                      f"{snapshot.contract_id} reached the disk: {e}")
+        if not committed:
+            self.telemetry.record_error(
+                f"prediction_not_committed: {snapshot.market_snapshot_id}")
+            self.telemetry.incr("predictions_not_committed")
+            log.error(f"[ALPHA_SERVICE] prediction for "
+                      f"{snapshot.contract_id} is NOT durably committed -- "
+                      f"marking DEFERRED, not ANALYZED, so the observation is "
+                      f"retried rather than lost")
+        terminal = committed and not deferred
         try:
             self.consumer.store.mark(
                 snapshot.market_snapshot_id,
-                STATUS_DEFERRED if deferred else STATUS_ANALYZED,
+                STATUS_ANALYZED if terminal else STATUS_DEFERRED,
                 contract_id=snapshot.contract_id,
-                detail=opportunity["state"],
+                detail=opportunity["state"] if committed
+                else "prediction_not_committed",
                 prediction_id=opportunity["prediction_id"])
         except RuntimeError as e:
             self.telemetry.record_error(str(e))
             log.error(f"[ALPHA_SERVICE] {e}")
 
-        if not deferred:
+        if terminal:
             self._schedule_observations(opportunity["prediction_id"])
+        deferred = not terminal
         return {"prediction_id": opportunity["prediction_id"],
                 "contract_id": snapshot.contract_id,
                 "state": opportunity["state"],

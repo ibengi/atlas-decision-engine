@@ -454,6 +454,19 @@ class Config:
     #: the spool would be almost entirely duplicates and the consumer would
     #: spend its budget deduplicating instead of analysing.
     RESEARCH_FEED_MIN_INTERVAL_S = _env_f("RESEARCH_FEED_MIN_INTERVAL_S", 900.0)
+    #: AA-11: a record COUNT was never a disk budget. The spool shares a
+    #: volume with the money path's state files, so it is bounded in BYTES as
+    #: well, and one oversized record cannot consume the whole allowance.
+    RESEARCH_FEED_MAX_BYTES = _env_i("RESEARCH_FEED_MAX_BYTES", 64 * 1024 * 1024)
+    RESEARCH_FEED_MAX_RECORD_BYTES = _env_i("RESEARCH_FEED_MAX_RECORD_BYTES",
+                                            256 * 1024)
+    #: AA-10: the hand-off queue between the engine observer and the isolated
+    #: research writer. Bounded by item count AND by bytes so a stalled writer
+    #: cannot grow the engine's heap. Full queue = dropped research work,
+    #: never a slowed decision cycle.
+    RESEARCH_FEED_QUEUE_MAX = _env_i("RESEARCH_FEED_QUEUE_MAX", 256)
+    RESEARCH_FEED_QUEUE_MAX_BYTES = _env_i("RESEARCH_FEED_QUEUE_MAX_BYTES",
+                                           8 * 1024 * 1024)
 
     # ── Alpha Shadow Service (consumer side, SEPARATE process) ───────────
     ALPHA_SPOOL_POLL_S      = _env_f("ALPHA_SPOOL_POLL_S", 15.0)
@@ -469,6 +482,12 @@ class Config:
     ALPHA_RESEARCH_FEED_TIMEOUT_S = _env_f("ALPHA_RESEARCH_FEED_TIMEOUT_S",
                                            20.0)
     ALPHA_STATE_FILE        = "alpha_processed.jsonl"
+    #: AA-15. The environment a prediction was made in, bound into the
+    #: prediction row and re-checked at settlement. A DEMO prediction must not
+    #: be silently settled by a PROD feed, or the other way round: the two are
+    #: different markets with different books and a shared prediction_id space.
+    #: Read-only label; it grants no authority and enables nothing.
+    ALPHA_ENVIRONMENT       = os.getenv("ALPHA_ENVIRONMENT", "demo").strip() or "demo"
     ALPHA_OBSERVATION_FILE  = "alpha_observations.jsonl"
     ALPHA_TELEMETRY_FILE    = "alpha_telemetry.json"
     #: Follow-up price observations after an analysis, in seconds. Measures

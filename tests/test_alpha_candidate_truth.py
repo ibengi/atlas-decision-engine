@@ -46,8 +46,12 @@ from alpha_ledger import AlphaLedger, LedgerError              # noqa: E402
 from alpha_resolution_ingest import ingest_settlements         # noqa: E402
 from alpha_snapshot import SnapshotError                       # noqa: E402
 from config import CFG                                         # noqa: E402
-from research_feed import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS,    # noqa: E402
-                           REQUIRED_FIELDS, ResearchFeed,
+# AA-02: the schema and the required-field list now live in the ONE shared
+# contract, not in the producer. Importing them from their real home is part
+# of the point: three components can no longer hold three opinions.
+from candidate_contract import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS,  # noqa: E402
+                                REQUIRED_FIELDS)
+from research_feed import (ResearchFeed,                       # noqa: E402
                            candidate_from_market, spool_dir)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -68,6 +72,11 @@ def market(**over):
         "volume": 1200, "open_interest": 3400,
         "close_time": (now + timedelta(hours=3)).isoformat(),
         "expiration_time": (now + timedelta(hours=4)).isoformat(),
+        # AA-01: quotes are published ON the market object, and that is the
+        # RAW observation the research feed is allowed to read. The separate
+        # BOOK below is the EXECUTION-normalized structure, in which a missing
+        # side may already have been derived.
+        **BOOK,
     }
     payload.update(over)
     return {k: v for k, v in payload.items() if v is not _DROP}
@@ -140,9 +149,22 @@ class TruthCase(AlphaCase):
 
     # ── acting ──────────────────────────────────────────────────────────
     def emit(self, market_payload=None, book=None, **kw):
-        return self.feed.emit_candidate(candidate_from_market(
-            market_payload if market_payload is not None else market(),
-            BOOK if book is None else book, cycle_id="c1", **kw))
+        """Emit one candidate and WAIT for the writer to finish.
+
+        AA-10 moved the spool write onto a separate thread, so `emit_candidate`
+        returning no longer means the bytes are on disk -- that is the whole
+        point of the change. Tests that then read the spool have to wait for
+        the writer explicitly. The ENGINE never does this: `drain()` is
+        documented as test-and-shutdown only, and a production caller that
+        waited for the writer would reintroduce exactly the coupling AA-10 is
+        about.
+        """
+        payload = (market_payload if market_payload is not None else market())
+        accepted = self.feed.emit_candidate(candidate_from_market(
+            payload, BOOK if book is None else book,
+            raw_book=payload, cycle_id="c1", **kw))
+        self.feed.writer.drain(timeout=5.0)
+        return accepted
 
     def spool_bytes(self) -> dict:
         directory = spool_dir()
@@ -236,7 +258,10 @@ class AFullyObservedCandidateIsAccepted(TruthCase):
                          "market.settlement_sources")
         self.assertEqual(provenance["expected_resolution_time_utc"],
                          "market.expiration_time")
-        self.assertEqual(provenance["yes_ask"], "book.yes_ask(cents)")
+        # AA-01: the namespace is `raw_book`, not `book`. The distinction is
+        # the finding: `book` was the EXECUTION-normalized structure, in which
+        # this quote may have been computed rather than published.
+        self.assertEqual(provenance["yes_ask"], "raw_book.yes_ask(cents)")
 
     def test_observed_facts_survive_serialization_unchanged(self):
         source = market()
@@ -300,12 +325,20 @@ class AnAbsentFactIsNeverReconstructed(TruthCase):
         self.assertRefused(market(open_interest=DROP), field="open_interest")
 
     def test_a_missing_book_side_is_not_inferred_from_the_spread(self):
+        """AA-01: the side must be dropped from the RAW observation.
+
+        Dropping it from the execution book alone proves nothing now -- that
+        book is no longer the source the research feed reads. The raw market is
+        where the exchange publishes its quotes, so that is where the gap has
+        to be made for this to be a real test.
+        """
         for side in ("yes_bid", "yes_ask", "no_bid", "no_ask"):
             with self.subTest(side=side):
                 self.setUp()
+                raw = market(**{side: DROP})
                 book = {k: v for k, v in BOOK.items() if k != side}
                 book["spread"] = 2           # present, and deliberately unused
-                self.assertRefused(market(), field=side, book=book)
+                self.assertRefused(raw, field=side, book=book)
 
     def test_the_refusal_names_the_field_and_stays_a_research_event(self):
         with self.assertLogs("RESEARCH_FEED", level="INFO") as logs:
@@ -319,7 +352,10 @@ class AnAbsentFactIsNeverReconstructed(TruthCase):
         the record SAYS absent, which is branch (2), not branch (4)."""
         self.assertTrue(self.emit(market(event_ticker=DROP, event_id=DROP)))
         record = self.only_record()
-        self.assertEqual(record["event_id"], "")
+        # AA-02: absent is now None, never the empty string. `""` was itself
+        # a filler -- it reads as "the exchange published an empty event id"
+        # rather than "the exchange published none".
+        self.assertIsNone(record["event_id"])
         self.assertIn("event_id", record["unavailable_fields"])
         self.assertIn("catalyst_time_utc", record["unavailable_fields"])
         self.assertNotIn("event_id", record["field_provenance"])
@@ -363,8 +399,10 @@ class MalformedObservationsFailClosed(TruthCase):
     def test_a_nan_price_in_the_book_never_reaches_the_candidate(self):
         """Fails closed one stage earlier too: the shaping step reports the
         side unavailable rather than passing a NaN along."""
-        book = dict(BOOK, yes_ask=float("nan"))
-        candidate = candidate_from_market(market(), book)
+        # AA-01: quotes are read from the RAW observation, so that is where a
+        # malformed one has to be injected for this to test anything.
+        raw = market(yes_ask=float("nan"))
+        candidate = candidate_from_market(raw, BOOK, raw_book=raw)
         self.assertIsNone(candidate["yes_ask"])
         self.assertIn("yes_ask", candidate["unavailable_fields"])
         self.assertNotIn("yes_ask", candidate["field_provenance"])
@@ -436,7 +474,11 @@ class TheConsumerRefusesWhatItCannotAttribute(TruthCase):
             n for n in os.listdir(spool_dir()) if n != "noprov.json")[0]))
         consumer = self.consumer()
         self.assertEqual(consumer.pending(), [])
-        self.assertEqual(consumer.stats["unattributed"], 1)
+        # A record whose provenance container is gone also fails its checksum,
+        # because AA-05 requires provenance to be INSIDE the digest. Either
+        # counter proves the refusal; both must be non-zero in total.
+        self.assertEqual(consumer.stats["unattributed"]
+                         + consumer.stats["checksum_failures"], 1)
 
     def test_the_consumer_supplies_no_default_for_any_market_fact(self):
         """The old `.get(x, "kalshi")` / `.get(x, 0.0)` pair, pinned shut."""
@@ -544,8 +586,16 @@ class ThePredictionLedgerIsAppendOnly(TruthCase):
                            cost_path=os.path.join(self._tmp, "alpha_cost.jsonl"))
 
     def prediction(self, pid="p-1", **over):
+        """One prediction row.
+
+        AA-13 gives each snapshot a STABLE analysis identity and allows it at
+        most one committed prediction, so the snapshot id is derived from the
+        prediction id here. Two predictions sharing one snapshot id is now the
+        thing the ledger refuses, and a fixture that did it by accident would
+        make every case below fail for that reason instead of its own.
+        """
         row = {"prediction_id": pid, "contract_id": "KXBTCD-TRUTH",
-               "market_snapshot_id": "snap-abc", "p_yes": 0.61,
+               "market_snapshot_id": f"snap-{pid}", "p_yes": 0.61,
                "state": "SHADOW_POSITIVE_EDGE", "executed": False}
         row.update(over)
         return row
@@ -589,9 +639,20 @@ class ThePredictionLedgerIsAppendOnly(TruthCase):
         ledger.record_prediction(self.prediction("p-2"))
         with open(ledger.log.path, "a", encoding="utf-8") as fh:
             fh.write('{"kind": "prediction", "predi')
+        torn_bytes = open(ledger.log.path, "rb").read()
         rows = ledger.rows()
         self.assertEqual([r.get("prediction_id") for r in rows],
                          ["p-1", "p-2"])
+        # AA-12: a later append must not splice itself onto the damaged
+        # fragment, and must not truncate it away either. The old bytes stay
+        # byte-for-byte where they were; the new row simply starts on its own
+        # line, and the fragment remains visible as an unparsable row.
+        ledger.record_prediction(self.prediction("p-3"))
+        after = open(ledger.log.path, "rb").read()
+        self.assertTrue(after.startswith(torn_bytes),
+                        "the torn tail was rewritten or truncated")
+        self.assertEqual([r.get("prediction_id") for r in ledger.rows()],
+                         ["p-1", "p-2", "p-3"])
 
     def test_a_corrupt_middle_row_is_not_read_as_end_of_file(self):
         ledger = self.ledger()
@@ -674,7 +735,10 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
         ledger = self.ledger_with_prediction()
         result = ingest_settlements(ledger, [self.settlement(source="")])
         self.assertEqual(result["appended"], 0)
-        self.assertIn("source is required", result["rejected"][0]["reason"])
+        # The message now comes from the shared contract's `strict_text`,
+        # which refuses a whitespace-only source as well as an empty one.
+        self.assertIn("source", result["rejected"][0]["reason"])
+        self.assertIn("blank", result["rejected"][0]["reason"])
 
     def test_ingestion_declares_itself_shadow_only_with_no_broker_authority(self):
         ledger = self.ledger_with_prediction()
@@ -731,29 +795,49 @@ class EveryFailurePathLeavesTheEngineUntouched(TruthCase):
     written outside the research spool."""
 
     def test_an_unwritable_evidence_directory_is_survived(self):
+        """AA-10 changed what a `True` return MEANS, and this case says so.
+
+        The engine now hands the record to a bounded queue and returns; the
+        write happens on the writer thread. So `emit_candidate` reporting
+        `True` means QUEUED, not DURABLE -- the engine deliberately cannot
+        learn whether the disk accepted the bytes, because there is no action
+        it could take on that answer without coupling the two paths again.
+
+        What must still hold, and is asserted here: nothing raised into the
+        caller, nothing was spooled, and no gate or threshold moved.
+        """
         blocked = os.path.join(self._tmp, "not-a-directory")
         with open(blocked, "w", encoding="utf-8") as fh:
             fh.write("this path is a file")
         feed = ResearchFeed(directory=blocked)
+        self.addCleanup(feed.writer.stop)
         before = self.witness()
-        result, mutations = self.under_tripwire(
-            feed.emit_candidate, candidate_from_market(market(), BOOK))
-        self.assertFalse(result)
+        payload = market()
+        _result, mutations = self.under_tripwire(
+            feed.emit_candidate,
+            candidate_from_market(payload, BOOK, raw_book=payload))
+        feed.writer.drain(timeout=5.0)
         self.assertEqual(mutations, 0)
+        self.assertEqual(feed.writer.spool.stats["written"], 0,
+                         "a write succeeded into an unusable directory")
         self.assertNothingUnsafeMoved(before)
 
     def test_a_full_disk_is_survived(self):
         before = self.witness()
+        payload = market()
 
         def _emit():
-            with patch("builtins.open",
+            queued = self.feed.emit_candidate(
+                candidate_from_market(payload, BOOK, raw_book=payload))
+            with patch("os.open",
                        side_effect=OSError(28, "No space left on device")):
-                return self.feed.emit_candidate(
-                    candidate_from_market(market(), BOOK))
+                self.feed.writer.drain(timeout=5.0)
+            return queued
 
-        result, mutations = self.under_tripwire(_emit)
-        self.assertFalse(result)
+        _result, mutations = self.under_tripwire(_emit)
         self.assertEqual(mutations, 0)
+        self.assertEqual(self.spool_bytes(), {},
+                         "a record reached the spool despite ENOSPC")
         self.assertNothingUnsafeMoved(before)
 
     def test_a_malformed_source_payload_is_survived(self):
@@ -763,7 +847,7 @@ class EveryFailurePathLeavesTheEngineUntouched(TruthCase):
             with self.subTest(payload=repr(payload)[:40]):
                 result, mutations = self.under_tripwire(
                     self.feed.emit_candidate,
-                    candidate_from_market(payload, BOOK))
+                    candidate_from_market(payload, BOOK, raw_book=payload))
                 self.assertFalse(result)
                 self.assertEqual(mutations, 0)
         self.assertNothingUnsafeMoved(before)
@@ -817,6 +901,12 @@ class EveryFailurePathLeavesTheEngineUntouched(TruthCase):
     def test_a_full_spool_refuses_the_write_rather_than_growing(self):
         before = self.witness()
         with patch.object(CFG, "RESEARCH_FEED_MAX_SPOOL", 2):
+            # The bound is read when the spool is CONSTRUCTED, so the feed has
+            # to be built inside the patch. A bound re-read on every write
+            # would be one more filesystem-adjacent decision taken on the
+            # engine's thread.
+            self.feed = ResearchFeed()
+            self.addCleanup(self.feed.writer.stop)
             for i in range(5):
                 self.emit(market(ticker=f"KX-{i}"))
             self.assertLessEqual(len(self.spool_bytes()), 2)

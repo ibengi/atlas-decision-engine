@@ -38,12 +38,63 @@ def learning_snapshot(ledger, *, astra_selector="astra",
     return report
 
 
+#: AA-16. Ledger files a derived report must never be able to replace. A
+#: report is a VIEW; an `os.replace` onto a source ledger would destroy the
+#: append-only history the whole subsystem rests on, in one syscall, with no
+#: trace and no recovery.
+def _protected_source_paths(ledger, directory) -> dict:
+    from config import CFG
+    paths = {}
+    for label, attr in (("prediction ledger", "log"),
+                        ("cost ledger", "cost_log")):
+        source = getattr(ledger, attr, None)
+        path = getattr(source, "path", None)
+        if path:
+            paths[os.path.realpath(path)] = label
+    processed = os.path.join(directory, CFG.ALPHA_STATE_FILE)
+    paths.setdefault(os.path.realpath(processed), "processed ledger")
+    return paths
+
+
+def _assert_not_a_source_ledger(target, ledger, directory) -> None:
+    """Refuse to publish a report over a ledger (AA-16).
+
+    Both paths are canonicalised with `realpath` first, so a symlink, a `..`
+    segment or a relative path cannot be used to reach a ledger under a name
+    that merely looks different. Where the target already exists, the check is
+    repeated on INODE identity, which catches a hard link -- the one alias
+    `realpath` cannot see through.
+    """
+    protected = _protected_source_paths(ledger, directory)
+    resolved = os.path.realpath(target)
+    if resolved in protected:
+        raise ValueError(
+            f"refusing to publish the learning report over the "
+            f"{protected[resolved]} at {resolved}: a derived report never "
+            f"replaces a source ledger")
+    try:
+        target_stat = os.stat(resolved)
+    except OSError:
+        return                       # does not exist yet; no alias possible
+    for path, label in protected.items():
+        try:
+            source_stat = os.stat(path)
+        except OSError:
+            continue
+        if (target_stat.st_dev, target_stat.st_ino) == \
+                (source_stat.st_dev, source_stat.st_ino):
+            raise ValueError(
+                f"refusing to publish the learning report over the {label}: "
+                f"{resolved} and {path} are the same file")
+
+
 def write_learning_report(ledger, directory, *, filename=DEFAULT_REPORT_FILE,
                           **kwargs) -> dict:
     """Atomically publish a derived report without editing ledger history."""
     report = learning_snapshot(ledger, **kwargs)
     os.makedirs(directory, exist_ok=True)
     target = os.path.join(directory, filename)
+    _assert_not_a_source_ledger(target, ledger, directory)
     fd, tmp = tempfile.mkstemp(prefix=".alpha-learning-", suffix=".tmp",
                                dir=directory, text=True)
     try:

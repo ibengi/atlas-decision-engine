@@ -41,7 +41,11 @@ def market(ticker="KXBTCD-1", hours=4, catalyst_in=None):
             "settlement_sources": [{"name": "CF Benchmarks RTI"}],
             "volume": 1200, "open_interest": 3400,
             "close_time": (now + timedelta(hours=hours - 1)).isoformat(),
-            "expiration_time": (now + timedelta(hours=hours)).isoformat()}
+            "expiration_time": (now + timedelta(hours=hours)).isoformat(),
+            # AA-01: the exchange publishes its quotes ON the market object,
+            # and that RAW observation is the only book the research feed may
+            # read. `BOOK` below stands for the EXECUTION-normalized structure.
+            **BOOK}
 
 
 BOOK = {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}
@@ -68,8 +72,17 @@ class ServiceCase(AlphaCase):
             os.path.join(self._tmp, "pricing.json"), rates=rates, **kw))
 
     def emit(self, ticker="KXBTCD-1", **kw):
-        return ResearchFeed().emit_candidate(
-            candidate_from_market(market(ticker, **kw), BOOK, cycle_id="c1"))
+        """Emit and WAIT -- see AA-10; the spool write is on another thread."""
+        payload = market(ticker, **kw)
+        feed = ResearchFeed()
+        try:
+            accepted = feed.emit_candidate(
+                candidate_from_market(payload, BOOK, raw_book=payload,
+                                      cycle_id="c1"))
+            feed.writer.drain(timeout=5.0)
+        finally:
+            feed.writer.stop()
+        return accepted
 
     def service(self, providers=None, quote_fn=None, **kw):
         return AlphaShadowService(
@@ -249,11 +262,25 @@ class CatalystInvalidation(ServiceCase):
 
     def analysed_with_catalyst(self, seconds):
         now = datetime.now(timezone.utc)
-        candidate = candidate_from_market(market(), BOOK)
+        payload = market()
+        candidate = candidate_from_market(payload, BOOK, raw_book=payload)
         candidate["catalyst_name"] = "CPI release"
         candidate["catalyst_time_utc"] = (
             now + timedelta(seconds=seconds)).isoformat()
-        ResearchFeed().emit_candidate(candidate)
+        # AA-05: an optional fact that CARRIES a value must also carry
+        # provenance, so a catalyst injected by hand has to be attributed the
+        # same way the producer would attribute an observed one.
+        candidate["field_provenance"]["catalyst_name"] = "observer.catalyst"
+        candidate["field_provenance"]["catalyst_time_utc"] = "observer.catalyst"
+        candidate["unavailable_fields"] = [
+            f for f in candidate["unavailable_fields"]
+            if f not in ("catalyst_name", "catalyst_time_utc")]
+        feed = ResearchFeed()
+        try:
+            feed.emit_candidate(candidate)
+            feed.writer.drain(timeout=5.0)    # AA-10: the write is async now
+        finally:
+            feed.writer.stop()
         service = self.service()
         summary = service.cycle()
         return service, summary
