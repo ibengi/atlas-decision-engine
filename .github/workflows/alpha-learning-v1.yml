@@ -31,6 +31,7 @@ jobs:
               pathlib.Path('alpha_feed_readiness.py'),
               pathlib.Path('tools/alpha_learning_report.py'),
               pathlib.Path('tools/alpha_resolution_ingest.py'),
+              pathlib.Path('tools/alpha_feed_readiness.py'),
           ]
           banned = {
               'order_manager','execution_engine','kalshi_client','risk_manager',
@@ -108,4 +109,32 @@ jobs:
           resolution = AlphaLedger().find_resolution('ci-p1')
           assert resolution and resolution['actual_outcome'] == 1, resolution
           print('resolution ingest CLI PASS')
+          PY
+
+      - name: Feed readiness CLI fails closed
+        run: |
+          tmpdir="$(mktemp -d)"
+          cat > "$tmpdir/partial.json" <<'EOF'
+          {"rows":[{"recorded_at":"2026-09-11T11:00:00+00:00","decision":{"ticker":"KX-CI","entry_ask":76,"spread":1,"model_output":{"features":{"minutes_remaining":12}}}}]}
+          EOF
+          set +e
+          python tools/alpha_feed_readiness.py --input "$tmpdir/partial.json" > "$tmpdir/readiness.json"
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          python - <<'PY'
+          import json, os
+          p = os.path.join(os.environ.get('TMPDIR', '/tmp'), 'unused')
+          PY
+          python - "$tmpdir/readiness.json" <<'PY'
+          import json, sys
+          obj = json.load(open(sys.argv[1], encoding='utf-8'))
+          assert obj['mode'] == 'SHADOW_ONLY', obj
+          assert obj['broker_authority'] is False, obj
+          assert obj['all_records_ready'] is False, obj
+          result = obj['results'][0]
+          assert 'yes_bid' in result['missing_fields'], result
+          assert 'expected_resolution_time_utc' in result['missing_fields'], result
+          assert result['prohibited_inferences'], result
+          print('feed readiness CLI fail-closed PASS')
           PY
