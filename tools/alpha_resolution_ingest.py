@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """Ingest trusted Alpha settlement facts from JSONL. SHADOW ONLY.
 
-Each input line must be a JSON object with prediction_id, outcome (0/1), and
-source. Optional resolved_at is preserved. This tool never reaches a broker;
-it only appends RESOLUTION rows to the existing AlphaLedger.
+Each input line must be a JSON object carrying `prediction_id`, `outcome`
+(0/1), `source`, and the COMPLETE settlement binding -- `contract_id`,
+`market_snapshot_id` and `source_record_sha256`. Optional `resolved_at` and
+`settlement_evidence_id` are preserved. This tool never reaches a broker; it
+only appends RESOLUTION rows to the existing AlphaLedger.
+
+`--trusted-source` is REQUIRED, and that is the point of it (AA-15 re-audit).
+No settlement authority has been qualified for this deployment, and an
+unqualified authority is a reason to accept nothing rather than everything.
+Naming one here is an operator STATING which feed they have verified; the
+statement is recorded on every resolution the run appends, so a calibration
+number can later be traced to the authority that produced its outcomes.
 """
 import argparse
 import json
@@ -36,6 +45,11 @@ def main(argv=None):
                     help="JSONL settlement feed prepared by a trusted read-only source")
     ap.add_argument("--strict", action="store_true",
                     help="exit non-zero if any row is rejected or conflicts")
+    ap.add_argument("--trusted-source", action="append", required=True,
+                    metavar="NAME", dest="trusted_sources",
+                    help="a settlement source you have verified. Repeatable, "
+                         "and required: without one, no authority has been "
+                         "qualified and every row is refused.")
     args = ap.parse_args(argv)
 
     rows = _read_jsonl(args.input)
@@ -44,12 +58,14 @@ def main(argv=None):
     clean_rows = [r for r in rows
                   if not (isinstance(r, dict) and r.get("__parse_error__"))]
     ledger = AlphaLedger()
-    result = ingest_settlements(ledger, clean_rows)
+    result = ingest_settlements(ledger, clean_rows,
+                                trusted_sources=args.trusted_sources)
     for error in parse_errors:
         result["rejected"].append({"reason": error})
     result["received"] += len(parse_errors)
     print(json.dumps(result, indent=2, sort_keys=True))
-    if args.strict and (result["rejected"] or result["conflicts"]):
+    if args.strict and (result["rejected"] or result["conflicts"]
+                        or result["quarantined"]):
         return 2
     return 0
 

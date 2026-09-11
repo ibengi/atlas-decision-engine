@@ -148,20 +148,45 @@ jobs:
           print('durable report CLI PASS')
           PY
 
+      # AA-15 (re-audit): the CLI now requires the operator to NAME the
+      # settlement authority they verified, and the settlement to carry the
+      # COMPLETE binding. Both halves are exercised, including the refusal.
       - name: Resolution ingest CLI boundary smoke test
         run: |
           tmpdir="$(mktemp -d)"
           export DATA_DIR="$tmpdir"
           python - <<'PY'
-          import os
           from alpha_ledger import AlphaLedger
-          ledger = AlphaLedger()
-          ledger.record_prediction({'prediction_id': 'ci-p1'})
+          AlphaLedger().record_prediction({
+              'prediction_id': 'ci-p1',
+              'contract_id': 'KX-CI',
+              'market_snapshot_id': 'snap-ci',
+              'source_binding': {'contract_id': 'KX-CI',
+                                 'market_snapshot_id': 'snap-ci',
+                                 'record_sha256': 'a' * 64}})
           PY
           cat > "$tmpdir/settlements.jsonl" <<'EOF'
-          {"prediction_id":"ci-p1","outcome":1,"source":"ci-trusted-feed"}
+          {"prediction_id":"ci-p1","outcome":1,"source":"ci-trusted-feed","contract_id":"KX-CI","market_snapshot_id":"snap-ci","source_record_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
           EOF
-          python tools/alpha_resolution_ingest.py --input "$tmpdir/settlements.jsonl" --strict > "$tmpdir/ingest.json"
+          # An unqualified source is refused. This is the DEFAULT, so it is
+          # asserted before the happy path rather than after it.
+          set +e
+          python tools/alpha_resolution_ingest.py --input "$tmpdir/settlements.jsonl" \
+            --strict --trusted-source some-unverified-blog > "$tmpdir/refused.json"
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          python - <<'PY'
+          import json, os
+          from alpha_ledger import AlphaLedger
+          refused = json.load(open(os.path.join(os.environ['DATA_DIR'],
+                                                'refused.json'), encoding='utf-8'))
+          assert refused['appended'] == 0, refused
+          assert AlphaLedger().find_resolution('ci-p1') is None, 'it resolved anyway'
+          print('unqualified settlement source REFUSED, as designed')
+          PY
+          python tools/alpha_resolution_ingest.py --input "$tmpdir/settlements.jsonl" \
+            --strict --trusted-source ci-trusted-feed > "$tmpdir/ingest.json"
           python - <<'PY'
           import json, os
           from alpha_ledger import AlphaLedger
@@ -170,8 +195,13 @@ jobs:
           assert result['mode'] == 'SHADOW_ONLY', result
           assert result['broker_authority'] is False, result
           assert result['appended'] == 1, result
+          assert result['trusted_sources_enforced'] is True, result
+          assert result['quarantined'] == [], result
           resolution = AlphaLedger().find_resolution('ci-p1')
           assert resolution and resolution['actual_outcome'] == 1, resolution
+          # The trust decision travels with the outcome (correction 12).
+          assert resolution['binding_verified'] is True, resolution
+          assert resolution['source_trusted'] is True, resolution
           print('resolution ingest CLI PASS')
           PY
 

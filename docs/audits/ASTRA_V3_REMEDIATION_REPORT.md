@@ -270,7 +270,7 @@ pytest -k "AA11 or AA12 or AA13 or AA13b or AA13c or AA14 or AA15 or M07P"
                                          ->  59 passed
 ```
 
-### Three defects this work found in itself
+### Four defects this work found in itself
 
 Both are recorded because a remediation that only reports what it set out to
 fix is a remediation nobody can calibrate.
@@ -292,6 +292,15 @@ fix is a remediation nobody can calibrate.
   wrapped around the *call* was therefore dead code, and an unopenable lock
   file would have escaped `BoundedSpool.write`, which promises never to raise
   for an expected condition. Found by re-reading the diff after the commit.
+
+* **The library default changed and the CLI did not.**
+  `ingest_settlements` began refusing unqualified sources, and
+  `tools/alpha_resolution_ingest.py` had no way for an operator to name one —
+  so the CLI could no longer append anything at all. Caught by hosted CI on
+  `67e0529`, which is what hosted CI is for: the local suite exercises the
+  library, and only the workflow exercises the tool. `--trusted-source` is
+  now required, repeatable, and recorded on every resolution the run appends;
+  the CI step asserts the refusal before the happy path.
 
 * **`M19` survived the first full probe run.** Removing the total wrapper
   from `validate_record` was NOT detected, because `_check_book` had also
