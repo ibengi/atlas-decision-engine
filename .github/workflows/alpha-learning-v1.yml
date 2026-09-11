@@ -1,0 +1,32 @@
+name: Alpha Learning v1 validation
+
+on:
+  push:
+    branches: [alpha/astra-learning-v1]
+
+jobs:
+  test-learning:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Unit tests
+        run: python -m unittest tests.test_alpha_learning -v
+      - name: Safety boundary
+        run: |
+          python - <<'PY'
+          import ast, pathlib
+          p = pathlib.Path('alpha_learning.py')
+          tree = ast.parse(p.read_text())
+          banned = {'order_manager','execution_engine','kalshi_client','risk_manager','position_sizer','trade_logger'}
+          imported = set()
+          for n in ast.walk(tree):
+              if isinstance(n, ast.Import):
+                  imported.update(a.name.split('.')[0] for a in n.names)
+              elif isinstance(n, ast.ImportFrom) and n.module:
+                  imported.add(n.module.split('.')[0])
+          assert not (imported & banned), imported & banned
+          print('SHADOW boundary PASS')
+          PY
