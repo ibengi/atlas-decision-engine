@@ -9,6 +9,7 @@ Status: **SHADOW ONLY**. This document applies only to `alpha/astra-learning-v1`
 - `alpha_learning_report.json` is published atomically and the append-only prediction ledger is not rewritten.
 - The memory CLI emits only prior resolved cases and emits no side, size, order, or execution instruction.
 - Settlement ingestion is append-only: matching duplicates are idempotent, unknown predictions are rejected, and conflicting outcomes are surfaced without overwriting the first resolution.
+- The candidate producer is fail-closed at the source: a market fact the exchange did not publish is refused and counted, never substituted, and every emitted fact carries the source key it was read from.
 - Feed readiness is fail-closed: missing immutable market facts are reported rather than reconstructed from ticker text, spread arithmetic, a relative horizon, settlement time, or a generic liquidity score.
 
 ## Requirements before wiring into `atlas-alpha-shadow`
@@ -26,20 +27,79 @@ Still required before declaring persistence proven:
 
 A telemetry file being writable on `/data` proves the mount is usable; it is not by itself proof that the learning ledger survives a restart.
 
-### R2 — Complete immutable candidate source — BLOCKER
+### R2 — Complete immutable candidate source — CODE PATH CLOSED, LIVE SAMPLE OUTSTANDING
 
-The currently observed production decision/shadow records are not sufficient to build an `atlas-alpha-v2` snapshot without inventing facts. The readiness preflight intentionally refuses those records when they lack directly persisted fields such as contract metadata, resolution rules/source, exchange volume/open interest, absolute close/resolution times, or the full contemporaneous order book.
+The original finding stands and is unchanged: `/api/research/v1/decisions` cannot
+produce an `atlas-alpha-v2` snapshot without inventing facts, because a decision
+record is what the engine *concluded*, not what it *saw*.
 
-Required before wiring:
+What was wrong was the assumed remedy. A neutral candidate boundary already
+existed — `research_feed.py` (producer, engine side), a bounded spool,
+`/api/research/v1/candidates`, and `alpha_consumer.py` (consumer, Alpha side).
+It was not missing. It was **untruthful**: both ends substituted values for facts
+the source had never recorded.
 
-- supply every field required by `alpha_snapshot.build_snapshot` directly from a producer/exchange record,
-- keep a stable producer record identity so the Alpha prediction can later be linked to settlement evidence,
-- do not infer a full book from `entry_ask + spread`,
-- do not derive close/expiry from `recorded_at/ts + minutes_remaining`,
-- do not turn ticker parsing into canonical contract text or resolution rules,
-- do not relabel a generic liquidity/ranker score as exchange volume/open interest.
+| substitution that used to happen | what it actually meant |
+| --- | --- |
+| `resolution_source` defaulted to the literal `"kalshi"` | the venue is not the settlement authority |
+| `volume` / `open_interest` fell back to `0.0` | "not reported" was recorded as "zero" |
+| `question` fell back to the ticker | a symbol is not the contract question |
+| `expected_resolution_time_utc` fell back to `close_time` | a close is not a settlement |
+| `resolution_rules` fell back to `""` | no rules is not empty rules |
 
-`tools/alpha_feed_readiness.py` is the release gate for this requirement. Wiring is not ready unless the real sampled feed returns `all_records_ready=true`.
+Each of those turns "the exchange did not tell us" into a fact Alpha would later
+calibrate against, and a model scored on invented premises looks better than it
+is. That is the one error a calibration subsystem cannot absorb.
+
+**The rule now enforced in code.** Every field is one of:
+
+1. directly observed and persisted, carrying the source key it was read from;
+2. explicitly listed in `unavailable_fields`;
+3. omitted because it is optional (`event_id`, catalyst).
+
+There is no fourth branch. In particular there is no "derive it, it is
+mathematically plausible" branch: a full book is never inferred from
+`entry_ask + spread`, an expiry is never derived from `recorded_at +
+minutes_remaining`, a missing book side is never invented, market metadata is
+never manufactured, and ticker text is never promoted to canonical contract text
+or resolution rules.
+
+**How it is enforced.**
+
+- Feed schema `atlas-research-candidate-v2`. `v1` records are **refused, not
+  migrated** — a v1 record was permitted to carry the substitutions above, so it
+  cannot be relabelled truthful and must be re-observed.
+- `REQUIRED_FIELDS` is the full snapshot-minting set. A record missing any of it
+  never reaches the spool: the producer refuses and counts the refusal
+  (`refused_incomplete`), because a refusal at ingest is much harder to trace
+  back to the market that caused it and, on a bounded spool, displaces a record
+  that was complete.
+- `MARKET_SOURCES` / `BOOK_SOURCES` list, per field, only the source keys that
+  are genuine aliases *for the same fact*. A key naming a different fact is a
+  derivation, and a derivation presented as an observation is the failure mode
+  this boundary exists to prevent.
+- Each record carries `field_provenance` (field → the source key it was read
+  from) and `unavailable_fields`. Both are inside `record_sha256`, so a record
+  re-attributed after the fact fails its own checksum.
+- The consumer supplies **no default for any market fact** and refuses a record
+  whose provenance does not name a real source key for every required field.
+- `alpha_feed_readiness.assess_record` honours the producer's own provenance:
+  an unattributed required field is reported missing and logged as a prohibited
+  inference, whatever value happens to sit in the record.
+
+**Direction is unchanged and asserted, not described.** ENGINE OBSERVATION →
+immutable read-only research evidence → Alpha Shadow → prediction ledger → later
+resolution. `tests/test_research_feed_boundary.py` pins the producer's import
+list with an allow-list, so the boundary cannot widen by accident; the engine may
+know the neutral producer, and may never know Alpha.
+
+**What remains outstanding for this requirement** is no longer a code path but a
+live sample: the exchange must actually publish `rules_primary` and
+`settlement_sources` for the markets being scanned. Where it does not, those
+markets are correctly refused and Alpha receives nothing for them — which is the
+intended behaviour, not a regression. `tools/alpha_feed_readiness.py` remains the
+release gate: wiring is not ready until a real sampled feed returns
+`all_records_ready=true`.
 
 ### R3 — A real Astra forecasting identity — BLOCKER
 

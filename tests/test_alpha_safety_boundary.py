@@ -218,6 +218,11 @@ class TheAutomaticFeedIntroducesNoPath(AlphaCase):
             ResearchFeed().emit_candidate(candidate_from_market(
                 {"ticker": "KX-SAFE", "title": "q", "volume": 1,
                  "open_interest": 1,
+                 # A complete market payload: the producer now
+                 # refuses to substitute rules or a settlement
+                 # source it never observed.
+                 "rules_primary": "as published",
+                 "settlement_sources": [{"name": "CF Benchmarks RTI"}],
                  "close_time": (now + timedelta(hours=3)).isoformat(),
                  "expiration_time": (now + timedelta(hours=4)).isoformat()},
                 {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}))
@@ -239,6 +244,11 @@ class TheAutomaticFeedIntroducesNoPath(AlphaCase):
             ResearchFeed().emit_candidate(candidate_from_market(
                 {"ticker": "KX-RO", "title": "q", "volume": 1,
                  "open_interest": 1,
+                 # A complete market payload: the producer now
+                 # refuses to substitute rules or a settlement
+                 # source it never observed.
+                 "rules_primary": "as published",
+                 "settlement_sources": [{"name": "CF Benchmarks RTI"}],
                  "close_time": (now + timedelta(hours=3)).isoformat(),
                  "expiration_time": (now + timedelta(hours=4)).isoformat()},
                 {"yes_bid": 44, "yes_ask": 46, "no_bid": 54, "no_ask": 56}))

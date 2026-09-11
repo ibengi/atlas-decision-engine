@@ -59,7 +59,8 @@ from datetime import datetime, timezone
 
 from alpha_snapshot import SnapshotError, build_snapshot
 from config import CFG, _p
-from research_feed import FEED_SCHEMA, spool_dir
+from research_feed import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS,
+                           REQUIRED_FIELDS, spool_dir)
 
 log = logging.getLogger("ALPHA")
 
@@ -309,12 +310,54 @@ class SpoolConsumer:
         self.directory = getattr(self.source, "directory", None)
         self.store = store or ProcessedStore()
         self.stats = {"records_read": 0, "malformed": 0, "duplicates": 0,
-                      "minted": 0, "feed_errors": 0}
+                      "minted": 0, "feed_errors": 0,
+                      # A record refused because the SOURCE was incomplete or
+                      # unattributed, told apart from one that was malformed.
+                      "unattributed": 0, "legacy_schema": 0}
         self.feed_error = None
 
     def _valid(self, record):
-        if not isinstance(record, dict) or record.get("schema") != FEED_SCHEMA:
+        """A record this consumer is allowed to mint a snapshot from.
+
+        Strict on three counts, and each one is a fact Alpha would otherwise
+        have to invent:
+
+        SCHEMA      only the current feed schema. A legacy v1 record was
+                    permitted to carry a substituted settlement source, a
+                    question parsed from a ticker and a "0.0" that meant
+                    absent; it cannot be re-labelled truthful, so it is
+                    refused and counted rather than migrated.
+        COMPLETE    every required fact present. This consumer no longer
+                    supplies a default for any of them -- `.get(x, "kalshi")`
+                    and `.get(x, 0.0)` were how an unobserved market fact
+                    entered the ledger looking like an observed one.
+        ATTRIBUTED  the producer's provenance names a real source key for
+                    every required fact, and none of them is listed as
+                    unavailable. A record that cannot say where a fact came
+                    from is not evidence.
+        """
+        if not isinstance(record, dict):
             return None
+        if record.get("schema") in LEGACY_FEED_SCHEMAS:
+            self.stats["legacy_schema"] += 1
+            log.warning("[ALPHA_CONSUMER] refusing legacy feed record "
+                        f"{record.get('schema')!r}: it may carry substituted "
+                        f"market facts and must be re-observed")
+            return None
+        if record.get("schema") != FEED_SCHEMA:
+            return None
+        provenance = record.get("field_provenance")
+        unavailable = record.get("unavailable_fields")
+        if not isinstance(provenance, dict) or not isinstance(unavailable, list):
+            self.stats["unattributed"] += 1
+            return None
+        for field in REQUIRED_FIELDS:
+            if record.get(field) in (None, "") or field in unavailable \
+                    or not str(provenance.get(field) or "").strip():
+                self.stats["unattributed"] += 1
+                log.warning(f"[ALPHA_CONSUMER] refusing {record.get('contract_id')}: "
+                            f"{field} is not an attributed observation")
+                return None
         return record
 
     def mint(self, record: dict):
@@ -326,14 +369,18 @@ class SpoolConsumer:
         """
         return build_snapshot(
             contract_id=record["contract_id"],
+            # No `.get(..., default)` on any market fact: `_valid` has
+            # already proved each one is present and attributed, so a KeyError
+            # here would mean the guard was bypassed, and crashing is the
+            # correct response to that. `event_id` is genuinely optional.
             event_id=record.get("event_id", ""),
             question=record["question"],
-            resolution_rules=record.get("resolution_rules", ""),
-            resolution_source=record.get("resolution_source", "kalshi"),
+            resolution_rules=record["resolution_rules"],
+            resolution_source=record["resolution_source"],
             yes_bid=record["yes_bid"], yes_ask=record["yes_ask"],
             no_bid=record["no_bid"], no_ask=record["no_ask"],
-            volume=record.get("volume", 0.0),
-            open_interest=record.get("open_interest", 0.0),
+            volume=record["volume"],
+            open_interest=record["open_interest"],
             snapshot_time_utc=record.get("emitted_at_utc"),
             market_close_time_utc=record["market_close_time_utc"],
             expected_resolution_time_utc=record["expected_resolution_time_utc"],

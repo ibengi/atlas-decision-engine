@@ -37,6 +37,11 @@ def market(ticker="KXBTCD-1", hours=4):
     return {"ticker": ticker, "event_ticker": "EV",
             "title": "Will BTC be above 60000?",
             "rules_primary": "CF Benchmarks RTI",
+            # The exchange publishes its settlement sources. The fixture
+            # carries them because a real market payload does: the producer
+            # refuses to invent one, so a fixture without them would be
+            # testing an incomplete market, not a complete candidate.
+            "settlement_sources": [{"name": "CF Benchmarks RTI"}],
             "volume": 1200, "open_interest": 3400,
             "close_time": (now + timedelta(hours=hours - 1)).isoformat(),
             "expiration_time": (now + timedelta(hours=hours)).isoformat()}

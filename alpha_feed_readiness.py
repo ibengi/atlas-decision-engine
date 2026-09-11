@@ -87,6 +87,34 @@ def assess_record(row: dict) -> dict:
 
     prohibited = []
 
+    # A record from the neutral research producer carries its own provenance:
+    # which source key each fact was read from, and which facts the source
+    # genuinely did not record. When it is present it OVERRIDES the path
+    # search above, because a value being syntactically present is not the
+    # same as it having been observed -- that gap is precisely how a
+    # substituted default ("kalshi", 0.0, the ticker) passes a shape check.
+    provenance = row.get("field_provenance")
+    unavailable = row.get("unavailable_fields")
+    if isinstance(provenance, dict) and isinstance(unavailable, list):
+        unattributed = []
+        for target in DIRECT_PATHS:
+            if target == "snapshot_time_utc":
+                continue          # supplied by the producer's emission clock
+            attributed = str(provenance.get(target) or "").strip()
+            if target in unavailable or not attributed:
+                unattributed.append(target)
+                direct.pop(target, None)
+                if target not in missing:
+                    missing.append(target)
+            else:
+                direct.setdefault(target, {})["provenance"] = attributed
+        if unattributed:
+            prohibited.append({
+                "would_infer": sorted(unattributed),
+                "from": ["producer default / unrecorded source fact"],
+                "reason": "the producer did not attribute these to an observed source key",
+            })
+
     # Common temptation in the currently deployed /decisions surface:
     # reconstruct a book from one chosen-side ask plus spread. Refuse it.
     if _has_any(row, ("entry_ask", "decision.entry_ask", "spread", "decision.spread")):

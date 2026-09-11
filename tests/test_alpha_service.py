@@ -37,7 +37,9 @@ from research_feed import ResearchFeed, candidate_from_market  # noqa: E402
 def market(ticker="KXBTCD-1", hours=4, catalyst_in=None):
     now = datetime.now(timezone.utc)
     return {"ticker": ticker, "event_ticker": "EV", "title": "BTC > 60000?",
-            "rules_primary": "RTI", "volume": 1200, "open_interest": 3400,
+            "rules_primary": "RTI",
+            "settlement_sources": [{"name": "CF Benchmarks RTI"}],
+            "volume": 1200, "open_interest": 3400,
             "close_time": (now + timedelta(hours=hours - 1)).isoformat(),
             "expiration_time": (now + timedelta(hours=hours)).isoformat()}
 

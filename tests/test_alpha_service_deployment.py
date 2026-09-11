@@ -245,17 +245,33 @@ class TheResearchFeedCrossesTheServiceBoundary(AlphaCase):
                                session=_FakeSession(pages), **kw)
 
     def record(self, contract_id="C1", sha="a" * 64):
-        return {"schema": "atlas-research-candidate-v1",
+        import research_feed
+        return {"schema": research_feed.FEED_SCHEMA,
                 "record_sha256": sha, "record_id": sha[:20],
                 "emitted_at_utc": "2026-09-09T12:00:00+00:00",
                 "contract_id": contract_id, "event_id": "E",
                 "question": "Will it?", "resolution_rules": "as written",
-                "resolution_source": "kalshi",
+                "resolution_source": "CF Benchmarks RTI",
                 "yes_bid": 0.44, "yes_ask": 0.46,
                 "no_bid": 0.54, "no_ask": 0.56,
                 "volume": 10.0, "open_interest": 5.0,
                 "market_close_time_utc": "2026-09-10T12:00:00+00:00",
-                "expected_resolution_time_utc": "2026-09-10T13:00:00+00:00"}
+                "expected_resolution_time_utc": "2026-09-10T13:00:00+00:00",
+                # Every required fact names the source key it was read from.
+                # A record without this is refused: see `SpoolConsumer._valid`.
+                "field_provenance": {
+                    "contract_id": "market.ticker", "question": "market.title",
+                    "resolution_rules": "market.rules_primary",
+                    "resolution_source": "market.settlement_sources",
+                    "yes_bid": "book.yes_bid(cents)",
+                    "yes_ask": "book.yes_ask(cents)",
+                    "no_bid": "book.no_bid(cents)",
+                    "no_ask": "book.no_ask(cents)",
+                    "volume": "market.volume",
+                    "open_interest": "market.open_interest",
+                    "market_close_time_utc": "market.close_time",
+                    "expected_resolution_time_utc": "market.expiration_time"},
+                "unavailable_fields": ["catalyst_name", "catalyst_time_utc"]}
 
     def test_the_default_transport_is_local_so_one_host_is_unchanged(self):
         with unittest.mock.patch.object(CFG, "ALPHA_FEED_TRANSPORT", "local"):
