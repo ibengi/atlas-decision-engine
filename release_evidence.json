@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-09-11T10:25:00Z",
+  "generated_at": "2026-09-11T19:10:00Z",
   "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
   "tree_sha": "cf2b4ea2dd730808c0874fdb8b31045944b55dc8",
   "deployment_id": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da",
@@ -181,7 +181,42 @@
             "pr64_status": "https://github.com/ibengi/atlas-decision-engine/pull/64 at e0d7448: repo-owned READ_ONLY observation through equity_drawdown, CI green, NOT MERGED, NOT DEPLOYED"
           }
         }
-      ]
+      ],
+      "subsequent_confirmations": {
+        "summary": "Two further production WOULD_SUBMIT decisions on the same deployment after the 09:55:03Z confirmation. Each completed the decision and was stopped by PROD_ACCESS_MODE=READ_ONLY before any write-path call. They corroborate the running shadow; they do not change its status or its deposit-dependence.",
+        "events": [
+          {
+            "at": "2026-09-11T12:53:04Z",
+            "decision": "KXBTC15M-26SEP110900-00 NO x1 @ 3c",
+            "model_probability": 0.14369181903250783,
+            "market_probability": 0.03,
+            "edge_net": 0.08369181903250784,
+            "rejection_reason": "prod_read_only"
+          },
+          {
+            "at": "2026-09-11T18:24:44Z",
+            "decision": "KXBTC15M-26SEP111430-30 NO x1 @ 8c",
+            "model_probability": 0.3130745655523469,
+            "market_probability": 0.09,
+            "edge_net": 0.1930745655523469,
+            "rejection_reason": "prod_read_only"
+          }
+        ],
+        "zero_write_verification": {
+          "window": "2026-09-11T00:00:00Z to 19:07Z on deployment 6f039c6e",
+          "would_submit_events_in_window": 3,
+          "order_submit_log_lines": 0,
+          "order_filled_log_lines": 0,
+          "broker_write_log_lines": 0,
+          "brokerwriteforbidden_log_lines": 0,
+          "cancel_log_lines": 0,
+          "persistence_halt": "none",
+          "reconciliation": "MATCH on every RECONCILE_VERIFY in the window, broker=0 local=0",
+          "drawdown_blocked_cycles": 0,
+          "method": "Railway deploy logs for deployment 6f039c6e, filtered once for WOULD_SUBMIT over the whole day and once for ORDER_SUBMIT/ORDER_FILLED/BROKER_WRITE/BrokerWriteForbidden/PERSISTENCE_HALT/MISMATCH/cancel over the same window; the second filter returned zero entries."
+        },
+        "still_true": "The shadow remains deposit-dependent rather than code-dependent. Neither claude/railway-atlas-readonly-shadow-scan (054a2e1) nor PR #64 has been merged or deployed. CAPITAL remains NOT authorized."
+      }
     },
     "shadow_history": {
       "guard": "equity_drawdown",
