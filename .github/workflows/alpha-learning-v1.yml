@@ -17,6 +17,7 @@ jobs:
         run: |
           python -m unittest tests.test_alpha_learning -v
           python -m unittest tests.test_alpha_learning_runtime -v
+          python -m unittest tests.test_alpha_resolution_ingest -v
 
       - name: Safety boundary
         run: |
@@ -25,7 +26,9 @@ jobs:
           files = [
               pathlib.Path('alpha_learning.py'),
               pathlib.Path('alpha_learning_runtime.py'),
+              pathlib.Path('alpha_resolution_ingest.py'),
               pathlib.Path('tools/alpha_learning_report.py'),
+              pathlib.Path('tools/alpha_resolution_ingest.py'),
           ]
           banned = {
               'order_manager','execution_engine','kalshi_client','risk_manager',
@@ -76,4 +79,31 @@ jobs:
           leftovers = [x for x in os.listdir(d) if x.startswith('.alpha-learning-')]
           assert not leftovers, leftovers
           print('durable report CLI PASS')
+          PY
+
+      - name: Resolution ingest CLI boundary smoke test
+        run: |
+          tmpdir="$(mktemp -d)"
+          export DATA_DIR="$tmpdir"
+          python - <<'PY'
+          import os
+          from alpha_ledger import AlphaLedger
+          ledger = AlphaLedger()
+          ledger.record_prediction({'prediction_id': 'ci-p1'})
+          PY
+          cat > "$tmpdir/settlements.jsonl" <<'EOF'
+          {"prediction_id":"ci-p1","outcome":1,"source":"ci-trusted-feed"}
+          EOF
+          python tools/alpha_resolution_ingest.py --input "$tmpdir/settlements.jsonl" --strict > "$tmpdir/ingest.json"
+          python - <<'PY'
+          import json, os
+          from alpha_ledger import AlphaLedger
+          d = os.environ['DATA_DIR']
+          result = json.load(open(os.path.join(d, 'ingest.json'), encoding='utf-8'))
+          assert result['mode'] == 'SHADOW_ONLY', result
+          assert result['broker_authority'] is False, result
+          assert result['appended'] == 1, result
+          resolution = AlphaLedger().find_resolution('ci-p1')
+          assert resolution and resolution['actual_outcome'] == 1, resolution
+          print('resolution ingest CLI PASS')
           PY
