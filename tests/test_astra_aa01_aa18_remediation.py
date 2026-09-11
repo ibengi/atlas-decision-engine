@@ -690,14 +690,19 @@ class AA10_ResearchIOBlockedTheEngineCycle(RemediationCase):
         """THE case for this finding. The writer's fsync is held forever; the
         engine's call must still return promptly."""
         released = threading.Event()
-        self.addCleanup(released.set)
         entered = threading.Event()
 
         def _hanging_fsync(_fd):
             entered.set()
-            released.wait(timeout=30)
+            # Bounded. `os.fsync` is patched process-wide, so an unrelated
+            # writer thread can enter this too; parking it for 30s would make
+            # one test able to stall the rest of the suite.
+            released.wait(timeout=10)
 
         feed = self.feed()
+        # Registered AFTER the feed, so LIFO cleanup releases the fsync BEFORE
+        # `writer.stop()` tries to join the thread that is sitting in it.
+        self.addCleanup(released.set)
         with patch("research_spool.os.fsync", _hanging_fsync):
             # First record occupies the writer thread inside the stalled fsync.
             feed.emit_candidate(valid_candidate(raw_market(ticker="KX-STALL")))

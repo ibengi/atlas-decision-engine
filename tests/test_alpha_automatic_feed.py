@@ -61,6 +61,9 @@ class FeedCase(AlphaCase):
         self._patches.append(patch.object(CFG, "RESEARCH_FEED_ENABLED", True))
         self._patches[-1].start()
         self.feed = ResearchFeed()
+        # AA-10 gave every feed its own writer thread. Stop it, or the
+        # suite accumulates one polling daemon per test.
+        self.addCleanup(self.feed.writer.stop)
 
     def emit(self, ticker="KXBTCD-1", **kw):
         """Emit and WAIT. AA-10 made the spool write asynchronous, so a test

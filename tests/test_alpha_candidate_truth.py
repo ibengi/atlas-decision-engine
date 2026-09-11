@@ -146,6 +146,9 @@ class TruthCase(AlphaCase):
         self._patches.append(patch.object(CFG, "RESEARCH_FEED_ENABLED", True))
         self._patches[-1].start()
         self.feed = ResearchFeed()
+        # AA-10 gave every feed its own writer thread. Stop it, or the
+        # suite accumulates one polling daemon per test.
+        self.addCleanup(self.feed.writer.stop)
 
     # ── acting ──────────────────────────────────────────────────────────
     def emit(self, market_payload=None, book=None, **kw):
