@@ -12,21 +12,68 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Unit tests
-        run: python -m unittest tests.test_alpha_learning -v
+        run: |
+          python -m unittest tests.test_alpha_learning -v
+          python -m unittest tests.test_alpha_learning_runtime -v
+
       - name: Safety boundary
         run: |
           python - <<'PY'
           import ast, pathlib
-          p = pathlib.Path('alpha_learning.py')
-          tree = ast.parse(p.read_text())
-          banned = {'order_manager','execution_engine','kalshi_client','risk_manager','position_sizer','trade_logger'}
-          imported = set()
-          for n in ast.walk(tree):
-              if isinstance(n, ast.Import):
-                  imported.update(a.name.split('.')[0] for a in n.names)
-              elif isinstance(n, ast.ImportFrom) and n.module:
-                  imported.add(n.module.split('.')[0])
-          assert not (imported & banned), imported & banned
-          print('SHADOW boundary PASS')
+          files = [
+              pathlib.Path('alpha_learning.py'),
+              pathlib.Path('alpha_learning_runtime.py'),
+              pathlib.Path('tools/alpha_learning_report.py'),
+          ]
+          banned = {
+              'order_manager','execution_engine','kalshi_client','risk_manager',
+              'position_sizer','trade_logger','position_manager','state_restore',
+              'equity_ledger','kalshi_alpha_bot'
+          }
+          violations = {}
+          for p in files:
+              tree = ast.parse(p.read_text())
+              imported = set()
+              for n in ast.walk(tree):
+                  if isinstance(n, ast.Import):
+                      imported.update(a.name.split('.')[0] for a in n.names)
+                  elif isinstance(n, ast.ImportFrom) and n.module:
+                      imported.add(n.module.split('.')[0])
+              hit = sorted(imported & banned)
+              if hit:
+                  violations[str(p)] = hit
+          assert not violations, violations
+          print('SHADOW boundary PASS:', ', '.join(str(p) for p in files))
+          PY
+
+      - name: Durable report and memory CLI smoke test
+        run: |
+          tmpdir="$(mktemp -d)"
+          export DATA_DIR="$tmpdir"
+          python tools/alpha_learning_report.py --memory-only --market-class macro --limit 3 > "$tmpdir/memory.json"
+          python - <<'PY'
+          import json, os
+          p = os.path.join(os.environ['DATA_DIR'], 'memory.json')
+          obj = json.load(open(p, encoding='utf-8'))
+          assert obj['purpose'] == 'forecast_calibration_memory', obj
+          assert obj['market_class'] == 'macro', obj
+          assert isinstance(obj['cases'], list), obj
+          print('memory CLI PASS')
+          PY
+          python tools/alpha_learning_report.py > "$tmpdir/stdout-report.json"
+          python - <<'PY'
+          import json, os
+          d = os.environ['DATA_DIR']
+          persisted = os.path.join(d, 'alpha_learning_report.json')
+          assert os.path.exists(persisted), persisted
+          obj = json.load(open(persisted, encoding='utf-8'))
+          assert obj['mode'] == 'SHADOW_ONLY', obj
+          assert obj['broker_authority'] is False, obj
+          assert obj['learning_version'] == 'astra-alpha-learning-v1', obj
+          assert isinstance(obj.get('selected_memory'), list), obj
+          leftovers = [x for x in os.listdir(d) if x.startswith('.alpha-learning-')]
+          assert not leftovers, leftovers
+          print('durable report CLI PASS')
           PY
