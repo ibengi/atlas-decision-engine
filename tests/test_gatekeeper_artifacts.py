@@ -41,14 +41,28 @@ DAY = 86400.0
 PROMOTION_OK = {"NO_LIVE_PROMOTION": "0", "MODEL_APPROVED_FOR_LIVE": "YES"}
 
 
-def green_report(age_days=0.0, ran=618):
+def green_report(age_days=0.0, ran=618, bind_to=None):
+    """A report the gate can accept.
+
+    Since the A08 remediation a green report must also say WHICH tree ran
+    and WHICH model manifest was present while it ran (`code_identity`,
+    `model_validation_sha256`). Both are bindings, not thresholds: a report
+    that omits them is refused, which is what
+    `test_a_report_without_the_code_binding_blocks` pins. `bind_to` is the
+    path of the manifest the report claims to have been run against.
+    """
     return {"generated_ts": time.time() - age_days * DAY, "ran": ran,
-            "failures": 0, "errors": 0, "skipped": 0, "failed_tests": []}
+            "failures": 0, "errors": 0, "skipped": 0, "failed_tests": [],
+            "code_identity": g.code_identity(),
+            "model_validation_sha256":
+                g.file_sha256(bind_to or "model_validation.json")}
 
 
 def approved_validation(age_days=0.0, approved=True):
     return {"generated_ts": time.time() - age_days * DAY,
-            "approved": approved, "model_version": "btc15m-baseline-0.1"}
+            "approved": approved, "model_version": "btc15m-baseline-0.1",
+            "criteria": [{"name": n, "passed": True} for n in sorted(
+                g.MODEL_CRITERIA["btc15m-baseline-0.1"])]}
 
 
 class _GateBase(unittest.TestCase):
@@ -94,12 +108,23 @@ class TestReportGatesLive(_GateBase):
 
     def setUp(self):
         super().setUp()
+        self.validation_age = 0.0
         self.write("model_validation.json", approved_validation())
+
+    def report(self, **kw):
+        """A report bound to the manifest this case actually shipped, dated
+        no earlier than it: the manifest must have existed when the tests
+        ran, so `tests older than the manifest` is itself incoherent."""
+        age = kw.get("age_days", 0.0)
+        if age > self.validation_age:
+            self.validation_age = age
+            self.write("model_validation.json", approved_validation(age_days=age))
+        return green_report(**kw)
 
     def test_a_green_fresh_pair_is_the_control_that_allows_live(self):
         """The one case that must PASS. Without it, every refusal below
         could be an artefact of a broken fixture."""
-        self.write("test_report.json", green_report())
+        self.write("test_report.json", self.report())
         ok, failed = self.gate()
         self.assertTrue(ok, f"le controle echoue: {failed}")
 
@@ -109,28 +134,28 @@ class TestReportGatesLive(_GateBase):
     def test_a_stale_report_blocks(self):
         """Age is measured, not assumed: a report from a fortnight ago
         describes a tree nobody is deploying any more."""
-        self.write("test_report.json", green_report(age_days=14))
+        self.write("test_report.json", self.report(age_days=14))
         self.assertRefused("trop ancien")
 
     def test_a_report_just_past_the_window_blocks(self):
         """The boundary, not just the comfortable case."""
-        self.write("test_report.json", green_report(age_days=7.01))
+        self.write("test_report.json", self.report(age_days=7.01))
         self.assertRefused("trop ancien")
 
     def test_a_report_just_inside_the_window_is_accepted(self):
-        self.write("test_report.json", green_report(age_days=6.9))
+        self.write("test_report.json", self.report(age_days=6.9))
         ok, failed = self.gate()
         self.assertTrue(ok, f"un rapport de 6.9 jours refuse: {failed}")
 
     def test_a_red_report_blocks(self):
-        r = green_report()
+        r = self.report()
         r["failures"] = 1
         r["failed_tests"] = ["test_something (tests.test_x)"]
         self.write("test_report.json", r)
         self.assertRefused("tests non verts")
 
     def test_a_report_with_errors_blocks(self):
-        r = green_report()
+        r = self.report()
         r["errors"] = 3
         self.write("test_report.json", r)
         self.assertRefused("tests non verts")
@@ -139,18 +164,19 @@ class TestReportGatesLive(_GateBase):
         """No timestamp means the age cannot be checked, and unknown age is
         not young age.
 
-        The refusal arrives as "trop ancien" rather than a missing-field
-        message: `float(tr.get("generated_ts", 0))` dates the report to
-        1970. That is the fail-closed direction -- an absent timestamp
-        makes the report infinitely old, never fresh -- so the behaviour
-        is pinned as-is rather than "corrected"."""
-        r = green_report()
+        The old gate reached the same verdict by accident:
+        `float(tr.get("generated_ts", 0))` dated the report to 1970, so
+        "missing" was answered with "trop ancien". Since A08 the missing
+        field is named as such -- an operator reading the refusal has to be
+        able to tell a stale artifact from a malformed one -- but the
+        direction is unchanged: absent is refused, never fresh."""
+        r = self.report()
         del r["generated_ts"]
         self.write("test_report.json", r)
-        self.assertRefused("trop ancien")
+        self.assertRefused("generated_ts")
 
     def test_a_report_with_a_non_numeric_timestamp_blocks(self):
-        r = green_report()
+        r = self.report()
         r["generated_ts"] = "hier"
         self.write("test_report.json", r)
         self.assertRefused("generated_ts")
@@ -167,21 +193,30 @@ class ModelValidationGatesLive(_GateBase):
 
     def setUp(self):
         super().setUp()
+        self.write("model_validation.json", approved_validation())
         self.write("test_report.json", green_report())
+
+    def write(self, name, payload):
+        """Writing the manifest re-binds the report to it: the binding is
+        the point of the A08 fix, not the subject of these cases."""
+        super().write(name, payload)
+        if name == "model_validation.json" and \
+                os.path.exists(os.path.join(self.tmp, "test_report.json")):
+            super().write("test_report.json", green_report())
 
     def test_approved_false_blocks_even_with_everything_else_green(self):
         """The artifact shipped in the image today. A fresh green test
         report and both promotion variables set must NOT be enough."""
         self.write("model_validation.json", approved_validation(approved=False))
         failed = self.assertRefused(
-            "model_validation.json absent ou non approuve",
+            "model_validation.json non approuve",
             "approved:false a laisse passer le live")
         self.assertEqual(len(failed), 1,
                          f"un autre critere masquait le test: {failed}")
 
     def test_a_missing_approved_field_blocks(self):
         self.write("model_validation.json", {"generated_ts": time.time()})
-        self.assertRefused("model_validation.json absent ou non approuve")
+        self.assertRefused("model_validation.json non approuve")
 
     def test_a_truthy_non_boolean_approved_blocks(self):
         """`approved: "yes"` is not approval. The gate tests identity with
@@ -197,7 +232,8 @@ class ModelValidationGatesLive(_GateBase):
         self.assertRefused("validation modele trop ancienne")
 
     def test_an_absent_validation_blocks(self):
-        self.assertRefused("model_validation.json absent ou non approuve")
+        os.remove(os.path.join(self.tmp, "model_validation.json"))
+        self.assertRefused("model_validation.json absent")
 
 
 class ShippedArtifactTest(unittest.TestCase):

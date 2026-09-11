@@ -72,11 +72,29 @@ class _GuardCase(unittest.TestCase):
 
     def _client(self, env="prod", base_url="https://api.example.invalid"):
         c = kalshi_client.KalshiClient.__new__(kalshi_client.KalshiClient)
+        import tempfile
+        from config import CFG
+        from authority_fixtures import provider_for
+        from persistence import PersistenceSentinel
+        tmp = tempfile.TemporaryDirectory(prefix="broker-guard-isolated-")
+        self.addCleanup(tmp.cleanup)
+        state = patch.object(CFG, "DATA_DIR", tmp.name)
+        state.start()
+        self.addCleanup(state.stop)
+        account = patch.object(CFG, "BROKER_ACCOUNT_ID", "guard-pinning-synthetic-account")
+        account.start()
+        self.addCleanup(account.stop)
+        PersistenceSentinel.reset()
+        c.continuity_authority = provider_for(env=env) if env in ("demo", "prod") else None
         c.env = env
         c.base_url = base_url
         c.key_id = "unit-test-not-a-credential"
         c._raw_logged = set()
         c.session = _CountingSession()
+        # Ambiguous cancellation dispatch now starts independent readback.
+        # Keep that observation distinct from the transport-policy probe:
+        # unavailable evidence leaves the intent UNKNOWN and authorizes no retry.
+        c.get_order = lambda order_id: None
         # A stub key, NOT a fabricated credential: `_sign_headers` is replaced
         # below, so nothing ever signs with it. It exists only so that
         # `/portfolio` paths get past the "RSA key not loaded" check and reach

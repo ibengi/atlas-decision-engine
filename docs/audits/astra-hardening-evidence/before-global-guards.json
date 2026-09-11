@@ -1,0 +1,119 @@
+{
+  "results": [
+    {
+      "id": "CONFIRM_nan_balance_global_gates",
+      "area": "A16",
+      "status": "FAIL",
+      "reason": "NaN balance passed balance and global accounting gates",
+      "detail": {
+        "balance_gate": [
+          true,
+          "solde=nan$ capital_effectif=10.00$"
+        ],
+        "global_guards": [
+          true,
+          null
+        ],
+        "snapshot": {
+          "risk_equity_status": "RECONCILED",
+          "seeded": true,
+          "strategy_equity": 10.0,
+          "risk_equity_reference": 10.0,
+          "drawdown_usd": 0.0,
+          "drawdown_pct": 0.0,
+          "external_flows_cum": 0.0,
+          "unclassified_flows": [],
+          "pending_residual": NaN,
+          "capital_hold": null,
+          "capital_guards": [],
+          "capital_eligible": true,
+          "unproven": [],
+          "sod_strategy_equity": 10.0,
+          "rebases": 0,
+          "journal_mismatch": null,
+          "continuity_block": null,
+          "duplicate_events": [],
+          "accounting_mode": "strategy",
+          "accounting_mode_valid": true,
+          "accounting_mode_capital_admissible": true,
+          "unexplained_residual": null,
+          "recovered_from_backup": null,
+          "ledger_generation": 3,
+          "continuity_head": {
+            "seq": 2,
+            "hash": "9bc43d446a1b566197ea377b2bf0f1611de252f59d19b840249fd6b26fd2aa58"
+          },
+          "conservative_equity": 10.0,
+          "tokens_consumed": 1,
+          "persistence_healthy": true
+        }
+      },
+      "tags": [
+        "malformed",
+        "new"
+      ]
+    },
+    {
+      "id": "CONFIRM_stale_hold_release_global_gates",
+      "area": "A15",
+      "status": "FAIL",
+      "reason": "Failed fenced hold release passed actual global risk gates",
+      "detail": {
+        "release_return": false,
+        "before": [
+          false,
+          "capital_hold_post_rebase"
+        ],
+        "after": [
+          true,
+          null
+        ],
+        "snapshot": {
+          "risk_equity_status": "RECONCILED",
+          "seeded": true,
+          "strategy_equity": 7.0,
+          "risk_equity_reference": 7.0,
+          "drawdown_usd": 0.0,
+          "drawdown_pct": 0.0,
+          "external_flows_cum": 0.0,
+          "unclassified_flows": [],
+          "pending_residual": null,
+          "capital_hold": null,
+          "capital_guards": [],
+          "capital_eligible": true,
+          "unproven": [],
+          "sod_strategy_equity": 10.0,
+          "rebases": 1,
+          "journal_mismatch": null,
+          "continuity_block": null,
+          "duplicate_events": [],
+          "accounting_mode": "strategy",
+          "accounting_mode_valid": true,
+          "accounting_mode_capital_admissible": true,
+          "unexplained_residual": null,
+          "recovered_from_backup": null,
+          "ledger_generation": 4,
+          "continuity_head": {
+            "seq": 5,
+            "hash": "3c83ef0865aa4a3688cbc2290859357a5fd38673ed04e06caab9cf82bc8ff533"
+          },
+          "conservative_equity": 7.0,
+          "tokens_consumed": 3,
+          "persistence_healthy": true
+        }
+      },
+      "tags": [
+        "race",
+        "persistence",
+        "new"
+      ]
+    }
+  ],
+  "counts": {
+    "PASS": 0,
+    "FAIL": 2,
+    "NEEDS_REVIEW": 0
+  },
+  "capital_enabled": false,
+  "broker_writes": 0
+}

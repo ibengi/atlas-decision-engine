@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import BrokerMock  # noqa: E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from persistence import PersistenceSentinel, verify_state_root  # noqa: E402
@@ -138,7 +139,7 @@ class State5RestoreSimulationTest(unittest.TestCase):
         # 3) Boot: continuity check passes, managers load restored state.
         self.assertTrue(verify_state_root())
         self.assertTrue(PersistenceSentinel.healthy())
-        cli = MagicMock()
+        cli = BrokerMock()
         cli.env = "demo"
         cli.get_positions.return_value = [dict(e)
                                           for e in REAL_BROKER_PAYLOAD]
@@ -173,7 +174,8 @@ class State5RestoreSimulationTest(unittest.TestCase):
         # 8-10) Submissions disabled; zero broker writes end to end.
         om = bot.OrderManager(cli)
         res = om.place_and_track("KXBTCD-26AUG2817-T84999.99", "yes", 1, 40)
-        self.assertEqual(res.status, "blocked:submission_disabled")
+        # The legacy five-file restore has no proof of an empty intent store.
+        self.assertEqual(res.status, "blocked:persistence_failure")
         self.assertEqual(cli.create_order.call_count, 0)
         self.assertEqual(cli.cancel_order.call_count, 0)
         self.assertEqual(self._hashes(), golden)

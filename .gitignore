@@ -47,6 +47,9 @@ dashboard_state.json*
 pipeline_stats.json*
 reject_reasons.json*
 intent_alerts.json*
+.atlas-state.lock
+.atlas-engine-writer.lock
+.atlas-prepare-*
 
 # Les familles ci-dessus generent aussi des rotations et des sommes
 # de controle (orders_state.json.bak1, .sha256). Le motif exact ne

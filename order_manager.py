@@ -3,6 +3,13 @@ import hashlib
 import json
 import logging
 import time
+import copy
+import os
+from strict_data import dumps, integer, finite_number
+from continuity_authority import account_identity
+from state_authority import recovery_problem, manifest, root_lock
+from execution_transaction import locked_submission
+from order_transaction import resolve_transaction
 from datetime import datetime, timezone
 
 from config import (CFG, _p, contract_cap_config,
@@ -14,7 +21,7 @@ from kalshi_client import KalshiAPIError, KalshiClient, pick, pick_int
 from alert_notifier import (FAILED, SENT, SKIPPED_NO_CHANNEL,
                             SKIPPED_SEVERITY, NotifierError,
                             build_notifier, build_payload)
-from persistence import JsonStore, PersistenceSentinel, verify_state_root
+from persistence import JsonStore, PersistenceSentinel, verify_state_root, file_fingerprint
 from position_manager import PositionManager
 from trade_logger import TradeLogger, now_iso
 
@@ -57,6 +64,8 @@ class OrderManager:
 
     def __init__(self, client: KalshiClient, notifier=None):
         self.client = client
+        self.identity = account_identity("kalshi", client.env,
+                                         getattr(CFG, "BROKER_ACCOUNT_ID", None))
         # Transport d'alerte: injectable, et volontairement IGNORANT du
         # broker. Il ne recoit qu'un payload plat; il ne peut donc ni
         # soumettre, ni annuler, ni toucher au verrou ou aux intentions.
@@ -67,6 +76,7 @@ class OrderManager:
         # trading comme sain sur un disque qui a perdu ses garanties.
         verify_state_root()
         self.open_orders = JsonStore.load(_p(CFG.ORDERS_FILE), {})  # id -> meta
+        self._orders_fingerprint = file_fingerprint(_p(CFG.ORDERS_FILE))
         # Garde anti-doublon de SESSION, independante de l'enregistrement des
         # trades : un ordre soumis (201) sur un ticker verrouille ce ticker
         # pour la duree configuree, MEME si la verification echoue ensuite.
@@ -74,6 +84,7 @@ class OrderManager:
         # a ete re-soumis et REMPLI ~8 fois, solde debite sans aucun trade
         # local. Ce verrou rend ce mode de defaillance impossible.
         guard_raw = JsonStore.load(_p("submission_guard.json"), {})
+        self._guard_fingerprint = file_fingerprint(_p("submission_guard.json"))
         now = time.time()
         self.session_submitted = {
             str(tk): float(ts) for tk, ts in (guard_raw or {}).items()
@@ -89,16 +100,31 @@ class OrderManager:
         # demander au broker « cet ordre existe-t-il ? » au lieu de
         # deviner. Fichier SEPARE de submission_guard.json, dont le schema
         # (ticker -> epoch) est fige par la migration Phase 2A/2B.
-        raw_intents = JsonStore.load(_p(self.PENDING_FILE), {})
-        self.pending_intents = {
-            str(tk): dict(v) for tk, v in (raw_intents or {}).items()
-            if isinstance(v, dict) and v.get("client_order_id")
-        }
+        raw_intents = JsonStore.load(_p(self.PENDING_FILE), None)
+        self.intent_recovery_error = None
+        if raw_intents is None:
+            # No file is not proof of emptiness once any economic state exists.
+            if any(os.path.exists(_p(name)) for name in (
+                    CFG.ORDERS_FILE, CFG.POSITIONS_FILE, CFG.TRADES_FILE, "state_epoch.json")):
+                self.intent_recovery_error = "missing expected intent state"
+            raw_intents = {}
+        if not isinstance(raw_intents, dict):
+            self.intent_recovery_error = "malformed intent collection"
+            raw_intents = {}
+        self.pending_intents = copy.deepcopy(raw_intents)
+        for ticker, row in self.pending_intents.items():
+            if not self._valid_intent(ticker, row):
+                self.intent_recovery_error = "unknown or malformed persisted intent"
+        if self.intent_recovery_error:
+            PersistenceSentinel.record_failure(_p(self.PENDING_FILE), self.intent_recovery_error)
+        self._pending_fingerprint = file_fingerprint(_p(self.PENDING_FILE))
         # Verrou GLOBAL fail-closed: arme quand une resolution est
         # impossible a trancher (plusieurs ordres portent le meme
         # client_order_id, ou le broker repond n'importe quoi). Tant qu'il
         # est arme, AUCUNE soumission n'est autorisee, sur aucun ticker.
-        self.resolution_halt = None
+        self.resolution_halt = ({"status": "RECOVERY_REQUIRED",
+                                 "detail": self.intent_recovery_error}
+                                if self.intent_recovery_error else None)
         raw_alerts = JsonStore.load(_p(self.ALERTS_FILE), {})
         self.intent_alerts = {str(k): dict(v)
                               for k, v in (raw_alerts or {}).items()
@@ -112,8 +138,12 @@ class OrderManager:
                 f"{sorted(self.pending_intents)}")
 
     def flush(self):
-        JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders)
-        self._flush_submission_guard()
+        if not JsonStore.save(_p(CFG.ORDERS_FILE), self.open_orders,
+                              expect_fingerprint=self._orders_fingerprint):
+            raise RuntimeError("order state commit failed")
+        self._orders_fingerprint = file_fingerprint(_p(CFG.ORDERS_FILE))
+        if not self._flush_submission_guard():
+            raise RuntimeError("submission guard commit failed")
 
     def _flush_submission_guard(self) -> bool:
         """Persiste le verrou anti-doublon afin qu'un redemarrage Railway
@@ -128,27 +158,128 @@ class OrderManager:
                 tk: ts for tk, ts in self.session_submitted.items()
                 if now - ts < CFG.SUBMIT_DEDUP_TTL_S
             }
-        return bool(JsonStore.save(_p("submission_guard.json"),
-                                   self.session_submitted))
+        ok = bool(JsonStore.save(_p("submission_guard.json"),
+                                 self.session_submitted, expect_fingerprint=self._guard_fingerprint))
+        if ok:
+            self._guard_fingerprint = file_fingerprint(_p("submission_guard.json"))
+        return ok
 
     # -- resolution d'un POST ambigu par client_order_id ---------------------
 
     def _flush_pending_intents(self) -> bool:
-        return bool(JsonStore.save(_p(self.PENDING_FILE), self.pending_intents))
+        try:
+            ok = bool(JsonStore.save(_p(self.PENDING_FILE), self.pending_intents,
+                                     expect_fingerprint=self._pending_fingerprint))
+            if ok:
+                self._pending_fingerprint = file_fingerprint(_p(self.PENDING_FILE))
+            return ok
+        except Exception as e:                                # noqa: BLE001
+            # JsonStore already swallows OSError, but a serialization fault
+            # or a patched store must not escape as an exception either: the
+            # caller's contract is a boolean it is REQUIRED to check.
+            log_api.error(f"[PENDING_INTENTS] ecriture impossible: {e}")
+            PersistenceSentinel.record_failure(_p(self.PENDING_FILE), str(e))
+            return False
 
     def _record_intent(self, ticker: str, client_order_id: str, count: int,
-                       limit_cents: int) -> bool:
-        """Enregistre l'INTENTION d'envoyer, avant le POST. Persistee, elle
-        permet de rejouer la resolution apres un redemarrage."""
-        self.pending_intents[ticker] = {
-            "client_order_id": client_order_id, "count": int(count),
-            "price": int(limit_cents), "at": now_iso(), "resolution": None,
-        }
-        return self._flush_pending_intents()
+                       limit_cents: int, side=None) -> bool:
+        """Enregistre l'INTENTION d'envoyer, AVANT le POST, et VERIFIE que
+        l'ecriture a reellement abouti (audit finding A09).
 
-    def _clear_intent(self, ticker: str) -> None:
-        if self.pending_intents.pop(ticker, None) is not None:
-            self._flush_pending_intents()
+        L'intention est la seule chose qui rend la question « cet ordre
+        existe-t-il chez le broker ? » posable apres un timeout ou un
+        redemarrage. Un POST parti sans intention persistee est un ordre
+        qu'aucune reprise ne peut retrouver : le retour de cette fonction
+        DOIT etre teste par l'appelant, qui doit s'abstenir d'appeler le
+        broker s'il est faux.
+
+        La verification est une RELECTURE du fichier, pas seulement le
+        booleen de JsonStore : un remplacement atomique qui echoue apres le
+        fsync du temporaire, un checksum non ecrit, un repertoire a la place
+        du fichier, tout cela doit se voir ici.
+        """
+        integer(count, "intent quantity", minimum=1)
+        integer(limit_cents, "intent price", minimum=1)
+        finite_number(limit_cents, "intent price", maximum=99)
+        row = {"version": 2, "client_order_id": client_order_id,
+               "contract": ticker, "side": side,
+               "count": count, "price": limit_cents, "operation": "create_order",
+               "creation_generation": manifest(_p(self.PENDING_FILE))["generation"] + 1,
+               "identity": self.identity, "state": "PREPARED", "at": now_iso(),
+               "resolution": None}
+        row["payload_digest"] = self._intent_digest(row)
+        if not self._valid_intent(ticker, row):
+            PersistenceSentinel.record_failure(_p(self.PENDING_FILE), "invalid complete intent")
+            return False
+        draft = copy.copy(self)
+        draft.pending_intents = copy.deepcopy(self.pending_intents)
+        draft.pending_intents[ticker] = row
+        if not draft._flush_pending_intents() or not draft._verify_intent_durable(ticker, client_order_id):
+            return False
+        self._pending_fingerprint = draft._pending_fingerprint
+        self.pending_intents = draft.pending_intents
+        return True
+
+    def _verify_intent_durable(self, ticker: str, client_order_id: str) -> bool:
+        """Relit pending_intents.json et confirme que l'intention y est."""
+        try:
+            raw = JsonStore.load(_p(self.PENDING_FILE), None)
+        except Exception as e:                                # noqa: BLE001
+            log_api.error(f"[PENDING_INTENTS] relecture impossible: {e}")
+            PersistenceSentinel.record_failure(_p(self.PENDING_FILE), str(e))
+            return False
+        row = (raw or {}).get(ticker) if isinstance(raw, dict) else None
+        if (not self._valid_intent(ticker, row) or
+                row != self.pending_intents.get(ticker) or
+                row.get("client_order_id") != client_order_id or
+                recovery_problem(_p(self.PENDING_FILE))):
+            log_api.critical(
+                f"[PENDING_INTENTS] l'intention de {ticker} n'est PAS "
+                f"relisible apres ecriture (client_order_id attendu "
+                f"{client_order_id}) -- persistance non prouvee.")
+            PersistenceSentinel.record_failure(
+                _p(self.PENDING_FILE),
+                f"intent for {ticker} not readable back after write")
+            return False
+        return True
+
+    @staticmethod
+    def _intent_digest(row):
+        immutable = ("version", "client_order_id", "contract", "side", "count", "price",
+                     "operation", "creation_generation", "identity", "state", "at")
+        return hashlib.sha256(dumps({k: row.get(k) for k in immutable}, sort_keys=True,
+            separators=(",", ":")).encode()).hexdigest()
+
+    def _valid_intent(self, ticker, row):
+        try:
+            if not isinstance(row, dict) or row.get("version") != 2:
+                return False
+            integer(row.get("count"), minimum=1)
+            integer(row.get("price"), minimum=1)
+            finite_number(row["price"], maximum=99)
+            integer(row.get("creation_generation"), minimum=1)
+            return (row.get("contract") == ticker and row.get("side") in ("yes", "no")
+                    and row.get("operation") == "create_order"
+                    and row.get("state") == "PREPARED"
+                    and isinstance(row.get("client_order_id"), str)
+                    and bool(row["client_order_id"])
+                    and row.get("identity") == self.identity
+                    and self.identity is not None
+                    and row.get("payload_digest") == self._intent_digest(row))
+        except (ValueError, TypeError):
+            return False
+
+    def _clear_intent(self, ticker: str) -> bool:
+        if ticker not in self.pending_intents:
+            return True
+        draft = copy.copy(self)
+        draft.pending_intents = copy.deepcopy(self.pending_intents)
+        draft.pending_intents.pop(ticker)
+        if not draft._flush_pending_intents():
+            return False
+        self._pending_fingerprint = draft._pending_fingerprint
+        self.pending_intents = draft.pending_intents
+        return True
 
     def _halt_resolution(self, reason: str, detail: str) -> None:
         self.resolution_halt = {"status": reason, "detail": detail,
@@ -158,16 +289,56 @@ class OrderManager:
             "soumission autorisee sur AUCUN ticker jusqu'a decision "
             "operateur.")
 
+    @resolve_transaction
     def resolve_intent(self, ticker: str, intent: dict) -> str:
         """Demande au broker si l'ordre porte par ce client_order_id existe.
 
-        Retourne l'un de: FOUND (adopte), NOT_FOUND, MULTIPLE, UNAVAILABLE,
-        MALFORMED. AUCUN de ces chemins ne re-soumet quoi que ce soit : la
-        resolution est une LECTURE. Seul FOUND leve l'incertitude, en
-        adoptant l'order_id et le statut reels.
+        Empty readings remain observations regardless of their count or age.
+        Absence closure requires a durable, independently resolved transport
+        outcome. A nonterminal transport row always retains this high-level
+        intent, even if a separate partial broker response looks successful.
         """
         cid = str(intent.get("client_order_id") or "")
         count = int(intent.get("count") or 0)
+        from transport_intent import (outcome_for_client_order, _order_matches,
+                                      _number, has_unresolved_transport)
+        wanted = {"client_order_id": cid, "ticker": ticker,
+                  "side": "bid" if intent["side"] == "yes" else "ask",
+                  "count": str(count),
+                  "price": f"{(intent['price'] if intent['side'] == 'yes' else 100 - intent['price']) / 100:.4f}"}
+        low = outcome_for_client_order(cid)
+        if low is None and has_unresolved_transport():
+            # Missing, duplicate, or unreadable low-level lookup cannot turn a
+            # surviving transport uncertainty into a legacy-adoption shortcut.
+            intent["resolution"] = "TRANSPORT_PENDING"
+            self._flush_pending_intents()
+            return "TRANSPORT_PENDING"
+        if low is not None:
+            body = low.get("request", {}).get("json", {})
+            try:
+                bound = (low.get("identity") == intent.get("identity") and
+                         low.get("operation") == "POST" and
+                         low.get("path") == "/portfolio/events/orders" and
+                         all(body.get(k) == wanted[k] for k in
+                             ("client_order_id", "ticker", "side")) and
+                         all(_number(body.get(k)) == _number(wanted[k])
+                             for k in ("count", "price")))
+            except (ValueError, TypeError):
+                bound = False
+            if not bound:
+                self._halt_resolution("TRANSPORT_INTENT_MISMATCH", f"{ticker}/{cid}")
+                intent["resolution"] = "MALFORMED"
+                self._flush_pending_intents()
+                return "MALFORMED"
+            if low["state"] in ("CONFIRMED_NOT_APPLIED", "TERMINAL_FAILED"):
+                intent["resolution"] = "CLOSED_ABSENT"
+                if not self._clear_intent(ticker):
+                    raise RuntimeError("proven transport closure was not durable")
+                return "CLOSED_ABSENT"
+            if low["state"] != "CONFIRMED_APPLIED":
+                intent["resolution"] = "TRANSPORT_PENDING"
+                self._flush_pending_intents()
+                return "TRANSPORT_PENDING"
         lookup = getattr(self.client, "find_orders_by_client_order_id", None)
         if not callable(lookup):
             # Client sans capacite de recherche (client ancien, double de
@@ -235,14 +406,8 @@ class OrderManager:
             return "MULTIPLE"
 
         if not matches:
-            # UNE lecture vide n'est pas une preuve d'absence: elle est
-            # prise juste apres le POST, au pire moment (un ordre accepte
-            # peut n'etre pas encore visible dans le listing). On exige
-            # AMBIGUOUS_NOT_FOUND_CONFIRMATIONS observations completes,
-            # espacees d'au moins AMBIGUOUS_NOT_FOUND_INTERVAL_S, avant de
-            # cloturer. Une observation trop rapprochee n'apporte aucune
-            # information nouvelle et n'est PAS comptee.
-            need = max(1, int(CFG.AMBIGUOUS_NOT_FOUND_CONFIRMATIONS))
+            # Complete but potentially delayed listings never prove absence.
+            # Keep spaced-read counts solely for diagnostics and alerting.
             gap = max(0.0, float(CFG.AMBIGUOUS_NOT_FOUND_INTERVAL_S))
             now = time.time()
             intent["unavailable_streak"] = 0      # une lecture a abouti
@@ -257,20 +422,9 @@ class OrderManager:
                     f"[AMBIGUOUS_RESOLUTION] {ticker} lecture vide ignoree "
                     f"({now - last:.0f}s < {gap:.0f}s depuis la precedente): "
                     "trop rapprochee pour constituer une confirmation.")
-            self._flush_pending_intents()
-            if seen >= need:
-                log_api.warning(
-                    f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
-                    f"-> CLOSED_ABSENT: {seen} lecture(s) completes et "
-                    f"espacees confirment qu'aucun ordre ne porte cet "
-                    "identifiant. Intention CLOTUREE; le ticker repasse sous "
-                    "les regles normales du verrou anti-doublon.")
-                intent["resolution"] = "CLOSED_ABSENT"
-                self._clear_intent(ticker)
-                return "CLOSED_ABSENT"
             log_api.warning(
                 f"[AMBIGUOUS_RESOLUTION] {ticker} client_order_id={cid} "
-                f"-> NOT_FOUND_PENDING ({seen}/{need} confirmation(s)): "
+                f"-> NOT_FOUND_PENDING ({seen} observation(s)): "
                 "absence NON concluante. Intention MAINTENUE ouverte, "
                 "aucune re-soumission possible sur ce ticker.")
             intent["resolution"] = "NOT_FOUND_PENDING"
@@ -279,10 +433,13 @@ class OrderManager:
 
         order = matches[0]
         order_id = str(pick(order, "order_id", "id", default="") or "")
-        if not order_id:
+        prior_order = ((low or {}).get("history") or [{}])[-1].get("evidence", {}).get("order")
+        expected_request = low or {"request": {"json": wanted}}
+        if (not order_id or not _order_matches(expected_request, order) or
+                (isinstance(prior_order, dict) and prior_order.get("order_id") != order_id)):
             self._halt_resolution(
                 "MALFORMED_ORDER_LISTING",
-                f"{ticker}/{cid}: ordre correspondant SANS order_id")
+                f"{ticker}/{cid}: immutable broker order identity/terms not proven")
             intent["resolution"] = "MALFORMED"
             self._flush_pending_intents()
             return "MALFORMED"
@@ -290,7 +447,7 @@ class OrderManager:
         # ADOPTION: l'ordre existe, on le reprend en suivi local comme s'il
         # venait d'etre place. Aucun ordre n'est cree ici.
         self.open_orders[order_id] = {
-            "ticker": ticker, "side": order.get("side") or order.get("action"),
+            "ticker": ticker, "side": intent["side"],
             "count": count, "price": int(intent.get("price") or 0),
             "placed_at": intent.get("at") or now_iso(),
             "adopted_from_client_order_id": cid,
@@ -308,6 +465,17 @@ class OrderManager:
         return "FOUND"
 
     # -- supervision des intentions ambigues ---------------------------------
+
+    @resolve_transaction
+    def _adopt_submission(self, ticker, order_id, side, count, price):
+        if not order_id or ticker not in self.pending_intents:
+            raise ValueError("confirmed order and durable intent required")
+        self.open_orders[order_id] = {"ticker": ticker, "side": side,
+            "count": count, "price": price, "placed_at": now_iso()}
+        self.flush()
+        if not self._clear_intent(ticker):
+            raise RuntimeError("intent closure failed")
+        return True
 
     @staticmethod
     def _age_seconds(iso_ts: str, now: float) -> float:
@@ -532,7 +700,9 @@ class OrderManager:
         """Rejoue la resolution pour chaque intention non resolue. Appele au
         demarrage: apres un redemarrage, l'ambiguite se retranche a partir
         de l'etat persiste, pas de la memoire perdue."""
-        outcomes = {}
+        from transport_intent import reconcile_transport_intents
+        transport = reconcile_transport_intents(self.client)
+        outcomes = {"transport": transport}
         for ticker, intent in list(self.pending_intents.items()):
             if intent.get("resolution") in ("FOUND", "CLOSED_ABSENT"):
                 continue          # deja tranchee, rien a redemander
@@ -594,6 +764,7 @@ class OrderManager:
         return f"alpha_{hashlib.sha256(idempotency_key.encode()).hexdigest()[:16]}"
 
     # -- cycle de vie complet d'un ordre --------------------------------------
+    @locked_submission
     def place_and_track(self, ticker: str, side: str, count: int,
                         limit_cents: int) -> ExecutionResult:
         # INVARIANT DUR : aucune ecriture broker apres une panne de
@@ -770,7 +941,24 @@ class OrderManager:
         # L'intention porte le client_order_id deterministe: c'est elle qui
         # rend la question « cet ordre existe-t-il ? » posable au broker,
         # maintenant ou apres un redemarrage.
-        self._record_intent(ticker, client_order_id, count, limit_cents)
+        #
+        # INVARIANT A09: AUCUNE soumission n'atteint le transport broker tant
+        # que son intention n'est pas DURABLEMENT persistee ET RELUE. Le
+        # retour de _record_intent etait ignore: un repertoire a la place de
+        # pending_intents.json faisait echouer l'ecriture et le POST partait
+        # quand meme -- un ordre potentiellement vivant chez le broker et
+        # invisible pour toute reprise. Pas de retry broker, pas de
+        # continuation silencieuse: on abandonne, et la sentinelle de
+        # persistance (pending_intents.json est un fichier CRITIQUE) coupe
+        # les soumissions jusqu'au redemarrage sur un disque sain.
+        if not self._record_intent(ticker, client_order_id, count, limit_cents, side=side):
+            log_api.critical(
+                "[ORDER_SUBMIT_ABORTED] intention d'envoi impossible a "
+                f"persister pour {ticker} -- create_order NON appele "
+                "(un ordre dont l'intention n'est pas durable ne peut plus "
+                "etre retrouve apres un timeout ou un redemarrage).")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:intent_unwritable", "rejected")
         if not self._flush_submission_guard():
             # Verrou non persistable = aucune garantie anti-doublon au
             # redemarrage : on n'appelle PAS le broker (fail-closed).
@@ -781,6 +969,9 @@ class OrderManager:
             return ExecutionResult(None, count, 0, limit_cents,
                                    "blocked:submission_guard_unwritable",
                                    "rejected")
+        if not self._verify_intent_durable(ticker, client_order_id):
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:intent_changed", "rejected")
         try:
             order = self.client.create_order(ticker, side, count, limit_cents,
                                              client_order_id=client_order_id)
@@ -817,7 +1008,9 @@ class OrderManager:
                 "price": limit_cents}
             outcome = self.resolve_intent(ticker, intent)
             if outcome == "FOUND":
-                return ExecutionResult(intent.get("order_id"), count, 0,
+                adopted = next((oid for oid, meta in self.open_orders.items()
+                    if meta.get("adopted_from_client_order_id") == client_order_id), None)
+                return ExecutionResult(adopted, count, 0,
                                        limit_cents, "adopted_after_ambiguous",
                                        "resting")
             return ExecutionResult(None, count, 0, limit_cents,
@@ -828,8 +1021,11 @@ class OrderManager:
         # seulement l'horodatage sur le succes confirme.
         self.session_submitted[ticker] = time.time()
         self._flush_submission_guard()
-        # POST revenu: plus d'ambiguite a trancher pour cette intention.
-        self._clear_intent(ticker)
+        # A response is not an adopted order. Keep the intent until the order
+        # identity and tracking state have committed together.
+        if not isinstance(order, dict):
+            self._halt_resolution("MALFORMED_ORDER_RESPONSE", "order response is not an object")
+            return ExecutionResult(None, count, 0, limit_cents, "unverified", "rejected")
         http_status = getattr(self.client, "last_http_status", None)
         order_id = str(pick(order, "order_id", "id", default="") or "")
         log_api.info("[ORDER_SUBMIT_RESPONSE] "
@@ -885,10 +1081,9 @@ class OrderManager:
                           f"Reponse: {json.dumps(order)[:300]}")
             return ExecutionResult(None, count, 0, limit_cents, "no_id", "rejected")
 
-        self.open_orders[order_id] = {"ticker": ticker, "side": side,
-                                      "count": count, "price": limit_cents,
-                                      "placed_at": now_iso()}
-        self.flush()
+        if self._adopt_submission(ticker, order_id, side, count, limit_cents) is not True:
+            return ExecutionResult(order_id, count, 0, limit_cents,
+                                   "blocked:recovery_required", "rejected")
 
         start = time.time()
         deadline = start + CFG.ORDER_TTL_SECONDS
@@ -1043,8 +1238,7 @@ class OrderManager:
         # Un POST ambigu laisse une INTENTION persistee: apres redemarrage,
         # on retranche la meme question au broker (lecture seule) avant
         # toute autre action.
-        if self.pending_intents:
-            self.resolve_pending_intents()
+        self.resolve_pending_intents()
         if not self.open_orders:
             return
         log_api.warning(f"Recovery: {len(self.open_orders)} ordre(s) non conclu(s) "

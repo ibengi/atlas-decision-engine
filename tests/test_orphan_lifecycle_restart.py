@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import BrokerMock  # noqa: E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from persistence import PersistenceSentinel  # noqa: E402
@@ -46,7 +47,7 @@ class OrphanLifecycleTest(unittest.TestCase):
 
     @staticmethod
     def _client(position=1, status="active", result=""):
-        c = MagicMock()
+        c = BrokerMock()
         c.env = "demo"
         c.get_positions.return_value = (
             [{"ticker": TICKER, "position": position}] if position else [])
@@ -94,24 +95,20 @@ class OrphanLifecycleTest(unittest.TestCase):
         cli.get_market.return_value = {"ticker": TICKER, "status": "settled",
                                        "result": "no"}
         realized = pm.check_settlements()
-        self.assertEqual(len(realized), 1)
-        self.assertTrue(realized[0].get("orphan"))
-        self.assertEqual(pm.open_count(), 0)
-        orphan_rows = [t for t in tlog.trades if t.get("orphan")]
-        self.assertEqual(len(orphan_rows), 1)
+        self.assertEqual(realized, [])
+        self.assertEqual(pm.open_count(), 1)
+        self.assertEqual(pm.reconcile_halt["status"], "UNKNOWN")
+        self.assertEqual(tlog.trades, [])
 
-        # 4) Restart on the SAME disk; broker is now flat.
+        # Restart retains the original evidence and blocks on broker mismatch.
         del tlog, pm
         cli2 = self._client(position=0, status="settled", result="no")
         tlog2, pm2 = self._managers(cli2)
-        self.assertEqual(pm2.open_count(), 0, "no resurrection after restart")
-        self.assertEqual(len([t for t in tlog2.trades if t.get("orphan")]), 1,
-                         "the settlement row survived the restart")
-        pm2.reconcile_with_broker()
-        self.assertEqual(pm2.open_count(), 0)
-        self.assertEqual(pm2.check_settlements(), [],
-                         "nothing left to settle: no double settlement")
-        self.assertEqual(len([t for t in tlog2.trades if t.get("orphan")]), 1)
+        self.assertEqual(pm2.open_count(), 1)
+        self.assertEqual(pm2.reconcile_with_broker()["status"], "MISMATCH")
+        self.assertEqual(pm2.check_settlements(), [])
+        self.assertEqual(pm2.open_count(), 1)
+        self.assertEqual(tlog2.trades, [])
 
 
 if __name__ == "__main__":

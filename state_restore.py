@@ -44,6 +44,7 @@ import sys
 import tarfile
 
 from config import _p
+from continuity import CONTINUITY_FILE, ChainError, ContinuityChain
 from persistence import JsonStore, PersistenceSentinel
 
 log = logging.getLogger("PERSISTENCE")
@@ -57,6 +58,55 @@ RESTORE_BASENAMES = (
     "risk_state.json",
     "positions_state.json",
 )
+
+#: Evidence that did not exist when the five-file manifest was written
+#: (audit finding A01 rule 7, invariant-map item 18). It is OPTIONAL in the
+#: manifest so existing five-file backups keep restoring unchanged, but when
+#: a hash IS declared the bytes are verified and written exactly like the
+#: rest. Leaving it out of a restore does not create a hole the engine
+#: cannot see: the continuity chain on the destination is the authority, and
+#: a restored ledger or journal that is behind it opens a blocking recovery
+#: state at the next load.
+RESTORE_OPTIONAL_BASENAMES = (
+    "equity_ledger.json",
+    "pending_intents.json",
+)
+
+
+def _continuity_path():
+    return _p(CONTINUITY_FILE)
+
+
+def _continuity_rollback_refusal() -> str:
+    """Why this restore must not proceed, or ''.
+
+    The continuity chain is append-only and may only GROW. Restoring
+    economic state onto a volume that already holds continuity evidence,
+    without addressing that evidence, is the coordinated rollback A01 is
+    about -- so it is refused here, at the entry point, rather than
+    detected afterwards.
+    """
+    path = _continuity_path()
+    if not os.path.exists(path):
+        return ""
+    chain = ContinuityChain(path)
+    ok, why = chain.healthy()
+    if not ok:
+        return (f"la chaine de continuite presente sur le volume est "
+                f"illisible ({why}): une restauration par-dessus une "
+                f"autorite anti-recul cassee est refusee")
+    try:
+        floor = chain.evidence_floor()
+    except ChainError as e:                       # pragma: no cover
+        return f"chaine de continuite inexploitable: {e}"
+    if floor is None:
+        return ""
+    return (f"le volume porte deja une chaine de continuite evidencant "
+            f"{floor['settled_count']} reglement(s) (equity la plus basse "
+            f"observee: {floor['strategy_equity']}). Restaurer un etat "
+            f"economique par-dessus reviendrait a rembobiner cette preuve. "
+            f"Reprise BLOQUEE: reconstruire depuis une autorite independante "
+            f"ou repartir d'un volume vierge.")
 
 
 def _fail(reason: str) -> bool:
@@ -87,7 +137,7 @@ def _read_b64_env() -> str:
     return b64 + "=" * (-len(b64) % 4) if b64 else ""
 
 
-def _restore_from_dir(src_dir: str, manifest: dict):
+def _restore_from_dir(src_dir: str, manifest: dict, wanted=None):
     """Byte source ON THE VOLUME: for each critical basename, scan the
     candidates JsonStore's rotation may hold (name, .bak1..3) in src_dir
     and select the one whose sha256 MATCHES the operator manifest. The
@@ -96,7 +146,7 @@ def _restore_from_dir(src_dir: str, manifest: dict):
     of its intact rotation copy. Fully mechanical: no payload ever
     transits a lossy channel. -> (contents, None) or (None, raison)."""
     contents = {}
-    for name in RESTORE_BASENAMES:
+    for name in (wanted or RESTORE_BASENAMES):
         want = str(manifest.get(name, "")).strip().lower()
         found = None
         for cand in (name, name + ".bak1", name + ".bak2", name + ".bak3"):
@@ -132,6 +182,9 @@ def maybe_restore_state() -> bool:
         return _fail(
             f"etat PARTIEL sur le volume ({sorted(present)}): ni vierge ni "
             f"complet -- aucun fichier ne sera ecrit ni ecrase")
+    refusal = _continuity_rollback_refusal()
+    if refusal:
+        return _fail(refusal)
 
     try:
         manifest = json.loads(os.getenv("RESTORE_STATE_SHA256", ""))
@@ -139,12 +192,17 @@ def maybe_restore_state() -> bool:
     except Exception:
         return _fail("RESTORE_STATE_SHA256 absent ou illisible: la "
                      "restauration sans verification de hash est interdite")
-    if sorted(manifest) != sorted(RESTORE_BASENAMES):
+    missing = [n for n in RESTORE_BASENAMES if n not in manifest]
+    unknown = [n for n in manifest
+               if n not in RESTORE_BASENAMES + RESTORE_OPTIONAL_BASENAMES]
+    if missing or unknown:
         return _fail(f"manifest de hash incomplet/inattendu: "
-                     f"{sorted(manifest)}")
+                     f"manquants={missing} inconnus={unknown}")
+    wanted = tuple(RESTORE_BASENAMES) + tuple(
+        n for n in RESTORE_OPTIONAL_BASENAMES if n in manifest)
 
     if src_dir:
-        contents, err = _restore_from_dir(src_dir, manifest)
+        contents, err = _restore_from_dir(src_dir, manifest, wanted)
         if err:
             return _fail(err)
     else:
@@ -154,13 +212,13 @@ def maybe_restore_state() -> bool:
             with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as tar:
                 for m in tar.getmembers():
                     name = os.path.basename(m.name)
-                    if not m.isfile() or name not in RESTORE_BASENAMES:
+                    if not m.isfile() or name not in wanted:
                         continue
                     contents[name] = tar.extractfile(m).read()
         except Exception as e:
             return _fail(f"archive RESTORE_STATE_TGZ_B64 illisible: {e}")
 
-    for name in RESTORE_BASENAMES:
+    for name in wanted:
         if name not in contents:
             return _fail(f"fichier absent de l'archive: {name}")
         got = hashlib.sha256(contents[name]).hexdigest()
@@ -170,7 +228,7 @@ def maybe_restore_state() -> bool:
 
     # Every byte verified against the operator manifest: write files +
     # sidecars atomically, marker last.
-    for name in RESTORE_BASENAMES:
+    for name in wanted:
         payload = contents[name]
         _atomic_write(_p(name), payload)
         _atomic_write(_p(name) + ".sha256",
@@ -188,8 +246,8 @@ def maybe_restore_state() -> bool:
     })
     if not ok:
         return _fail("state_epoch.json impossible a ecrire apres restore")
-    log.info("[STATE_RESTORE] restauration COMPLETE: 5/5 fichiers + "
-             "state_epoch.json crees.")
+    log.info(f"[STATE_RESTORE] restauration COMPLETE: {len(wanted)} fichier(s) "
+             f"({sorted(wanted)}) + state_epoch.json crees.")
     return True
 
 

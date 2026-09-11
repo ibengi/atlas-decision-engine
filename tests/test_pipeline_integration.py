@@ -17,6 +17,7 @@ os.environ["DATA_DIR"] = _TMP0
 os.environ.setdefault("KALSHI_DEMO_KEY_ID", "test")
 os.environ.setdefault("KALSHI_DEMO_PRIVATE_KEY", "test")
 import _bootstrap  # noqa: F401  (ajoute src/* au sys.path)
+from _broker_double import CompletePositionsProof  # noqa: E402
 
 import kalshi_alpha_bot as bot                        # noqa: E402
 from strategy_router import build_default_registry    # noqa: E402
@@ -53,7 +54,7 @@ def fake_ctx(strike=None, minutes_remaining=None, **kw):
     return FakeCtx()
 
 
-class FakeClient:
+class FakeClient(CompletePositionsProof):
     """Client Kalshi factice : AUCUN reseau. Scenarios d'ordre pilotables."""
     env = "demo"
     base_url = "fake://demo"
@@ -140,6 +141,8 @@ def make_engine(client):
     cible sur le FakeClient. DATA_DIR isole par test."""
     tmp = tempfile.mkdtemp(prefix="kalshi_eng_")
     bot.CFG.DATA_DIR = tmp
+    from persistence import PersistenceSentinel
+    PersistenceSentinel.reset()
     bot.CFG.SHADOW_MODE = False
     bot.CFG.KILL_SWITCH = False
     bot.CFG.ORDER_TTL_SECONDS = 0          # pas d'attente en test
@@ -219,6 +222,8 @@ class TestOrderLifecycle(unittest.TestCase):
     def _om(self, cli):
         tmp = tempfile.mkdtemp(prefix="kalshi_om_")
         bot.CFG.DATA_DIR = tmp
+        from persistence import PersistenceSentinel
+        PersistenceSentinel.reset()
         bot.CFG.ORDER_TTL_SECONDS = 0
         return bot.OrderManager(cli), tmp
 
@@ -257,6 +262,10 @@ class TestOrderLifecycle(unittest.TestCase):
         cli = FakeClient(order_scenario="fill")
         tmp = tempfile.mkdtemp(prefix="kalshi_rec_")
         bot.CFG.DATA_DIR = tmp
+        from authority_fixtures import initialize_empty
+        from persistence import PersistenceSentinel
+        PersistenceSentinel.reset()
+        initialize_empty()
         cli._orders["o9"] = {"order_id": "o9", "status": "executed",
                              "taker_fill_count": 1, "side": "yes",
                              "price": 48}

@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from config import CFG, _p
-from persistence import JsonStore
+from persistence import JsonStore, file_fingerprint
+from risk_transaction import risk_transaction
 from position_manager import PositionManager
 from trade_logger import TradeLogger, now_iso
 
@@ -13,17 +14,28 @@ log_rsk = logging.getLogger("RISK")
 
 
 class RiskManager:
+    #: F2 risk-equity ledger (equity_ledger.EquityLedger), attached by the
+    #: engine. None or unseeded -> the historical cash formulas apply.
+    equity = None
+
     def __init__(self, tlog: TradeLogger, posmgr: PositionManager, capital: float):
         self.tlog, self.posmgr, self.capital = tlog, posmgr, capital
+        # F2: the risk-equity ledger (equity_ledger.EquityLedger), attached by
+        # the engine. None or unseeded -> the historical cash formulas.
+        self.equity = None
         st = JsonStore.load(_p(CFG.RISK_FILE), {})
+        self._fingerprint = file_fingerprint(_p(CFG.RISK_FILE))
         today = datetime.now(timezone.utc).date().isoformat()
         if st.get("date") != today:
-            st = {"date": today}
+            st = {**st, "date": today}
         self.state = st
         self.flush()
 
     def flush(self):
-        JsonStore.save(_p(CFG.RISK_FILE), self.state)
+        ok = JsonStore.save(_p(CFG.RISK_FILE), self.state, expect_fingerprint=self._fingerprint)
+        if ok:
+            self._fingerprint = file_fingerprint(_p(CFG.RISK_FILE))
+        return ok
 
     # -- agregats jour (recalcules depuis le journal : source de verite unique)
     def _today_settled(self) -> list:
@@ -55,11 +67,41 @@ class RiskManager:
             peak = max(peak, curve)
         return max(0.0, peak - curve)
 
-    def rolling_drawdown_pct(self) -> float:
-        """Drawdown courant en pourcentage du capital effectif.
+    def _strategy_mode(self) -> bool:
+        """True when F2 accounting decides percentages (audit finding A05).
 
-        Evite l'ancien melange d'un drawdown en dollars avec une limite en %.
+        The old test was `mode == "strategy"`, so ANY other string -- a typo,
+        an empty variable, a stale value from an older release -- silently
+        selected the cash denominator. That is not a neutral fallback: a
+        deposit raises cash, so a cash-denominated drawdown SHRINKS when
+        money is added, which is exactly the loss-derived protection F2
+        exists to preserve. Astra turned a 30% strategy drawdown into 3% that
+        way and walked through the global gate.
+
+        So: only a RECOGNIZED mode may choose a denominator at all, and only
+        the recognized `cash` rollback -- an explicit, deliberate value --
+        gets the historical one. Anything unrecognized keeps the
+        loss-preserving computation whenever a seeded ledger can provide it,
+        and `equity_ledger.GUARD_ACCOUNTING_MODE` blocks CAPITAL either way.
         """
+        if self.equity is None or not getattr(self.equity, "seeded", False):
+            return False
+        mode = str(getattr(CFG, "RISK_EQUITY_MODE", "strategy") or "").strip().lower()
+        if mode == "cash":
+            return False              # recognized rollback, CAPITAL blocked
+        return True                   # "strategy", or anything unrecognized
+
+    def rolling_drawdown_pct(self) -> float:
+        """Drawdown courant en pourcentage.
+
+        F2 (strategy mode): 100 x (HWM - strategy_equity) / HWM from the
+        equity ledger -- a deposit cannot lower it, a withdrawal cannot raise
+        it. Otherwise: the historical ratio to effective capital (cash).
+        """
+        if self._strategy_mode():
+            pct = self.equity.drawdown_pct()
+            if pct is not None:
+                return float(pct)
         if self.capital <= 0:
             return 0.0
         return 100.0 * self.rolling_drawdown() / self.capital
@@ -69,7 +111,21 @@ class RiskManager:
         CAPITAL EFFECTIF). Pour 93,26$ : min(50, 4.66) = 4,66$. Le capital
         de reference (500$) ne peut plus influencer un solde inferieur."""
         pct_stop = max(0.0, self.capital) * CFG.MAX_DAILY_LOSS_PCT / 100.0
-        return round(min(CFG.MAX_DAILY_LOSS, pct_stop), 2)
+        stop = min(CFG.MAX_DAILY_LOSS, pct_stop)
+        if self._strategy_mode():
+            # F2 §7: the start-of-day strategy equity bounds the stop too, so
+            # an intraday deposit cannot widen it; the cash term stays so a
+            # withdrawal still tightens it. Never below one cent while the
+            # reference is positive: `stop == 0` would read as "disabled".
+            sod = self.equity.sod_strategy_equity()
+            if sod is None:
+                sod = self.equity.strategy_equity()
+            if sod is not None:
+                stop = min(stop, max(0.0, float(sod)) * CFG.MAX_DAILY_LOSS_PCT / 100.0)
+                ref = self.equity.risk_equity_reference()
+                if ref is not None and ref > 0:
+                    stop = max(stop, 0.01)
+        return round(stop, 2)
 
     def consecutive_losses(self) -> int:
         """Pertes consecutives en fin de sequence des trades regles."""
@@ -108,6 +164,7 @@ class RiskManager:
         elapsed = self.seconds_since_last_settlement()
         return elapsed is not None and elapsed >= CFG.CONSECUTIVE_LOSS_COOLDOWN_S
 
+    @risk_transaction
     def claim_half_open_attempt(self, ticker: str) -> (bool, str):
         """Reserve atomiquement l'unique essai demi-ouvert.
 
@@ -131,13 +188,15 @@ class RiskManager:
             "half_open_claimed_at": now_iso(),
             "half_open_ticker": ticker,
         })
-        self.flush()
+        if not self.flush():
+            return False, "risk_state_recovery_required"
         log_rsk.warning(
             f"[RISK] essai demi-ouvert RESERVE pour {ticker}; aucune autre "
             "soumission autorisee avant un nouveau reglement.",
             extra={"event": "half_open_reserved", "ticker": ticker})
         return True, ""
 
+    @risk_transaction
     def release_half_open_attempt(self, ticker: str, reason: str) -> bool:
         """Libere un claim demi-ouvert uniquement lorsqu'aucun ordre n'a ete
         accepte par Kalshi ou lorsqu'un ordre est confirme sans aucun fill.
@@ -155,7 +214,8 @@ class RiskManager:
             "half_open_released_at": now_iso(),
             "half_open_release_reason": reason,
         })
-        self.flush()
+        if not self.flush():
+            return False
         log_rsk.warning(f"[RISK] essai demi-ouvert LIBERE pour {ticker}: {reason}",
                         extra={"event": "half_open_released",
                                "ticker": ticker, "reason": reason})
@@ -259,4 +319,6 @@ class RiskManager:
             "win_rate":  round(len(wins) / len(settled), 4) if settled else 0.0,
             "profit_factor": round(gp / gl, 3) if gl > 0 else None,
             "rolling_drawdown": round(self.rolling_drawdown(), 2),
+            "rolling_drawdown_pct": round(self.rolling_drawdown_pct(), 4),
+            "risk_equity": (self.equity.snapshot() if self.equity is not None else None),
         }

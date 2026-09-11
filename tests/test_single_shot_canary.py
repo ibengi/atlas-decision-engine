@@ -227,7 +227,7 @@ class HttpCreatedIsAuthoritativeTest(_CanaryBase):
 
         self.assertEqual(client2.create_order.call_count, 0,
                          "a failed read-back caused a second order")
-        self.assertEqual(res2.status, "blocked:duplicate_submission_guard")
+        self.assertEqual(res2.status, "blocked:ambiguous_intent_unresolved")
 
 
 class NoRepostOnAmbiguousPostTest(_CanaryBase):

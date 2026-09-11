@@ -14,6 +14,8 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+from _broker_double import BrokerMock  # noqa: E402
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
 
@@ -35,7 +37,7 @@ class VerifyTestCase(unittest.TestCase):
         self._old_dir = bot.CFG.DATA_DIR
         bot.CFG.DATA_DIR = self.tmp
         PersistenceSentinel.reset()
-        self.cli = MagicMock()
+        self.cli = BrokerMock()
         self.tlog = MagicMock()
         self.tlog.trades = []
         self.pm = bot.PositionManager(self.cli, self.tlog)

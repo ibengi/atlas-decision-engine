@@ -2,6 +2,9 @@
 
 import base64
 import json
+from transport_intent import durable_transport, BeforeSendFailure
+import math
+from strict_data import loads as strict_loads, validate_tree
 import logging
 import time
 import uuid
@@ -239,6 +242,7 @@ class KalshiClient:
                    f"Aucune requete reseau mutante n'a ete emise.")
 
     # -- Requete avec retry/backoff ------------------------------------------
+    @durable_transport
     def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
         # BUTOIR DE TRANSPORT. Place AVANT tout le reste (y compris la
         # verification de cle) pour qu'une ecriture LIVE non autorisee soit
@@ -257,6 +261,8 @@ class KalshiClient:
                 0, f"methode HTTP inutilisable pour {path}: valeur non "
                    f"classable. Aucune requete emise.")
         if self._pk is None and path.startswith("/portfolio"):
+            if _is_mutating_method(method):
+                raise BeforeSendFailure("authentication key unavailable before dispatch")
             raise KalshiAPIError(
                 0, f"{method} {path}: requete authentifiee IMPOSSIBLE — cle "
                    f"RSA non chargee (cle absente/non-PEM ou dependance "
@@ -268,8 +274,14 @@ class KalshiClient:
         while True:
             attempt += 1
             try:
+                headers = self._sign_headers(method, url)
+            except Exception as exc:
+                if _is_mutating_method(method):
+                    raise BeforeSendFailure("request signing failed before dispatch") from exc
+                raise
+            try:
                 r = self.session.request(method, url,
-                                         headers=self._sign_headers(method, url),
+                                         headers=headers,
                                          timeout=15, **kw)
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt > retries:
@@ -297,7 +309,7 @@ class KalshiClient:
                 raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
 
             try:
-                return r.json() if r.text.strip() else {}
+                return strict_loads(r.text) if r.text.strip() else {}
             except ValueError:
                 raise KalshiAPIError(r.status_code, f"{method} {path}: JSON invalide", r.text)
 
@@ -360,7 +372,7 @@ class KalshiClient:
             if dollars is not None:
                 try:
                     value = float(dollars)
-                    return value if value >= 0 else None
+                    return value if math.isfinite(value) and value >= 0 else None
                 except (TypeError, ValueError):
                     pass
             cents = pick_int(r, "balance", "available_balance", default=-1)
@@ -614,12 +626,145 @@ class KalshiClient:
                 if str(pick(o, "client_order_id", "client_id",
                             default="")).strip() == cid]
 
+    #: Endpoint et enveloppes ACCEPTEES pour les positions. Kalshi documente
+    #: `market_positions` (et `event_positions` pour l'agregat par evenement,
+    #: qui n'est PAS la vue par marche). Toute autre forme est une reponse
+    #: que ce client ne sait pas lire -- jamais un portefeuille plat.
+    POSITIONS_PATH = "/portfolio/positions"
+    POSITIONS_ENVELOPE_KEYS = ("market_positions",)
+    #: Noms qui designeraient LA MEME vue par marche. Si un de ceux-ci
+    #: accompagne l'enveloppe acceptee en portant des lignes, la reponse se
+    #: contredit: on ne peut pas savoir laquelle enumere le portefeuille, et
+    #: choisir la vide fabriquerait une absence.
+    POSITIONS_ALIAS_KEYS = ("positions", "data", "market_position")
+    #: Plafond de pagination. Atteindre ce plafond AVEC un curseur encore
+    #: actif est une collecte INCOMPLETE, donc une absence non concluante.
+    POSITIONS_MAX_PAGES = 25
+    POSITIONS_PAGE_LIMIT = 200
+
+    def get_positions_proof(self, *, limit: int = None,
+                            max_pages: int = None) -> dict:
+        """Positions du portefeuille AVEC la preuve que la collecte est
+        complete (audit finding A02).
+
+        L'ancienne version faisait
+        ``r.get("market_positions", r.get("positions", [])) or []`` et
+        ignorait le curseur. Trois absences FABRIQUEES en decoulaient :
+
+          * une enveloppe inconnue ou renommee -> `[]` (« aucune position »)
+          * ``market_positions: null`` -> `[]` par le `or []`
+          * une premiere page pleine de lignes a zero, une position ouverte
+            en page deux -> `[]` parce que le curseur n'etait jamais suivi
+
+        Or « je n'ai vu aucune position » et « je n'ai pas pu regarder » ne
+        sont pas la meme phrase : la premiere autorise un rebase, la seconde
+        doit le refuser. Cette methode ne renvoie donc jamais de liste sans
+        dire si elle est complete, et leve KalshiAPIError des que la reponse
+        n'est pas interpretable.
+
+        Retour : ``{"rows": [...], "complete": True, "pages": n,
+                    "cursors": [...]}``. `complete` n'est True que lorsque le
+        broker a annonce la fin de la pagination.
+        """
+        limit = int(limit or self.POSITIONS_PAGE_LIMIT)
+        max_pages = int(max_pages or self.POSITIONS_MAX_PAGES)
+        rows, cursor, pages, seen_cursors = [], "", 0, []
+        seen_tickers, seen_ids = set(), set()
+        while pages < max_pages:
+            pages += 1
+            params = {"limit": limit}
+            if cursor:
+                params["cursor"] = cursor
+            r = self._req("GET", self.POSITIONS_PATH, params=params)
+            if not isinstance(r, dict):
+                raise KalshiAPIError(
+                    0, f"listing de positions incoherent: reponse "
+                       f"{type(r).__name__}, objet attendu")
+            present = [k for k in self.POSITIONS_ENVELOPE_KEYS if k in r]
+            if not present:
+                raise KalshiAPIError(
+                    0, f"listing de positions incoherent: aucune enveloppe "
+                       f"connue {list(self.POSITIONS_ENVELOPE_KEYS)} dans la "
+                       f"reponse (cles vues: {sorted(r)[:8]}) -- schema "
+                       f"inconnu, PAS un portefeuille vide")
+            if len(present) > 1:
+                raise KalshiAPIError(
+                    0, f"listing de positions incoherent: enveloppes "
+                       f"multiples {present}, impossible de choisir")
+            conflicting = [k for k in self.POSITIONS_ALIAS_KEYS
+                           if isinstance(r.get(k), list) and r.get(k)]
+            if conflicting:
+                raise KalshiAPIError(
+                    0, f"listing de positions incoherent: enveloppes "
+                       f"contradictoires {present + conflicting} -- "
+                       f"impossible de savoir laquelle enumere le "
+                       f"portefeuille")
+            block = r[present[0]]
+            if block is None:
+                raise KalshiAPIError(
+                    0, f"listing de positions incoherent: '{present[0]}' est "
+                       f"null -- inconnu, PAS un portefeuille vide")
+            if not isinstance(block, list):
+                raise KalshiAPIError(
+                    0, f"listing de positions incoherent: '{present[0]}' "
+                       f"n'est pas une liste ({type(block).__name__})")
+            for row in block:
+                if not isinstance(row, dict):
+                    raise KalshiAPIError(
+                        0, f"listing de positions incoherent: entree "
+                           f"non-objet dans '{present[0]}'")
+                if not str(row.get("ticker") or "").strip():
+                    raise KalshiAPIError(
+                        0, f"listing de positions incoherent: ligne sans "
+                           f"ticker exploitable ({sorted(row)[:6]})")
+                tk = row.get("ticker")
+                if not isinstance(tk, str) or not tk.strip() or tk in seen_tickers:
+                    raise KalshiAPIError(0, "CONFLICTED: invalid or duplicate position ticker")
+                seen_tickers.add(tk)
+                for field in ("position_id", "id"):
+                    ident = row.get(field)
+                    if ident is not None:
+                        if not isinstance(ident, str) or not ident or (field, ident) in seen_ids:
+                            raise KalshiAPIError(0, "CONFLICTED: duplicate position identity")
+                        seen_ids.add((field, ident))
+                try:
+                    validate_tree(row)
+                except ValueError as exc:
+                    raise KalshiAPIError(0, str(exc)) from exc
+            if pages == 1:
+                self._log_raw_once("positions", r)
+            rows.extend(block)
+            raw_cursor = r.get("cursor", "")
+            if raw_cursor is not None and not isinstance(raw_cursor, str):
+                raise KalshiAPIError(
+                    0, f"listing de positions incoherent: 'cursor' de type "
+                       f"{type(raw_cursor).__name__}, pagination "
+                       f"inexploitable")
+            next_cursor = (raw_cursor or "").strip()
+            if not next_cursor:
+                return {"rows": rows, "complete": True, "pages": pages,
+                        "cursors": seen_cursors}
+            if next_cursor in seen_cursors:
+                raise KalshiAPIError(
+                    0, "listing de positions incoherent: 'cursor' ne "
+                       "progresse pas (meme valeur renvoyee), pagination "
+                       "sans fin")
+            seen_cursors.append(next_cursor)
+            cursor = next_cursor
+        raise KalshiAPIError(
+            0, f"listing de positions tronque: {max_pages} pages lues et le "
+               f"broker annonce encore une suite -- absence non concluante")
+
     def get_positions(self) -> list:
-        """Positions cote broker (source de verite pour la reconciliation)."""
+        """Positions cote broker (source de verite pour la reconciliation).
+
+        Compatibilite : renvoie la liste complete, ou None quand la verite
+        n'a pas pu etre etablie. None est un verrou fail-closed chez tous les
+        appelants ; une liste vide ne l'est pas, et n'est donc jamais
+        fabriquee a partir d'une reponse incomprise (audit finding A02).
+        """
         try:
-            r = self._req("GET", "/portfolio/positions")
-            self._log_raw_once("positions", r)
-            return r.get("market_positions", r.get("positions", [])) or []
+            return self.get_positions_proof()["rows"]
         except KalshiAPIError as e:
             log_api.warning(f"get_positions: {e}")
             return None

@@ -167,6 +167,40 @@ def banner(client: KalshiClient, capital: float):
              f"min {CFG.MIN_MINUTES:g}min | TTL ordre {CFG.ORDER_TTL_SECONDS}s")
     log.info("=" * 62)
 
+def publish_read_only_startup_snapshot(client: KalshiClient, capital: float):
+    """Refresh dashboard_state.json right after the startup banner, in
+    PRODUCTION READ_ONLY only. Observability only.
+
+    A process blocked by an early global guard could otherwise leave a stale
+    snapshot from an older DEMO process indefinitely. Runs only after `main`
+    has completed its production-mode and credential validation and built the
+    real client; the balance GET is read-only and any write failure is
+    non-fatal. Repo-owned: every entrypoint (Dockerfile CMD, Procfile, a
+    Railway start command, a local launch) gets it from `--live-read-only`.
+    """
+    try:
+        bal = client.get_balance()
+        effective = min(float(capital), bal) if bal is not None else None
+        JsonStore.save(_p("dashboard_state.json"), {
+            "ts": now_iso(),
+            "version": ENGINE_VERSION,
+            "env": getattr(client, "env", None),
+            "cycle": 0,
+            "balance": bal,
+            "capital": effective,
+            "configured_capital": float(capital),
+            "read_only": True,
+            "startup_snapshot": True,
+            "capital_blocking_guard": None,
+            "candidates": [],
+        })
+        log.info(
+            "[DASHBOARD_STARTUP_SNAPSHOT] env=%s balance=%s read_only=true",
+            getattr(client, "env", None), bal)
+    except Exception as exc:  # observability must never block the engine
+        log.warning("[DASHBOARD_STARTUP_SNAPSHOT] non ecrit: %s", exc)
+
+
 def _start_dashboard_if_enabled():
     """Dashboard web en thread daemon. Zero dependance, lecture seule des
     fichiers d'etat -- ne peut ni bloquer ni influencer le trading."""
@@ -364,6 +398,9 @@ def main():
 
     client = KalshiClient(env)
     banner(client, args.capital)
+    if env == "prod" and config.prod_is_read_only() \
+            and not (args.scan_only or args.rank_only):
+        publish_read_only_startup_snapshot(client, args.capital)
     _start_dashboard_if_enabled()
 
     if args.scan_only or args.rank_only:

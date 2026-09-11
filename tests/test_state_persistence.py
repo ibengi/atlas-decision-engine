@@ -20,13 +20,14 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import BrokerMock  # noqa: E402
 
 import kalshi_alpha_bot as bot  # noqa: E402
 
 
 class BrokerRebuildHonestyTest(unittest.TestCase):
     def setUp(self):
-        self.client = MagicMock()
+        self.client = BrokerMock()
         self.tlog = MagicMock()
         self.tlog.trades = []
         self.pm = bot.PositionManager(self.client, self.tlog)
@@ -99,7 +100,7 @@ class StateLossDetectionTest(unittest.TestCase):
     """The one moment the loss is visible: startup."""
 
     def setUp(self):
-        self.client = MagicMock()
+        self.client = BrokerMock()
         self.tlog = MagicMock()
         self.pm = bot.PositionManager(self.client, self.tlog)
         self.pm.positions = {}

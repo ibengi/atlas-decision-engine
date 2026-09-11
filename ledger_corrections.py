@@ -248,8 +248,7 @@ def apply_ledger_corrections(tlog: TradeLogger) -> list:
             "corrects_trade_id": corr["target_trade_id"],
             "broker_evidence": dict(corr["broker_evidence"]),
         }
-        tlog.trades.append(rec)
-        tlog.flush()
+        tlog.append_correction(rec)
         applied.append(rec)
 
         seen = _marker_count_on_disk(tlog, cid)

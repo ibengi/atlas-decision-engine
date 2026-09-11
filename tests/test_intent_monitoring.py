@@ -54,7 +54,8 @@ SECRETS = [
 
 def order_row(order_id="ord-1"):
     return {"order_id": order_id, "client_order_id": CID, "ticker": TICKER,
-            "side": SIDE, "status": "resting", "fill_count": 0,
+            "side": SIDE, "action": "buy", "initial_count": COUNT,
+            "yes_price": PRICE, "status": "resting", "fill_count": 0,
             "remaining_count": COUNT}
 
 
@@ -119,6 +120,9 @@ class _MonitorBase(unittest.TestCase):
         from datetime import datetime, timedelta, timezone
         born = datetime.now(timezone.utc) - timedelta(seconds=seconds)
         om.pending_intents[TICKER]["at"] = born.isoformat(timespec="seconds")
+        # This fixture changes immutable creation time before testing age.
+        if TICKER in om.pending_intents:
+            om.pending_intents[TICKER]["payload_digest"] = om._intent_digest(om.pending_intents[TICKER])
         om._flush_pending_intents()
 
 
@@ -176,6 +180,9 @@ class HealthSnapshotTest(_MonitorBase):
             "client_order_id": "alpha_other", "count": 1, "price": 10,
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "resolution": None}
+        # This fixture changes immutable creation time before testing age.
+        if TICKER in om.pending_intents:
+            om.pending_intents[TICKER]["payload_digest"] = om._intent_digest(om.pending_intents[TICKER])
         om._flush_pending_intents()
 
         health = om.intent_health()
@@ -222,6 +229,9 @@ class StaleIntentAlertTest(_MonitorBase):
         self.assertEqual(len(om.evaluate_intent_alerts()), 1)
 
         om.pending_intents.clear()            # resolved by the policy
+        # This fixture changes immutable creation time before testing age.
+        if TICKER in om.pending_intents:
+            om.pending_intents[TICKER]["payload_digest"] = om._intent_digest(om.pending_intents[TICKER])
         om._flush_pending_intents()
 
         self.assertEqual(om.evaluate_intent_alerts(), [])

@@ -2,11 +2,19 @@
 
 import logging
 import os
+import math
 import re
 
-def _env_f(name, default): 
-    try: return float(os.getenv(name, str(default)))
-    except ValueError: return default
+def _env_f(name, default):
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError:
+        if name == "BTC_CONTEXT_CYCLE_TTL_S":
+            return default
+        raise
+    if not math.isfinite(value):
+        raise ValueError(f"{name}: non-finite configuration refused")
+    return value
 def _env_i(name, default):
     try: return int(os.getenv(name, str(default)))
     except ValueError: return default
@@ -189,6 +197,8 @@ def daily_quarantine_blocks(ticker) -> bool:
 
 
 class Config:
+    # Stable non-secret account identifier; credentials and key IDs are not identity.
+    BROKER_ACCOUNT_ID = os.getenv("BROKER_ACCOUNT_ID")
     # Environnements
     PROD_URL  = "https://api.elections.kalshi.com/trade-api/v2"
     DEMO_URL  = "https://demo-api.kalshi.co/trade-api/v2"
@@ -345,6 +355,19 @@ class Config:
     MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
     MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
     MAX_EQUITY_DRAWDOWN_PCT = _env_f("MAX_EQUITY_DRAWDOWN_PCT", 20.0)
+    # F2 risk-equity accounting (docs/design/risk-equity-accounting.md).
+    # "strategy": loss-derived percentages use strategy equity / the
+    # high-water mark from equity_ledger.json; "cash": the historical
+    # broker-cash denominator (rollback, byte-identical to before F2).
+    RISK_EQUITY_MODE = (os.getenv("RISK_EQUITY_MODE", "strategy") or "strategy").strip().lower()
+    # Separate policy, off by default: a CONSERVATIVE_ESTIMATE baseline may
+    # count as CAPITAL-eligible. Never set by migration or by code.
+    RISK_EQUITY_ALLOW_CONSERVATIVE_ESTIMATE = _env_gate(
+        "RISK_EQUITY_ALLOW_CONSERVATIVE_ESTIMATE", default=False)
+    EQUITY_FLOW_QUIET_CYCLES = _env_i("EQUITY_FLOW_QUIET_CYCLES", 3)
+    EQUITY_FLOW_EPS          = _env_f("EQUITY_FLOW_EPS", 0.01)
+    EQUITY_FLOW_EPS_PER_TRADE = _env_f("EQUITY_FLOW_EPS_PER_TRADE", 0.005)
+    EQUITY_LEDGER_FILE = "equity_ledger.json"
     # Portes edge/EV du pipeline (voir strategy_router.GateConfig)
     MIN_MODEL_CONFIDENCE  = _env_i("MIN_MODEL_CONFIDENCE", 6)
     MIN_GROSS_EDGE        = _env_f("MIN_GROSS_EDGE", 0.05)

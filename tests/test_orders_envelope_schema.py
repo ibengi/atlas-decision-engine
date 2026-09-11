@@ -44,7 +44,8 @@ CID = bot.OrderManager._client_order_id(TICKER, SIDE, COUNT, PRICE)
 
 def order_row(order_id="ord-1", client_order_id=CID):
     return {"order_id": order_id, "client_order_id": client_order_id,
-            "ticker": TICKER, "side": SIDE, "status": "resting",
+            "ticker": TICKER, "side": SIDE, "action": "buy",
+            "initial_count": COUNT, "yes_price": PRICE, "status": "resting",
             "fill_count": 0, "remaining_count": COUNT}
 
 

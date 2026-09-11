@@ -1,0 +1,36 @@
+{
+  "commit": "3af848e6aebc8769ea59f878d68674f89e04af0d",
+  "results": [
+    {
+      "id": "incomplete_settlement",
+      "status": "FAIL",
+      "detail": {
+        "retained_exposure": 0
+      }
+    },
+    {
+      "id": "unknown_journal",
+      "status": "FAIL",
+      "detail": {
+        "unknown_history_preserved": false
+      }
+    },
+    {
+      "id": "subcent_settlement",
+      "status": "FAIL",
+      "detail": {
+        "persisted_loss": -0.0
+      }
+    },
+    {
+      "id": "concurrent_risk_claims",
+      "status": "FAIL",
+      "detail": {
+        "first_claim": true,
+        "second_claim": true
+      }
+    }
+  ],
+  "real_broker_writes": 0,
+  "capital_enabled": false
+}

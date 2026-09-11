@@ -20,6 +20,8 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock
 
+from _broker_double import BrokerMock
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
 
@@ -83,7 +85,7 @@ class _Base(unittest.TestCase):
         self._saved_dir = bot.CFG.DATA_DIR
         bot.CFG.DATA_DIR = self.tmp
         self.addCleanup(self._cleanup)
-        self.client = MagicMock()
+        self.client = BrokerMock()
         self.client.get_positions.return_value = [dict(e) for e in
                                                   REAL_BROKER_PAYLOAD]
         self.pm = PositionManager(self.client, MagicMock())

@@ -42,14 +42,23 @@ class PositionSizer:
         return max(0.0, (p * b - q) / b)
 
     @staticmethod
-    def _legacy(capital, price_cents, taille_str, confidence, drawdown, open_risk):
+    def _throttled(capital, drawdown, drawdown_pct) -> bool:
+        """F2: an explicit drawdown percentage (strategy-equity based) wins;
+        None keeps the historical dollars-over-cash expression."""
+        if drawdown_pct is not None:
+            return float(drawdown_pct) >= CFG.DD_THROTTLE_PCT
+        return capital > 0 and drawdown / capital * 100.0 >= CFG.DD_THROTTLE_PCT
+
+    @staticmethod
+    def _legacy(capital, price_cents, taille_str, confidence, drawdown, open_risk,
+                drawdown_pct=None):
         base_pct = {"0.5%": 0.5, "1%": 1.0, "2%": 2.0}.get(taille_str)
         if base_pct is None or price_cents <= 0:
             return 0
         pct = min(base_pct, CFG.MAX_POS_PCT)
         if confidence <= 4:
             pct *= 0.5
-        if capital > 0 and drawdown / capital * 100.0 >= CFG.DD_THROTTLE_PCT:
+        if PositionSizer._throttled(capital, drawdown, drawdown_pct):
             pct *= 0.5
             log_rsk.info(f"Sizer: drawdown {drawdown:.2f}$ >= "
                          f"{CFG.DD_THROTTLE_PCT:g}% du capital -- taille reduite.")
@@ -68,10 +77,11 @@ class PositionSizer:
     @staticmethod
     def contracts(capital: float, price_cents: int, taille_str: str,
                   confidence: int, drawdown: float, open_risk: float,
-                  probability=None, side: str = "yes") -> int:
+                  probability=None, side: str = "yes", drawdown_pct=None) -> int:
         if not getattr(CFG, "KELLY_ENABLED", False) or probability is None:
             return PositionSizer._legacy(capital, price_cents, taille_str,
-                                         confidence, drawdown, open_risk)
+                                         confidence, drawdown, open_risk,
+                                         drawdown_pct=drawdown_pct)
         if capital <= 0 or price_cents <= 0:
             return 0
         full = PositionSizer.full_kelly(probability, price_cents, side)
@@ -83,7 +93,7 @@ class PositionSizer:
             return 0
         if confidence <= 4:
             pct *= 0.5
-        if capital > 0 and drawdown / capital * 100.0 >= CFG.DD_THROTTLE_PCT:
+        if PositionSizer._throttled(capital, drawdown, drawdown_pct):
             pct *= 0.5
         budget_left = capital * CFG.RISK_BUDGET_PCT / 100.0 - open_risk
         alloc = min(capital * pct / 100.0, max(0.0, budget_left))

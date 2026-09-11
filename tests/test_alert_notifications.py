@@ -140,6 +140,8 @@ class _NotifyBase(unittest.TestCase):
         from datetime import datetime, timedelta, timezone
         born = datetime.now(timezone.utc) - timedelta(seconds=seconds)
         om.pending_intents[TICKER]["at"] = born.isoformat(timespec="seconds")
+        # This fixture changes immutable creation time before testing age.
+        om.pending_intents[TICKER]["payload_digest"] = om._intent_digest(om.pending_intents[TICKER])
         om._flush_pending_intents()
 
     def _multiple_om(self, notifier):

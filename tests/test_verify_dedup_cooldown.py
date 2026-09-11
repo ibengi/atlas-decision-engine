@@ -12,11 +12,12 @@ import tempfile
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from _broker_double import CompletePositionsProof  # noqa: E402
 
 import kalshi_alpha_bot as bot
 
 
-class ProdLikeClient:
+class ProdLikeClient(CompletePositionsProof):
     """Reproduit le comportement observe : create 201 executed,
     get_order 404, get_fills et positions fonctionnels."""
     env = "demo"

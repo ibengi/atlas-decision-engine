@@ -8,6 +8,7 @@ import time
 from typing import Optional
 
 from btc_strategy import BtcStrategy, BTC_AVAILABLE, get_btc_context
+from equity_ledger import EquityLedger, ACCOUNTING_GUARDS
 from config import (CFG, prod_is_read_only, GATE_PARSE_WARNINGS, _env_b, _p, contract_cap_config,
                     daily_oracle_approved, daily_quarantine_blocks,
                     ticker_is_wellformed)
@@ -142,13 +143,202 @@ def log_execution_banner(client):
         log.info("NOTE: ordres reels sur l'API DEMO — fonds DEMO uniquement, "
                  "aucun argent reel.")
 
+#: The ONE global guard that PRODUCTION READ_ONLY observation may continue
+#: through. Deliberately a single name, not a set: `equity_drawdown` is a
+#: CAPITAL guard (it protects money that READ_ONLY cannot move), so stopping
+#: the scanner on it destroys model evidence without adding money-path
+#: safety. Every other guard, in every mode, and this guard in CAPITAL and
+#: DEMO, keep their fail-closed verdict.
+OBSERVATION_ONLY_GUARD = "equity_drawdown"
+#: F2: the four accounting guards are CAPITAL guards of the same nature
+#: (they protect money READ_ONLY cannot move) and are observed through the
+#: same way, each recorded by name as `would_block_capital`. This is the
+#: complete allow-list; every other guard stops the scan in every mode.
+OBSERVATION_ONLY_GUARDS = frozenset((OBSERVATION_ONLY_GUARD, *ACCOUNTING_GUARDS))
+
+
+def _broker_open_order_ids(client, orders):
+    """(ids, error). A read that fails yields (None, reason): unknown is
+    never an empty set."""
+    from order_manager import OrderManager
+    terminal = {str(s).lower() for s in getattr(orders, "TERMINAL", OrderManager.TERMINAL)}
+    try:
+        rows = client.list_orders()
+    except Exception as e:                                # noqa: BLE001
+        return None, f"{type(e).__name__}: {e}"
+    if not isinstance(rows, list):
+        return None, "broker orders incomplete: list required"
+    ids = []
+    seen = set()
+    for r in rows:
+        if not isinstance(r, dict) or not isinstance(r.get("status"), str):
+            return None, "malformed broker order"
+        ident = r.get("order_id") or r.get("id")
+        if not isinstance(ident, str) or not ident or ident in seen:
+            return None, "duplicate or absent broker order identity"
+        seen.add(ident)
+        remaining = r.get("remaining_count", 0)
+        if type(remaining) is not int or remaining < 0:
+            return None, "invalid remaining quantity"
+        status = str((r or {}).get("status") or "").lower()
+        remaining = int((r or {}).get("remaining_count") or 0)
+        if status not in terminal or remaining > 0:
+            ids.append(str(r.get("order_id") or r.get("id") or "?"))
+    return sorted(ids), None
+
+
+def equity_rebase_context(client, orders, posmgr, risk, equity=None,
+                          quiescent: bool = True) -> dict:
+    """The authoritative context for an equity rebase (F2 §6, audit A03).
+
+    Orders come from the persisted OrderManager state (`open_orders`,
+    `pending_intents`, `resolution_halt`) AND a fresh read-only broker
+    listing; positions from the persisted PositionManager state AND a fresh
+    broker verification. A query that fails leaves the broker side `None`
+    (unknown), which the ledger treats as a refusal; a disagreement between
+    local and broker order sets is a refusal too. Nothing here writes to the
+    broker.
+
+    Two GETs are not a transaction. Astra demonstrated an order appearing
+    between the order query and the position query, invisible to both. The
+    broker listing is therefore read TWICE, bracketing the position read: an
+    exposure that appears anywhere inside the bracket shows up in the second
+    listing and marks the evidence unstable. That does not make the pair
+    atomic -- the broker offers no such primitive here -- and it is not
+    claimed to: the bracket narrows the window to zero *observed* orders on
+    both sides of the position read, and anything else refuses. The local
+    files are fingerprinted on both sides of the whole collection for the
+    same reason, and re-checked by the ledger at commit.
+    """
+    execution_freeze = getattr(client, "execution_freeze", None)
+    bound_before = equity.bound_state() if equity is not None else None
+    local_open = sorted(str(k) for k in (getattr(orders, "open_orders", None) or {}))
+    pending = sorted(str(k) for k in (getattr(orders, "pending_intents", None) or {}))
+    halt = getattr(orders, "resolution_halt", None)
+    broker_ids, broker_error = _broker_open_order_ids(client, orders)
+    reconcile, reconcile_detail = "UNKNOWN", None
+    verify = getattr(posmgr, "verify_against_broker", None)
+    if callable(verify):
+        try:
+            report = verify() or {}
+            reconcile = str(report.get("status") or "UNKNOWN")
+            reconcile_detail = report.get("detail")
+        except Exception as e:                            # noqa: BLE001
+            reconcile = f"UNKNOWN ({type(e).__name__})"
+    elif getattr(posmgr, "reconcile_halt", None) is None:
+        reconcile = "MATCH"
+    broker_ids_after, broker_error_after = _broker_open_order_ids(client, orders)
+    unstable = None
+    if broker_ids is None or broker_ids_after is None:
+        unstable = (f"broker order listing unreadable "
+                    f"({broker_error or broker_error_after})")
+    elif broker_ids != broker_ids_after:
+        unstable = (f"the broker order set changed across the position read: "
+                    f"{broker_ids} -> {broker_ids_after}")
+    local_after = sorted(str(k) for k in (getattr(orders, "open_orders", None) or {}))
+    pending_after = sorted(str(k) for k in (getattr(orders, "pending_intents", None) or {}))
+    if (local_after, pending_after) != (local_open, pending):
+        unstable = "local order/intent state changed during collection"
+    if equity is not None:
+        drift = equity._bound_state_drift(bound_before)
+        if drift:
+            unstable = f"local evidence files changed during collection: {drift}"
+    drawdown_firing = False
+    try:
+        drawdown_firing = float(risk.rolling_drawdown_pct()) >= CFG.MAX_EQUITY_DRAWDOWN_PCT
+    except Exception:                                     # noqa: BLE001
+        pass
+    broker_open = None if broker_ids is None else len(broker_ids)
+    disagreement = broker_ids is not None and set(local_open) != set(broker_ids)
+    ctx = {"drawdown_firing": drawdown_firing,
+           "reconcile_status": reconcile,
+           "reconcile_detail": reconcile_detail,
+           "open_positions": int(posmgr.open_count()),
+           "in_flight_orders": len(local_open) + len(pending) + (broker_open or 0),
+           "quiescent": bool(quiescent), "execution_freeze": execution_freeze,
+           "evidence_unstable": unstable,
+           "bound_state": bound_before,
+           "orders": {"local_open": local_open, "pending_intents": pending,
+                      "resolution_halt": bool(halt), "broker_open": broker_open,
+                      "broker_open_ids": broker_ids or [],
+                      "broker_error": broker_error or broker_error_after,
+                      "disagreement": disagreement}}
+    if equity is not None:
+        ctx["revalidate"] = lambda: equity_rebase_context(
+            client, orders, posmgr, risk, equity=equity, quiescent=quiescent)
+    return ctx
+
+
+def _equity_of(engine):
+    """The engine's EquityLedger, or None. Module-level so that harnesses
+    which borrow engine methods onto stub objects keep working."""
+    return getattr(engine, "equity", None)
+
+
+def _equity_status_of(engine):
+    equity = _equity_of(engine)
+    return equity.derive_status() if equity is not None else None
+
+
+def _equity_dashboard_fields(engine) -> dict:
+    equity = _equity_of(engine)
+    if equity is None:
+        return {}
+    s = equity.snapshot()
+    return {"risk_equity_status": s["risk_equity_status"],
+            "strategy_equity": s["strategy_equity"],
+            "risk_equity_reference": s["risk_equity_reference"],
+            "strategy_drawdown_pct": s["drawdown_pct"],
+            "external_flows_cum": s["external_flows_cum"],
+            "capital_guards": s["capital_guards"],
+            "capital_hold": s["capital_hold"],
+            "capital_eligible": (s["capital_eligible"]
+                                 and not getattr(engine, "_capital_blocking_guard", None))}
+
+
 class ExecutionEngine:
     """Cycle normal = PIPELINE INTEGRE :
     scanner -> ranker -> routeur -> portes edge/EV -> risque -> execution
     -> verification fills -> reconciliation. Plus de dependance exclusive
     a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
 
-    def __init__(self, client: KalshiClient, capital: float):
+    #: Per-cycle: the CAPITAL guard that fired but was REPORTED rather than
+    #: obeyed (PROD READ_ONLY only). Reset at the start of every cycle path,
+    #: at the start of every gate evaluation and in a `finally` at the end of
+    #: every finalization, so it can never survive an exception into the
+    #: next cycle.
+    _capital_blocking_guard = None
+
+    def __init__(self, client: KalshiClient, capital: float, continuity_authority=None):
+        # Acquire BEFORE any economic component is constructed or loaded. The
+        # OS lock, not a persisted PID, owns authority for this process.
+        from state_authority import WriterLease
+        self._writer_lease = WriterLease(_p("equity_ledger.json"))
+        self._authority_initialized = False
+        try:
+            client._engine_writer_lease = self._writer_lease
+            if continuity_authority is not None:
+                client.continuity_authority = continuity_authority
+            self._initialize(client, capital, continuity_authority)
+            self._authority_initialized = True
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        """Revoke this engine before releasing its process writer lease."""
+        self._authority_initialized = False
+        executor = getattr(self, "_executor", None)
+        lease = getattr(self, "_writer_lease", None)
+        try:
+            if executor is not None and lease is not None and lease.pid == os.getpid():
+                executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            self._executor = None
+            if lease is not None:
+                lease.close()
+
+    def _initialize(self, client: KalshiClient, capital: float, continuity_authority=None):
         from strategy_router import (GateConfig, build_default_registry,
                                      RegistryValidationError)
         from opportunity_pipeline import MarketOpportunityPipeline
@@ -166,6 +356,12 @@ class ExecutionEngine:
         self.posmgr   = PositionManager(client, self.tlog)
         self.orders   = OrderManager(client)
         self.risk     = RiskManager(self.tlog, self.posmgr, capital)
+        # F2 risk-equity accounting: strategy equity, high-water mark,
+        # external flows and baseline provenance, persisted under DATA_DIR.
+        # Deposits raise affordability (self.capital) and never touch it.
+        self.equity   = EquityLedger(self.tlog, self.posmgr, env=client.env, authority=continuity_authority)
+        self.risk.equity = self.equity
+        self._current_cycle = 0
         self.stats    = StatsEngine(self.tlog)
         self.strategy = BtcStrategy(client)          # analyse crypto existante
         # REGISTRE CANONIQUE indexe par market_type (correctif cause racine :
@@ -227,6 +423,12 @@ class ExecutionEngine:
         self.orders.reconcile_startup(self.tlog, self.posmgr)
         self.posmgr.reconcile_startup()
         self.posmgr.reconcile_with_broker()
+        # F2: declarative operator actions (seed, classification, rebase,
+        # hold release, attestation) are applied once, here, after the
+        # broker truth is established; every refusal is a logged no-op.
+        self._apply_equity_operator_actions()
+        log.warning(self.equity.banner_line())
+        HEALTH.extra["risk_equity"] = self.equity.snapshot()
         # Reconciliation periodique : le passage de demarrage vient d'avoir
         # lieu, le premier passage periodique attend un intervalle complet.
         self._last_broker_verify = time.monotonic()
@@ -306,9 +508,16 @@ class ExecutionEngine:
             bal = self.client.get_balance()
         self.last_balance = bal
         if bal is not None:
+            from strict_data import finite_number
+            try:
+                finite_number(bal, "broker cash", minimum=0)
+                finite_number(self.configured_capital, "configured capital", minimum=0)
+            except ValueError:
+                return False, "non-finite or negative capital: CAPITAL_BLOCKED"
             self.capital = min(self.configured_capital, bal) \
                 if self.configured_capital else bal
             self.risk.capital = self.capital
+            self._observe_equity(bal)
             return True, f"solde={bal:.2f}$ capital_effectif={self.capital:.2f}$"
         if self.client.env != "demo":
             return False, "solde broker INDISPONIBLE en production -- aucun trade"
@@ -333,7 +542,91 @@ class ExecutionEngine:
         self._last_health = health
         return bal, health
 
+    # ── F2 risk-equity accounting hooks ──────────────────────────────────
+    def _observe_equity(self, bal) -> None:
+        """One ledger observation per balance read. Never raises into the
+        cycle: accounting evidence must not be able to stop observation."""
+        equity = getattr(self, "equity", None)
+        if equity is None:
+            return
+        try:
+            orders = getattr(self, "orders", None)
+            in_flight = bool(getattr(orders, "pending_intents", None))
+            halt = getattr(getattr(self, "posmgr", None), "reconcile_halt", None)
+            equity.observe(bal, cycle_n=getattr(self, "_current_cycle", 0),
+                           quiet=(not in_flight and halt is None))
+            HEALTH.extra["risk_equity"] = equity.snapshot()
+        except Exception as e:                            # noqa: BLE001
+            log_rsk.error(f"[EQUITY] observation failed: {e}")
+
+    def _apply_equity_operator_actions(self) -> None:
+        equity = getattr(self, "equity", None)
+        if equity is None:
+            return
+        cash = None
+        if os.getenv("EQUITY_LEDGER_SEED_PRE_FLOW_CASH"):
+            # only a seed proposal needs today's cash; nothing else reads
+            # the broker here (one balance GET per cycle stays the rule)
+            try:
+                cash = self.client.get_balance()
+            except Exception as e:                        # noqa: BLE001
+                log_rsk.warning(f"[EQUITY] balance unavailable for the seed proposal: {e}")
+        if os.getenv("EQUITY_LEDGER_REBASE_TOKEN"):
+            # a rebase needs the authoritative order and position truth,
+            # including a fresh read-only broker query; anything unknown
+            # refuses. Other actions never need it.
+            # Boot-time only: the cycle loop has not started, so execution
+            # is quiescent by construction (nothing can submit while this
+            # runs). The ledger re-verifies at commit anyway.
+            ctx = equity_rebase_context(self.client, self.orders, self.posmgr,
+                                        self.risk, equity=equity, quiescent=True)
+        else:
+            halt = getattr(self.posmgr, "reconcile_halt", None)
+            ctx = {"drawdown_firing": False,
+                   "reconcile_status": "MATCH" if halt is None else str(halt.get("status")),
+                   "open_positions": self.posmgr.open_count(),
+                   "in_flight_orders": len(getattr(self.orders, "pending_intents", {}) or {})}
+        done = equity.apply_operator_actions(os.environ, cash, ctx)
+        if done:
+            log.warning(f"[EQUITY] operator actions: {done}")
+
+    def _is_prod_read_only(self) -> bool:
+        """"Not demo" and read-only dominance -- the write boundary's own
+        formulation (`_assert_broker_write_allowed`), never "is prod"."""
+        client = getattr(self, "client", None)
+        return getattr(client, "env", None) != "demo" and prod_is_read_only()
+
     def _post_balance_gates(self) -> tuple:
+        """Portes de risque globales APRES le solde. Retourne (ok, guard).
+
+        Every guard is evaluated by `_evaluate_global_guards`, unchanged.
+        Exactly one verdict is then re-read: `equity_drawdown` in PRODUCTION
+        READ_ONLY. There, no broker mutation exists to protect, so the guard
+        is RECORDED for this cycle (`_capital_blocking_guard`, surfaced as
+        `would_block_capital` in the durable row, `capital_blocking_guard` in
+        the cycle report and the dashboard) and observation continues:
+        scanner, model, shadow evidence and sizing all run; the write layer
+        is unreachable regardless. CAPITAL and DEMO keep the block. Every
+        other guard keeps its verdict in every mode.
+
+        The flag is reset FIRST so nothing an earlier cycle left behind can
+        be mistaken for this cycle's verdict.
+        """
+        self._capital_blocking_guard = None
+        ok, guard = self._evaluate_global_guards()
+        if ok:
+            return ok, guard
+        if guard in OBSERVATION_ONLY_GUARDS and self._is_prod_read_only():
+            self._capital_blocking_guard = guard
+            log_rsk.warning(
+                f"[READ_ONLY_OBSERVATION] capital_guard={guard} "
+                f"scanner_continues=true broker_writes=false",
+                extra={"event": "read_only_observation",
+                       "would_block_capital": guard})
+            return True, None
+        return ok, guard
+
+    def _evaluate_global_guards(self) -> tuple:
         """Portes de risque globales APRES le solde (capital effectif a
         jour). Retourne (ok, guard) ; ok=False si le cycle doit s'arreter.
 
@@ -341,6 +634,20 @@ class ExecutionEngine:
         VALEURS DE RETOUR SONT INCHANGES — seul le nom du bloqueur, jusqu'ici
         perdu, est desormais rendu au cycle pour etre journalise.
         """
+        from strict_data import finite_number
+        try:
+            for key in ("MAX_DAILY_LOSS", "MAX_DAILY_LOSS_PCT", "MAX_EQUITY_DRAWDOWN_PCT",
+                        "MAX_POS_PCT", "RISK_BUDGET_PCT", "DD_THROTTLE_PCT"):
+                finite_number(getattr(CFG, key), key, minimum=0)
+        except (ValueError, AttributeError):
+            return False, "invalid_numeric_risk_configuration"
+        lease = getattr(self, "_writer_lease", None)
+        from state_authority import root_of
+        if ((hasattr(self, "_authority_initialized") and
+             (not self._authority_initialized or lease is None)) or
+                (lease is not None and (not lease.valid() or
+                 lease.root != root_of(_p("equity_ledger.json"))))):
+            return False, "stale_engine_writer_lease"
         # Portes fail-closed structurelles AVANT les portes de risque :
         # une panne de persistance critique ou une divergence broker/local
         # non resolue interdit toute nouvelle soumission.
@@ -351,6 +658,13 @@ class ExecutionEngine:
                           extra={"event": "trading_blocked",
                                  "reason": "persistence_failure"})
             return False, "persistence_failure"
+        from persistence import file_fingerprint
+        for manager, attribute, filename in ((getattr(self, "orders", None), "_orders_fingerprint", CFG.ORDERS_FILE),
+                (getattr(self, "orders", None), "_pending_fingerprint", "pending_intents.json"),
+                (getattr(self, "risk", None), "_fingerprint", CFG.RISK_FILE)):
+            expected = getattr(manager, attribute, None)
+            if isinstance(expected, str) and file_fingerprint(_p(filename)) != expected:
+                return False, "stale_instance_reload_required"
         cap, cap_err = contract_cap_config()
         if cap is None:
             log_rsk.error(f"Trading bloque: {cap_err}",
@@ -392,6 +706,15 @@ class ExecutionEngine:
                        "drawdown_amount": self.risk.rolling_drawdown(),
                        "limit_pct": CFG.MAX_EQUITY_DRAWDOWN_PCT})
             return False, "equity_drawdown"
+        # F2 accounting guards (CAPITAL only; DEMO reports, never blocks).
+        # Order and names: equity_ledger.ACCOUNTING_GUARDS.
+        equity = getattr(self, "equity", None)
+        if equity is not None and getattr(getattr(self, "client", None), "env", None) != "demo":
+            for guard in equity.guards():
+                log_rsk.warning(f"Trading bloque: {guard} "
+                                f"(risk_equity_status={equity.derive_status()})",
+                                extra={"event": "trading_blocked", "reason": guard})
+                return False, guard
         return True, None
 
     #: P0 observability. Funnel stage names carried from the pipeline report
@@ -404,8 +727,13 @@ class ExecutionEngine:
 
     def _record_cycle_evidence(self, n: int, execution_path: str,
                                blocking_global_guard=None, detail: str = "",
-                               pipeline: dict = None) -> dict:
+                               pipeline: dict = None,
+                               would_block_capital=None) -> dict:
         """Write exactly one durable evidence row per cycle. Observability only.
+
+        `would_block_capital` defaults to this cycle's recorded CAPITAL guard
+        (PROD READ_ONLY observation, see `_post_balance_gates`); an explicit
+        value from the caller wins.
 
         Before P0 a cycle that returned early at a global guard wrote nothing
         at all, so "no decisions this cycle" had three indistinguishable
@@ -419,6 +747,9 @@ class ExecutionEngine:
 
         Never raises: evidence must not be able to break a trading cycle.
         """
+        if would_block_capital is None:
+            # getattr: harnesses borrow this method onto stub objects.
+            would_block_capital = getattr(self, "_capital_blocking_guard", None)
         row = {
             "cycle": n,
             "occurred_at": now_iso(),
@@ -426,6 +757,12 @@ class ExecutionEngine:
             "execution_path": execution_path,
             "blocking_global_guard": blocking_global_guard,
             "scan_executed": pipeline is not None,
+            # Names a CAPITAL guard that fired but was REPORTED rather than
+            # obeyed, which only PRODUCTION READ_ONLY observation may do.
+            # None on every other cycle. A row with scan_executed=true and
+            # a value here is a shadow cycle that CAPITAL would have refused.
+            "would_block_capital": would_block_capital,
+            "risk_equity_status": _equity_status_of(self),
         }
         if detail:
             row["blocking_detail"] = str(detail)[:300]
@@ -445,11 +782,13 @@ class ExecutionEngine:
             log.warning(f"[CYCLE_EVIDENCE] write failed: {e}")
         log.info(f"[CYCLE_EVIDENCE] cycle={n} path={execution_path} "
                  f"blocking_global_guard={blocking_global_guard} "
-                 f"scan_executed={row['scan_executed']}",
+                 f"scan_executed={row['scan_executed']} "
+                 f"would_block_capital={would_block_capital}",
                  extra={"event": "cycle_evidence", "cycle": n,
                         "execution_path": execution_path,
                         "blocking_global_guard": blocking_global_guard,
-                        "scan_executed": row["scan_executed"]})
+                        "scan_executed": row["scan_executed"],
+                        "would_block_capital": would_block_capital})
         return row
 
     def _probability_engine_report(self):
@@ -594,6 +933,8 @@ class ExecutionEngine:
     def _cycle_sequential(self, n: int) -> int:
         """Chemin par defaut (P8 desactive) : kill switch, solde, portes de
         risque globales, PUIS scan — ordre historique inchange."""
+        self._capital_blocking_guard = None
+        self._current_cycle = n
         # 2) Kill switch (seule porte qui ne depend pas du capital effectif)
         #    et 3-4) portes de risque globales — mesurees ensemble : ce sont
         #    les controles risque du cycle (P4.4).
@@ -641,6 +982,8 @@ class ExecutionEngine:
         risque. Resultats strictement identiques au sequentiel : solde et
         scan sont independants (le scan ne lit ni n'ecrit self.capital /
         self.risk — portes inchangees, executees apres la jointure)."""
+        self._capital_blocking_guard = None
+        self._current_cycle = n
         # 2) Kill switch d'abord : aucun scan lance inutilement.
         if CFG.KILL_SWITCH:
             log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.",
@@ -677,7 +1020,26 @@ class ExecutionEngine:
     def _finish_cycle(self, n: int, res: dict,
                       execution_path: str = "sequential") -> int:
         """Execution des candidats acceptes + rapports de fin de cycle
-        (partage sequentiel/parallele)."""
+        (partage sequentiel/parallele).
+
+        Carries this cycle's recorded CAPITAL guard (PROD READ_ONLY
+        observation) into the cycle report before it is persisted, and
+        clears the flag in `finally` whether finalization returns or raises.
+        """
+        guard = getattr(self, "_capital_blocking_guard", None)
+        try:
+            report = res.get("report") if isinstance(res, dict) else None
+            if guard and isinstance(report, dict):
+                report["capital_blocking_guard"] = guard
+                report["capital_eligible"] = False
+            if isinstance(report, dict):
+                report.update(_equity_dashboard_fields(self))
+            return self._finalize_cycle(n, res, execution_path)
+        finally:
+            self._capital_blocking_guard = None
+
+    def _finalize_cycle(self, n: int, res: dict,
+                        execution_path: str = "sequential") -> int:
         report = res["report"]
         placed = 0
         for dec in res["accepted"]:
@@ -755,6 +1117,13 @@ class ExecutionEngine:
                 "exchange_paused": time.time() <
                 getattr(self.orders, "exchange_pause_until", 0.0),
                 "candidates": cands,
+                # PROD READ_ONLY observation: the CAPITAL guard this cycle
+                # observed through, None on every other cycle.
+                "capital_blocking_guard":
+                    getattr(self, "_capital_blocking_guard", None),
+                **_equity_dashboard_fields(self),
+                **({"read_only": True, "capital_eligible": False}
+                   if getattr(self, "_capital_blocking_guard", None) else {}),
             })
         except Exception as e:
             log.warning(f"dashboard_state: {e}")
@@ -870,7 +1239,11 @@ class ExecutionEngine:
                 self.capital, entry, dec.taille, dec.confidence,
                 self.risk.rolling_drawdown(), self.posmgr.open_risk(),
                 probability=getattr(dec, "model_probability", None),
-                side=getattr(dec, "side", "yes"))
+                side=getattr(dec, "side", "yes"),
+                # F2: the throttle reads the strategy-equity drawdown
+                # percentage, never dollars over cash
+                drawdown_pct=(self.risk.rolling_drawdown_pct()
+                              if hasattr(self.risk, "rolling_drawdown_pct") else None))
             count = int(count * self.risk.drawdown_size_factor())
             proposed_risk = count * entry / 100.0
             ok, why = self.risk.portfolio_check(ticker, cat, proposed_risk)
