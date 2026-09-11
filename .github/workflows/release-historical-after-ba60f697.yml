@@ -1,0 +1,85 @@
+name: Release historical AFTER ba60f697
+
+on:
+  push:
+    branches: [release-engineering/validate-ba60f697]
+
+permissions:
+  contents: read
+
+jobs:
+  exact-candidate-historical-after:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EXPECTED_SHA: ba60f69798788b1730da71c8a3841d614e58fb48
+      EXPECTED_TREE: 56ba4e6fd7745b92d18884dc25db9ddd7ddd9208
+    steps:
+      - name: Checkout exact audited candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ba60f69798788b1730da71c8a3841d614e58fb48
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact source identity before execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install repository and audit dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Execute all 304 historical AFTER scenarios offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/atlas-historical-after
+          python tools/astra_regressions/reproduce_historical.py \
+            --phase after \
+            --after . \
+            --output /tmp/atlas-historical-after
+
+      - name: Verify historical evidence receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          p='/tmp/atlas-historical-after/reproduction-after.json'
+          r=json.load(open(p, encoding='utf-8'))
+          assert r['status']=='PASS', r['status']
+          assert r['capital_enabled'] is False
+          assert r['real_broker_writes']==0
+          assert r['external_sockets_permitted'] is False
+          a=r['phases']['after']
+          assert a['status']=='PASS', a['status']
+          assert a['source']['commit']=='ba60f69798788b1730da71c8a3841d614e58fb48'
+          assert a['source']['tree']=='56ba4e6fd7745b92d18884dc25db9ddd7ddd9208'
+          assert a['source_unchanged_during_execution'] is True
+          assert a['exact_committed_source'] is True
+          assert a['reproduced_or_safe_cases']==59
+          total=sum(s['case_count'] for s in a['suites'].values())
+          assert total==304, total
+          for name,s in a['suites'].items():
+              assert s['exit_code']==0, (name,s)
+              assert set(s['counts'])=={'PASS'}, (name,s['counts'])
+          print('HISTORICAL_AFTER_PASS: 304/304 scenarios; 59/59 mapped safety cases; CAPITAL OFF; broker writes 0')
+          PY
+
+      - name: Final exact source identity check
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$EXPECTED_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
