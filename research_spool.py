@@ -346,16 +346,14 @@ class BoundedSpool:
         # research writer thread. AA-10 is what makes that true -- the engine
         # hands its record to a queue and never waits for this function, so
         # serializing writers costs research latency and nothing else.
+        #
+        # `exclusive_lock` is a generator-based context manager: calling it
+        # runs nothing, so every failure it can have -- opening the sidecar,
+        # acquiring the lock, timing out -- surfaces at `__enter__`, inside
+        # the `with`. Catching around the call would have been dead code.
         try:
-            lock = exclusive_lock(
-                os.path.join(self.directory, RESERVATION_LOCK), timeout=5.0)
-        except OSError as exc:
-            self.stats["capacity_unknown"] += 1
-            log.warning(f"[RESEARCH_SPOOL] cannot open the reservation "
-                        f"lock: {exc}")
-            return False
-        try:
-            with lock:
+            with exclusive_lock(os.path.join(self.directory,
+                                             RESERVATION_LOCK), timeout=5.0):
                 return self._reserve_and_write(record, payload)
         except TimeoutError:
             # Another writer is holding the spool. Refuse rather than queue
@@ -363,6 +361,13 @@ class BoundedSpool:
             self.stats["reservation_timeouts"] += 1
             log.warning("[RESEARCH_SPOOL] another writer holds the spool; "
                         "this record is NOT spooled")
+            return False
+        except OSError as exc:
+            # An unopenable lock file is an unknown capacity, and unknown
+            # capacity fails closed like any other.
+            self.stats["capacity_unknown"] += 1
+            log.warning(f"[RESEARCH_SPOOL] cannot take the reservation "
+                        f"lock: {exc}")
             return False
 
     def _reserve_and_write(self, record: dict, payload: bytes) -> bool:

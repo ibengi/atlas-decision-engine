@@ -553,6 +553,27 @@ class AA11_PartialWritesEscapedTheBound(AlphaCase):
                          f"both writers took the last slot: {results}")
         self.assertEqual(len(self.record_names(spool_a)), 1)
 
+    def test_an_unopenable_reservation_lock_fails_closed_without_raising(self):
+        """`write()` promises never to raise for an expected condition.
+
+        Found by self-review: `exclusive_lock` is a generator-based context
+        manager, so calling it runs nothing and every failure it can have
+        surfaces at `__enter__`. A `try/except` wrapped around the CALL was
+        dead code, and an unopenable sidecar would have escaped `write()`.
+        """
+        spool = self.spool()
+        real_open = os.open
+
+        def refuse_the_lock(path, *a, **kw):
+            if str(path).endswith(".lock"):
+                raise OSError(13, "Permission denied")
+            return real_open(path, *a, **kw)
+
+        with patch("durable_append.os.open", side_effect=refuse_the_lock):
+            self.assertFalse(spool.write(valid_record()))
+        self.assertEqual(spool.stats["capacity_unknown"], 1)
+        self.assertEqual(self.record_names(spool), [])
+
     def test_capacity_still_fails_closed_when_it_cannot_be_established(self):
         spool = self.spool()
         with patch("os.listdir", side_effect=OSError("volume gone")):

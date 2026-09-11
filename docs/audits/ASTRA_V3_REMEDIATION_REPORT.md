@@ -263,14 +263,14 @@ Mutations `M12`–`M25` were added, one per newly closed invariant, so the
 
 ```
 python tools/astra_mutation_probe.py     ->  26/26 killed, 0 survivor(s)
-python run_tests.py                      ->  1915 tests, 0 failures,
+python run_tests.py                      ->  1916 tests, 0 failures,
                                              0 errors, 0 skipped
-python -m unittest tests.test_astra_v3_remediation  ->  91 tests, OK
+python -m unittest tests.test_astra_v3_remediation  ->  92 tests, OK
 pytest -k "AA11 or AA12 or AA13 or AA13b or AA13c or AA14 or AA15 or M07P"
                                          ->  59 passed
 ```
 
-### Two defects this work found in itself
+### Three defects this work found in itself
 
 Both are recorded because a remediation that only reports what it set out to
 fix is a remediation nobody can calibrate.
@@ -284,6 +284,14 @@ fix is a remediation nobody can calibrate.
   commit rather than start another: the receipt's own append fsyncs the whole
   file, so the earlier row becomes durable at the same moment its receipt
   does, and the ORIGINAL prediction id survives.
+
+* **A dead `except` around a generator-based context manager.**
+  `exclusive_lock` is a `@contextlib.contextmanager`, so calling it runs
+  nothing: every failure it can have — opening the sidecar, acquiring the
+  lock, timing out — surfaces at `__enter__`. The `try/except OSError`
+  wrapped around the *call* was therefore dead code, and an unopenable lock
+  file would have escaped `BoundedSpool.write`, which promises never to raise
+  for an expected condition. Found by re-reading the diff after the commit.
 
 * **`M19` survived the first full probe run.** Removing the total wrapper
   from `validate_record` was NOT detected, because `_check_book` had also
