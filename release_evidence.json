@@ -1,14 +1,14 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-09-08T18:20:00Z",
-  "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
-  "tree_sha": "4ae98383c9f07a064885949e6161b58672b50bfe",
-  "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
-  "deployment_created_at": "2026-09-07T13:33:39Z",
-  "deployment_ready_at": "2026-09-07T13:34:28Z",
+  "generated_at": "2026-09-11T10:25:00Z",
+  "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
+  "tree_sha": "cf2b4ea2dd730808c0874fdb8b31045944b55dc8",
+  "deployment_id": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da",
+  "deployment_created_at": "2026-09-09T18:33:55Z",
+  "deployment_ready_at": "2026-09-09T18:36:03Z",
   "deployment_status": "SUCCESS",
   "docker_build_pass": true,
-  "test_count": 949,
+  "test_count": 954,
   "test_failures": 0,
   "test_errors": 0,
   "test_skipped": 0,
@@ -25,16 +25,17 @@
   "ready_for_investor_demo": true,
   "ready_for_capital_live": false,
   "stale": false,
-  "what_this_release_is": "ATLAS is connected to the REAL Kalshi production account in READ_ONLY. Authentication, balance and reconciliation are verified against the live account. Zero broker writes. The full live SHADOW IS RUNNING: since the 2026-09-07T18:02Z deposit (balance 0.04$ -> 9.84$) the cash-denominated equity drawdown reads 4.9% and no longer cuts the scan; on 2026-09-08T14:54:44Z the engine produced its first production WOULD_SUBMIT (KXBTC15M NO x1 @ 9c) with no call to the write path. The shadow is deposit-dependent, not code-dependent: PR #64 is open and undeployed, and the F2 accounting design (a deposit must never clear a loss-derived guard) is awaiting cross-audit.",
+  "what_this_release_is": "ATLAS is connected to the REAL Kalshi production account in READ_ONLY. Authentication, balance and reconciliation are verified against the live account. Zero broker writes. The full live SHADOW IS RUNNING on the current deployment: on 2026-09-11T09:55:03Z the engine produced a production WOULD_SUBMIT (KXBTC15M-26SEP110600-00 NO x1 @ 3c) on cycle 2186, which recorded risk_passed=1 and orders_submitted=0 with rejection reason prod_read_only -- the decision completed and PROD_ACCESS_MODE=READ_ONLY stopped it before any call to the write path. 56 consecutive cycles around that event submitted nothing and filled nothing. This is the second confirmed shadow decision; the first was 2026-09-08T14:54:44Z on the previous deployment. The shadow remains deposit-dependent, not code-dependent: neither claude/railway-atlas-readonly-shadow-scan nor PR #64 has been merged or deployed, and the F2 accounting design (a deposit must never clear a loss-derived guard) is still awaiting cross-audit. CAPITAL remains NOT authorized.",
   "binds_to": {
-    "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
+    "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
     "merged_pull_requests": [
       "https://github.com/ibengi/atlas-decision-engine/pull/61",
       "https://github.com/ibengi/atlas-decision-engine/pull/62",
-      "https://github.com/ibengi/atlas-decision-engine/pull/63"
+      "https://github.com/ibengi/atlas-decision-engine/pull/63",
+      "https://github.com/ibengi/atlas-decision-engine/pull/65"
     ],
-    "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
-    "note": "PR #62 made --live-read-only the repository startup default; PR #63 added the read-only dashboard startup snapshot (Railway startCommand: python read_only_dashboard_bootstrap.py). The engine boots PROD READ_ONLY from that image."
+    "deployment_id": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da",
+    "note": "PR #62 made --live-read-only the repository startup default; PR #63 added the read-only dashboard startup snapshot (Railway startCommand: python read_only_dashboard_bootstrap.py). PR #65 (merge 5c4e789, second parent e04296c) is the only change merged to main since the previously recorded deployment d0995a1: an observability-only fix stopping a completed cycle from recording its fill count as its cycle number. No gate, threshold, model, oracle or broker-write path changed. The engine boots PROD READ_ONLY from that image."
   },
   "evidence": {
     "merge_gate": {
@@ -62,17 +63,18 @@
       "blocks_live_read_only": false
     },
     "in_image_suite": {
-      "railway_build": "Ran 949 tests in 74.383s / OK",
+      "railway_build": "Ran 954 tests in 79.779s / OK",
       "test_report_json": {
-        "ran": 949,
+        "ran": 954,
         "failures": 0,
         "errors": 0,
         "skipped": 0,
-        "collected": 949,
-        "collected_by_unittest_discovery": 944,
-        "collected_module_level": 5
+        "collected": 954
       },
-      "note": "949 = 944 discovered by unittest + 5 module-level, compared against real pytest rather than hard-coded. This ran inside the image that is now deployed, not on a developer machine."
+      "build_gate_observed": "[tests 7/7] RUN python -c ...test_report.json... completed, then [runtime 6/9] COPY --from=tests /src/test_report.json /app/test_report.json and [runtime 7/9] RUN test -f /app/test_report.json both completed",
+      "build_log_deployment": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da, BuildKit vertex log 2026-09-09T18:35:28Z",
+      "independent_local_reproduction": "The watch re-ran run_tests.py at the deployed commit 5c4e7897a0b99065f3a23bc4ed834b44dba9580c in a clean worktree: ran 954, failures 0, errors 0, skipped 0. The in-image number and the independently reproduced number agree.",
+      "note": "954 tests. This ran inside the image that is now deployed, and was independently reproduced at the same commit outside the image."
     },
     "runtime": {
       "banner_version": "v11.4-audit-fixed-2026-07-28",
@@ -116,32 +118,70 @@
       "fills": 0,
       "cancels": 0,
       "mutating_http_to_kalshi": 0,
-      "RECONCILE_LATEST": "MATCH (tickers broker=0 local=0) @ 2026-09-08T15:08:42Z, 14 minutes after the first WOULD_SUBMIT"
+      "RECONCILE_LATEST": "MATCH (tickers broker=0 local=0) @ 2026-09-11T09:58:08Z, 3 minutes after the 2026-09-11 WOULD_SUBMIT; MATCH x4 in the 09:05-10:11Z window"
     },
     "live_shadow": {
       "status": "RUNNING",
-      "first_would_submit_at": "2026-09-08T14:54:44Z",
-      "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
-      "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
-      "cycle_id": "f28e770049",
-      "decision": "KXBTC15M-26SEP081100-00 NO x1 @ 9c | model 23.9% vs market 11.0% | edge_net +0.099 | ev_net +0.109 | strategy btc15m_above_strike",
-      "log_line": "[WOULD_SUBMIT] KXBTC15M-26SEP081100-00 NO x1 @ 9c -- PROD_ACCESS_MODE=READ_ONLY: decision complete, AUCUN appel au chemin d'ecriture.",
-      "cycle_summary": "risk_passed 1, orders_submitted 0, fills 0",
+      "confirmed_on_current_deployment_at": "2026-09-11T09:55:03Z",
+      "deployment_id": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da",
+      "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
+      "cycle_id": "852f88df42",
+      "cycle": 2186,
+      "decision": "KXBTC15M-26SEP110600-00 NO x1 @ 3c | model 13.742% vs market 3.0% | edge_net +0.07742 | ev_net +0.08742 | est_fee_total 0.01 | strategy btc15m_above_strike",
+      "log_line": "[WOULD_SUBMIT] KXBTC15M-26SEP110600-00 NO x1 @ 3c -- PROD_ACCESS_MODE=READ_ONLY: decision complete, AUCUN appel au chemin d'ecriture.",
+      "log_attributes": {
+        "would_submit": true,
+        "rejection_reason": "prod_read_only",
+        "environment": "prod",
+        "market_type": "btc_15m_above_strike"
+      },
+      "cycle_summary": "risk_passed 1, orders_submitted 0, fills 0, rejections_by_reason includes prod_read_only: 1",
       "zero_write_verification": {
-        "window": "2026-09-08T14:16Z to 15:14Z (54 cycles, all scan_executed=true, blocking_global_guard=None)",
+        "window": "2026-09-11T09:11:40Z to 10:11:05Z, cycles 2146-2201 inclusive (56 consecutive cycles, every one scan_executed with no blocking_global_guard)",
         "orders_submitted": 0,
         "fills": 0,
         "cancels": 0,
-        "mutating_http_indicators_in_unfiltered_cycle_log": 0,
-        "reconciliation": "MATCH x4 in the window, including 15:08:42Z after the WOULD_SUBMIT",
-        "persistence_halt": "none"
+        "would_submit_events_in_window": 1,
+        "order_submit_log_lines": 0,
+        "broker_write_log_lines": 0,
+        "brokerwriteforbidden_log_lines": 0,
+        "reconciliation": "MATCH x4 in the window (09:12:42Z, 09:27:52Z, 09:43:04Z, 09:58:08Z)",
+        "persistence_halt": "none",
+        "method": "Railway deploy logs for deployment 6f039c6e read twice: once filtered for ORDER_SUBMIT/BROKER_WRITE/BrokerWriteForbidden/FILL/REGLE and once for the cycle summaries themselves. Every CYCLE-SUMMARY in the window carries orders_submitted 0 and fills 0."
       },
       "why_it_started": {
-        "mechanism": "deposit, not code",
-        "detail": "The cash-denominated drawdown (100 * 0.4839 / balance) fell from 1222% at 0.04$ to 4.9% at 9.84$ after the 2026-09-07T18:02Z deposit, below the 20% guard, so the unchanged main image scans every cycle. At a 9c ask, 1% of 9.84$ (0.0984$) buys one contract, so sizing produced 1 and the READ_ONLY decision reached WOULD_SUBMIT. Every candidate priced above 9c still sizes to 0 (audit: capital/risk/position-sizing, 2026-09-07).",
-        "dependency": "A withdrawal below 2.42$ would re-trip the guard with no trade. This is audit finding F2; the design that makes drawdown deposit-independent is docs/design/risk-equity-accounting.md (rev 2), not implemented.",
-        "pr64_status": "https://github.com/ibengi/atlas-decision-engine/pull/64 at e0d7448: repo-owned READ_ONLY observation through equity_drawdown, CI green, NOT MERGED, NOT DEPLOYED"
-      }
+        "mechanism": "unchanged from the 2026-09-08 confirmation: balance, not code",
+        "detail": "No deployment or merge changed the shadow gating between the two confirmations. The active deployment moved from 471b446f (d0995a1) to 6f039c6e (5c4e789) on 2026-09-09 for an observability-only fix. The equity_drawdown guard has not cut a scan in any cycle observed by this watch since 2026-09-10T13:30Z; at a 3c ask, sizing produced 1 contract and the READ_ONLY decision reached WOULD_SUBMIT.",
+        "dependency": "A withdrawal that pushes the cash-denominated drawdown back over 20% would re-trip the guard and silence the shadow with no trade. This is audit finding F2; the design that makes drawdown deposit-independent is docs/design/risk-equity-accounting.md (rev 2), not implemented.",
+        "branches_not_deployed": "claude/railway-atlas-readonly-shadow-scan (054a2e1) and PR #64 (e0d7448) both remain unreviewed/unmerged and undeployed. Neither is responsible for the shadow running."
+      },
+      "previous_confirmations": [
+        {
+          "status": "RUNNING",
+          "first_would_submit_at": "2026-09-08T14:54:44Z",
+          "deployment_id": "471b446f-0b7b-4a59-92ec-2cfe86d47892",
+          "git_sha": "d0995a1051321cace6bb9af6018f36e3f9601882",
+          "cycle_id": "f28e770049",
+          "decision": "KXBTC15M-26SEP081100-00 NO x1 @ 9c | model 23.9% vs market 11.0% | edge_net +0.099 | ev_net +0.109 | strategy btc15m_above_strike",
+          "log_line": "[WOULD_SUBMIT] KXBTC15M-26SEP081100-00 NO x1 @ 9c -- PROD_ACCESS_MODE=READ_ONLY: decision complete, AUCUN appel au chemin d'ecriture.",
+          "cycle_summary": "risk_passed 1, orders_submitted 0, fills 0",
+          "zero_write_verification": {
+            "window": "2026-09-08T14:16Z to 15:14Z (54 cycles, all scan_executed=true, blocking_global_guard=None)",
+            "orders_submitted": 0,
+            "fills": 0,
+            "cancels": 0,
+            "mutating_http_indicators_in_unfiltered_cycle_log": 0,
+            "reconciliation": "MATCH x4 in the window, including 15:08:42Z after the WOULD_SUBMIT",
+            "persistence_halt": "none"
+          },
+          "why_it_started": {
+            "mechanism": "deposit, not code",
+            "detail": "The cash-denominated drawdown (100 * 0.4839 / balance) fell from 1222% at 0.04$ to 4.9% at 9.84$ after the 2026-09-07T18:02Z deposit, below the 20% guard, so the unchanged main image scans every cycle. At a 9c ask, 1% of 9.84$ (0.0984$) buys one contract, so sizing produced 1 and the READ_ONLY decision reached WOULD_SUBMIT. Every candidate priced above 9c still sizes to 0 (audit: capital/risk/position-sizing, 2026-09-07).",
+            "dependency": "A withdrawal below 2.42$ would re-trip the guard with no trade. This is audit finding F2; the design that makes drawdown deposit-independent is docs/design/risk-equity-accounting.md (rev 2), not implemented.",
+            "pr64_status": "https://github.com/ibengi/atlas-decision-engine/pull/64 at e0d7448: repo-owned READ_ONLY observation through equity_drawdown, CI green, NOT MERGED, NOT DEPLOYED"
+          }
+        }
+      ]
     },
     "shadow_history": {
       "guard": "equity_drawdown",
