@@ -9,6 +9,7 @@ Status: SHADOW ONLY. This document is for the `alpha/astra-learning-v1` branch a
 - The durable report path writes `alpha_learning_report.json` atomically and leaves the append-only prediction ledger untouched.
 - The memory CLI emits prior resolved cases only and emits no side, size, order, or execution instruction.
 - The branch is additive relative to `claude/exciting-fermat-fmcoix`; existing Alpha Gateway/Service files are not modified.
+- The settlement-ingestion boundary is append-only: matching duplicate outcomes are idempotent, unknown predictions are rejected, and conflicting outcomes are surfaced without overwriting the first resolution.
 
 ## Requirements before wiring into `atlas-alpha-shadow`
 
@@ -36,16 +37,16 @@ Required before integration:
 
 Do not silently relabel another model as Astra; model provenance must remain auditable.
 
-### R3 — Automatic trusted resolution feed (BLOCKER FOR LEARNING)
+### R3 — Automatic trusted resolution feed (SOURCE STILL REQUIRED)
 
-The Alpha service can append an outcome with `attach_outcome()` / the `resolve` CLI, but the current learning loop does not automatically ingest market settlements. Without trusted resolutions, predictions accumulate but calibration, error memory, Brier/log-loss, and ROI do not learn.
+The append-only ingestion boundary is now implemented in `alpha_resolution_ingest.py`, with a strict JSONL CLI in `tools/alpha_resolution_ingest.py`. It accepts trusted settlement facts only for known predictions, appends exactly one immutable `RESOLUTION` row, treats matching repeats as idempotent, and refuses conflicting outcomes without changing history.
 
-Required:
+Still required before automatic learning:
 
-- add a read-only settlement resolver or settlement feed,
-- append exactly one immutable `RESOLUTION` row per prediction,
-- make resolution idempotent and auditable by source,
-- never update the original prediction row in place.
+- provide a trusted read-only settlement source that emits `prediction_id`, `outcome`, `source`, and optional `resolved_at`,
+- connect that source to the ingestion boundary without importing broker/execution modules,
+- define operational handling for rejected/conflicting settlement facts,
+- keep the original prediction row immutable.
 
 ### R4 — Learning report refresh trigger
 
@@ -65,7 +66,7 @@ The real quantitative provider identity is `atlas_quant`. Runtime/CLI defaults o
 2. Restart-persistence proof.
 3. R2 Astra forecasting source in SHADOW ONLY.
 4. Confirm validated Astra predictions enter the immutable ledger.
-5. R3 automatic resolution ingestion.
+5. Connect a trusted read-only settlement source to the proven R3 ingestion boundary.
 6. Generate learning report after resolutions.
 7. Accumulate a statistically meaningful sample before allowing learned weights to influence the ensemble.
 8. Introduce memory-enhanced Astra as a separate A/B model version.
