@@ -166,21 +166,32 @@ def strict_number(value, *, field, minimum=None, maximum=None,
     if isinstance(value, str):
         if not allow_numeric_string:
             raise ContractError(
-                f"{field}: {value!r} is a string; numeric strings are not "
-                f"accepted as market facts")
+                f"{field}: {safe_render(value)} is a string; numeric strings "
+                f"are not accepted as market facts")
         text = value.strip()
         if not text:
             raise ContractError(f"{field}: blank string is not a number")
         try:
             value = float(text)
         except ValueError:
-            raise ContractError(f"{field}: {value!r} is not numeric")
+            raise ContractError(
+                f"{field}: {safe_render(value)} is not numeric")
     elif isinstance(value, int):
         # An int beyond 2**53 silently loses precision as a float. Detect it
         # on the INTEGER, before the lossy conversion hides the problem.
         if abs(value) > MAX_SAFE_NUMBER:
+            # V4-RA-03: `f"{value}"` on a large integer is not a diagnostic,
+            # it is a decimal expansion. On CPython 3.11+ it RAISES
+            # `ValueError` past 4300 digits -- so the one function whose
+            # contract is "or raise ContractError" raised something else
+            # entirely, from inside the construction of its own refusal, and
+            # `observed_cents`'s `except ContractError` did not catch it. A
+            # plain JSON integer quote of `10 ** 5000` therefore escaped the
+            # producer and reached the observer's synchronous log call. It is
+            # also unbounded work on the engine's thread below that limit.
             raise ContractError(
-                f"{field}: {value} exceeds the exactly representable range")
+                f"{field}: {safe_render(value)} exceeds the exactly "
+                f"representable range")
     elif not isinstance(value, float):
         raise ContractError(
             f"{field}: {type(value).__name__} is not a number")
@@ -246,6 +257,119 @@ def iso_second(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+# ── V4-RA-03: rendering a raw source value is ENGINE-THREAD work ─────────
+#: Hard ceiling on any rendering of a raw source value, in characters.
+MAX_RENDER_CHARS = 200
+
+#: How far `safe_render` descends into a container before naming its type
+#: instead of describing its members.
+MAX_RENDER_DEPTH = 2
+
+#: How many members of a container `safe_render` describes.
+MAX_RENDER_MEMBERS = 6
+
+
+def _render(value, budget: int, depth: int) -> str:
+    """One rendering step. Raises nothing it can help; `safe_render` is total.
+
+    Every branch here is bounded by construction, and the reason is that this
+    runs on the ENGINE's observer thread (V4-RA-03). "The diagnostic is
+    truncated afterwards" is not a bound: the truncated string still has to be
+    BUILT first, and building it is the cost the decision cycle pays.
+    """
+    if isinstance(value, str):
+        # SLICE FIRST, and never through `repr`. `repr` of a 100MB string
+        # materialises a 100MB string before anything truncates it; `value`
+        # is a raw exchange field and its length is the exchange's choice,
+        # not ours. Bare rather than quoted, because AA-03 pins the rendered
+        # form of a contradictory text alias as the text itself.
+        head = value[:budget]
+        return head if len(head) == len(value) else head + "..."
+    if value is None or isinstance(value, (bool, float, complex)):
+        # Provably short: none of these has a rendering longer than a line.
+        return f"{type(value).__name__}:{value!r}"
+    if isinstance(value, int):
+        # An integer's decimal expansion is UNBOUNDED -- `10 ** 10 ** 9` has
+        # a billion digits and `repr` builds every one of them. `bit_length`
+        # is cheap and decides whether the digits are affordable.
+        bits = value.bit_length()
+        if bits <= 4 * max(budget, 1) + 64:
+            return f"int:{value!r}"
+        return f"int:<{bits} bits>"
+    if isinstance(value, (bytes, bytearray)):
+        head = bytes(value[:budget])
+        tail = "" if len(head) == len(value) else "..."
+        return f"{type(value).__name__}:{head!r}{tail}"
+    if isinstance(value, dict):
+        if depth <= 0 or budget <= 8:
+            return f"dict:<{len(value)} key(s)>"
+        parts, shown = [], 0
+        for key, item in value.items():
+            if shown >= MAX_RENDER_MEMBERS:
+                break
+            parts.append(f"{_render(key, 24, 0)}: "
+                         f"{_render(item, max(8, budget // 4), depth - 1)}")
+            shown += 1
+        if shown < len(value):
+            parts.append("...")
+        return "dict:{" + ", ".join(parts) + "}"
+    if isinstance(value, (list, tuple)):
+        if depth <= 0 or budget <= 8:
+            return f"{type(value).__name__}:<{len(value)} item(s)>"
+        parts, shown = [], 0
+        for item in value:
+            if shown >= MAX_RENDER_MEMBERS:
+                break
+            parts.append(_render(item, max(8, budget // 4), depth - 1))
+            shown += 1
+        if shown < len(value):
+            parts.append("...")
+        return f"{type(value).__name__}:[" + ", ".join(parts) + "]"
+    if isinstance(value, (set, frozenset)):
+        # Members deliberately NOT described: a set's iteration order is not
+        # stable across processes, and this rendering goes INSIDE the record
+        # digest (AA-03 puts `contradictory_fields` under the checksum). A
+        # digest that depends on hash seeding is a digest of nothing.
+        return f"{type(value).__name__}:<{len(value)} item(s)>"
+    # An object whose `__repr__` is the exchange's code, not ours. Its class
+    # name reads a slot on the type and is the one description of a hostile
+    # value that cannot itself misbehave.
+    return f"<{type(value).__name__}>"
+
+
+def safe_render(value, *, limit: int = MAX_RENDER_CHARS) -> str:
+    """A raw source value rendered for a human. TOTAL and BOUNDED.
+
+    V4-RA-03. Two properties, and both of them are properties of the MONEY
+    PATH rather than of research, because `candidate_from_market` runs on the
+    engine's observer thread:
+
+      TOTAL     it never raises. A value whose `__repr__` raises used to
+                propagate that exception out of the producer, into the
+                observer's `except`, and from there into a SYNCHRONOUS log
+                call on the engine's own thread.
+
+      BOUNDED   it never builds a large intermediate. `f"{value!r}"[:200]`
+                is not bounded; it is a 100MB allocation followed by a
+                truncation, paid for by the decision cycle.
+
+    `KeyboardInterrupt` and `SystemExit` are deliberately NOT caught: an
+    operator interrupting the process must not be swallowed by a diagnostic.
+    Everything else -- including `MemoryError` and `RecursionError`, which a
+    hostile `__repr__` is exactly how you provoke -- becomes text.
+    """
+    try:
+        text = _render(value, max(int(limit), 8), MAX_RENDER_DEPTH)
+    except Exception:                                         # noqa: BLE001
+        try:
+            return f"<unrenderable {type(value).__name__}>"
+        except Exception:                                     # noqa: BLE001
+            return "<unrenderable>"
+    if not isinstance(text, str):                       # pragma: no cover
+        return "<unrenderable>"
+    return text if len(text) <= limit else text[:max(limit - 3, 1)] + "..."
+
+
 # ── AA-03: alias contradiction ───────────────────────────────────────────
 def resolve_alias(source: dict, field: str, keys, *, comparator=None):
     """`(value, key)` for a fact the source recorded, or `(None, None)`.
@@ -271,9 +395,16 @@ def resolve_alias(source: dict, field: str, keys, *, comparator=None):
         reference = normalise(first_value)
         for key, value in present[1:]:
             if normalise(value) != reference:
+                # V4-RA-03: `{first_value!r}` was the raising site. This
+                # message is built on the engine's observer thread, and
+                # interpolating a raw exchange value through `repr` hands
+                # that thread code the exchange wrote: a `__repr__` that
+                # raises propagated out of the producer entirely, and one
+                # that returns 100MB made the cycle pay for 100MB.
                 raise AliasContradiction(
                     f"{field}: contradictory aliases -- {first_key}="
-                    f"{first_value!r} and {key}={value!r} claim to be the "
+                    f"{safe_render(first_value)} and "
+                    f"{key}={safe_render(value)} claim to be the "
                     f"same fact; neither is chosen",
                     field=field,
                     # EVERY present alias, not just the two that differ: an

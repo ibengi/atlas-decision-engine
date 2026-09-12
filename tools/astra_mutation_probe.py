@@ -190,9 +190,8 @@ MUTATIONS = {
         "research_feed.py",
         "    if isinstance(value, bool) or not isinstance(value, str):\n"
         "        raise MalformedSettlementSource(\n"
-        "            f\"{key} is {type(value).__name__}, not text\")\n"
-        "    text = value.strip()\n",
-        "    text = str(value).strip()\n",
+        "            f\"{key} is {type(value).__name__}, not text\")\n",
+        "    value = str(value)\n",
         ["tests/test_astra_v3_remediation.py::AA02_NumericSettlementMembersAreCoercedToText",
          "tests/test_astra_v4_remediation.py::RA01_ValidNameSkippedTheRestOfTheContainer"],
     ),
@@ -200,7 +199,7 @@ MUTATIONS = {
         "file a contradiction as an ordinary absence (AA-03)",
         "research_feed.py",
         "        except AliasContradiction as exc:\n"
-        "            contradictions[field] = {k: _diagnostic(v)\n"
+        "            contradictions[field] = {str(k): _diagnostic(v)\n"
         "                                     for k, v in exc.values.items()}\n"
         "            facts[field] = None\n"
         "            # Deliberately NOT appended to `unavailable_fields`.\n"
@@ -361,19 +360,19 @@ MUTATIONS = {
         'return on the first present settlement-source key, leaving the rest of the member unvalidated (RA-01)',
         "research_feed.py",
         '        fields = []\n'
-        '        for key in SOURCE_IDENTITY_KEYS:\n'
+        '        for key in SOURCE_OBJECT_SCHEMA:\n'
         '            if key not in value:\n'
         '                continue\n'
         '            text = _identity_text(value[key], key)\n'
         '            if text is not None:\n'
         '                fields.append((key, text))',
         '        fields = []\n'
-        '        for key in SOURCE_IDENTITY_KEYS:\n'
+        '        for key in SOURCE_OBJECT_SCHEMA:\n'
         '            if key not in value:\n'
         '                continue\n'
         '            text = _identity_text(value[key], key)\n'
         '            if text is not None:\n'
-        '                return ((("name", text),),)',
+        '                return (("name", text),)',
         [
          "tests/test_astra_v4_remediation.py::RA01_ValidNameSkippedTheRestOfTheContainer",
         ],
@@ -381,17 +380,33 @@ MUTATIONS = {
     "M28": (
         'compare settlement-source aliases by the flattened comma-joined names again (RA-02)',
         "research_feed.py",
+        # The WHOLE handler, `except Exception` clause included. Anchoring
+        # only the `try` body left that clause dangling after the
+        # replacement, and the mutated module then failed to IMPORT -- which
+        # the runner reports as INCONCLUSIVE rather than KILLED, exactly as
+        # RA-15 requires, because a collection error is not a behavioural
+        # kill.
         '    try:\n'
-        '        return settlement_source_identity(value) or None\n'
+        '        identity = settlement_source_identity(value)\n'
+        '        if not identity:\n'
+        '            return _SOURCE_NONE_PUBLISHED\n'
+        '        return render_settlement_source(identity)\n'
         '    except MalformedSettlementSource:\n'
-        '        return None',
+        '        return _SOURCE_MALFORMED\n'
+        '    except Exception:                                         # noqa: BLE001\n'
+        '        # V4-RA-03: `resolve_alias` calls this ON THE ENGINE\'S THREAD, and a\n'
+        '        # comparator that raises makes the whole normalization raise. There\n'
+        '        # is no failure here that is not "we cannot read this".\n'
+        '        return _SOURCE_MALFORMED\n',
         '    names = []\n'
         '    try:\n'
         '        for member in settlement_source_identity(value):\n'
         '            names.append(dict(member).get("name") or "")\n'
         '    except MalformedSettlementSource:\n'
         '        return None\n'
-        '    return ", ".join(names) or None',
+        '    except Exception:                                     # noqa: BLE001\n'
+        '        return None\n'
+        '    return ", ".join(names) or None\n',
         [
          "tests/test_astra_v4_remediation.py::RA02_StructuredSourceIdentitiesWereFlattenedBeforeComparison",
         ],
@@ -632,6 +647,99 @@ MUTATIONS = {
         '    pass',
         [
          "tests/test_astra_v4_remediation.py::RA14_TheBudgetLedgerWasNotProtectedFromTheReport",
+        ],
+    ),
+    # ── the v4 COUNTER-audit, V4-RA-01..V4-RA-04 ────────────────────────
+    "M41": (
+        "ignore the keys a settlement-source object carries that this "
+        "producer has no definition for (V4-RA-01)",
+        "research_feed.py",
+        '        unsupported = []\n'
+        '        for key in value:\n'
+        '            if key in SOURCE_OBJECT_SCHEMA:\n'
+        '                continue\n'
+        '            unsupported.append(safe_render(key, limit=64))\n'
+        '            if len(unsupported) >= 8:\n'
+        '                break\n'
+        '        if unsupported:\n',
+        '        unsupported = []\n'
+        '        if unsupported:\n',
+        [
+         "tests/test_astra_v4_ra01_ra04.py::V4RA01_TheSourceObjectHadNoSchema",
+         "tests/test_astra_v4_ra01_ra04.py::V4RA02_DistinctSourcesProducedOneRecord",
+        ],
+    ),
+    "M42": (
+        "flatten a nested settlement-source collection into its parent "
+        "again, so the grouping the source published is erased (V4-RA-02)",
+        "research_feed.py",
+        '        raise MalformedSettlementSource(\n'
+        '            f"a settlement-source collection member is itself a "\n'
+        '            f"{type(value).__name__} of {len(value)}; nesting is not a shape "\n'
+        '            f"this producer understands, and flattening it would erase the "\n'
+        '            f"grouping the source published")\n',
+        '        flattened = []\n'
+        '        for item in value:\n'
+        '            flattened.extend(_source_collection(item))\n'
+        '        return flattened[0] if flattened else (("name", "?"),)\n',
+        [
+         "tests/test_astra_v4_ra01_ra04.py::V4RA02_DistinctSourcesProducedOneRecord",
+         "tests/test_astra_v4_ra01_ra04.py::V4RA01_TheSourceObjectHadNoSchema",
+        ],
+    ),
+    "M43": (
+        "log synchronously on the engine's own thread from the research "
+        "hook's error path again (V4-RA-03)",
+        "execution_engine.py",
+        "            try:\n"
+        "                self.research_feed.note_observer_failure(type(e).__name__)\n"
+        "            except Exception:                                 # noqa: BLE001\n"
+        "                pass\n",
+        '            log.debug(f"research feed: {e}")\n',
+        [
+         "tests/test_astra_v4_ra01_ra04.py::V4RA03_TheObserverErrorPathLoggedSynchronously",
+        ],
+    ),
+    "M44": (
+        "read a transient ENOENT during a capacity reservation as an empty "
+        "spool again (V4-RA-04)",
+        "research_spool.py",
+        "            except FileNotFoundError as exc:\n"
+        "                if reserved:\n"
+        "                    raise SpoolCapacityUnknown(\n"
+        '                        f"{name} was listed and then vanished during a "\n'
+        '                        f"capacity reservation ({exc}); nobody else holds "\n'
+        '                        f"this spool, so how much of the budget it occupies "\n'
+        '                        f"cannot be established")\n'
+        "                continue                      # pruned under us; not an error\n",
+        "            except FileNotFoundError:\n"
+        "                continue\n",
+        [
+         "tests/test_astra_v4_ra01_ra04.py::V4RA04_TransientEnoentWasReadAsAnEmptySpool",
+        ],
+    ),
+    "M45": (
+        "treat a spool directory that has disappeared after initialization "
+        "as an empty one again (V4-RA-04)",
+        "research_spool.py",
+        "        except FileNotFoundError as exc:\n"
+        "            if self._established or reserved:\n",
+        "        except FileNotFoundError as exc:\n"
+        "            if False:\n",
+        [
+         "tests/test_astra_v4_ra01_ra04.py::V4RA04_TransientEnoentWasReadAsAnEmptySpool",
+        ],
+    ),
+    "M46": (
+        "render a raw source value through `repr` on the observer's thread "
+        "again, so a hostile one raises into the decision cycle (V4-RA-03)",
+        "research_feed.py",
+        '    return safe_render(value, limit=200)\n',
+        '    text = value if isinstance(value, str) \\\n'
+        '        else f"{type(value).__name__}:{value!r}"\n'
+        '    return text if len(text) <= 200 else text[:197] + "..."\n',
+        [
+         "tests/test_astra_v4_ra01_ra04.py::V4RA03_TheObserverErrorPathLoggedSynchronously",
         ],
     ),
 }

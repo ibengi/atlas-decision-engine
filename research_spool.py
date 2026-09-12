@@ -121,6 +121,34 @@ class SpoolCapacityUnknown(RuntimeError):
     """The spool's size could not be established, so writing is unsafe."""
 
 
+class _Reservation(threading.local):
+    """Per-thread depth of the capacity reservation currently being held.
+
+    V4-RA-04. `_scan` has to answer two questions with one syscall result,
+    and the right answer differs:
+
+      OUTSIDE a reservation   a listed entry that is gone by the time we stat
+                              it is an ordinary race with our own pruning and
+                              recovery. Skipping it is correct, and failing
+                              closed there would turn every prune into a
+                              refusal.
+
+      INSIDE a reservation    the advisory lock means WE are the only writer,
+                              and admission is being decided against this
+                              count. An entry that vanishes between `listdir`
+                              and `stat` is then metadata we cannot account
+                              for, and interpreting it as "zero occupancy" is
+                              how `max_records=1` became two records.
+
+    `threading.local` rather than an attribute, because the depth is a
+    property of the thread inside the `with`, not of the spool -- and a test
+    (or a future second writer) that calls `capacity()` from elsewhere while
+    the writer holds the lock must get the OUTSIDE answer for itself.
+    """
+
+    depth = 0
+
+
 class BoundedSpool:
     """A directory of JSON records bounded by COUNT and by BYTES.
 
@@ -142,6 +170,20 @@ class BoundedSpool:
                       "write_errors": 0, "temp_bytes": 0, "temp_files": 0,
                       "temp_recovered": 0, "reservation_timeouts": 0}
         self._sequence = 0
+        #: V4-RA-04. True once this spool has been OBSERVED to exist -- a
+        #: successful `listdir`, or a `makedirs` that returned. Monotonic on
+        #: purpose: it records that the directory was real at least once, and
+        #: nothing can un-know that.
+        #:
+        #: It is what separates the two readings of `FileNotFoundError` from
+        #: `listdir`. Before it is set, the answer is "this spool has not been
+        #: created yet", occupancy is genuinely zero and a first write must be
+        #: allowed. After it is set, the answer is "a directory we know
+        #: existed is no longer there", occupancy is UNKNOWN, and the old code
+        #: read that as an empty spool at exactly the moment the filesystem
+        #: was misbehaving.
+        self._established = False
+        self._reservation = _Reservation()
         # AA-11 (re-audit): recovery happens HERE, at construction, rather
         # than in a method nothing called. A producer that starts with its
         # own crashed partials still occupying the budget has inherited the
@@ -163,20 +205,59 @@ class BoundedSpool:
         previous implementation returned `[]`, which reads as "the spool is
         empty, go ahead and write" at the exact moment the filesystem is
         failing.
+
+        V4-RA-04 -- `FileNotFoundError` IS NOT ONE FACT.
+            AA-11 propagated every `OSError` and then made `ENOENT` the
+            exception to its own rule, in both places it can arrive:
+
+              * `listdir` raising `ENOENT` returned `([], [])`. That is right
+                for a spool whose directory has never been created and wrong
+                for one we have already written to -- and a spool the writer
+                is mid-reservation on is emphatically the second kind.
+              * `stat` raising `ENOENT` for a listed entry was skipped as
+                "pruned under us". Under the reservation lock nobody else is
+                pruning, so the entry is instead one whose occupancy cannot
+                be established, and skipping it removed it from the very
+                bound it occupies. A synthetic transient `ENOENT` let
+                `max_records=1` hold two records.
+
+            So each is classified rather than assumed: `_established` tells a
+            first-time absent directory from one that has disappeared, and the
+            reservation depth tells an ordinary prune race from uncertainty
+            inside an admission decision. Both uncertain readings become
+            `SpoolCapacityUnknown`, which `_reserve_and_write` already fails
+            closed on -- and which the next write retries from scratch, so
+            recovery stays asynchronous and automatic.
         """
+        reserved = self._reservation.depth > 0
         try:
             names = os.listdir(self.directory)
-        except FileNotFoundError:
+        except FileNotFoundError as exc:
+            if self._established or reserved:
+                raise SpoolCapacityUnknown(
+                    f"{self.directory} existed and is now absent ({exc}); "
+                    f"how much it holds cannot be established, and an absent "
+                    f"directory is not an empty one once we have written to "
+                    f"it")
+            # Genuinely the first time: the spool has never existed, so its
+            # occupancy really is zero and a first write must be allowed.
             return [], []
         except OSError as exc:
             raise SpoolCapacityUnknown(
                 f"cannot enumerate {self.directory}: {exc}")
+        self._established = True
         records, temp = [], []
         for name in names:
             path = os.path.join(self.directory, name)
             try:
                 st = os.stat(path)
-            except FileNotFoundError:
+            except FileNotFoundError as exc:
+                if reserved:
+                    raise SpoolCapacityUnknown(
+                        f"{name} was listed and then vanished during a "
+                        f"capacity reservation ({exc}); nobody else holds "
+                        f"this spool, so how much of the budget it occupies "
+                        f"cannot be established")
                 continue                      # pruned under us; not an error
             except OSError as exc:
                 raise SpoolCapacityUnknown(
@@ -357,6 +438,13 @@ class BoundedSpool:
             self.stats["capacity_unknown"] += 1
             log.warning(f"[RESEARCH_SPOOL] spool directory unusable: {exc}")
             return False
+        # V4-RA-04: the directory is now known to exist, so from here on an
+        # `ENOENT` from `listdir` is a DISAPPEARANCE rather than a spool that
+        # was never created. This is also what keeps recovery asynchronous:
+        # an operator who deletes the spool gets it re-created on the next
+        # write, that `listdir` succeeds on an empty directory, and writing
+        # resumes without anything having to be reset by hand.
+        self._established = True
 
         # AA-11 (re-audit) -- CAPACITY IS RESERVED, NOT MERELY CHECKED.
         #
@@ -398,7 +486,23 @@ class BoundedSpool:
             return False
 
     def _reserve_and_write(self, record: dict, payload: bytes) -> bool:
-        """Under the reservation lock: decide, take the slot, write it."""
+        """Under the reservation lock: decide, take the slot, write it.
+
+        V4-RA-04: the whole body runs with the reservation depth raised, so
+        `_scan` knows that any uncertainty it meets is uncertainty inside an
+        ADMISSION DECISION rather than an ordinary race with a prune, and
+        fails closed instead of reading it as free space. The depth is
+        restored in `finally`, so a refusal does not leave the next scan
+        permanently strict.
+        """
+        self._reservation.depth += 1
+        try:
+            return self._decide_and_write(record, payload)
+        finally:
+            self._reservation.depth -= 1
+
+    def _decide_and_write(self, record: dict, payload: bytes) -> bool:
+        """The reservation proper. Always called with the depth raised."""
         try:
             self.prune()
             capacity = self.capacity()

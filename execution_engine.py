@@ -19,7 +19,7 @@ from market_validator import MarketValidator
 from order_manager import OrderManager
 from persistence import JsonStore, PersistenceSentinel
 from position_manager import PositionManager
-from research_feed import ResearchFeed, candidate_from_market
+from research_feed import ResearchFeed
 from position_sizer import PositionSizer
 from risk_manager import RiskManager
 from stats_engine import StatsEngine
@@ -430,6 +430,22 @@ class ExecutionEngine:
         # lives here because `dec` is already frozen and the caller already
         # absorbs exceptions -- this hook is the engine's existing
         # record-never-decide boundary, not a new one.
+        # V4-RA-03 -- NEITHER THE NORMALIZATION NOR ITS FAILURE MAY LOG HERE.
+        #
+        # This block used to call `candidate_from_market(...)` -- research
+        # NORMALIZATION, on the decision cycle's own thread -- and catch its
+        # exceptions with `log.debug(f"research feed: {e}")`. That `except`
+        # was the hole: `logging.Handler.handle` takes the handler's lock and
+        # emits synchronously, so a handler held by another thread (a file
+        # handler on a stalled volume is the ordinary case) blocked the CYCLE
+        # here. A research subsystem whose ERROR path can stall the money path
+        # has become part of the money path, which is the whole of AA-10.
+        #
+        # `observe_market` is total and reports through the writer's bounded
+        # queue, so there is nothing left for this side to catch. The `try`
+        # below is kept anyway, because the engine's guarantee must not depend
+        # on a promise made in another module -- and its body says something
+        # the same non-blocking way instead of touching a device.
         try:
             raw_market = getattr(snapshot, "raw_market", None) or {}
             # AA-01. `raw_market` is the exchange's own observation; `book` is
@@ -439,11 +455,29 @@ class ExecutionEngine:
             # quote from a computed one -- and REFUSE the computed one. The
             # order path keeps using `book` exactly as before; nothing about
             # execution changes here.
-            self.research_feed.emit_candidate(candidate_from_market(
+            self.research_feed.observe_market(
                 raw_market, book, raw_book=raw_market,
-                cycle_id=(dec.decision_id or "").split("-", 1)[0] or ""))
+                cycle_id=(dec.decision_id or "").split("-", 1)[0] or "")
         except Exception as e:                                # noqa: BLE001
-            log.debug(f"research feed: {e}")
+            # The fallback, and its three properties:
+            #
+            #   NON-BLOCKING  no `log` call. The report goes to the research
+            #                 writer's bounded queue and is emitted on the
+            #                 writer's thread, where a stalled handler costs
+            #                 research latency and nothing else.
+            #   BOUNDED       `type(e).__name__` reads a slot on the class.
+            #                 `str(e)` can run an arbitrary `__str__` and
+            #                 return an arbitrary number of bytes, and this
+            #                 exception may well be carrying a value the
+            #                 exchange sent.
+            #   TOTAL         written inline, with its own `except`, so the
+            #                 whole block is total for ANY `self` -- a
+            #                 failure to say something is never allowed to
+            #                 become a failure of the thing trying to speak.
+            try:
+                self.research_feed.note_observer_failure(type(e).__name__)
+            except Exception:                                 # noqa: BLE001
+                pass
         try:
             if (dec.strategy or "").startswith("btc_daily"):
                 self.btc_daily_evidence.record(
