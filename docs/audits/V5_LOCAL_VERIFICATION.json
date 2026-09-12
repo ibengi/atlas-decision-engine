@@ -4,14 +4,16 @@
   "scope": "SHADOW_ONLY",
   "local_tests": {
     "baseline_original": 2020,
-    "full_canonical": 2180,
-    "full_pytest": 2180,
-    "pytest_subtests": 903,
-    "new_v5": 158,
+    "full_canonical": 2185,
+    "full_pytest": 2185,
+    "pytest_subtests": 914,
+    "new_v5": 163,
     "additional_semantic_witnesses": 2,
     "failures": 0,
     "errors": 0,
-    "skips": 0
+    "skips": 0,
+    "canonical_code_identity": "f8b016d0b7cbc4ca730d6c30dc6636d374d7dfc2379306ad8f03cbe7791032ab",
+    "model_validation_sha256": "8745f027ce3819fa8a49959fb232292979bb0c1c33ce0d04e58248aeb1880a95"
   },
   "v4_closure": {
     "V4-RA-01": "PASS",
@@ -73,499 +75,950 @@
     {
       "mutation": "M01",
       "description": "re-introduce the substituted settlement source (\"kalshi\")",
-      "status": "SURVIVED",
       "effective_safety_mutation": false,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts"
-      ],
       "effectiveness_evidence": {
         "refusal": "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts::test_m01_an_absent_settlement_source_mints_nothing",
         "positive": "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts::test_control_a_complete_observation_mints",
         "reason": "The late substituted authority carries no independently replayable source preimage; candidate_contract rejects the present missing proof. The original zero-mint/zero-prediction assertion and a real minting control both pass. M01P separately fabricates the authority before source capture and must be killed."
+      },
+      "status": "SURVIVED",
+      "outcomes": {
+        "passed": 6,
+        "subtests passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 6,
+          "subtests passed": 4
+        },
+        "collected": 6
       }
     },
     {
       "mutation": "M01P",
       "description": "fabricate a default settlement authority before retained source/provenance capture (stronger M01 variant)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 5,
+        "subtests passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 6,
+          "subtests passed": 4
+        },
+        "collected": 6
+      }
     },
     {
       "mutation": "M02",
       "description": "re-introduce the 0.0 volume default",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 4,
+        "subtests passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 6,
+          "subtests passed": 4
+        },
+        "collected": 6
+      }
     },
     {
       "mutation": "M03",
       "description": "use the close time as the expected resolution time",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts",
-        "tests/test_astra_aa01_aa18_remediation.py::AA03_ContradictoryAliasesSilentlyChosen"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 9,
+        "subtests passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 12,
+          "subtests passed": 4
+        },
+        "collected": 12
+      }
     },
     {
       "mutation": "M04",
       "description": "ignore per-field provenance (SURVIVED in the rejected candidate)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M04_IgnorePerFieldProvenance"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 13,
+        "passed": 4,
+        "subtests passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 5,
+          "subtests passed": 13
+        },
+        "collected": 5
+      }
     },
     {
       "mutation": "M05",
       "description": "exclude provenance from the checksum",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M05_ProvenanceExcludedFromTheChecksum"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 2
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M06",
       "description": "accept legacy v1 records",
-      "status": "DIAGNOSTIC_ONLY",
       "effective_safety_mutation": false,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M11_AcceptLegacyWhileKeepingDiagnostics",
-        "tests/test_alpha_feed_readiness.py"
-      ]
+      "status": "DIAGNOSTIC_ONLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 14
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 16
+        },
+        "collected": 16
+      }
     },
     {
       "mutation": "M07",
       "description": "allow a missing book side",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::M07P_CompleteRecordWithDerivedQuotes",
-        "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 9,
+        "passed": 8,
+        "subtests passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 13,
+          "subtests passed": 8
+        },
+        "collected": 13
+      }
     },
     {
       "mutation": "M07P",
       "description": "accept a complete record whose quotes are declared DERIVED",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::M07P_CompleteRecordWithDerivedQuotes",
-        "tests/test_astra_aa01_aa18_remediation.py::AA01_DerivedQuotesArePresentedAsObserved"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 10,
+        "passed": 6
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 12,
+          "subtests passed": 4
+        },
+        "collected": 12
+      }
     },
     {
       "mutation": "M08",
       "description": "add a forbidden execution import to the producer",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_research_feed_boundary.py",
-        "tests/test_alpha_safety_boundary.py"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 33,
+        "subtests passed": 13
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 36,
+          "subtests passed": 13
+        },
+        "collected": 36
+      }
     },
     {
       "mutation": "M09",
       "description": "let a producer exception propagate into the decision cycle",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M09_ProducerExceptionPropagation",
-        "tests/test_alpha_automatic_feed.py"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 23,
+        "subtests passed": 11
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 25,
+          "subtests passed": 11
+        },
+        "collected": 25
+      }
     },
     {
       "mutation": "M10",
       "description": "overwrite historical bytes instead of appending",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M10_OverwriteHistoricalBytes",
-        "tests/test_astra_aa01_aa18_remediation.py::AA12_ShortWritesAndTornTails"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 7,
+        "passed": 3
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 10
+        },
+        "collected": 10
+      }
     },
     {
       "mutation": "M11",
       "description": "accept legacy while preserving the diagnostics (SURVIVED in the rejected candidate)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M11_AcceptLegacyWhileKeepingDiagnostics"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 4,
+        "passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 5
+        },
+        "collected": 5
+      }
     },
     {
       "mutation": "M12",
       "description": "coerce a numeric settlement-source member into a name (AA-02)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA02_NumericSettlementMembersAreCoercedToText",
-        "tests/test_astra_v4_remediation.py::RA01_ValidNameSkippedTheRestOfTheContainer"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 10,
+        "passed": 8,
+        "subtests passed": 5
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 13,
+          "subtests passed": 10
+        },
+        "collected": 13
+      }
     },
     {
       "mutation": "M13",
       "description": "file a contradiction as an ordinary absence (AA-03)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA03_ContradictionWasDowngradedToAbsence"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 4,
+        "passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 8
+        },
+        "collected": 8
+      }
     },
     {
       "mutation": "M14",
       "description": "count only complete files against the spool bound (AA-11)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA11_PartialWritesEscapedTheBound"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 9
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 10
+        },
+        "collected": 10
+      }
     },
     {
       "mutation": "M15",
       "description": "treat readable bytes as proof of a durable commit (AA-13)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA13_ReadableBytesWereTreatedAsCommitted"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 7
+        },
+        "collected": 7
+      }
     },
     {
       "mutation": "M16",
       "description": "accept a partial settlement binding as verified (AA-15)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA15_PartialBindingWasAcceptedAsVerified"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 4,
+        "passed": 6,
+        "subtests passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 6,
+          "subtests passed": 5
+        },
+        "collected": 6
+      }
     },
     {
       "mutation": "M17",
       "description": "trust an unqualified settlement source by default (AA-15)",
-      "status": "DIAGNOSTIC_ONLY",
       "effective_safety_mutation": false,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA15b_UnqualifiedSourcesWereTrustedByDefault"
-      ]
+      "status": "DIAGNOSTIC_ONLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 5
+        },
+        "collected": 5
+      }
     },
     {
       "mutation": "M18",
       "description": "let the processed store skip the durable append protocol (AA-12)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA12_ProcessedStoreBypassedTheDurableProtocol"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 2
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 5
+        },
+        "collected": 5
+      }
     },
     {
       "mutation": "M19",
       "description": "raise instead of failing closed on a malformed number (NEW-01)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::NEW01_MalformedNumbersRaiseInsteadOfFailingClosed"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 4,
+        "passed": 7,
+        "subtests passed": 6
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 7,
+          "subtests passed": 10
+        },
+        "collected": 7
+      }
     },
     {
       "mutation": "M20",
       "description": "dispatch to providers without a durable PREPARE (AA-13)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA13c_PrepareFailureDidNotStopDispatch"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M21",
       "description": "re-dispatch an analysis that was already committed (AA-13)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA13b_RestartPaidTwiceForACommittedAnalysis"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 3
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M22",
       "description": "leave an unserialized appender on a shared file (AA-14)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA14_UnserializedAppendersAndStaleCaches"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 5
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 7
+        },
+        "collected": 7
+      }
     },
     {
       "mutation": "M23",
       "description": "protect a guessed processed-state path instead of the real one (AA-16)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA16_ProtectionMissedTheConfiguredProcessedPath"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M24",
       "description": "drop the source evidence the digest describes (AA-15)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA15c_SourceDigestCouldNotBeReverifiedAfterPruning"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 2
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 5
+        },
+        "collected": 5
+      }
     },
     {
       "mutation": "M25",
       "description": "log synchronously on the engine's own thread (AA-10)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v3_remediation.py::AA10_ResearchLoggingStillBlockedTheCycle",
-        "tests/test_astra_v4_remediation.py::RA03_TheObserverThreadStillHashedAndValidated"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 13,
+        "subtests passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 15,
+          "subtests passed": 4
+        },
+        "collected": 15
+      }
     },
     {
       "mutation": "M26",
       "description": "swallow the directory fsync failure, so an undurable NAME reads as a durable append (RA-05)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA05_UnknownDurabilityWasReportedAsSuccess",
-        "tests/test_astra_v4_remediation.py::RA15_TheDirectoryFsyncBarrierIsAssertedBySemantics"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 6,
+        "passed": 5
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 11
+        },
+        "collected": 11
+      }
     },
     {
       "mutation": "M26P",
       "description": "remove the actual directory synchronization primitive (exact prior barrier-deletion variant, RA-05)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_durability.py::V4RA05DirectoryRetry",
-        "tests/test_astra_v4_remediation.py::RA15_TheDirectoryFsyncBarrierIsAssertedBySemantics"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 7,
+        "passed": 5
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 12
+        },
+        "collected": 12
+      }
     },
     {
       "mutation": "M27",
       "description": "return on the first present settlement-source key, leaving the rest of the member unvalidated (RA-01)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA01_ValidNameSkippedTheRestOfTheContainer"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 4,
+        "passed": 2,
+        "subtests passed": 6
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 6,
+          "subtests passed": 6
+        },
+        "collected": 6
+      }
     },
     {
       "mutation": "M28",
       "description": "compare settlement-source aliases by the flattened comma-joined names again (RA-02)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M28_StructuredIdentityConsumerWitness",
-        "tests/test_astra_v4_remediation.py::RA02_StructuredSourceIdentitiesWereFlattenedBeforeComparison"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 6,
+        "passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 7
+        },
+        "collected": 7
+      }
     },
     {
       "mutation": "M29",
       "description": "serialize, hash and validate the record on the engine's observer thread again (RA-03)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA03_TheObserverThreadStillHashedAndValidated"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 6,
+        "subtests passed": 4
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 9,
+          "subtests passed": 4
+        },
+        "collected": 9
+      }
     },
     {
       "mutation": "M30",
       "description": "classify spool entries with a second, disagreeing stat again (RA-04)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA04_TheSecondStatCouldDisagreeWithTheFirst"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 3
+        },
+        "collected": 3
+      }
     },
     {
       "mutation": "M31",
       "description": "let an unreadable budget row make recorded spend SMALLER instead of unknown (RA-06)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA06_TheBudgetLedgerBypassedTheDurableProtocol"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 2
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 5
+        },
+        "collected": 5
+      }
     },
     {
       "mutation": "M32",
       "description": "discard the durable prediction row the ledger returned and keep the generated id (RA-07)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA07_TheGeneratedIdWasAcknowledgedInsteadOfTheDurableOne"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 6
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 7
+        },
+        "collected": 7
+      }
     },
     {
       "mutation": "M33",
       "description": "treat readable PREPARE bytes as a durable announcement on a retry (RA-08)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_recovery.py::V5Recovery::test_persistent_prepare_failure_seven_polls_and_recreated_service_never_dispatches",
-        "tests/test_astra_v5_durability.py"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 9,
+        "passed": 28,
+        "subtests passed": 3
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 37,
+          "subtests passed": 3
+        },
+        "collected": 37
+      }
     },
     {
       "mutation": "M34",
       "description": "patch the processed cache and re-stamp its generation AFTER the append lock is released (RA-09)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA09_TheProcessedCacheAdvancedPastAnotherWritersRow"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 2
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M35",
       "description": "promote a recovered spend refusal to a terminal ANALYZED (RA-10)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_mutation_regression.py::M35_RefusalAcknowledgementWitness",
-        "tests/test_astra_v4_remediation.py::RA10_ABudgetRefusalTurnedTerminalOnRecovery"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 10
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 11
+        },
+        "collected": 11
+      }
     },
     {
       "mutation": "M36",
       "description": "make the environment and the contract version optional in a settlement binding again (RA-11)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA11_TheRequiredSettlementBindingWasIncomplete"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 6,
+        "passed": 5,
+        "subtests passed": 15
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 5,
+          "subtests passed": 21
+        },
+        "collected": 5
+      }
     },
     {
       "mutation": "M37",
       "description": "qualify a settlement without recomputing the prediction's retained evidence (RA-12)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA12_RetainedEvidenceWasNotVerifiedAtSettlement"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 3,
+        "passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M38",
       "description": "let the learning report score every resolution, qualified or not (RA-13)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA13_LearningConsumedUnqualifiedSettlements"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 3
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M39",
       "description": "let the Meta engine's calibration lookup weight unqualified outcomes (RA-13)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA13_LearningConsumedUnqualifiedSettlements"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 3
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M40",
       "description": "drop the budget ledger from the report-overwrite guard (RA-14)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v4_remediation.py::RA14_TheBudgetLedgerWasNotProtectedFromTheReport"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 6,
+        "passed": 3,
+        "subtests passed": 3
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 9,
+          "subtests passed": 3
+        },
+        "collected": 9
+      }
     },
     {
       "mutation": "M41",
       "description": "count failed pytest summaries as behavioral kills without structured evidence (V4-RA-18)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_mutations.py::V4RA18TruthfulMutationEvidence"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 6,
+        "passed": 7
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 13
+        },
+        "collected": 13
+      }
     },
     {
       "mutation": "M42",
       "description": "discard unsupported structured source extensions (V4-RA-01/V4-RA-02)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_producer.py::V5SourceSchema"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 6,
+        "passed": 7,
+        "subtests passed": 13
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 7,
+          "subtests passed": 19
+        },
+        "collected": 7
+      }
     },
     {
       "mutation": "M43",
       "description": "treat transient spool directory ENOENT as empty capacity (V4-RA-04)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_producer.py::V5CapacityUncertainty"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "passed": 3,
+        "subtests passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 4,
+          "subtests passed": 2
+        },
+        "collected": 4
+      }
     },
     {
       "mutation": "M44",
       "description": "admit a resolution before its prediction (V4-RA-14 chronology)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_binding.py::SettlementQualificationTests"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 4,
+        "passed": 32,
+        "subtests passed": 132
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 36,
+          "subtests passed": 132
+        },
+        "collected": 36
+      }
     },
     {
       "mutation": "M45",
       "description": "admit impossible future resolution chronology (V4-RA-14)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_binding.py::SettlementQualificationTests"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1,
+        "passed": 35,
+        "subtests passed": 132
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 36,
+          "subtests passed": 132
+        },
+        "collected": 36
+      }
     },
     {
       "mutation": "M46",
       "description": "wait for a contended research queue mutex on the engine hook (V4-RA-03)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_producer.py::V5ObserverIsolation::test_contended_accounting_or_queue_mutex_drops_without_wait"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 2,
+        "subtests passed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 1,
+          "subtests passed": 2
+        },
+        "collected": 1
+      }
     },
     {
       "mutation": "M47",
       "description": "bind source A to economically different snapshot B (V4-RA-17)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_binding.py::SettlementQualificationTests",
-        "tests/test_astra_v5_recovery.py::V5Recovery::test_snapshot_b_with_same_labels_and_other_quotes_is_refused"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 4,
+        "passed": 33,
+        "subtests passed": 132
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 37,
+          "subtests passed": 132
+        },
+        "collected": 37
+      }
     },
     {
       "mutation": "M48",
       "description": "leave a concurrency gap between provider accounting and prediction publication (v5 self-adversarial)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_recovery.py::V5Recovery::test_two_services_cannot_redispatch_between_usage_and_prediction_commit"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 1
+        },
+        "collected": 1
+      }
     },
     {
       "mutation": "M49",
       "description": "allow lossy historical source evidence into settlement learning (V4-RA-02/V4-RA-17)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_binding.py::SettlementQualificationTests::test_historical_lossy_source_without_preimage_stays_immutable_unqualified"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 1
+        },
+        "collected": 1
+      }
     },
     {
       "mutation": "M50",
       "description": "drop atomic runtime path registration during derived-report publication (V4-RA-15)",
-      "status": "KILLED_BEHAVIORALLY",
       "effective_safety_mutation": true,
-      "detecting_tests": [
-        "tests/test_astra_v5_binding.py::RuntimePathProtectionTests::test_registration_during_publication_cannot_lose_new_runtime_state"
-      ]
+      "status": "KILLED_BEHAVIORALLY",
+      "outcomes": {
+        "failed": 1
+      },
+      "baseline": {
+        "returncode": 0,
+        "outcomes": {
+          "passed": 1
+        },
+        "collected": 1
+      }
     }
   ],
   "safety_counters": {
@@ -578,5 +1031,20 @@
     "CREDENTIAL_CHANGES": 0,
     "HISTORICAL_LEDGER_REWRITES": 0
   },
-  "hosted_ci": "PENDING_EXACT_COMMIT_PUBLICATION"
+  "hosted_ci": {
+    "code_commit": {
+      "id": 34707841477,
+      "head_sha": "eb6f41e12b6a95e327a7c2ca5306443e21a37bf4",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/ibengi/atlas-decision-engine/actions/runs/34707841477",
+      "name": "Alpha Learning v1 validation",
+      "event": "push",
+      "run_attempt": 1,
+      "created_at": "2026-09-12T17:18:38Z",
+      "updated_at": "2026-09-12T17:22:54Z"
+    },
+    "final_documentation_commit": "Exact final head CI is verified after publication and supplied in the external final handoff receipt."
+  },
+  "code_sha": "eb6f41e12b6a95e327a7c2ca5306443e21a37bf4"
 }
