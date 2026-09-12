@@ -389,8 +389,17 @@ class AlphaShadowService:
                 sid = prepared.get("market_snapshot_id")
                 if self.ledger.prediction_is_committed(sid):
                     continue
-                unacknowledged.append({"market_snapshot_id": sid,
-                                       "contract_id": prepared.get("contract_id")})
+                # RA-10 made a spend refusal record NO prediction row, which
+                # is right -- nothing was analysed -- and it means an
+                # announced-but-uncommitted analysis is now the ORDINARY
+                # shape of a deferral as well as the shape of a loss. The
+                # processed status is what tells those apart, so it travels
+                # with the entry rather than leaving an operator to guess.
+                unacknowledged.append({
+                    "market_snapshot_id": sid,
+                    "contract_id": prepared.get("contract_id"),
+                    "processed_status": (rows.get(sid) or {}).get("status"),
+                    "processed_detail": (rows.get(sid) or {}).get("detail")})
         except Exception:                                     # noqa: BLE001
             pass
         if orphans:

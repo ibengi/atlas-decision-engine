@@ -181,14 +181,14 @@ All figures from runs on this branch, Python 3.11, no network (`tests/_netblock.
 
 | Suite | Result |
 |---|---|
-| Full repository suite | **2019 passed, 699 subtests passed**, 0 failed, 0 errors, 0 skipped |
-| `tests/test_astra_v4_remediation.py` (RA-01..RA-15) | 102 passed, 57 subtests passed |
+| Full repository suite | **2020 passed, 699 subtests passed**, 0 failed, 0 errors, 0 skipped |
+| `tests/test_astra_v4_remediation.py` (RA-01..RA-15) | 103 passed, 59 subtests passed |
 | `tests/test_astra_v3_remediation.py` (AA-02/03/10..17, NEW-01) | 92 passed, 23 subtests passed |
 | `tests/test_astra_aa01_aa18_remediation.py` (AA-01..AA-18) | 121 passed, 148 subtests passed |
 | `tests/test_astra_mutation_regression.py` (effect-based) | 26 passed, 23 subtests passed |
 
-The suite grew from **1916** at the v3 head to **2019**: +103 tests, of which
-102 are the RA reproductions and the hosted-CI checks, and 1 is the
+The suite grew from **1916** at the v3 head to **2020**: +104 tests, of which
+103 are the RA reproductions and the hosted-CI checks, and 1 is the
 writer-side companion added to `test_alpha_automatic_feed` (§4).
 
 ### Mutation probe
@@ -286,6 +286,12 @@ than only a zero exit code.
   cannot be tied to a market stay in `resolved()` as audit evidence and are
   counted as excluded. That is deliberate: repairing them would be the
   retroactive edit this subsystem exists to prevent.
+* **RA-10 makes `prepared_without_acknowledgement` a busier list.** A spend
+  refusal now records no prediction, so "announced but not committed" is the
+  ordinary shape of a deferral as well as the shape of a crash that lost one.
+  `reconcile_processed` therefore carries the processed status and detail with
+  each entry, so the two are distinguishable rather than merging into one
+  growing list of apparent losses.
 * **RA-05 changed a runtime behaviour, deliberately, and it is worth
   stating.** `fsync_directory` now raises on every failure, including ones a
   platform might consider benign — an `EINVAL` from a filesystem that cannot

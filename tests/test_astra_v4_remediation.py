@@ -1196,6 +1196,28 @@ class RA10_ABudgetRefusalTurnedTerminalOnRecovery(ServiceCase):
                             caps={"ALPHA_MAX_COST_PER_ANALYSIS_USD": 1e-9,
                                   "ALPHA_MAX_COST_PER_DAY_USD": 1e-9})
 
+    def test_reconciliation_can_tell_a_deferral_from_a_loss(self):
+        """RA-10's consequence for the operator-facing report.
+
+        A spend refusal records no prediction, so an announced-but-
+        uncommitted analysis is now the ordinary shape of a deferral as well
+        as the shape of a crash that lost one. `reconcile_processed` carries
+        the processed status so those are distinguishable rather than being
+        one growing list of apparent losses.
+        """
+        from alpha_consumer import STATUS_DEFERRED
+        service = self.refusing_service()
+        snapshot = self.snapshot()
+        service._analyze_one(snapshot, self.record())
+        report = service.reconcile_processed()
+        self.assertEqual(report["analyzed_without_prediction"], [])
+        pending = [e for e in report["prepared_without_acknowledgement"]
+                   if e["market_snapshot_id"] == snapshot.market_snapshot_id]
+        self.assertEqual(len(pending), 1, report)
+        self.assertEqual(pending[0]["processed_status"], STATUS_DEFERRED)
+        self.assertIn("budget_refused_before_dispatch",
+                      pending[0]["processed_detail"])
+
     def test_the_refusal_still_reports_itself_as_a_budget_refusal(self):
         """DEFERRED is the processed-store answer, not the whole answer.
 
@@ -2052,3 +2074,4 @@ class RA_HostedCITargetsThisBranch(unittest.TestCase):
         self.assertIn("summary['surviving_effective_safety_mutations'] == 0",
                       text)
         self.assertIn("summary['inconclusive'] == 0", text)
+
