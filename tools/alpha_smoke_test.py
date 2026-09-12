@@ -98,7 +98,7 @@ def probe(provider, snapshot, guard) -> dict:
         return result
 
     from alpha_providers import build_prompt
-    verdict = guard.check(provider.name, provider.model,
+    verdict = guard.reserve(provider.name, provider.model,
                           prompt_chars=len(build_prompt(snapshot)))
     result["pricing_configured"] = verdict["estimate"]["cost_priced"]
     result["worst_case_cost_usd"] = verdict["estimated_cost_usd"]
@@ -115,7 +115,13 @@ def probe(provider, snapshot, guard) -> dict:
     result["latency_captured"] = isinstance(meta.get("latency_ms"), int)
     cost = meta.get("cost") or {}
     result["cost"] = cost
-    guard.record_actual({**cost, "outcome": "SMOKE_TEST"})
+    accounting = guard.record_actual({**cost, "outcome": "SMOKE_TEST"},
+                                     reservation_id=verdict["reservation_id"])
+    result["accounting_durable"] = accounting["recorded"]
+    if not accounting["recorded"]:
+        result["verdict"] = "FAIL"
+        result["detail"] = accounting["detail"]
+        return result
 
     if meta.get("error"):
         result["reachable"] = "connection" not in str(meta["error"]).lower()

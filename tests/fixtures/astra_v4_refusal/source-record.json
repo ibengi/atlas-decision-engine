@@ -1,0 +1,49 @@
+{
+  "catalyst_name": null,
+  "catalyst_time_utc": null,
+  "contract_id": "SYNTH-V4",
+  "contradictory_fields": {},
+  "cycle_id": "",
+  "emitted_at_utc": "2026-09-11T12:00:00+00:00",
+  "event_id": "SYNTH-EVENT",
+  "expected_resolution_time_utc": "2026-09-11T18:00:00+00:00",
+  "field_provenance": {
+    "contract_id": "market.ticker",
+    "emitted_at_utc": "observer.emitted_at_utc",
+    "event_id": "market.event_ticker",
+    "expected_resolution_time_utc": "market.expected_expiration_time",
+    "market_close_time_utc": "market.close_time",
+    "no_ask": "raw_book.no_ask(cents)",
+    "no_bid": "raw_book.no_bid(cents)",
+    "open_interest": "market.open_interest",
+    "question": "market.title",
+    "resolution_rules": "market.rules_primary",
+    "resolution_source": "market.settlement_sources",
+    "volume": "market.volume",
+    "yes_ask": "raw_book.yes_ask(cents)",
+    "yes_bid": "raw_book.yes_bid(cents)"
+  },
+  "market_close_time_utc": "2026-09-11T17:00:00+00:00",
+  "no_ask": 0.57,
+  "no_bid": 0.55,
+  "open_interest": 4.0,
+  "question": "Synthetic refusal recovery?",
+  "quote_observation": {
+    "no_ask": "observed",
+    "no_bid": "observed",
+    "yes_ask": "observed",
+    "yes_bid": "observed"
+  },
+  "record_sha256": "2915419d24e41c8bbd940c8a988784846d93713a0bcb33e6d28c51977ce2c046",
+  "resolution_rules": "Synthetic rule",
+  "resolution_source": "Synthetic authority",
+  "schema": "atlas-research-candidate-v3",
+  "source": "scanner",
+  "unavailable_fields": [
+    "catalyst_name",
+    "catalyst_time_utc"
+  ],
+  "volume": 10.0,
+  "yes_ask": 0.45,
+  "yes_bid": 0.43
+}

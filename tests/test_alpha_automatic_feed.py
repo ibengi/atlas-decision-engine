@@ -373,7 +373,7 @@ class TheEngineHookIsInert(FeedCase):
         # module, and none of them reaches execution.
         self.assertEqual(imported,
                          {"datetime", "logging", "os", "config",
-                          "candidate_contract", "research_spool"})
+                          "candidate_contract", "research_spool", "source_identity"})
 
 
 if __name__ == "__main__":

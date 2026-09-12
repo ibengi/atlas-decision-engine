@@ -74,3 +74,31 @@ def valid_record(market=None, book=None, **kw):
         raise AssertionError(
             f"the fixture is not contract-valid: {feed.last_errors}")
     return record
+
+
+def record_for_snapshot(snapshot):
+    """Produce the exact observation named by an existing synthetic snapshot.
+
+    Persistence fault tests must reach persistence. Pairing an unrelated
+    generic record with that snapshot would now correctly fail the earlier
+    semantic source gate and make those tests vacuous.
+    """
+    market = raw_market(
+        ticker=snapshot.contract_id, event_ticker=snapshot.event_id,
+        title=snapshot.question, rules_primary=snapshot.resolution_rules,
+        settlement_sources=[{"name": snapshot.resolution_source}],
+        volume=snapshot.volume, open_interest=snapshot.open_interest,
+        close_time=snapshot.market_close_time_utc,
+        expiration_time=snapshot.expected_resolution_time_utc,
+        **{field: round(getattr(snapshot, field) * 100, 8)
+           for field in ("yes_bid", "yes_ask", "no_bid", "no_ask")})
+    candidate = valid_candidate(market,
+                                observed_at_utc=snapshot.snapshot_time_utc)
+    if snapshot.next_known_catalyst.time_utc:
+        candidate["catalyst_name"] = snapshot.next_known_catalyst.name
+        candidate["catalyst_time_utc"] = snapshot.next_known_catalyst.time_utc
+    feed = ResearchFeed(start_writer=False)
+    record = feed._build(candidate)
+    if record is None:
+        raise AssertionError(feed.last_errors)
+    return record

@@ -753,24 +753,18 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
     #: prediction whose evidence does not recompute is quarantined rather
     #: than settled -- which would leave every case below asserting on an
     #: idempotency and a conflict that never got the chance to happen.
-    RECORD = valid_record()
-    BINDING = {"contract_id": "KXBTCD-TRUTH",
-               "market_snapshot_id": "snap-truth",
-               "record_sha256": RECORD["record_sha256"],
-               "environment": "test",
-               "contract_schema": RECORD["schema"],
-               "source_evidence": canonical_content(RECORD)}
+    from _settlement import qualified_fixture
+    RECORD, SNAPSHOT, PREDICTION, SETTLEMENT = qualified_fixture(
+        prediction_id="p-1", contract_id="KXBTCD-TRUTH", source="kalshi feed")
+    BINDING = PREDICTION["source_binding"]
     TRUSTED = ["kalshi feed"]
 
     def ledger_with_prediction(self, pid="p-1"):
         ledger = AlphaLedger(
             path=os.path.join(self._tmp, "alpha_ledger.jsonl"),
             cost_path=os.path.join(self._tmp, "alpha_cost.jsonl"))
-        ledger.record_prediction({"prediction_id": pid,
-                                  "contract_id": "KXBTCD-TRUTH",
-                                  "market_snapshot_id": "snap-truth",
-                                  "source_binding": dict(self.BINDING),
-                                  "p_yes": 0.61, "executed": False})
+        ledger.record_prediction(dict(self.PREDICTION, prediction_id=pid,
+                                      p_yes=0.61, executed=False))
         return ledger
 
     def settlement(self, **over):
@@ -780,7 +774,7 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
                "source_record_sha256": self.BINDING["record_sha256"],
                "environment": self.BINDING["environment"],
                "contract_schema": self.BINDING["contract_schema"],
-               "resolved_at": "2026-09-12T20:10:00+00:00",
+               "resolved_at": self.SETTLEMENT["resolved_at"],
                "settlement_evidence_id": "kalshi-settlement-truth-0001"}
         row.update(over)
         return row
@@ -822,10 +816,11 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
         ledger = self.ledger_with_prediction()
         result = self.ingest(ledger, [self.settlement(source="")])
         self.assertEqual(result["appended"], 0)
-        # The message now comes from the shared contract's `strict_text`,
-        # which refuses a whitespace-only source as well as an empty one.
+        # Missing or blank identities are uniformly quarantined in v5.
         self.assertIn("source", result["rejected"][0]["reason"])
-        self.assertIn("blank", result["rejected"][0]["reason"])
+        self.assertEqual(len(result["quarantined"]), 1)
+        self.assertIn("source", result["quarantined"][0]["reason"])
+        self.assertIsNone(ledger.find_resolution("p-1"))
 
     def test_ingestion_declares_itself_shadow_only_with_no_broker_authority(self):
         ledger = self.ledger_with_prediction()

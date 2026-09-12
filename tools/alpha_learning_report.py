@@ -12,6 +12,7 @@ from alpha_consumer import ProcessedStore
 from alpha_cost import BudgetLedger
 from alpha_learning_runtime import memory_context, write_learning_report
 from alpha_ledger import AlphaLedger
+from alpha_telemetry import Telemetry
 from config import CFG
 
 
@@ -44,6 +45,7 @@ def main(argv=None):
         # actually use rather than only the configured defaults.
         processed_store=ProcessedStore(),
         budget_ledger=BudgetLedger(),
+        telemetry=Telemetry(),
         astra_selector=selector,
         baseline_selector=os.getenv("ASTRA_BASELINE_SELECTOR", "atlas_quant") or "atlas_quant",
         subscription_cost_usd=_cost(),

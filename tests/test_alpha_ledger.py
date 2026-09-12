@@ -224,23 +224,24 @@ class MetricsAreDerived(LedgerCase):
         from _candidate import valid_record
         from alpha_resolution_ingest import ingest_settlements
         from alpha_service import source_binding_for
+        from _settlement import qualified_fixture
+        from alpha_snapshot import parse_utc
         ledger = AlphaLedger()
         ids = []
         for i, outcome in enumerate(outcomes):
-            snapshot = self.snapshot(contract_id=f"KX-{i}")
-            record = valid_record()
-            binding = source_binding_for(
-                record, contract_id=snapshot.contract_id,
-                market_snapshot_id=snapshot.market_snapshot_id,
-                digest_verified=True)
+            record, snapshot, fixture, settlement = qualified_fixture(
+                contract_id=f"KX-{i}")
+            binding = fixture["source_binding"]
             opportunity = AlphaGateway(
                 providers=self.agreeing_providers(),
-                ledger=ledger).analyze(snapshot, source_binding=binding)
+                ledger=ledger,
+                now_fn=lambda: parse_utc(fixture["prediction_time"])
+            ).analyze(snapshot, source_binding=binding)
             result = ingest_settlements(ledger, [{
                 "prediction_id": opportunity["prediction_id"],
                 "outcome": outcome,
                 "source": "trusted-settlement-feed",
-                "resolved_at": "2026-09-12T20:10:00+00:00",
+                "resolved_at": settlement["resolved_at"],
                 "settlement_evidence_id": f"fixture-settlement-{i}",
                 "contract_id": binding["contract_id"],
                 "market_snapshot_id": binding["market_snapshot_id"],

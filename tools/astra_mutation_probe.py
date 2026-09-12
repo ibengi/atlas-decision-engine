@@ -13,7 +13,9 @@ This tool re-runs that experiment on demand. For each mutation it:
      restores it afterwards is one crash away from committing a mutation);
   2. applies one textual mutation that re-introduces a specific finding;
   3. runs the tests that are supposed to detect it;
-  4. reports KILLED (the tests failed, as they should) or SURVIVED.
+  4. records pytest phases and a reviewed invariant-specific assertion;
+  5. reports a behavioral kill, diagnostic-only result, survival, or an
+     explicit inconclusive category.
 
 A SURVIVED line is a gap in the suite, not a bug in this tool. So is an
 INCONCLUSIVE one: see `_classify` below for why a non-zero pytest exit is
@@ -23,7 +25,9 @@ not by itself a behavioural kill (RA-15).
     python tools/astra_mutation_probe.py --only M04
     python tools/astra_mutation_probe.py --json
 
-Exit code 0 means every mutation was detected; 1 means at least one survived.
+Exit code 0 means every effective mutation has a behavioral witness, known
+diagnostic controls are classified honestly, and no experiment is inconclusive
+or unapplied. Exit code 1 means that evidence gate is not satisfied.
 """
 import argparse
 import json
@@ -114,7 +118,7 @@ MUTATIONS = {
         "        kind = observation.get(field)\n",
         "    for field in ():\n"
         "        kind = observation.get(field)\n",
-        ["tests/test_astra_aa01_aa18_remediation.py::AA01_DerivedQuotesArePresentedAsObserved",
+        ["tests/test_astra_v3_remediation.py::M07P_CompleteRecordWithDerivedQuotes",
          "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts"],
     ),
     # M07 deletes the quote-observation check entirely. M07P is the harder
@@ -637,6 +641,232 @@ MUTATIONS = {
 }
 
 
+# v5 invariant-preserving mutation ports. The original counterexamples above
+# remain readable, while these anchors target the current shared guards.
+# M16/M36 model illicitly inventing omitted binding data; M37 defeats the
+# shared source proof so a second independent call cannot hide the mutation.
+_V5_PORTS = {'M09': ('research_feed.py',
+         '        except Exception:                                     # noqa: BLE001\n'
+         '            self.rejected += 1\n'
+         '            # AA-10 (re-audit): DEFERRED, not logged. `log.warning` here runs\n'
+         "            # the handler on the engine's thread, and the handler writes to\n"
+         '            # the same volume the fsync was moved off.\n'
+         '            self._note(logging.WARNING,\n'
+         '                       "[RESEARCH_FEED] candidate admission refused")\n'
+         '            return False',
+         '        except Exception:\n            raise',
+         None),
+ 'M12': ('source_identity.py',
+         '    if isinstance(value, bool) or not isinstance(value, str):\n'
+         '        raise MalformedSettlementSource(\n'
+         '            f"{key} is {type(value).__name__}, not text")\n'
+         '    text = value.strip()\n',
+         '    text = str(value).strip()\n',
+         None),
+ 'M16': ('alpha_resolution_ingest.py',
+         '        missing = _missing_binding(row["supplied_binding"], committed)',
+         '        row["supplied_binding"] = {**committed, **row["supplied_binding"]}\n'
+         '        missing = _missing_binding(row["supplied_binding"], committed)',
+         None),
+ 'M18': ('alpha_consumer.py',
+         '            with serialized_append(self.path) as append:\n'
+         '                self._observed_file = True\n'
+         '                append(line)\n',
+         '            fd = os.open(self.path,\n'
+         '                         os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)\n'
+         '            try:\n'
+         '                os.write(fd, line.encode("utf-8"))\n'
+         '                os.fsync(fd)\n'
+         '            finally:\n'
+         '                os.close(fd)\n',
+         None),
+ 'M21': ('alpha_service.py',
+         '        if recovered is not None and recovered.get("state") not in NON_TERMINAL_STATES:\n'
+         '            return self._acknowledge_recovered(snapshot, recovered)',
+         '        if False:\n            return self._acknowledge_recovered(snapshot, recovered)',
+         None),
+ 'M27': ('source_identity.py',
+         '        fields = []\n'
+         '        for key in SOURCE_IDENTITY_KEYS:\n'
+         '            if key not in value:\n'
+         '                continue\n'
+         '            text = _identity_text(value[key], key)\n'
+         '            if text is not None:\n'
+         '                fields.append((key, text))',
+         '        fields = []\n'
+         '        for key in SOURCE_IDENTITY_KEYS:\n'
+         '            if key not in value:\n'
+         '                continue\n'
+         '            text = _identity_text(value[key], key)\n'
+         '            if text is not None:\n'
+         '                return ((("name", text),),)',
+         None),
+ 'M28': ('source_identity.py',
+         '        return tuple(members)',
+         '        return ((("name", ", ".join(dict(member).get("name", "") for member in '
+         'members)),),)',
+         None),
+ 'M31': ('alpha_cost.py',
+         '            except (ValueError, TypeError, RuntimeError) as exc:\n'
+         '                raise RuntimeError(f"budget ledger row {i + 1} is invalid: {exc}") from '
+         'exc',
+         '            except (ValueError, TypeError, RuntimeError):\n                continue',
+         None),
+ 'M33': ('alpha_ledger.py',
+         '        try:\n'
+         '            if not sync_path(self.path, expected_generation=generation):\n'
+         '                raise LedgerError("ledger disappeared before its durability barrier")\n'
+         '        except OSError as exc:\n'
+         '            raise LedgerError(f"alpha ledger durability remains unconfirmed: {exc}") '
+         'from exc',
+         '        return None',
+         ['tests/test_astra_v5_recovery.py::V5Recovery::test_persistent_prepare_failure_seven_polls_and_recreated_service_never_dispatches',
+          'tests/test_astra_v5_durability.py']),
+ 'M34': ('alpha_consumer.py',
+         '        try:\n'
+         '            with serialized_append(self.path) as append:\n'
+         '                self._observed_file = True\n'
+         '                append(line)\n'
+         '                # RA-09: inside the lock, and an INVALIDATION rather than a\n'
+         '                # patch. While this lock is held no other writer can append,\n'
+         '                # so clearing the generation here cannot be stamped past\n'
+         "                # somebody else's row. Patching the cache and re-stamping\n"
+         '                # afterwards could, and did.\n'
+         '                self._cache = None\n'
+         '                self._generation = None\n'
+         '        except (OSError, TimeoutError) as e:\n'
+         '            # If we cannot remember that we processed this, a restart will\n'
+         '            # process it again and pay for it again. Loud, and the caller\n'
+         '            # stops consuming this cycle.\n'
+         '            raise RuntimeError(f"processed status not durable: {e}")',
+         '        try:\n'
+         '            with serialized_append(self.path) as append:\n'
+         '                append(line)\n'
+         '        except (OSError, TimeoutError) as e:\n'
+         '            raise RuntimeError(f"processed status not durable: {e}")\n'
+         '        if self._cache is not None:\n'
+         '            self._cache[snapshot_id] = row\n'
+         '            self._generation = self._current_generation()',
+         None),
+ 'M35': ('alpha_service.py',
+         '        non_terminal = state in NON_TERMINAL_STATES',
+         '        non_terminal = False',
+         None),
+ 'M36': ('alpha_resolution_ingest.py',
+         '        committed = _prediction_binding(prediction)\n'
+         '        missing = _missing_binding(row["supplied_binding"], committed)',
+         '        committed = _prediction_binding(prediction)\n'
+         '        for key in ("environment", "contract_schema"):\n'
+         '            row["supplied_binding"].setdefault(key, committed.get(key))\n'
+         '        missing = _missing_binding(row["supplied_binding"], committed)',
+         None),
+ 'M37': ('alpha_settlement_validation.py',
+         '    verdict = {"verified": False, "claimed": "", "recomputed": None,\n'
+         '               "reason": ""}\n'
+         '    try:',
+         '    verdict = {"verified": True, "claimed": "", "recomputed": None,\n'
+         '               "reason": ""}\n'
+         '    return verdict\n'
+         '    try:',
+         None)}
+for _key, (_file, _old, _new, _selectors) in _V5_PORTS.items():
+    _description, *_unused, _original_selectors = MUTATIONS[_key]
+    MUTATIONS[_key] = (_description, _file, _old, _new,
+                      _selectors or _original_selectors)
+
+
+# Independent v5 negative controls, including the retained M26P.
+MUTATIONS.update({'M26P': ('remove the actual directory synchronization primitive (exact prior barrier-deletion '
+          'variant, RA-05)',
+          'durable_append.py',
+          'def fsync_directory(parent: str) -> None:\n',
+          'def fsync_directory(parent: str) -> None:\n    return None\n',
+          ['tests/test_astra_v5_durability.py::V4RA05DirectoryRetry',
+           'tests/test_astra_v4_remediation.py::RA15_TheDirectoryFsyncBarrierIsAssertedBySemantics']),
+ 'M41': ('count failed pytest summaries as behavioral kills without structured evidence (V4-RA-18)',
+         'tools/astra_mutation_probe.py',
+         '    detail = {"counts": _outcomes(proc.stdout), "semantic_witnesses": []}\n',
+         '    detail = {"counts": _outcomes(proc.stdout), "semantic_witnesses": []}\n'
+         '    if proc.returncode == 1:\n'
+         '        return "KILLED_BEHAVIORALLY", detail\n',
+         ['tests/test_astra_v5_mutations.py::V4RA18TruthfulMutationEvidence']),
+ 'M42': ('discard unsupported structured source extensions (V4-RA-01/V4-RA-02)',
+         'source_identity.py',
+         '        if any(type(key) is not str or key not in SOURCE_IDENTITY_KEYS\n'
+         '               for key in value):',
+         '        if False:',
+         ['tests/test_astra_v5_producer.py::V5SourceSchema']),
+ 'M43': ('treat transient spool directory ENOENT as empty capacity (V4-RA-04)',
+         'research_spool.py',
+         '            names = os.listdir(self.directory)\n        except OSError as exc:',
+         '            names = os.listdir(self.directory)\n'
+         '        except FileNotFoundError:\n'
+         '            return [], []\n'
+         '        except OSError as exc:',
+         ['tests/test_astra_v5_producer.py::V5CapacityUncertainty']),
+ 'M44': ('admit a resolution before its prediction (V4-RA-14 chronology)',
+         'alpha_settlement_validation.py',
+         '        if resolved_at <= predicted_at:\n'
+         '            raise ValueError("resolution must strictly follow prediction")',
+         '        if False:\n'
+         '            raise ValueError("resolution must strictly follow prediction")',
+         ['tests/test_astra_v5_binding.py::SettlementQualificationTests']),
+ 'M45': ('admit impossible future resolution chronology (V4-RA-14)',
+         'alpha_settlement_validation.py',
+         '        if resolved_at > current or predicted_at > current:\n'
+         '            raise ValueError("prediction or resolution is in the future")',
+         '        if False:\n'
+         '            raise ValueError("prediction or resolution is in the future")',
+         ['tests/test_astra_v5_binding.py::SettlementQualificationTests']),
+ 'M46': ('wait for a contended research queue mutex on the engine hook (V4-RA-03)',
+         'research_spool.py',
+         '            if not self._queue.mutex.acquire(blocking=False):',
+         '            if not self._queue.mutex.acquire(blocking=True):',
+         ['tests/test_astra_v5_producer.py::V5ObserverIsolation::test_contended_accounting_or_queue_mutex_drops_without_wait']),
+ 'M47': ('bind source A to economically different snapshot B (V4-RA-17)',
+         'alpha_settlement_validation.py',
+         '        for field, value in expected.items():\n'
+         '            if _canonical(observed.get(field)) != _canonical(value):',
+         '        for field, value in expected.items():\n            if False:',
+         ['tests/test_astra_v5_binding.py::SettlementQualificationTests',
+          'tests/test_astra_v5_recovery.py::V5Recovery::test_snapshot_b_with_same_labels_and_other_quotes_is_refused']),
+ 'M48': ('leave a concurrency gap between provider accounting and prediction publication (v5 '
+         'self-adversarial)',
+         'alpha_service.py',
+         '            with exclusive_lock(lock_path, timeout=10.0):\n'
+         '                return self._analyze_one_locked(snapshot, record)',
+         '            if True:\n                return self._analyze_one_locked(snapshot, record)',
+         ['tests/test_astra_v5_recovery.py::V5Recovery::test_two_services_cannot_redispatch_between_usage_and_prediction_commit'])})
+
+for _key, _selector in {
+    "M28": "tests/test_astra_mutation_regression.py::M28_StructuredIdentityConsumerWitness",
+    "M35": "tests/test_astra_mutation_regression.py::M35_RefusalAcknowledgementWitness",
+}.items():
+    _description, _file, _old, _new, _selectors = MUTATIONS[_key]
+    MUTATIONS[_key] = (_description, _file, _old, _new, [_selector, *_selectors])
+
+MUTATIONS.update({'M49': ('allow lossy historical source evidence into settlement learning (V4-RA-02/V4-RA-17)',
+         'alpha_settlement_validation.py',
+         '        if not source_identity["verified"]:',
+         '        if False:',
+         ['tests/test_astra_v5_binding.py::SettlementQualificationTests::test_historical_lossy_source_without_preimage_stays_immutable_unqualified']),
+ 'M50': ('drop atomic runtime path registration during derived-report publication (V4-RA-15)',
+         'alpha_learning_runtime.py',
+         '        with publication_guard():',
+         '        with __import__("contextlib").nullcontext():',
+         ['tests/test_astra_v5_binding.py::RuntimePathProtectionTests::test_registration_during_publication_cannot_lose_new_runtime_state'])})
+
+MUTATIONS.update({'M01P': ('fabricate a default settlement authority before retained source/provenance capture '
+          '(stronger M01 variant)',
+          'research_feed.py',
+          '    market = market if isinstance(market, dict) else {}\n',
+          '    market = dict(market) if isinstance(market, dict) else {}\n'
+          '    if not any(market.get(key) for key in ("settlement_sources", '
+          '"settlement_source")):\n'
+          '        market["settlement_sources"] = [{"name": "kalshi"}]\n',
+          ['tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts'])})
+
+
 def _copy_repo(destination):
     def _ignore(directory, names):
         return {n for n in names
@@ -679,76 +909,272 @@ def _outcomes(output: str) -> dict:
     return {}
 
 
-def _classify(proc) -> tuple:
-    """`(status, detail)` from one pytest run of the detecting tests."""
-    counts = _outcomes(proc.stdout)
-    failed = counts.get("failed", 0) + counts.get("subtests failed", 0)
-    errors = counts.get("errors", 0)
-    collected = (failed + errors + counts.get("passed", 0)
-                 + counts.get("skipped", 0) + counts.get("xfailed", 0)
-                 + counts.get("xpassed", 0))
+STATUSES = frozenset({
+    "KILLED_BEHAVIORALLY", "DIAGNOSTIC_ONLY", "INCONCLUSIVE_SETUP",
+    "INCONCLUSIVE_COLLECTION", "INCONCLUSIVE_IMPORT",
+    "INCONCLUSIVE_INFRASTRUCTURE", "SURVIVED", "NOT_APPLIED",
+})
+
+# These two mutations alter a redundant refusal branch.  They have semantic
+# controls, but the controls still refuse all unsafe inputs.  A wording or
+# counter assertion failing is therefore diagnostic evidence only.
+DIAGNOSTIC_MUTATIONS = frozenset({"M06", "M17"})
+
+
+# The original late-default M01 is now independently blocked by the retained
+# source preimage validator. Keep that exact mutation and report its survival
+# honestly. Exemption from the EFFECTIVE survivor count requires both named
+# consumer/ledger refusal and anti-vacuity tests to execute and pass.
+INEFFECTIVE_CONTROLS = {
+    "M01": {
+        "refusal": "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts::test_m01_an_absent_settlement_source_mints_nothing",
+        "positive": "tests/test_astra_mutation_regression.py::M01_M03_SubstitutedMarketFacts::test_control_a_complete_observation_mints",
+        "reason": "The late substituted authority carries no independently replayable source preimage; candidate_contract rejects the present missing proof. The original zero-mint/zero-prediction assertion and a real minting control both pass. M01P separately fabricates the authority before source capture and must be killed.",
+    },
+}
+
+# Reviewed witness manifest. A node selector alone is not enough: the failed
+# traceback must contain this particular semantic operation. Diagnostic
+# counters, refusal wording and unrelated assertions are deliberately absent.
+# ``ast.unparse`` in the evidence plugin gives statements a stable spelling.
+_WITNESS_ASSERTIONS = {
+    "M01": ["self.assertEqual(pending, []"],
+    "M01P": ["self.assertEqual(pending, []"],
+    "M02": ["self.assertEqual(pending, []"],
+    "M03": ["self.assertEqual(pending, []", "self.assertEqual(len(pending), 1"],
+    "M04": ["self.assertEqual(pending, []"],
+    "M05": ["self.assertEqual(pending, []"],
+    "M06": ["self.assertEqual(pending, []"],
+    "M07": ["self.assertEqual(pending, []"],
+    "M07P": ["self.assertEqual(pending, []"],
+    "M08": ["self.assertEqual(bad, []"],
+    "M09": ["self.assertFalse(feed.emit_candidate("],
+    "M10": ["self.assertTrue(open(ledger.log.path, 'rb').read().startswith(first))", "self.assertEqual(rows, [{'i': i} for i in range(5)])"],
+    "M11": ["self.assertEqual(pending, []", "self.assertEqual([s.contract_id for s, _ in pending], ['KX-GOOD'])"],
+    "M12": ["self.assertIsNone(self.emit([{'name': bad}])"],
+    "M13": ["self.assertIn('expected_resolution_time_utc', candidate['contradictory_fields'])"],
+    "M14": ["self.assertFalse(refused"],
+    "M15": ["self.assertFalse(ledger.prediction_is_committed('snap-1'))"],
+    "M16": ["self.assertEqual(result['appended'], 0)"],
+    "M17": ["self.assertEqual(result['appended'], 0)"],
+    "M18": ["self.assertEqual(len(lines), 3"],
+    "M19": ["errors = validate_record(record)"],
+    "M20": ["self.assertEqual(provider.calls, 0"],
+    "M21": ["self.assertEqual(provider.calls, 0"],
+    "M22": ["self.assertEqual(len(rows), 1"],
+    "M23": ["with self.assertRaises(ValueError):"],
+    "M24": ["self.assertEqual(binding['source_evidence']['contract_id']", "self.assertEqual(recomputed, binding['record_sha256'])"],
+    "M25": ["self.assertLess(elapsed,"],
+    "M26": ["self.assertEqual(calls, []", "self.assertEqual(provider.calls, 0", "self.assertFalse("],
+    "M27": ["self.assertIsNone(valid_candidate(market)['resolution_source']"],
+    "M28": ["self.assertEqual(pending, []", "self.assertIsNone("],
+    "M29": ["self.assertLess(elapsed,"],
+    "M30": ["self.assertEqual(capacity['records'], 3"],
+    "M31": ["with self.assertRaises(RuntimeError):"],
+    "M32": ["self.assertEqual(opportunity['prediction_id'], durable"],
+    "M33": ["self.assertFalse(result['deferred'])", "self.assertEqual(provider.calls, 0"],
+    "M34": ["self.assertIsNotNone(mine.status('snap-theirs')"],
+    "M35": ["self.assertTrue(result['deferred'])", "self.assertNotEqual("],
+    "M36": ["self.assertEqual(result['appended'], 0"],
+    "M37": ["self.assertEqual(result['appended'], 0"],
+    "M38": ["self.assertEqual(report['astra']['samples'], 0"],
+    "M39": ["self.assertIsNone(ledger.calibration('astra')"],
+    "M40": ["with self.assertRaises(ValueError) as caught:"],
+}
+_WITNESS_ASSERTIONS.update({
+    "M26P": ["self.assertFalse(self.store.seen(snapshot.market_snapshot_id))", "self.assertTrue(result['deferred'])"],
+    "M41": ["self.assertEqual(self.classify(", "self.assertEqual(probe._classify(proc)[0], 'INCONCLUSIVE_INFRASTRUCTURE')"],
+    "M42": ["self.assertIsNone(self.feed._build(candidate))", "self.assertEqual(consumer.pending(), []"],
+    "M43": ["self.assertFalse(spool.write(record))"],
+    "M44": ["self.assertEqual(result['appended'], 0)", "self.assertFalse(ok, reason)"],
+    "M45": ["self.assertEqual(result['appended'], 0)", "self.assertFalse(ok, reason)"],
+    "M46": ["self.assertTrue(done.wait(0.75), 'research blocked the engine hook')"],
+    "M47": ["self.assertFalse(ok, reason)", "self.assertTrue(result['deferred'])", "self.assertEqual(provider.calls, 0)"],
+    "M48": ["self.assertEqual(second_provider.calls, 0)"],
+})
+_WITNESS_ASSERTIONS.update({
+    "M49": ["self.assertEqual(result['appended'], 0)"],
+    "M50": ["self.assertEqual(json.loads(target.read_text()).get('cycles'), 9)"],
+})
+SEMANTIC_WITNESSES = {
+    key: [{"node": selector, "assertion": assertion,
+           "invariant": description,
+           "exceptions": (["RuntimeError"] if key == "M09" else
+                          ["OverflowError", "RecursionError", "MemoryError",
+                           "ZeroDivisionError"] if key == "M19" else
+                          ["KeyError", "AssertionError"] if key == "M24" else
+                          ["AssertionError"])}
+          for selector in selectors
+          for assertion in _WITNESS_ASSERTIONS.get(key, ())]
+    for key, (description, _filename, _old, _new, selectors) in MUTATIONS.items()
+}
+
+def _semantic_failure(report, witnesses):
+    if report.get("when") != "call" or report.get("fixture_failure"):
+        return None
+    for witness in witnesses:
+        if not report.get("nodeid", "").startswith(witness["node"]):
+            continue
+        if report.get("exception") not in witness.get("exceptions", ["AssertionError"]):
+            continue
+        for frame in report.get("frames", []):
+            if witness["assertion"] in frame.get("statement", ""):
+                return {"invariant": witness["invariant"],
+                        "nodeid": report["nodeid"], "frame": frame}
+    return None
+
+
+def _classify(proc, evidence=None, witnesses=(), diagnostic=False) -> tuple:
+    """Classify structured phases and reviewed semantic assertions.
+
+    A pytest summary is only a display count.  It cannot establish collection,
+    execution of a test body, or the meaning of an assertion.  Missing or
+    damaged phase evidence consequently never establishes a behavioral kill.
+    """
+    detail = {"counts": _outcomes(proc.stdout), "semantic_witnesses": []}
+    if not isinstance(evidence, dict) or evidence.get("schema") != "astra-mutation-phases-v1":
+        return "INCONCLUSIVE_INFRASTRUCTURE", detail
+    if evidence.get("session_exit") != proc.returncode:
+        return "INCONCLUSIVE_INFRASTRUCTURE", detail
+    collection = evidence.get("collection_errors", [])
+    if collection:
+        text = "\n".join(collection)
+        status = "INCONCLUSIVE_IMPORT" if any(token in text for token in (
+            "ImportError", "ModuleNotFoundError", "SyntaxError")) else "INCONCLUSIVE_COLLECTION"
+        return status, detail
+    if not evidence.get("collected"):
+        return "INCONCLUSIVE_COLLECTION", detail
+    reports = evidence.get("reports", [])
+    failures = [r for r in reports if r.get("outcome") == "failed"]
+    if any(r.get("fixture_failure") or r.get("when") != "call" for r in failures):
+        return "INCONCLUSIVE_SETUP", detail
     if proc.returncode == 0:
-        return "SURVIVED", counts
-    if not counts:
-        return "INCONCLUSIVE_NO_SUMMARY", counts
-    if collected == 0:
-        return "INCONCLUSIVE_NOTHING_RAN", counts
-    if failed == 0 and errors:
-        # setUp/teardown errors only. The mutation may simply have broken the
-        # fixture; that is not a behavioural assertion firing.
-        return "INCONCLUSIVE_ERRORS_ONLY", counts
-    if failed == 0:
-        return "INCONCLUSIVE_DIAGNOSTIC_ONLY", counts
-    if errors:
-        return "KILLED_WITH_ERRORS", counts
-    return "KILLED", counts
+        if failures or not any(r.get("when") == "call" and r.get("outcome") == "passed"
+                               for r in reports):
+            return "INCONCLUSIVE_INFRASTRUCTURE", detail
+        return "DIAGNOSTIC_ONLY" if diagnostic else "SURVIVED", detail
+    if proc.returncode != 1 or not failures:
+        return "INCONCLUSIVE_INFRASTRUCTURE", detail
+    semantic = [match for report in failures
+                if (match := _semantic_failure(report, witnesses)) is not None]
+    if semantic:
+        detail["semantic_witnesses"] = semantic
+        return "KILLED_BEHAVIORALLY", detail
+    if all(r.get("exception") == "AssertionError" for r in failures):
+        # Untagged assertions cannot prove a safety invariant.  They remain
+        # diagnostic, and an effective mutation with only this evidence fails
+        # the gate even though this label is deliberately not a kill.
+        return "DIAGNOSTIC_ONLY", detail
+    return "INCONCLUSIVE_INFRASTRUCTURE", detail
 
 
-def run_one(key, verbose=False):
+def _phase_run(root, selectors, phase, timeout=1800):
+    receipt = os.path.join(root, f".astra-{phase}-phases.json")
+    command = [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+               "-p", "tools.astra_mutation_pytest", "--astra-phase-file", receipt,
+               *selectors]
+    proc = subprocess.run(command, cwd=root, capture_output=True, text=True,
+                          timeout=timeout)
+    try:
+        with open(receipt, encoding="utf-8") as stream:
+            evidence = json.load(stream)
+    except (OSError, ValueError):
+        evidence = None
+    return proc, evidence
+
+
+def _save_phase(directory, key, phase, proc, evidence):
+    """Retain complete disposable-test outputs for independent classification."""
+    if not directory:
+        return
+    os.makedirs(directory, exist_ok=True)
+    prefix = os.path.join(directory, f"{key}.{phase}")
+    for suffix, content in (("stdout.log", proc.stdout or ""),
+                            ("stderr.log", proc.stderr or ""),
+                            ("phases.json", json.dumps(evidence, indent=2))):
+        with open(prefix + "." + suffix, "w", encoding="utf-8") as stream:
+            stream.write(content)
+
+
+def summarize(results):
+    behavioral = sum(r["status"] == "KILLED_BEHAVIORALLY" for r in results)
+    inconclusive = sum(r["status"].startswith("INCONCLUSIVE_") for r in results)
+    not_applied = sum(r["status"] == "NOT_APPLIED" for r in results)
+    effective_unresolved = [r for r in results
+                            if r.get("effective_safety_mutation", True)
+                            and r["status"] != "KILLED_BEHAVIORALLY"]
+    return {
+        "mode": "SHADOW_ONLY", "broker_authority": False,
+        "mutations_run": len(results), "killed": behavioral,
+        "behavioural_kills": behavioral,
+        "diagnostic_only": sum(r["status"] == "DIAGNOSTIC_ONLY" for r in results),
+        "kills_with_setup_errors": 0,
+        "inconclusive": inconclusive, "not_applied": not_applied,
+        "surviving_effective_safety_mutations": sum(
+            r["status"] == "SURVIVED" and r.get("effective_safety_mutation", True)
+            for r in results),
+        "unresolved_effective_safety_mutations": len(effective_unresolved),
+        "survivors": sum(r["status"] == "SURVIVED" for r in results),
+        "gate_passed": not effective_unresolved and not inconclusive and not not_applied,
+        "results": results,
+    }
+
+def run_one(key, verbose=False, evidence_dir=None):
     description, filename, old, new, selectors = MUTATIONS[key]
+    result = {"mutation": key, "description": description,
+              "effective_safety_mutation": key not in DIAGNOSTIC_MUTATIONS,
+              "detecting_tests": selectors}
     workdir = tempfile.mkdtemp(prefix=f"astra-mut-{key}-")
     try:
         root = os.path.join(workdir, "repo")
         _copy_repo(root)
         target = os.path.join(root, filename)
-        source = open(target, encoding="utf-8").read()
-        if old not in source:
-            return {"mutation": key, "description": description,
-                    "status": "NOT_APPLIED",
-                    "detail": f"anchor text absent from {filename}; the "
-                              f"mutation could not be applied, so this run "
-                              f"proves nothing"}
-        open(target, "w", encoding="utf-8").write(source.replace(old, new, 1))
-
-        # RA-15: confirm the detecting tests still COLLECT under the mutation
-        # before believing anything the real run reports. A mutation that
-        # makes the detecting module unimportable would otherwise be recorded
-        # as detected by it.
-        collect = subprocess.run(
-            [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p",
-             "no:cacheprovider", *selectors],
-            cwd=root, capture_output=True, text=True, timeout=600)
-        if collect.returncode != 0:
-            return {"mutation": key, "description": description,
-                    "status": "INCONCLUSIVE_NOT_COLLECTABLE",
-                    "detecting_tests": selectors,
-                    "detail": "the detecting tests could not be collected "
-                              "under this mutation, so a failure would not "
-                              "be a behavioural kill: "
-                              + (collect.stdout or "")[-800:]}
-
-        proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "-x", "-q", "-p",
-             "no:cacheprovider", *selectors],
-            cwd=root, capture_output=True, text=True, timeout=1800)
-        status, counts = _classify(proc)
-        return {"mutation": key, "description": description,
-                "status": status,
-                "outcomes": counts,
-                "detecting_tests": selectors,
-                "detail": (proc.stdout or "")[-1500:]
-                if verbose or not status.startswith("KILLED")
-                else (proc.stdout or "").strip().splitlines()[-1:]}
+        with open(target, encoding="utf-8") as stream:
+            source = stream.read()
+        if source.count(old) != 1:
+            return dict(result, status="NOT_APPLIED",
+                        detail=f"expected exactly one anchor in {filename}; found {source.count(old)}")
+        # A broken positive baseline invalidates a mutation experiment.  Both
+        # runs execute the same selectors under the same local environment.
+        baseline, baseline_evidence = _phase_run(root, selectors, "baseline")
+        _save_phase(evidence_dir, key, "baseline", baseline, baseline_evidence)
+        baseline_status, baseline_detail = _classify(baseline, baseline_evidence)
+        if baseline_status != "SURVIVED":
+            status = baseline_status if baseline_status.startswith("INCONCLUSIVE_") else "INCONCLUSIVE_INFRASTRUCTURE"
+            return dict(result, status=status,
+                        detail="unmutated detecting tests do not pass",
+                        baseline=baseline_detail,
+                        output=(baseline.stdout + baseline.stderr)[-6000:])
+        with open(target, "w", encoding="utf-8") as stream:
+            stream.write(source.replace(old, new, 1))
+        proc, evidence = _phase_run(root, selectors, "mutated")
+        _save_phase(evidence_dir, key, "mutated", proc, evidence)
+        status, detail = _classify(proc, evidence, SEMANTIC_WITNESSES.get(key, ()),
+                                   diagnostic=key in DIAGNOSTIC_MUTATIONS)
+        effectiveness = INEFFECTIVE_CONTROLS.get(key)
+        if effectiveness and status == "SURVIVED":
+            passed = {row["nodeid"] for row in evidence["reports"]
+                      if row.get("when") == "call" and row.get("outcome") == "passed"}
+            required = {effectiveness["refusal"], effectiveness["positive"]}
+            if required.issubset(passed):
+                result["effective_safety_mutation"] = False
+                result["effectiveness_evidence"] = effectiveness
+            else:
+                status = "INCONCLUSIVE_INFRASTRUCTURE"
+        return dict(result, status=status, outcomes=detail["counts"],
+                    baseline={"returncode": baseline.returncode,
+                              "outcomes": baseline_detail["counts"],
+                              "collected": baseline_evidence["collected"]},
+                    semantic_witnesses=detail["semantic_witnesses"],
+                    phase_evidence=evidence,
+                    detail=(proc.stdout + proc.stderr)[-6000:] if verbose
+                           or status != "KILLED_BEHAVIORALLY" else "reviewed semantic assertion failed")
+    except subprocess.TimeoutExpired as exc:
+        return dict(result, status="INCONCLUSIVE_INFRASTRUCTURE",
+                    detail=f"synthetic test process exceeded {exc.timeout}s")
+    except (OSError, ValueError) as exc:
+        return dict(result, status="INCONCLUSIVE_INFRASTRUCTURE",
+                    detail=f"mutation experiment unavailable: {type(exc).__name__}: {exc}")
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -759,45 +1185,25 @@ def main(argv=None):
                         help="run just these mutation ids")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--evidence-dir", default=None,
+                        help="retain complete baseline/mutated logs and phase receipts")
     args = parser.parse_args(argv)
-
     keys = args.only or sorted(MUTATIONS)
-    results = [run_one(key, verbose=args.verbose) for key in keys]
-    # RA-15: a BEHAVIOURAL kill is the only kind that counts. Everything else
-    # -- survived, not applied, nothing collected, errors without a failure --
-    # is a survivor, because a run that proves nothing is not evidence.
-    killed = [r for r in results if r["status"].startswith("KILLED")]
-    survived = [r for r in results if not r["status"].startswith("KILLED")]
-    summary = {
-        "mode": "SHADOW_ONLY",
-        "broker_authority": False,
-        "mutations_run": len(results),
-        "killed": len(killed),
-        "behavioural_kills": sum(1 for r in results
-                                 if r["status"] == "KILLED"),
-        "kills_with_setup_errors": sum(1 for r in results
-                                       if r["status"] == "KILLED_WITH_ERRORS"),
-        "inconclusive": sum(1 for r in results
-                            if r["status"].startswith("INCONCLUSIVE")),
-        "not_applied": sum(1 for r in results
-                           if r["status"] == "NOT_APPLIED"),
-        "surviving_effective_safety_mutations": len(survived),
-        "survivors": len(survived),
-        "results": results,
-    }
+    unknown = sorted(set(keys) - set(MUTATIONS))
+    if unknown:
+        parser.error(f"unknown mutation IDs: {unknown}")
+    summary = summarize([run_one(key, verbose=args.verbose,
+                                 evidence_dir=args.evidence_dir) for key in keys])
     if args.json:
         print(json.dumps(summary, indent=2))
     else:
-        for row in results:
-            print(f"{row['mutation']}  {row['status']:<32} "
-                  f"{row['description']}")
-            if not row["status"].startswith("KILLED"):
-                print(f"    {row['detail']}")
-        print(f"\n{summary['killed']}/{summary['mutations_run']} killed "
-              f"({summary['behavioural_kills']} behavioural), "
-              f"{summary['survivors']} survivor(s), "
-              f"{summary['inconclusive']} inconclusive")
-    return 1 if survived else 0
+        for row in summary["results"]:
+            print(f"{row['mutation']}  {row['status']:<32} {row['description']}")
+        print(f"\n{summary['behavioural_kills']} behavioral kills; "
+              f"{summary['diagnostic_only']} diagnostic; "
+              f"{summary['inconclusive']} inconclusive; "
+              f"{summary['unresolved_effective_safety_mutations']} effective unresolved")
+    return 0 if summary["gate_passed"] else 1
 
 
 if __name__ == "__main__":

@@ -45,14 +45,15 @@ PRODUCER = "research_feed.py"
 #:                         observation instead of being defaulted downstream.
 ALLOWED_IMPORTS = frozenset({"datetime", "hashlib", "json", "logging", "os",
                              "time", "config", "candidate_contract",
-                             "research_spool"})
+                             "research_spool", "source_identity"})
 
 #: The neutral modules the producer is allowed to reach. Each is pinned to its
 #: own allow-list below, so the boundary cannot be widened by the back door --
 #: adding an Alpha import to `research_spool` would otherwise reach the engine
 #: transitively without touching `research_feed.py` at all.
 NEUTRAL_MODULES = {
-    "candidate_contract.py": frozenset({"hashlib", "json", "math", "datetime"}),
+    "candidate_contract.py": frozenset({"hashlib", "json", "math", "datetime", "source_identity"}),
+    "source_identity.py": frozenset(),
     # `re` parses the owner pid out of a partial's name; `durable_append`
     # supplies the advisory lock the capacity RESERVATION is serialized on
     # (AA-11 re-audit) and, since RA-05, the ONE honest directory fsync.

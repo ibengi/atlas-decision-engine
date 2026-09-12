@@ -439,11 +439,13 @@ class ExecutionEngine:
             # quote from a computed one -- and REFUSE the computed one. The
             # order path keeps using `book` exactly as before; nothing about
             # execution changes here.
-            self.research_feed.emit_candidate(candidate_from_market(
-                raw_market, book, raw_book=raw_market,
-                cycle_id=(dec.decision_id or "").split("-", 1)[0] or ""))
-        except Exception as e:                                # noqa: BLE001
-            log.debug(f"research feed: {e}")
+            self.research_feed.emit_market(
+                raw_market, book,
+                cycle_id=(dec.decision_id or "").split("-", 1)[0] or "")
+        except Exception:                                     # noqa: BLE001
+            # Even exception diagnostics belong to the research worker.
+            # An unavailable or malformed observer has no decision authority.
+            pass
         try:
             if (dec.strategy or "").startswith("btc_daily"):
                 self.btc_daily_evidence.record(

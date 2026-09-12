@@ -1,0 +1,8 @@
+{
+  "files": {
+    "predictions.jsonl": "ac268e5764175d61c597c0f61baf41c6762ecbb38b17efead3d52da83b644efc",
+    "source-record.json": "eb935a9f7c6de03f6caf30e18a0e1e5599fc2d96f12a54730c0693716582ec3d"
+  },
+  "generator": "tools/astra_v5_legacy_fixture.py",
+  "source_commit": "57d497566b9a218919c5934046edd67e61b9ff43"
+}

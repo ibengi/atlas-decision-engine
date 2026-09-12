@@ -11,6 +11,7 @@ import tempfile
 from datetime import datetime, timezone
 
 from alpha_learning import learning_report, similar_cases
+from alpha_persistence_paths import publication_guard
 
 DEFAULT_REPORT_FILE = "alpha_learning_report.json"
 
@@ -43,7 +44,8 @@ def learning_snapshot(ledger, *, astra_selector="astra",
 #: append-only history the whole subsystem rests on, in one syscall, with no
 #: trace and no recovery.
 def _protected_source_paths(ledger, directory, processed_store=None,
-                            budget_ledger=None) -> dict:
+                            budget_ledger=None, telemetry=None,
+                            persistence_objects=()) -> dict:
     """Every append-only source file a derived report must never replace.
 
     AA-16 (re-audit) -- PROTECT THE PATH THE STORE ACTUALLY USES.
@@ -86,7 +88,13 @@ def _protected_source_paths(ledger, directory, processed_store=None,
         spellings AA-16's re-audit settled on, for the same reason.
     """
     from config import CFG, _p
-    paths = {}
+    from alpha_persistence_paths import registered_persistence_paths
+    paths = {os.path.realpath(path): label for path, label in
+             registered_persistence_paths().items()}
+    for source in (telemetry, *persistence_objects):
+        path = getattr(source, "path", None)
+        if path:
+            paths.setdefault(os.path.realpath(path), "runtime persistence")
     for label, attr in (("prediction ledger", "log"),
                         ("cost ledger", "cost_log")):
         source = getattr(ledger, attr, None)
@@ -133,7 +141,8 @@ def _protected_source_paths(ledger, directory, processed_store=None,
 
 def _assert_not_a_source_ledger(target, ledger, directory,
                                 processed_store=None,
-                                budget_ledger=None) -> None:
+                                budget_ledger=None, telemetry=None,
+                                persistence_objects=()) -> None:
     """Refuse to publish a report over a ledger (AA-16).
 
     Both paths are canonicalised with `realpath` first, so a symlink, a `..`
@@ -143,7 +152,8 @@ def _assert_not_a_source_ledger(target, ledger, directory,
     `realpath` cannot see through.
     """
     protected = _protected_source_paths(ledger, directory,
-                                        processed_store, budget_ledger)
+                                        processed_store, budget_ledger,
+                                        telemetry, persistence_objects)
     resolved = os.path.realpath(target)
     if resolved in protected:
         raise ValueError(
@@ -152,12 +162,12 @@ def _assert_not_a_source_ledger(target, ledger, directory,
             f"replaces a source ledger")
     try:
         target_stat = os.stat(resolved)
-    except OSError:
+    except FileNotFoundError:
         return                       # does not exist yet; no alias possible
     for path, label in protected.items():
         try:
             source_stat = os.stat(path)
-        except OSError:
+        except FileNotFoundError:
             continue
         if (target_stat.st_dev, target_stat.st_ino) == \
                 (source_stat.st_dev, source_stat.st_ino):
@@ -168,6 +178,7 @@ def _assert_not_a_source_ledger(target, ledger, directory,
 
 def write_learning_report(ledger, directory, *, filename=DEFAULT_REPORT_FILE,
                           processed_store=None, budget_ledger=None,
+                          telemetry=None, persistence_objects=(),
                           **kwargs) -> dict:
     """Atomically publish a derived report without editing ledger history.
 
@@ -180,7 +191,7 @@ def write_learning_report(ledger, directory, *, filename=DEFAULT_REPORT_FILE,
     os.makedirs(directory, exist_ok=True)
     target = os.path.join(directory, filename)
     _assert_not_a_source_ledger(target, ledger, directory, processed_store,
-                                budget_ledger)
+                                budget_ledger, telemetry, persistence_objects)
     fd, tmp = tempfile.mkstemp(prefix=".alpha-learning-", suffix=".tmp",
                                dir=directory, text=True)
     try:
@@ -189,7 +200,11 @@ def write_learning_report(ledger, directory, *, filename=DEFAULT_REPORT_FILE,
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, target)
+        # Re-evaluate the live path registry at the publication boundary.
+        with publication_guard():
+            _assert_not_a_source_ledger(target, ledger, directory, processed_store,
+                                        budget_ledger, telemetry, persistence_objects)
+            os.replace(tmp, target)
         # Persist the directory entry where supported.
         try:
             dfd = os.open(directory, os.O_RDONLY)

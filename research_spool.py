@@ -141,6 +141,7 @@ class BoundedSpool:
                       "dropped_oversize": 0, "capacity_unknown": 0,
                       "write_errors": 0, "temp_bytes": 0, "temp_files": 0,
                       "temp_recovered": 0, "reservation_timeouts": 0}
+        self.stats["recovery_unknown"] = 0
         self._sequence = 0
         # AA-11 (re-audit): recovery happens HERE, at construction, rather
         # than in a method nothing called. A producer that starts with its
@@ -148,12 +149,11 @@ class BoundedSpool:
         # previous run's failure as a smaller spool.
         try:
             self.recover_owned_partials()
-        except Exception as exc:                              # noqa: BLE001
+        except Exception:                                     # noqa: BLE001
             # Startup recovery is an optimisation of capacity, never a
             # precondition for running. A spool that cannot be recovered is
             # still a spool that fails closed when it is full.
-            log.warning(f"[RESEARCH_SPOOL] startup partial recovery failed: "
-                        f"{type(exc).__name__}: {exc}")
+            self.stats["recovery_unknown"] += 1
 
     # ── enumeration that refuses to guess ───────────────────────────────
     def _scan(self):
@@ -166,8 +166,6 @@ class BoundedSpool:
         """
         try:
             names = os.listdir(self.directory)
-        except FileNotFoundError:
-            return [], []
         except OSError as exc:
             raise SpoolCapacityUnknown(
                 f"cannot enumerate {self.directory}: {exc}")
@@ -176,8 +174,6 @@ class BoundedSpool:
             path = os.path.join(self.directory, name)
             try:
                 st = os.stat(path)
-            except FileNotFoundError:
-                continue                      # pruned under us; not an error
             except OSError as exc:
                 raise SpoolCapacityUnknown(
                     f"cannot stat {name}: {exc}")
@@ -252,8 +248,11 @@ class BoundedSpool:
         """
         try:
             _records, temp = self._scan()
-        except SpoolCapacityUnknown as exc:
-            log.warning(f"[RESEARCH_SPOOL] partial recovery skipped: {exc}")
+        except SpoolCapacityUnknown:
+            # Construction can precede directory creation. This is unknown
+            # recovery state, never an authoritative zero-capacity scan.
+            # Keep a counter without running a handler on the caller.
+            self.stats["recovery_unknown"] += 1
             return 0
         removed = 0
         for name, _size, _mtime in temp:
@@ -271,31 +270,12 @@ class BoundedSpool:
         return removed
 
     def recover_temp_files(self) -> int:
-        """Remove leftover partial writes from a previous crash.
+        """Compatibility entry point for the same owner-checked recovery.
 
-        ONLY files carrying this producer's own temp suffix are removed, and
-        only after they are older than the age bound. AA-11 is explicit that
-        unknown files are never deleted: this directory is on a shared volume,
-        and a research component that deletes files it does not recognise is a
-        worse problem than a full spool.
+        Age alone never establishes ownership: even an old unrecognized
+        partial may be another writer's evidence and remains untouched.
         """
-        try:
-            _records, temp = self._scan()
-        except SpoolCapacityUnknown as exc:
-            log.warning(f"[RESEARCH_SPOOL] temp recovery skipped: {exc}")
-            return 0
-        removed = 0
-        cutoff = time.time() - self.max_age_s
-        for name, _size, mtime in temp:
-            if mtime >= cutoff:
-                continue                     # possibly an in-flight write
-            try:
-                os.remove(os.path.join(self.directory, name))
-                removed += 1
-            except OSError:
-                continue
-        self.stats["temp_recovered"] += removed
-        return removed
+        return self.recover_owned_partials()
 
     def prune(self) -> int:
         """Age first, then count, then bytes. Oldest first in every pass."""
@@ -482,6 +462,7 @@ ITEM_NOTE = "note"
 #: RA-03. An ADMITTED candidate: type-checked by the observer, not yet
 #: assembled, hashed or validated. The finalizer runs on THIS thread.
 ITEM_CANDIDATE = "candidate"
+ITEM_OBSERVATION = "observation"
 
 
 class ResearchWriter:
@@ -517,6 +498,7 @@ class ResearchWriter:
         #: means nobody wired one, and an admitted candidate is then DROPPED
         #: rather than written unvalidated.
         self.finalizer = None
+        self.observation_finalizer = None
         self.max_queue = int(max_queue)
         self.max_queue_bytes = int(max_queue_bytes)
         self._queue = queue.Queue(maxsize=self.max_queue)
@@ -526,6 +508,7 @@ class ResearchWriter:
         self._stop = threading.Event()
         self.stats = {"offered": 0, "queued": 0, "dropped_queue_full": 0,
                       "dropped_queue_bytes": 0, "drained": 0,
+                      "dropped_queue_busy": 0,
                       # AA-10: diagnostics that never reached the writer.
                       # Counted rather than logged, because logging a dropped
                       # log on the engine thread would be the original bug.
@@ -546,22 +529,48 @@ class ResearchWriter:
         there is no action it could take on a dropped research record that
         would not couple the two paths.
         """
-        self.stats["offered"] += 1
+        return self._offer(ITEM_RECORD, record, approx_bytes)
+
+    def _offer(self, kind, payload, approx_bytes) -> bool:
+        """Never wait on either writer accounting or Queue's internal lock.
+
+        Queue.put_nowait only makes *capacity* nonblocking; acquiring its
+        mutex can still wait. Acquire both mutexes with blocking=False and
+        perform Queue's standard bounded insertion while holding its mutex.
+        No worker callback or device operation runs while either is held.
+        """
+        note = kind == ITEM_NOTE
+        self.stats["offered"] += int(not note)
         size = int(approx_bytes or 0)
-        # `self._lock` is held ONLY by offer() and by the writer's accounting,
-        # never across a write or an fsync, so this can never wait on disk.
-        with self._lock:
+        if not self._lock.acquire(blocking=False):
+            self.stats["dropped_queue_busy"] += 1
+            self.stats["dropped_notes"] += int(note)
+            return False
+        try:
             if self._queued_bytes + size > self.max_queue_bytes:
                 self.stats["dropped_queue_bytes"] += 1
+                self.stats["dropped_notes"] += int(note)
+                return False
+            if not self._queue.mutex.acquire(blocking=False):
+                self.stats["dropped_queue_busy"] += 1
+                self.stats["dropped_notes"] += int(note)
                 return False
             try:
-                self._queue.put_nowait((ITEM_RECORD, record, size))
-            except queue.Full:
-                self.stats["dropped_queue_full"] += 1
-                return False
-            self._queued_bytes += size
-            self.stats["queued"] += 1
-        return True
+                if self._queue.maxsize > 0 and \
+                        self._queue._qsize() >= self._queue.maxsize:
+                    self.stats["dropped_queue_full"] += 1
+                    self.stats["dropped_notes"] += int(note)
+                    return False
+                self._queue._put((kind, payload, size))
+                self._queue.unfinished_tasks += 1
+                self._queue.not_empty.notify()
+                self._queued_bytes += size
+                self.stats["notes" if note else "queued"] += 1
+                return True
+            finally:
+                self._queue.mutex.release()
+        finally:
+            self._lock.release()
 
     def offer_candidate(self, candidate: dict, *,
                         approx_bytes: int = 0) -> bool:
@@ -571,20 +580,10 @@ class ResearchWriter:
         `offer`; the only difference is how much work has been done to the
         payload before it got here, and that is the entire point.
         """
-        self.stats["offered"] += 1
-        size = int(approx_bytes or 0)
-        with self._lock:
-            if self._queued_bytes + size > self.max_queue_bytes:
-                self.stats["dropped_queue_bytes"] += 1
-                return False
-            try:
-                self._queue.put_nowait((ITEM_CANDIDATE, candidate, size))
-            except queue.Full:
-                self.stats["dropped_queue_full"] += 1
-                return False
-            self._queued_bytes += size
-            self.stats["queued"] += 1
-        return True
+        return self._offer(ITEM_CANDIDATE, candidate, approx_bytes)
+
+    def offer_observation(self, observation: dict, *, approx_bytes=0) -> bool:
+        return self._offer(ITEM_OBSERVATION, observation, approx_bytes)
 
     def note(self, level: int, message: str) -> bool:
         """Say something, later, on the writer's thread (AA-10).
@@ -597,19 +596,8 @@ class ResearchWriter:
         research subsystem that will not stay quiet under pressure is a
         research subsystem that can stall the money path to be heard.
         """
-        size = len(message) + 64
-        with self._lock:
-            if self._queued_bytes + size > self.max_queue_bytes:
-                self.stats["dropped_notes"] += 1
-                return False
-            try:
-                self._queue.put_nowait((ITEM_NOTE, (int(level), message), size))
-            except queue.Full:
-                self.stats["dropped_notes"] += 1
-                return False
-            self._queued_bytes += size
-            self.stats["notes"] += 1
-        return True
+        size = 4 * len(message) + 64
+        return self._offer(ITEM_NOTE, (int(level), message), size)
 
     # ── writer side: owns every blocking operation ──────────────────────
     def start(self) -> None:
@@ -637,16 +625,18 @@ class ResearchWriter:
                 # research latency and nothing else.
                 level, message = payload
                 log.log(level, message)
-            elif kind == ITEM_CANDIDATE:
+            elif kind in (ITEM_CANDIDATE, ITEM_OBSERVATION):
                 # RA-03: serialization, hashing, contract validation and the
                 # formatting of every diagnostic all happen HERE.
-                if self.finalizer is None:
+                finalizer = (self.observation_finalizer
+                             if kind == ITEM_OBSERVATION else self.finalizer)
+                if finalizer is None:
                     self.stats["unfinalizable"] += 1
                     log.warning("[RESEARCH_WRITER] an admitted candidate "
                                 "arrived with no finalizer wired; it is "
                                 "DROPPED rather than spooled unvalidated")
                 else:
-                    record = self.finalizer(payload)
+                    record = finalizer(payload)
                     self.stats["finalized"] += 1
                     if record is None:
                         self.stats["refused_by_contract"] += 1

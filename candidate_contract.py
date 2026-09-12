@@ -17,8 +17,8 @@ WHAT THIS MODULE REFUSES TO DO
     candidate for.
 
 NO EXECUTION AUTHORITY
-    Imports `hashlib`, `json`, `math` and `datetime` only. It cannot reach a
-    broker, an order path, a risk gate or CAPITAL, and
+    Imports standard-library validation tools and the dependency-free
+    `source_identity` verifier. It cannot reach a broker, order path or CAPITAL, and
     `tests/test_research_feed_boundary.py` pins that import list.
 """
 
@@ -26,6 +26,7 @@ import hashlib
 import json
 import math
 from datetime import datetime, timezone
+from source_identity import verify_settlement_source_evidence
 
 #: Bumped from v2: a v2 record carried a `field_provenance` that was only
 #: required to be a non-empty STRING (AA-05), and a book whose NO side may
@@ -519,6 +520,15 @@ def _validate_record(record, *, require_checksum=True) -> list:
             errors.append(str(exc))
 
     provenance, unavailable = _check_provenance_container(record, errors)
+
+    # Existing v3 records remain recoverable for SHADOW history. If source
+    # preimage evidence is supplied, its complete versioned shape must be
+    # valid. Settlement/learning separately require this evidence to exist;
+    # an old rendered label cannot reconstruct discarded source structure.
+    if "settlement_source_evidence" in record:
+        identity = verify_settlement_source_evidence(record)
+        if not identity["verified"]:
+            errors.append("settlement_source_evidence: " + identity["reason"])
 
     for field in TEXT_FIELDS:
         try:

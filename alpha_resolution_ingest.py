@@ -51,6 +51,7 @@ AA-15 -- R4 IS A VERIFIED JOIN, NOT A prediction_id LOOKUP
 """
 
 from alpha_ledger import verify_source_evidence
+from alpha_settlement_validation import settlement_qualification
 from candidate_contract import ContractError, strict_text, strict_timestamp
 
 #: Binding fields a settlement may carry. Each one, WHEN SUPPLIED, must agree
@@ -107,12 +108,20 @@ REQUIRED_BINDING = ("contract_id", "market_snapshot_id",
 REQUIRED_SETTLEMENT_FIELDS = ("resolved_at", "settlement_evidence_id")
 
 
+class IncompleteSettlement(ValueError):
+    """A required identity is absent; preserve its quarantine classification."""
+
+
+def _absent(value):
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 def _prediction_binding(prediction: dict) -> dict:
     """The identity a prediction was committed with.
 
-    Falls back to the prediction's own top-level fields for rows written
-    before `source_binding` existed, so an older prediction can still be
-    settled on the fields it does carry rather than being unresolvable.
+    Top-level legacy identities help classify missing-field diagnostics.
+    They never establish qualification: the shared validator independently
+    requires complete retained source evidence and an exact snapshot binding.
     """
     binding = dict(prediction.get("source_binding") or {})
     binding.setdefault("contract_id", prediction.get("contract_id"))
@@ -125,6 +134,11 @@ def _normalise(row, index):
     """One settlement row, strictly typed, or raise (AA-02 types, AA-15)."""
     if not isinstance(row, dict):
         raise ValueError(f"row {index}: settlement must be an object")
+    missing = [key for key in ("prediction_id", "source")
+               if _absent(row.get(key))]
+    if missing:
+        raise IncompleteSettlement("missing required settlement identifiers: "
+                                   + ", ".join(missing))
     try:
         prediction_id = strict_text(row.get("prediction_id"),
                                     field="prediction_id", max_length=200)
@@ -178,7 +192,7 @@ def _normalise(row, index):
     supplied = {}
     for key in BINDING_CHECKS:
         value = row.get(key)
-        if value in (None, ""):
+        if _absent(value):
             continue
         try:
             supplied[key] = strict_text(value, field=key, max_length=300)
@@ -248,8 +262,13 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
     into the resolution row so a calibration number can be traced back to the
     authority that produced its outcomes.
     """
-    allowed = {str(s).strip() for s in trusted_sources} if trusted_sources \
-        else set()
+    # An operator-qualified identity is text, never coercion of arbitrary
+    # values or iteration over the characters of one source string.
+    allowed = set()
+    if isinstance(trusted_sources, (list, tuple, set, frozenset)) and all(
+            isinstance(s, str) and s.strip() and s == s.strip()
+            for s in trusted_sources):
+        allowed = set(trusted_sources)
     result = {
         "mode": "SHADOW_ONLY",
         "broker_authority": False,
@@ -277,6 +296,11 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
         result["received"] += 1
         try:
             row = _normalise(raw, index)
+        except IncompleteSettlement as exc:
+            detail = {"row": index, "reason": str(exc)}
+            result["quarantined"].append(detail)
+            result["rejected"].append(dict(detail))
+            continue
         except (TypeError, ValueError) as exc:
             result["rejected"].append({"row": index, "reason": str(exc)})
             continue
@@ -366,6 +390,23 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
                                 f"cannot be qualified: {evidence['reason']}"}
             result["evidence_unverified"].append(detail)
             result["quarantined"].append(dict(detail))
+            result["rejected"].append(dict(detail))
+            continue
+
+        candidate_resolution = {
+            "schema": "atlas-alpha-ledger-v1", "kind": "RESOLUTION",
+            "prediction_id": prediction_id, "actual_outcome": row["outcome"],
+            "resolved_at": row["resolved_at"], "resolution_source": row["source"],
+            "settlement_binding": row["supplied_binding"],
+            "settlement_evidence_id": row["settlement_evidence_id"],
+            "binding_verified": True, "source_trusted": True,
+            "source_evidence_verified": True, "trusted_sources": sorted(allowed),
+        }
+        qualified, reason = settlement_qualification(prediction, candidate_resolution)
+        if not qualified:
+            detail = {"row": index, "prediction_id": prediction_id,
+                      "reason": "settlement qualification failed: " + reason}
+            result["quarantined"].append(detail)
             result["rejected"].append(dict(detail))
             continue
 

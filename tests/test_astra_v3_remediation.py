@@ -976,6 +976,14 @@ class AA13b_RestartPaidTwiceForACommittedAnalysis(AlphaCase):
         self._patches.append(patch.object(CFG, "ALPHA_GATEWAY_ENABLED", True))
         self._patches[-1].start()
 
+    def snapshot(self, **kwargs):
+        self._service_snapshot = super().snapshot(**kwargs)
+        return self._service_snapshot
+
+    def record(self):
+        from _candidate import record_for_snapshot
+        return record_for_snapshot(self._service_snapshot)
+
     def service(self, providers):
         from alpha_consumer import ProcessedStore, SpoolConsumer
         from alpha_ledger import AlphaLedger
@@ -1014,7 +1022,7 @@ class AA13b_RestartPaidTwiceForACommittedAnalysis(AlphaCase):
             "market_snapshot_id": snapshot.market_snapshot_id,
             "contract_id": snapshot.contract_id})
 
-        result = service._analyze_one(snapshot, valid_record())
+        result = service._analyze_one(snapshot, self.record())
 
         self.assertEqual(provider.calls, 0,
                          "the providers were paid twice for one analysis")
@@ -1028,7 +1036,7 @@ class AA13b_RestartPaidTwiceForACommittedAnalysis(AlphaCase):
             "prediction_id": "p-already-committed",
             "market_snapshot_id": snapshot.market_snapshot_id,
             "contract_id": snapshot.contract_id})
-        service._analyze_one(snapshot, valid_record())
+        service._analyze_one(snapshot, self.record())
         row = self.store._load()[snapshot.market_snapshot_id]
         self.assertEqual(row["status"], "ANALYZED")
         self.assertEqual(row["prediction_id"], "p-already-committed")
@@ -1040,14 +1048,14 @@ class AA13b_RestartPaidTwiceForACommittedAnalysis(AlphaCase):
             "prediction_id": "p-already-committed",
             "market_snapshot_id": snapshot.market_snapshot_id,
             "contract_id": snapshot.contract_id})
-        service._analyze_one(snapshot, valid_record())
+        service._analyze_one(snapshot, self.record())
         self.assertEqual(len(self.ledger.predictions()), 1)
 
     def test_an_uncommitted_snapshot_is_still_analysed_normally(self):
         """Anti-vacuity: recovery must not swallow genuinely new work."""
         provider = _CountingProvider()
         service = self.service([provider])
-        service._analyze_one(self.snapshot(), valid_record())
+        service._analyze_one(self.snapshot(), self.record())
         self.assertGreater(provider.calls, 0)
 
 
@@ -1073,6 +1081,14 @@ class AA13c_PrepareFailureDidNotStopDispatch(AlphaCase):
         super().setUp()
         self._patches.append(patch.object(CFG, "ALPHA_GATEWAY_ENABLED", True))
         self._patches[-1].start()
+
+    def snapshot(self, **kwargs):
+        self._service_snapshot = super().snapshot(**kwargs)
+        return self._service_snapshot
+
+    def record(self):
+        from _candidate import record_for_snapshot
+        return record_for_snapshot(self._service_snapshot)
 
     def service(self, providers):
         from alpha_consumer import ProcessedStore, SpoolConsumer
@@ -1109,7 +1125,7 @@ class AA13c_PrepareFailureDidNotStopDispatch(AlphaCase):
         service = self.service([provider])
         with patch.object(type(self.ledger), "prepare",
                           side_effect=LedgerError("read-only filesystem")):
-            result = service._analyze_one(self.snapshot(), valid_record())
+            result = service._analyze_one(self.snapshot(), self.record())
         self.assertEqual(provider.calls, 0,
                          "providers were paid with nowhere to record it")
         self.assertTrue(result["deferred"])
@@ -1120,7 +1136,7 @@ class AA13c_PrepareFailureDidNotStopDispatch(AlphaCase):
         snapshot = self.snapshot()
         with patch.object(type(self.ledger), "prepare",
                           side_effect=LedgerError("read-only filesystem")):
-            service._analyze_one(snapshot, valid_record())
+            service._analyze_one(snapshot, self.record())
         row = self.store._load()[snapshot.market_snapshot_id]
         self.assertEqual(row["status"], "DEFERRED")
 
@@ -1132,7 +1148,7 @@ class AA13c_PrepareFailureDidNotStopDispatch(AlphaCase):
         snapshot = self.snapshot()
         with patch.object(type(self.ledger), "prepare",
                           side_effect=LedgerError("read-only filesystem")):
-            service._analyze_one(snapshot, valid_record())
+            service._analyze_one(snapshot, self.record())
         row = self.store._load()[snapshot.market_snapshot_id]
         self.assertEqual(row["prediction_id"], "",
                          "an uncommitted prediction id was acknowledged")
@@ -1140,7 +1156,7 @@ class AA13c_PrepareFailureDidNotStopDispatch(AlphaCase):
     def test_a_healthy_prepare_still_dispatches(self):
         provider = _CountingProvider()
         service = self.service([provider])
-        service._analyze_one(self.snapshot(), valid_record())
+        service._analyze_one(self.snapshot(), self.record())
         self.assertGreater(provider.calls, 0)
         self.assertEqual([r["kind"] for r in self.ledger.rows()][0], "PREPARE")
 
@@ -1172,34 +1188,17 @@ class AA15_PartialBindingWasAcceptedAsVerified(AlphaCase):
         self.ledger = AlphaLedger(
             path=os.path.join(self._tmp, "ledger.jsonl"),
             cost_path=os.path.join(self._tmp, "cost.jsonl"))
-        self.record = valid_record()
-        self.binding = {
-            "contract_id": "KX-1",
-            "market_snapshot_id": "snap-1",
-            "record_sha256": self.record["record_sha256"],
-            "contract_schema": self.record["schema"],
-            "environment": "test",
-            "digest_verified": True,
-            # RA-12: the retained evidence, because settlement qualification
-            # now recomputes the digest from it rather than comparing two
-            # copies of the claim about it.
-            "source_evidence": contract.canonical_content(self.record),
-        }
-        self.ledger.record_prediction({
-            "prediction_id": "p-1", "market_snapshot_id": "snap-1",
-            "contract_id": "KX-1", "source_binding": dict(self.binding)})
+        from _settlement import qualified_fixture
+        self.record, self.observation, self.prediction, self.settlement_row = qualified_fixture(
+            prediction_id="p-1", contract_id="KX-1", source="CF Benchmarks RTI",
+            environment="test")
+        self.binding = self.prediction["source_binding"]
+        self.ledger.record_prediction(dict(self.prediction))
 
     def settlement(self, **over):
         # RA-11 widened the required binding to the full versioned identity
         # and made the resolution instant and the evidence identity required.
-        row = {"prediction_id": "p-1", "outcome": 1,
-               "source": "CF Benchmarks RTI",
-               "contract_id": "KX-1", "market_snapshot_id": "snap-1",
-               "source_record_sha256": self.record["record_sha256"],
-               "environment": "test",
-               "contract_schema": self.record["schema"],
-               "resolved_at": "2026-09-12T20:10:00+00:00",
-               "settlement_evidence_id": "cf-rti-2026-09-12"}
+        row = dict(self.settlement_row)
         row.update(over)
         return {k: v for k, v in row.items() if v is not DROP}
 
@@ -1286,26 +1285,14 @@ class AA15b_UnqualifiedSourcesWereTrustedByDefault(AlphaCase):
         # carried cannot be re-derived from anything, so it now lands in the
         # evidence-unverified quarantine -- which would leave every case
         # below asserting on a refusal that happens for the wrong reason.
-        self.record = valid_record()
-        self.ledger.record_prediction({
-            "prediction_id": "p-1", "market_snapshot_id": "snap-1",
-            "contract_id": "KX-1", "p_yes": 0.6,
-            "source_binding": {
-                "contract_id": "KX-1",
-                "market_snapshot_id": "snap-1",
-                "record_sha256": self.record["record_sha256"],
-                "environment": "test",
-                "contract_schema": self.record["schema"],
-                "source_evidence": contract.canonical_content(self.record)}})
+        from _settlement import qualified_fixture
+        self.record, self.observation, self.prediction, self.settlement_row = qualified_fixture(
+            prediction_id="p-1", contract_id="KX-1", source="CF Benchmarks RTI",
+            environment="test", p_yes=0.6)
+        self.ledger.record_prediction(dict(self.prediction))
 
     def settlement(self, source="CF Benchmarks RTI"):
-        return {"prediction_id": "p-1", "outcome": 1, "source": source,
-                "contract_id": "KX-1", "market_snapshot_id": "snap-1",
-                "source_record_sha256": self.record["record_sha256"],
-                "environment": "test",
-                "contract_schema": self.record["schema"],
-                "resolved_at": "2026-09-12T20:10:00+00:00",
-                "settlement_evidence_id": "cf-rti-2026-09-12"}
+        return dict(self.settlement_row, source=source)
 
     def test_an_unqualified_source_is_refused_by_default(self):
         from alpha_resolution_ingest import ingest_settlements
@@ -1372,14 +1359,13 @@ class AA15c_SourceDigestCouldNotBeReverifiedAfterPruning(AlphaCase):
         self.ledger = AlphaLedger(
             path=os.path.join(self._tmp, "ledger.jsonl"),
             cost_path=os.path.join(self._tmp, "cost.jsonl"))
-        self.record = valid_record()
+        from _settlement import qualified_fixture
+        self.record, self.observation, self.prediction, _ = qualified_fixture(
+            prediction_id="p-1")
 
     def binding(self):
-        from alpha_service import source_binding_for
-        return source_binding_for(self.record,
-                                  contract_id=self.record["contract_id"],
-                                  market_snapshot_id="snap-1",
-                                  digest_verified=True)
+        import copy
+        return copy.deepcopy(self.prediction["source_binding"])
 
     def test_the_binding_carries_the_canonical_source_evidence(self):
         binding = self.binding()
@@ -1389,10 +1375,7 @@ class AA15c_SourceDigestCouldNotBeReverifiedAfterPruning(AlphaCase):
 
     def test_the_digest_is_recomputable_from_what_was_persisted(self):
         from alpha_ledger import verify_source_evidence
-        self.ledger.record_prediction({
-            "prediction_id": "p-1", "market_snapshot_id": "snap-1",
-            "contract_id": self.record["contract_id"],
-            "source_binding": self.binding()})
+        self.ledger.record_prediction(dict(self.prediction))
         # The spool is gone; nothing of the original bytes survives outside
         # the prediction row.
         verdict = verify_source_evidence(self.ledger.find_prediction("p-1"))
@@ -1403,9 +1386,7 @@ class AA15c_SourceDigestCouldNotBeReverifiedAfterPruning(AlphaCase):
         from alpha_ledger import verify_source_evidence
         binding = self.binding()
         binding["source_evidence"]["question"] = "a different question"
-        self.ledger.record_prediction({
-            "prediction_id": "p-1", "market_snapshot_id": "snap-1",
-            "source_binding": binding})
+        self.ledger.record_prediction(dict(self.prediction, source_binding=binding))
         verdict = verify_source_evidence(self.ledger.find_prediction("p-1"))
         self.assertIs(verdict["verified"], False)
         self.assertIn("mismatch", verdict["reason"])

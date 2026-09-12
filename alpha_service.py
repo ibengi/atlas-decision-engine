@@ -148,13 +148,14 @@ def assert_no_broker_credentials(env=None) -> list:
 
 def source_binding_for(record: dict, *, contract_id: str,
                        market_snapshot_id: str,
-                       digest_verified: bool) -> dict:
+                       digest_verified: bool, snapshot=None) -> dict:
     """The source identity a prediction is committed with (AA-15).
 
-    `record_sha256` is copied from a record whose digest the CONSUMER already
-    recomputed and compared (AA-04). Nothing here computes or invents one: if
-    the consumer did not verify it, the value is absent and the binding says
-    so rather than carrying an unchecked digest.
+    When an actual snapshot is supplied, this independently verifies the
+    source checksum and complete economic identity before retaining evidence.
+    Without a snapshot this is an evidence builder, not a qualification:
+    the shared replay validator still requires a complete matching snapshot.
+    A caller-controlled `digest_verified` flag never substitutes for proof.
 
     RE-AUDIT -- THE EVIDENCE TRAVELS WITH THE DIGEST
         A digest is a claim ABOUT some bytes, and those bytes lived in the
@@ -171,6 +172,13 @@ def source_binding_for(record: dict, *, contract_id: str,
         it answers does.
     """
     record = record if isinstance(record, dict) else {}
+    if snapshot is not None:
+        from alpha_settlement_validation import validate_source_snapshot
+        valid, reason = validate_source_snapshot(record, snapshot)
+        if not valid or snapshot.contract_id != contract_id or \
+                snapshot.market_snapshot_id != market_snapshot_id:
+            raise ValueError(f"source/snapshot binding refused: {reason}")
+        digest_verified = True
     digest = str(record.get("record_sha256") or "")
     evidence = canonical_content(record) if record else {}
     return {
@@ -234,6 +242,7 @@ class AlphaShadowService:
         self._pending_observations = []       # [(due_ts, prediction_id, s)]
         self._last_duplicate_total = 0
         self.health = {}
+        self.consumer.terminal_validator = self._terminal_processed_valid
 
     # ── startup ─────────────────────────────────────────────────────────
     def startup_report(self) -> dict:
@@ -272,7 +281,9 @@ class AlphaShadowService:
             "openai_configured": self._configured("openai"),
             "pricing_valid": bool(priced) and all(
                 self._priced(name) for name in ("grok", "gemini", "openai")),
-            "budget_available": not bool(budget.get("exhausted")),
+            "budget_available": not bool(budget.get("exhausted") or
+                                         budget.get("error") or
+                                         budget.get("accounting_uncertain")),
             "broker_credentials_present": False,
             "capital_authority": False,
             "execution_imports": len(loaded_execution_modules()),
@@ -301,7 +312,11 @@ class AlphaShadowService:
         self.telemetry.incr("cycles")
         summary = {"analyzed": [], "deferred": [], "invalidated": 0,
                    "observations": 0}
+        reconciliation = self.reconcile_processed()
+        summary["reconciliation"] = reconciliation
         try:
+            if reconciliation.get("error") or reconciliation.get("blocked"):
+                raise RuntimeError("processed/prediction reconciliation unavailable")
             pending = self.consumer.pending(limit=limit)
         except Exception as e:                                # noqa: BLE001
             self.telemetry.record_error(f"consume: {type(e).__name__}: {e}")
@@ -350,65 +365,92 @@ class AlphaShadowService:
         return source_binding_for(
             record, contract_id=snapshot.contract_id,
             market_snapshot_id=snapshot.market_snapshot_id,
-            digest_verified=verified)
+            digest_verified=verified, snapshot=snapshot)
+
+    def _terminal_processed_valid(self, snapshot_id, row) -> bool:
+        """Check the exact identity again at the terminal-skip boundary."""
+        if row.get("status") != STATUS_ANALYZED:
+            return True
+        committed = self.ledger.committed_prediction(snapshot_id)
+        if committed is None or committed.get("state") in NON_TERMINAL_STATES:
+            raise RuntimeError("terminal processed row lacks a completed durable prediction")
+        if row.get("prediction_id") != committed.get("prediction_id") or \
+                row.get("contract_id") != committed.get("contract_id"):
+            raise RuntimeError("terminal processed identity changed after reconciliation")
+        return True
 
     def reconcile_processed(self) -> dict:
-        """AA-13 restart reconciliation. Read-only; appends nothing.
+        """Reconcile exact durable identities before every consumer poll.
 
-        A processed row saying ANALYZED is only believable if the prediction
-        it names is actually in the ledger. A crash between the prediction
-        append and the acknowledgement -- or the reverse order on a filesystem
-        that reordered them -- leaves the two disagreeing, and the disagreement
-        is the thing worth surfacing: it is the difference between "we already
-        paid for this analysis" and "we lost it".
-
-        Returns the mismatches instead of repairing them. Rewriting either
-        ledger to make them agree is exactly the retroactive edit this
-        subsystem forbids; an operator decides what to do.
+        Repairs are new processed events; prediction and processed history
+        are never rewritten. A terminal row with no committed counterpart is
+        quarantined as a persistent, nonterminal reconciliation obligation.
+        The cycle refuses dispatch until that obligation can be resolved.
         """
-        orphans, unacknowledged = [], []
+        report = {"checked": 0, "analyzed_without_prediction": [],
+                  "prepared_without_acknowledgement": [], "repaired": [],
+                  "blocked": False}
         try:
+            # Both accessors synchronize under their own append lock and
+            # return one stable generation. Reads are sequential, so each
+            # candidate is checked again at the actual skip boundary below.
             rows = self.consumer.store._load()
-        except Exception as e:                                # noqa: BLE001
-            return {"checked": 0, "error": f"{type(e).__name__}: {e}",
-                    "analyzed_without_prediction": [],
-                    "prepared_without_acknowledgement": []}
-        for snapshot_id, row in rows.items():
-            if row.get("status") != STATUS_ANALYZED:
-                continue
-            try:
-                if not self.ledger.prediction_is_committed(snapshot_id):
-                    orphans.append({"market_snapshot_id": snapshot_id,
-                                    "prediction_id": row.get("prediction_id")})
-            except Exception:                                 # noqa: BLE001
-                continue
-        try:
+            committed = self.ledger.committed_predictions()
+            report["checked"] = len(rows)
+            for sid, row in rows.items():
+                orphan = str(row.get("detail", "")).startswith("reconcile_orphan:")
+                if row.get("status") != STATUS_ANALYZED and not orphan:
+                    continue
+                prediction = committed.get(sid)
+                if prediction is None:
+                    report["analyzed_without_prediction"].append({
+                        "market_snapshot_id": sid,
+                        "prediction_id": row.get("prediction_id")})
+                    report["blocked"] = True
+                    if not orphan:
+                        self.consumer.store.mark(
+                            sid, STATUS_DEFERRED,
+                            contract_id=row.get("contract_id", ""),
+                            detail="reconcile_orphan: no exact durable prediction",
+                            prediction_id="")
+                    continue
+                nonterminal = prediction.get("state") in NON_TERMINAL_STATES
+                mismatch = row.get("prediction_id") != prediction.get("prediction_id") or \
+                    row.get("contract_id") != prediction.get("contract_id")
+                if mismatch:
+                    report["analyzed_without_prediction"].append({
+                        "market_snapshot_id": sid,
+                        "prediction_id": row.get("prediction_id")})
+                if mismatch or orphan or nonterminal:
+                    self.consumer.store.mark(
+                        sid, STATUS_DEFERRED if nonterminal else STATUS_ANALYZED,
+                        contract_id=prediction.get("contract_id", ""),
+                        prediction_id=prediction.get("prediction_id", ""),
+                        detail=("legacy_budget_refusal_retry" if nonterminal
+                                else "reconciled_exact_committed_prediction"))
+                    report["repaired"].append(sid)
             for prepared in self.ledger.rows():
                 if prepared.get("kind") != "PREPARE":
                     continue
                 sid = prepared.get("market_snapshot_id")
-                if self.ledger.prediction_is_committed(sid):
+                if sid in committed:
                     continue
-                # RA-10 made a spend refusal record NO prediction row, which
-                # is right -- nothing was analysed -- and it means an
-                # announced-but-uncommitted analysis is now the ORDINARY
-                # shape of a deferral as well as the shape of a loss. The
-                # processed status is what tells those apart, so it travels
-                # with the entry rather than leaving an operator to guess.
-                unacknowledged.append({
+                report["prepared_without_acknowledgement"].append({
                     "market_snapshot_id": sid,
                     "contract_id": prepared.get("contract_id"),
                     "processed_status": (rows.get(sid) or {}).get("status"),
                     "processed_detail": (rows.get(sid) or {}).get("detail")})
-        except Exception:                                     # noqa: BLE001
-            pass
-        if orphans:
+            # Do not trust a successful first read when metadata fails or
+            # another writer changes a terminal identity before pending().
+            self.consumer.store._load()
+        except Exception as exc:                              # noqa: BLE001
+            report["error"] = f"{type(exc).__name__}: {exc}"
+            report["blocked"] = True
+            self.telemetry.record_error("reconcile: " + report["error"])
+        if report["analyzed_without_prediction"]:
             self.telemetry.record_error(
-                f"reconcile: {len(orphans)} snapshot(s) marked ANALYZED with "
-                f"no committed prediction")
-        return {"checked": len(rows),
-                "analyzed_without_prediction": orphans,
-                "prepared_without_acknowledgement": unacknowledged}
+                "reconcile: processed acknowledgement did not name its exact durable prediction")
+        return report
 
     def _acknowledge_recovered(self, snapshot, prediction) -> dict:
         """A prediction that was already durably committed (correction 7).
@@ -444,6 +486,7 @@ class AlphaShadowService:
                 f"{snapshot.contract_id} is {state}, which means no provider "
                 f"was ever asked; it is acknowledged DEFERRED, not ANALYZED, "
                 f"so the observation is retried rather than discarded")
+        acknowledged = False
         try:
             self.consumer.store.mark(
                 snapshot.market_snapshot_id,
@@ -452,6 +495,7 @@ class AlphaShadowService:
                 detail=(f"recovered_non_terminal: {state}" if non_terminal
                         else "recovered_committed_prediction"),
                 prediction_id=prediction_id)
+            acknowledged = True
         except RuntimeError as e:
             self.telemetry.record_error(str(e))
             log.error(f"[ALPHA_SERVICE] {e}")
@@ -462,7 +506,7 @@ class AlphaShadowService:
                                  f"ever asked" if non_terminal else ""),
                 "p_meta": prediction.get("p_meta"),
                 "shadow_net_edge": prediction.get("shadow_net_edge"),
-                "recovered": True, "deferred": non_terminal}
+                "recovered": True, "deferred": non_terminal or not acknowledged}
 
     def _defer_without_dispatch(self, snapshot, reason: str,
                                 state: str = "DEFERRED") -> dict:
@@ -492,8 +536,27 @@ class AlphaShadowService:
                 "shadow_net_edge": None, "deferred": True}
 
     def _analyze_one(self, snapshot, record) -> dict:
-        """One snapshot through the gateway, with the budget gate attached."""
+        """Serialize the full research transaction across service writers.
+
+        Ledger append locking alone cannot protect the interval after paid
+        provider usage and before prediction publication. A separate process
+        lock covers recovery, dispatch, commit and acknowledgement together;
+        the inner ledger locks never reenter this lock. Process death releases
+        it automatically, and timeout remains a retryable refusal.
+        """
+        from durable_append import exclusive_lock
+        lock_path = os.path.realpath(self.ledger.log.path) + ".analysis"
+        try:
+            with exclusive_lock(lock_path, timeout=10.0):
+                return self._analyze_one_locked(snapshot, record)
+        except (OSError, TimeoutError) as exc:
+            self.telemetry.record_error(f"analysis_writer_lock: {type(exc).__name__}")
+            return self._defer_without_dispatch(snapshot, "analysis_writer_unavailable")
+
+    def _analyze_one_locked(self, snapshot, record) -> dict:
+        """One snapshot through the gateway with both transaction gates held."""
         analysis_spend = {"usd": 0.0}
+        reservations = {}
 
         # The worst case is priced against the REAL prompt, so the refusal
         # is made on the largest amount this call could actually cost.
@@ -504,11 +567,13 @@ class AlphaShadowService:
             prompt_chars = None
 
         def gate(provider):
-            verdict = self.budget.check(
+            verdict = self.budget.reserve(
                 provider.name, provider.model,
                 analysis_spent_usd=analysis_spend["usd"],
-                prompt_chars=prompt_chars)
+                prompt_chars=prompt_chars,
+                reservation_group=snapshot.market_snapshot_id)
             if verdict["allowed"]:
+                reservations[(provider.name, provider.model)] = verdict.get("reservation_id")
                 analysis_spend["usd"] += verdict["estimated_cost_usd"]
             else:
                 log.warning(f"[ALPHA_BUDGET] {provider.name}/{provider.model} "
@@ -522,9 +587,14 @@ class AlphaShadowService:
             if cost.get("provider"):
                 self.budget.record_actual({**cost,
                                            "outcome": "VALID" if sig.valid
-                                           else (sig.rejected_reason or "")})
+                                           else (sig.rejected_reason or "")},
+                    reservation_id=reservations.get((sig.provider, sig.model)))
 
-        source_binding = self._source_binding(snapshot, record)
+        try:
+            source_binding = self._source_binding(snapshot, record)
+        except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+            self.telemetry.record_error(f"source_binding: {type(exc).__name__}: {exc}")
+            return self._defer_without_dispatch(snapshot, "source_snapshot_mismatch")
 
         # AA-13 (re-audit), correction 7 -- RECOVER BEFORE YOU RE-DISPATCH.
         #
@@ -545,8 +615,14 @@ class AlphaShadowService:
                 snapshot.market_snapshot_id)
         except Exception as e:                                # noqa: BLE001
             self.telemetry.record_error(f"recover: {type(e).__name__}: {e}")
-        if recovered is not None:
+            return self._defer_without_dispatch(snapshot, "prediction_recovery_uncertain")
+        if recovered is not None and recovered.get("state") not in NON_TERMINAL_STATES:
             return self._acknowledge_recovered(snapshot, recovered)
+        # A historical no-dispatch refusal is audit history, not an economic
+        # result. Ledger uniqueness permits one append-only successor linked
+        # to that exact refusal; a later completed result is recovered above.
+        if recovered is not None:
+            self.telemetry.incr("legacy_budget_attempt_retried")
 
         # AA-13 step 1, AA-15, correction 8 -- PREPARE IS A PRECONDITION.
         #
@@ -557,13 +633,10 @@ class AlphaShadowService:
         # on providers is guaranteed unrecoverable BEFORE it is incurred.
         # Nothing is dispatched without a durable PREPARE.
         #
-        # RA-08: and it is a precondition on EVERY dispatch, including a
-        # retry. `prepare()` used to return a PREPARE row it had merely READ,
-        # so an append whose fsync had failed satisfied the precondition on
-        # the next poll and every provider was paid against a ledger that was
-        # still not writable. The receipt is what is checked now, and the
-        # check is a fresh read of the ledger rather than the return value of
-        # the call that was supposed to produce it.
+        # V4-RA-09: durability is a precondition on EVERY dispatch. The
+        # ledger validates the exact PREPARE/receipt binding and performs a
+        # fresh file and directory synchronization barrier under its lock.
+        # Readable PREPARE and PREPARE_COMMIT bytes alone confer no authority.
         from alpha_ledger import analysis_identity
         try:
             self.ledger.prepare(
@@ -574,8 +647,8 @@ class AlphaShadowService:
             if not self.ledger.prepare_is_durable(
                     analysis_identity(snapshot.market_snapshot_id)):
                 raise RuntimeError(
-                    "the PREPARE row left no durable receipt, so this "
-                    "analysis is not announced and must not be dispatched")
+                    "the PREPARE identity and synchronization barrier are "
+                    "not confirmed; this analysis must not be dispatched")
         except Exception as e:                                # noqa: BLE001
             self.telemetry.record_error(f"prepare: {type(e).__name__}: {e}")
             self.telemetry.incr("prepare_not_durable")
@@ -643,18 +716,10 @@ class AlphaShadowService:
         # reason to defer is a prediction that is not durably committed.
         deferred = False
 
-        # AA-13 step 3. The TERMINAL acknowledgement is published only after
-        # the prediction is confirmed durable, and the confirmation is a fresh
-        # read of the ledger rather than the in-process "persisted" flag --
-        # the flag says the append call returned, the read says the bytes are
-        # findable. If the prediction is NOT committed, the snapshot is marked
-        # DEFERRED (non-terminal) so a later poll retries it, instead of
-        # ANALYZED, which would lose the observation permanently.
-        #
-        # RA-07: the confirmation also YIELDS THE IDENTITY. Reading back the
-        # committed row and using its `prediction_id` is what makes the
-        # acknowledgement and the scheduled observations name a row that
-        # exists, whatever id the gateway happened to generate in memory.
+        # V4-RA-08: terminal acknowledgement requires the exact committed
+        # row from a successful locked synchronization barrier. A read-back,
+        # an in-memory persisted flag, or a visible COMMIT cannot establish
+        # durability. The returned durable identity also binds observations.
         committed_row = None
         try:
             committed_row = self.ledger.committed_prediction(
@@ -692,13 +757,14 @@ class AlphaShadowService:
                 # from the ledger row, not from memory.
                 prediction_id=durable_id if committed else "")
         except RuntimeError as e:
+            terminal = False
             self.telemetry.record_error(str(e))
             log.error(f"[ALPHA_SERVICE] {e}")
 
         if terminal:
             self._schedule_observations(durable_id)
         deferred = not terminal
-        return {"prediction_id": durable_id or opportunity["prediction_id"],
+        return {"prediction_id": durable_id,
                 "contract_id": snapshot.contract_id,
                 "state": opportunity["state"],
                 "p_meta": opportunity["p_meta"],

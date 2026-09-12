@@ -17,6 +17,7 @@ import threading
 from datetime import datetime, timezone
 
 from config import CFG, _p
+from alpha_persistence_paths import register_persistence_path
 
 log = logging.getLogger("ALPHA")
 
@@ -56,6 +57,7 @@ COUNTERS = (
     "prepare_not_durable",
     "budget_refused_before_dispatch",
     "recovered_non_terminal",
+    "legacy_budget_attempt_retried",
     "cycles",
     "errors",
 )
@@ -77,6 +79,16 @@ class Telemetry:
         #: answers is invisible in a combined success rate.
         self.by_provider = {}
         self.last_error = None
+
+    @property
+    def path(self):
+        return self._path
+
+    @path.setter
+    def path(self, value):
+        # Register both initial and subsequently assigned runtime paths.
+        self._path = register_persistence_path(value, "telemetry ledger")
+        register_persistence_path(self._path + ".tmp", "telemetry in-progress snapshot")
 
     def incr(self, name: str, by: int = 1) -> None:
         with self._lock:

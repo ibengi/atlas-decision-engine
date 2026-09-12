@@ -185,7 +185,7 @@ class TheAutomaticFeedIntroducesNoPath(AlphaCase):
         # `tests/test_research_feed_boundary.py`; none is an Alpha module.
         self.assertEqual(imported,
                          {"datetime", "logging", "os", "config",
-                          "candidate_contract", "research_spool"})
+                          "candidate_contract", "research_spool", "source_identity"})
         self.assertFalse([m for m in imported if m.startswith("alpha_")])
         self.assertFalse(imported & FORBIDDEN_MODULES)
 

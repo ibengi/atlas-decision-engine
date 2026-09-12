@@ -251,12 +251,15 @@ class UsageIsStoredWellEnoughToRecompute(BudgetCase):
 
     def test_actual_spend_is_recorded_after_the_call(self):
         guard = self.guard()
+        reservation = guard.reserve("grok", "grok")
+        self.assertTrue(reservation["allowed"])
         guard.record_actual({"provider": "grok", "model": "grok",
                              "input_tokens": 1000, "output_tokens": 500,
                              "api_cost_usd": 0.0105, "cost_priced": True,
                              "pricing_version": "test-1", "latency_ms": 900,
-                             "outcome": "VALID"})
-        rows = guard.ledger.rows()
+                             "outcome": "VALID"},
+                            reservation_id=reservation["reservation_id"])
+        rows = [r for r in guard.ledger.rows() if r.get("event") == "USAGE"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["input_tokens"], 1000)
         self.assertEqual(rows[0]["pricing_version"], "test-1")

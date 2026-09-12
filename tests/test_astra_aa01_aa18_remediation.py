@@ -867,8 +867,8 @@ class AA11_SpoolLimitsFailUnderFilesystemFaults(RemediationCase):
     def test_startup_cleanup_removes_only_our_own_stale_temp_files(self):
         spool = self.spool()
         os.makedirs(spool.directory, exist_ok=True)
-        stale = os.path.join(spool.directory, "old.json.partial")
-        fresh = os.path.join(spool.directory, "new.json.partial")
+        stale = os.path.join(spool.directory, "old.2147483647.partial")
+        fresh = os.path.join(spool.directory, f"new.{os.getpid()}.partial")
         for path in (stale, fresh):
             with open(path, "wb") as fh:
                 fh.write(b"{}")
@@ -1059,13 +1059,16 @@ class AA13_PredictionCommitVersusProcessedAck(RemediationCase):
                          "treated as finished")
 
     def test_restart_reconciliation_reports_a_disagreement(self):
-        """An ANALYZED mark whose prediction is not in the ledger is surfaced,
-        not repaired: rewriting either side to make them agree is exactly the
-        retroactive edit this subsystem forbids."""
+        """An orphan is surfaced and quarantined by a NEW processed event.
+
+        V5 preserves every historical byte while refusing to continue treating
+        an unsupported terminal mark as an authoritative acknowledgement.
+        """
         from alpha_service import AlphaShadowService
         store = ProcessedStore(path=os.path.join(self._tmp, "proc13b.jsonl"))
         ledger = self.ledger()
         store.mark("snap-orphan", STATUS_ANALYZED, prediction_id="p-gone")
+        before = open(store.path, "rb").read()
         service = AlphaShadowService.__new__(AlphaShadowService)
         service.ledger = ledger
         service.consumer = type("C", (), {"store": store})()
@@ -1074,8 +1077,9 @@ class AA13_PredictionCommitVersusProcessedAck(RemediationCase):
         self.assertEqual(
             [row["market_snapshot_id"]
              for row in report["analyzed_without_prediction"]], ["snap-orphan"])
-        # Nothing was rewritten.
-        self.assertEqual(store.status("snap-orphan"), STATUS_ANALYZED)
+        self.assertTrue(open(store.path, "rb").read().startswith(before))
+        self.assertEqual(store.status("snap-orphan"), "DEFERRED")
+        self.assertTrue(report["blocked"])
 
     def test_reconciliation_reports_a_prepare_with_no_prediction(self):
         from alpha_service import AlphaShadowService
@@ -1169,26 +1173,10 @@ class AA14_MultiWriterRaces(RemediationCase):
         # carry cannot be re-derived from anything, so since RA-12 it lands in
         # the evidence-unverified quarantine -- which would leave this case
         # asserting on a conflict that never got the chance to happen.
-        record = valid_record()
-        binding = {"contract_id": "KX-C", "market_snapshot_id": "snap-c",
-                   "record_sha256": record["record_sha256"],
-                   "environment": "demo",
-                   "contract_schema": contract.FEED_SCHEMA,
-                   "source_evidence": contract.canonical_content(record)}
-        ledger.record_prediction({"prediction_id": "p1",
-                                  "market_snapshot_id": "snap-c",
-                                  "contract_id": "KX-C",
-                                  "source_binding": dict(binding)})
-        # Complete binding and a qualified source: since the re-audit those
-        # are preconditions, and without them this would exercise the
-        # quarantine path instead of the conflict path it names.
-        settlement = {"prediction_id": "p1", "contract_id": "KX-C",
-                      "market_snapshot_id": "snap-c",
-                      "source_record_sha256": record["record_sha256"],
-                      "environment": "demo",
-                      "contract_schema": contract.FEED_SCHEMA,
-                      "resolved_at": "2026-09-12T20:10:00+00:00",
-                      "settlement_evidence_id": "cf-rti-2026-09-12"}
+        from _settlement import qualified_fixture
+        record, snapshot, prediction, settlement = qualified_fixture(
+            contract_id="KX-C", environment="demo")
+        ledger.record_prediction(prediction)
         trusted = ["feed-a", "feed-b"]
         ingest_settlements(ledger, [dict(settlement, outcome=1,
                                          source="feed-a")],
@@ -1241,28 +1229,14 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
     def setUp(self):
         super().setUp()
         self.path = os.path.join(self._tmp, "ledger15.jsonl")
-        self.record = valid_record()
+        from _settlement import qualified_fixture
+        self.record, self.observation, self.prediction, self.settlement_row = qualified_fixture(
+            contract_id="KXBTCD-26SEP1200-T60000", source="trusted-feed",
+            environment="demo")
 
     def ledger_with_binding(self):
         ledger = AlphaLedger(path=self.path)
-        ledger.record_prediction({
-            "prediction_id": "p1",
-            "market_snapshot_id": "snap-15",
-            "contract_id": "KXBTCD-26SEP1200-T60000",
-            "source_binding": {
-                "record_sha256": self.record["record_sha256"],
-                "digest_verified": True,
-                "contract_id": "KXBTCD-26SEP1200-T60000",
-                "market_snapshot_id": "snap-15",
-                "contract_schema": contract.FEED_SCHEMA,
-                "environment": "demo",
-                # RA-12: the RETAINED evidence, because production retains it
-                # and settlement qualification now recomputes the digest from
-                # it. A fixture without it would exercise the
-                # evidence-unverified quarantine rather than the mismatch
-                # path each case below names.
-                "source_evidence": contract.canonical_content(self.record)},
-        })
+        ledger.record_prediction(dict(self.prediction))
         return ledger
 
     #: Since the re-audit a settlement must carry the COMPLETE required
@@ -1276,14 +1250,7 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
         # -- environment and contract version as well -- and made the
         # resolution instant and the evidence identity required too. The
         # fixture carries all of them, because production does.
-        row = {"prediction_id": "p1", "outcome": 1, "source": "trusted-feed",
-               "contract_id": "KXBTCD-26SEP1200-T60000",
-               "market_snapshot_id": "snap-15",
-               "source_record_sha256": self.record["record_sha256"],
-               "environment": "demo",
-               "contract_schema": contract.FEED_SCHEMA,
-               "resolved_at": "2026-09-12T20:10:00+00:00",
-               "settlement_evidence_id": "cf-rti-2026-09-12"}
+        row = dict(self.settlement_row)
         row.update(over)
         return row
 
@@ -1315,17 +1282,7 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
             with self.subTest(field=field):
                 ledger = AlphaLedger(
                     path=os.path.join(self._tmp, f"l15-{field}.jsonl"))
-                ledger.record_prediction({
-                    "prediction_id": "p1", "market_snapshot_id": "snap-15",
-                    "contract_id": "KXBTCD-26SEP1200-T60000",
-                    "source_binding": {
-                        "record_sha256": self.record["record_sha256"],
-                        "contract_id": "KXBTCD-26SEP1200-T60000",
-                        "market_snapshot_id": "snap-15",
-                        "contract_schema": contract.FEED_SCHEMA,
-                        "environment": "demo",
-                        "source_evidence": contract.canonical_content(
-                            self.record)}})
+                ledger.record_prediction(dict(self.prediction))
                 result = self.ingest(
                     ledger, [self.settlement(**{field: wrong})])
                 self.assertEqual(result["appended"], 0)
@@ -1345,17 +1302,7 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
             with self.subTest(value=repr(bad)):
                 ledger = AlphaLedger(
                     path=os.path.join(self._tmp, f"l15t-{bad!r}.jsonl"))
-                ledger.record_prediction({
-                    "prediction_id": "p1", "market_snapshot_id": "snap-15",
-                    "contract_id": "KXBTCD-26SEP1200-T60000",
-                    "source_binding": {
-                        "record_sha256": self.record["record_sha256"],
-                        "contract_id": "KXBTCD-26SEP1200-T60000",
-                        "market_snapshot_id": "snap-15",
-                        "contract_schema": contract.FEED_SCHEMA,
-                        "environment": "demo",
-                        "source_evidence": contract.canonical_content(
-                            self.record)}})
+                ledger.record_prediction(dict(self.prediction))
                 result = self.ingest(
                     ledger, [self.settlement(resolved_at=bad)])
                 self.assertEqual(result["appended"], 0, bad)
@@ -1375,11 +1322,11 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
         ledger = self.ledger_with_binding()
         result = self.ingest(ledger, [self.settlement(
             contract_id="KXBTCD-26SEP1200-T60000",
-            market_snapshot_id="snap-15",
+            market_snapshot_id=self.observation.market_snapshot_id,
             source_record_sha256=self.record["record_sha256"],
             contract_schema=contract.FEED_SCHEMA,
             environment="demo",
-            resolved_at="2026-09-12T20:10:00+00:00",
+            resolved_at=self.settlement_row["resolved_at"],
             settlement_evidence_id="cf-rti-2026-09-12")])
         self.assertEqual(result["appended"], 1, result["rejected"])
         row = ledger.find_resolution("p1")

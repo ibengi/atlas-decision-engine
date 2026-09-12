@@ -63,7 +63,7 @@ from candidate_contract import (ContractError, FEED_SCHEMA,
 from alpha_snapshot import SnapshotError, build_snapshot
 from config import CFG, _p
 from research_feed import spool_dir
-from durable_append import serialized_append
+from durable_append import serialized_append, exclusive_lock, sync_path
 
 log = logging.getLogger("ALPHA")
 
@@ -145,54 +145,76 @@ class ProcessedStore:
         self._generation = None
 
     def _current_generation(self):
-        """What the file looks like from outside. Cheap, and enough.
-
-        `(size, mtime_ns, inode)` changes on every append, on truncation, and
-        on replacement. It is not a cryptographic identity and does not need
-        to be: the question it answers is "did anything happen to this file
-        since I last read it", and a false MISS only costs a re-read.
-        """
+        """Distinguish proven absence from unavailable metadata (V4-RA-13)."""
         try:
             st = os.stat(self.path)
-        except OSError:
+        except FileNotFoundError:
             return None
-        return (st.st_size, st.st_mtime_ns, st.st_ino)
+        except OSError as exc:
+            raise RuntimeError("processed metadata unavailable") from exc
+        return (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
 
     def _load(self) -> dict:
-        generation = self._current_generation()
-        if self._cache is not None and generation == self._generation:
-            return self._cache
-        out = {}
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, encoding="utf-8") as fh:
-                    lines = fh.read().splitlines()
-            except OSError as e:
-                raise RuntimeError(f"processed store unreadable: {e}")
-            for i, line in enumerate(lines):
-                if not line.strip():
-                    continue
+        """Read a stable, synchronized generation under the append lock.
+
+        A readable terminal acknowledgement is not yet durable. Every read
+        that can suppress work performs the same file/directory barrier as
+        an append; retry and restart cannot turn a failed fsync into success.
+        Metadata failures invalidate the cache and never mean an empty file.
+        """
+        try:
+            with exclusive_lock(self.path):
+                generation = self._current_generation()
                 try:
-                    row = json.loads(line)
-                except ValueError:
-                    # AA-12: REPORTED, never silently treated as the end of
-                    # the file. A torn last line is the durable trace of a
-                    # crash mid-append, and a store that swallows it cannot
-                    # tell "nothing more was written" from "something was
-                    # written and lost".
-                    where = "last" if i == len(lines) - 1 else f"line {i + 1}"
-                    log.error(f"[ALPHA_CONSUMER] torn or unparsable processed "
-                              f"row ({where}) in {self.path} -- PRESERVED and "
-                              f"skipped, NOT treated as end of file")
-                    continue
-                if isinstance(row, dict) and row.get("market_snapshot_id"):
-                    # Later rows supersede earlier ones for the same id: a
-                    # DEFERRED snapshot that is later ANALYZED must read as
-                    # analysed.
-                    out[row["market_snapshot_id"]] = row
-        self._cache = out
-        self._generation = generation
-        return out
+                    with open(self.path, encoding="utf-8") as fh:
+                        st = os.fstat(fh.fileno())
+                        opened = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
+                        if generation is None or opened != generation:
+                            raise RuntimeError("processed metadata changed before read")
+                        lines = fh.read().splitlines()
+                        st = os.fstat(fh.fileno())
+                        after = (st.st_size, st.st_mtime_ns, st.st_ino, st.st_dev)
+                except FileNotFoundError as exc:
+                    if generation is not None or getattr(self, "_observed_file", False):
+                        raise RuntimeError("processed history disappeared") from exc
+                    # Recheck absence inside the same lock. A transient failed
+                    # lookup must not bless an actually existing ledger.
+                    if self._current_generation() is not None:
+                        raise RuntimeError("processed absence was inconsistent")
+                    self._cache, self._generation = {}, None
+                    return self._cache
+                if after != generation or self._current_generation() != generation:
+                    raise RuntimeError("processed metadata changed during read")
+                self._observed_file = True
+                if not sync_path(self.path):
+                    raise RuntimeError("processed history disappeared at barrier")
+                if self._current_generation() != generation:
+                    raise RuntimeError("processed metadata changed after barrier")
+                if self._cache is not None and generation == self._generation:
+                    return {key: dict(row) for key, row in self._cache.items()}
+                out = {}
+                for i, line in enumerate(lines):
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except ValueError:
+                        where = "last" if i == len(lines) - 1 else f"line {i + 1}"
+                        log.error(f"[ALPHA_CONSUMER] torn or unparsable processed "
+                                  f"row ({where}) in {self.path} -- PRESERVED and "
+                                  f"skipped, NOT treated as end of file")
+                        continue
+                    if isinstance(row, dict) and row.get("market_snapshot_id"):
+                        out[row["market_snapshot_id"]] = row
+                self._cache, self._generation = out, generation
+                return {key: dict(row) for key, row in out.items()}
+        except (OSError, TimeoutError, RuntimeError) as exc:
+            self._cache, self._generation = None, None
+            raise RuntimeError(f"processed state durability unavailable: {exc}") from exc
+
+    def entry(self, snapshot_id: str):
+        row = self._load().get(snapshot_id)
+        return dict(row) if row is not None else None
 
     def status(self, snapshot_id: str):
         return (self._load().get(snapshot_id) or {}).get("status")
@@ -210,6 +232,7 @@ class ProcessedStore:
                           ensure_ascii=False, default=str) + "\n"
         try:
             with serialized_append(self.path) as append:
+                self._observed_file = True
                 append(line)
                 # RA-09: inside the lock, and an INVALIDATION rather than a
                 # patch. While this lock is held no other writer can append,
@@ -566,7 +589,15 @@ class SpoolConsumer:
             self._safe_mark(record, STATUS_REJECTED, str(e))
             return None
         sid = snapshot.market_snapshot_id
-        if sid in seen_now or self.store.seen(sid):
+        entry = self.store.entry(sid)
+        terminal = bool(entry and entry.get("status") in TERMINAL_STATUSES)
+        validator = getattr(self, "terminal_validator", None)
+        if terminal and validator is not None:
+            # Recheck the exact prediction at the moment deduplication would
+            # suppress work. An earlier cycle reconciliation cannot prove a
+            # later read stayed healthy (V4-RA-11).
+            terminal = validator(sid, entry)
+        if sid in seen_now or terminal:
             self.stats["duplicates"] += 1
             return None
         seen_now.add(sid)

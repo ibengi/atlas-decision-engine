@@ -747,10 +747,14 @@ class RA06_TheBudgetLedgerBypassedTheDurableProtocol(AlphaCase):
         pricing_path = os.path.join(self._tmp, "pricing.json")
         write_pricing(pricing_path)
         guard = BudgetGuard(PricingTable(pricing_path), self.ledger())
-        with patch.object(type(guard.ledger), "record",
-                          side_effect=OSError(errno.EIO, "no space")):
-            guard.record_actual({"provider": "grok", "model": "grok",
-                                 "api_cost_usd": 5.0, "cost_priced": True})
+        reservation = guard.reserve("grok", "grok")
+        self.assertTrue(reservation["allowed"])
+        with patch("durable_append.write_all",
+                   side_effect=OSError(errno.EIO, "no space")):
+            recorded = guard.record_actual(
+                {"provider": "grok", "model": "grok", "api_cost_usd": 5.0,
+                 "cost_priced": True}, reservation_id=reservation["reservation_id"])
+        self.assertFalse(recorded["recorded"])
         verdict = guard.check("grok", "grok", prompt_chars=100)
         self.assertFalse(verdict["allowed"],
                          "money was spent, the row could not be written, and "
@@ -837,8 +841,12 @@ class ServiceCase(AlphaCase):
                               "no_bid": 0.54, "no_ask": 0.56})
 
     def record(self):
-        from _candidate import valid_record
-        return valid_record()
+        from _candidate import record_for_snapshot
+        return record_for_snapshot(self._service_snapshot)
+
+    def snapshot(self, **kwargs):
+        self._service_snapshot = super().snapshot(**kwargs)
+        return self._service_snapshot
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1308,7 +1316,7 @@ class RA10_ABudgetRefusalTurnedTerminalOnRecovery(ServiceCase):
         """
         from alpha_consumer import STATUS_DEFERRED
         from alpha_service import STATE_BUDGET_EXHAUSTED
-        service = self.service([_CountingProvider()])
+        service = self.refusing_service()
         snapshot = self.snapshot()
         self.ledger.record_prediction({
             "prediction_id": "pred-legacy-refusal",
@@ -1318,10 +1326,12 @@ class RA10_ABudgetRefusalTurnedTerminalOnRecovery(ServiceCase):
             "state_reason": "every provider was refused before being called",
             "p_meta": None})
 
+        before = open(self.ledger.log.path, "rb").read()
         result = service._analyze_one(snapshot, self.record())
 
-        self.assertTrue(result["recovered"])
+        self.assertEqual(result["state"], STATE_BUDGET_EXHAUSTED)
         self.assertTrue(result["deferred"])
+        self.assertTrue(open(self.ledger.log.path, "rb").read().startswith(before))
         self.assertEqual(self.store.status(snapshot.market_snapshot_id),
                          STATUS_DEFERRED)
         self.assertFalse(self.store.seen(snapshot.market_snapshot_id))
@@ -1381,13 +1391,11 @@ class SettlementCase(AlphaCase):
 
     def committed(self, ledger, *, evidence=True, tampered=False,
                   binding_without=(), snapshot_id="snap-1"):
-        from _candidate import valid_record
-        from alpha_service import source_binding_for
-        record = valid_record()
-        binding = source_binding_for(record,
-                                     contract_id=record["contract_id"],
-                                     market_snapshot_id=snapshot_id,
-                                     digest_verified=True)
+        from _settlement import qualified_fixture
+        record, snapshot, prediction, settlement = qualified_fixture(
+            prediction_id="pred-1")
+        binding = prediction["source_binding"]
+        self._resolution_time = settlement["resolved_at"]
         if not evidence:
             binding["source_evidence"] = {}
         if tampered:
@@ -1397,7 +1405,9 @@ class SettlementCase(AlphaCase):
                   if k not in binding_without}
         ledger.record_prediction({
             "prediction_id": "pred-1",
-            "market_snapshot_id": snapshot_id,
+            "market_snapshot_id": snapshot.market_snapshot_id,
+            "snapshot": snapshot.as_dict(),
+            "prediction_time": prediction["prediction_time"],
             "contract_id": record["contract_id"],
             "source_binding": stored,
             "p_meta": 0.62, "confidence": 0.8,
@@ -1413,7 +1423,7 @@ class SettlementCase(AlphaCase):
             "prediction_id": "pred-1",
             "outcome": 1,
             "source": TRUSTED,
-            "resolved_at": "2026-09-12T12:00:00+00:00",
+            "resolved_at": self._resolution_time,
             "settlement_evidence_id": "kalshi-settlement-2026-09-12-0001",
             "contract_id": binding["contract_id"],
             "market_snapshot_id": binding["market_snapshot_id"],
@@ -1497,7 +1507,7 @@ class RA11_TheRequiredSettlementBindingWasIncomplete(SettlementCase):
         row = ledger.find_resolution("pred-1")
         self.assertTrue(row["binding_verified"])
         self.assertTrue(row["source_trusted"])
-        self.assertEqual(row["resolved_at"], "2026-09-12T12:00:00+00:00")
+        self.assertEqual(row["resolved_at"], self._resolution_time)
         self.assertEqual(row["settlement_evidence_id"],
                          "kalshi-settlement-2026-09-12-0001")
 
@@ -1922,59 +1932,70 @@ class RA15b_TheRunnerDistinguishesBehaviouralKills(unittest.TestCase):
         proc.stdout = stdout
         return proc
 
-    def test_a_real_failure_is_a_behavioural_kill(self):
-        from tools.astra_mutation_probe import _classify
-        status, counts = self._classify(2, "3 failed, 5 passed in 1.20s")
-        self.assertEqual(status, "KILLED")
-        self.assertEqual(counts["failed"], 3)
+    @staticmethod
+    def evidence(returncode, *, passed=False, fixture=False):
+        return {"schema": "astra-mutation-phases-v1", "session_exit": returncode,
+                "collected": 1, "collection_errors": [], "reports": [{
+                    "nodeid": "test_effect.py::test_no_unsafe_append", "when": "call",
+                    "outcome": "passed" if passed else "failed",
+                    "exception": "" if passed else "AssertionError",
+                    "fixture_failure": fixture,
+                    "frames": [{"statement": "assert appended == 0"}]}]}
 
-    def _classify(self, returncode, stdout):
+    def _classify(self, returncode, stdout, evidence=None):
         from tools.astra_mutation_probe import _classify
-        return _classify(self.proc(returncode, stdout))
+        witness = {"node": "test_effect.py::test_no_unsafe_append",
+                   "assertion": "assert appended == 0",
+                   "invariant": "inadmissible evidence cannot append"}
+        return _classify(self.proc(returncode, stdout), evidence, [witness])
+
+    def test_a_real_failure_is_a_behavioural_kill(self):
+        status, detail = self._classify(1, "3 failed, 5 passed in 1.20s",
+                                        self.evidence(1))
+        self.assertEqual(status, "KILLED_BEHAVIORALLY")
+        self.assertEqual(detail["counts"]["failed"], 3)
+        self.assertTrue(detail["semantic_witnesses"])
 
     def test_a_clean_run_is_a_survivor(self):
-        self.assertEqual(self._classify(0, "8 passed in 0.30s")[0], "SURVIVED")
+        self.assertEqual(self._classify(0, "8 passed in 0.30s",
+                                       self.evidence(0, passed=True))[0], "SURVIVED")
 
     def test_a_collection_error_is_not_a_kill(self):
-        status, _ = self._classify(
-            2, "ERROR tests/test_x.py\n1 error in 0.10s")
-        self.assertTrue(status.startswith("INCONCLUSIVE"), status)
+        status, _ = self._classify(2, "ERROR tests/test_x.py\n1 error in 0.10s")
+        self.assertEqual(status, "INCONCLUSIVE_INFRASTRUCTURE")
 
     def test_a_run_where_nothing_ran_is_not_a_kill(self):
         status, _ = self._classify(4, "no tests ran in 0.01s")
-        self.assertTrue(status.startswith("INCONCLUSIVE"), status)
+        self.assertEqual(status, "INCONCLUSIVE_INFRASTRUCTURE")
 
     def test_a_usage_error_with_no_summary_is_not_a_kill(self):
-        status, _ = self._classify(
-            4, "ERROR: not found: tests/test_x.py::Nope")
-        self.assertEqual(status, "INCONCLUSIVE_NO_SUMMARY")
+        status, _ = self._classify(4, "ERROR: not found: tests/test_x.py::Nope")
+        self.assertEqual(status, "INCONCLUSIVE_INFRASTRUCTURE")
 
     def test_setup_errors_alone_are_not_a_kill(self):
-        status, _ = self._classify(1, "2 errors, 4 passed in 0.50s")
-        self.assertEqual(status, "INCONCLUSIVE_ERRORS_ONLY")
+        status, _ = self._classify(1, "2 errors, 4 passed in 0.50s",
+                                   self.evidence(1, fixture=True))
+        self.assertEqual(status, "INCONCLUSIVE_SETUP")
 
     def test_a_failure_alongside_an_error_is_reported_as_such(self):
-        status, _ = self._classify(1, "1 failed, 1 error, 3 passed in 0.50s")
-        self.assertEqual(status, "KILLED_WITH_ERRORS")
+        evidence = self.evidence(1)
+        evidence["reports"].extend(self.evidence(1, fixture=True)["reports"])
+        status, _ = self._classify(1, "1 failed, 1 error, 3 passed in 0.50s", evidence)
+        self.assertEqual(status, "INCONCLUSIVE_SETUP")
 
     def test_a_subtest_failure_counts(self):
-        status, _ = self._classify(
-            1, "1 failed, 4 passed, 2 subtests failed in 0.50s")
-        self.assertEqual(status, "KILLED")
+        status, detail = self._classify(
+            1, "1 failed, 4 passed, 2 subtests failed in 0.50s", self.evidence(1))
+        self.assertEqual(status, "KILLED_BEHAVIORALLY")
+        self.assertEqual(detail["counts"]["subtests failed"], 2)
 
     def test_only_behavioural_kills_count_as_killed_in_the_summary(self):
-        """Static: `main` must not fall back to "not SURVIVED means killed"."""
-        import ast
-        with open(os.path.join(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__))), "tools",
-                "astra_mutation_probe.py"), encoding="utf-8") as fh:
-            tree = ast.parse(fh.read())
-        main = next(n for n in ast.walk(tree)
-                    if isinstance(n, ast.FunctionDef) and n.name == "main")
-        text = ast.unparse(main)
-        self.assertIn("surviving_effective_safety_mutations", text)
-        self.assertIn("startswith('KILLED')", text)
-        self.assertIn("inconclusive", text)
+        from tools.astra_mutation_probe import summarize
+        summary = summarize([{"status": status} for status in (
+            "KILLED_BEHAVIORALLY", "DIAGNOSTIC_ONLY", "INCONCLUSIVE_SETUP")])
+        self.assertEqual(summary["behavioural_kills"], 1)
+        self.assertEqual(summary["kills_with_setup_errors"], 0)
+        self.assertFalse(summary["gate_passed"])
 
     def test_every_ra_finding_has_a_mutation(self):
         from tools.astra_mutation_probe import MUTATIONS
@@ -2074,4 +2095,3 @@ class RA_HostedCITargetsThisBranch(unittest.TestCase):
         self.assertIn("summary['surviving_effective_safety_mutations'] == 0",
                       text)
         self.assertIn("summary['inconclusive'] == 0", text)
-

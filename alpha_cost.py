@@ -37,10 +37,11 @@ import math
 import os
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 
 from config import CFG, _p
-from durable_append import serialized_append
+from durable_append import serialized_append, sync_path
 
 log = logging.getLogger("ALPHA")
 
@@ -62,8 +63,11 @@ def _iso(ts: float = None) -> str:
 
 
 def _finite(value):
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(float(value)))
+    try:
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(float(value)))
+    except (OverflowError, ValueError, TypeError):
+        return False
 
 
 def _parse_utc(value):
@@ -370,121 +374,204 @@ def budgeted_cost(cost_row: dict) -> float:
     return float(value) if _finite(value) else 0.0
 
 
+BUDGET_EVENT_SCHEMA = "atlas-alpha-budget-v1"
+
+
+def _budget_text(value):
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_budget_row(row):
+    """Validate before date filtering. Legacy usage remains immutable/readable.
+
+    Refunds/corrections have no schema here and cannot silently reduce spend.
+    """
+    if not isinstance(row, dict):
+        raise RuntimeError("budget row must be an object")
+    if not _finite(row.get("ts")) or row["ts"] < 0:
+        raise RuntimeError("budget row has an invalid timestamp")
+    try:
+        datetime.fromtimestamp(row["ts"], timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        raise RuntimeError("budget timestamp is outside the supported UTC range")
+    if not _budget_text(row.get("provider")):
+        raise RuntimeError("budget row has no provider identity")
+    if not _finite(row.get("api_cost_usd")) or row["api_cost_usd"] < 0:
+        raise RuntimeError("budget row has no nonnegative finite cost")
+    for key in ("input_tokens", "cached_input_tokens", "output_tokens",
+                "tool_calls", "search_queries", "latency_ms"):
+        if key in row and (type(row[key]) is not int or row[key] < 0):
+            raise RuntimeError(f"budget row has an invalid {key}")
+    for key in ("estimated_cost_usd", "billed_cost_usd"):
+        if key in row and row[key] is not None and (
+                not _finite(row[key]) or row[key] < 0):
+            raise RuntimeError(f"budget row has an invalid {key}")
+    billed = row.get("billed_cost_usd")
+    if billed is not None and billed != row["api_cost_usd"]:
+        raise RuntimeError("effective budget cost disagrees with vendor billed cost")
+    if "cost_source" in row:
+        source = row["cost_source"]
+        if source not in ("vendor_billed", "rate_card_estimate"):
+            raise RuntimeError("unknown budget cost source")
+        if source == "vendor_billed" and billed is None:
+            raise RuntimeError("vendor billed cost source has no vendor amount")
+        if source == "rate_card_estimate" and billed is not None:
+            raise RuntimeError("rate card source contradicts vendor billing evidence")
+    if "cost_priced" in row and type(row["cost_priced"]) is not bool:
+        raise RuntimeError("budget row cost_priced must be a boolean")
+    if "model" in row and not _budget_text(row["model"]):
+        raise RuntimeError("budget row has an invalid model identity")
+    if "at" in row:
+        at = row["at"]
+        if not isinstance(at, str) or not at.strip():
+            raise RuntimeError("budget row has an invalid ISO timestamp")
+        try:
+            parsed = datetime.fromisoformat(at.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or abs(parsed.timestamp() - row["ts"]) > 1.1:
+                raise ValueError("timestamp mismatch")
+        except (ValueError, OverflowError, OSError):
+            raise RuntimeError("budget row ISO and numeric timestamps disagree")
+    if "schema" not in row and "event" not in row:
+        if any(key in row for key in ("reservation_id", "owner_id", "owner_pid",
+                                      "reservation_group")):
+            raise RuntimeError("untagged budget event cannot become legacy usage")
+        return
+    if row.get("schema") != BUDGET_EVENT_SCHEMA:
+        raise RuntimeError("unknown budget event schema")
+    if row.get("event") not in ("RESERVATION", "USAGE"):
+        raise RuntimeError("unknown budget event")
+    for key in ("reservation_id", "owner_id", "reservation_group", "model"):
+        if not _budget_text(row.get(key)):
+            raise RuntimeError(f"budget event has no {key}")
+    if type(row.get("owner_pid")) is not int or row["owner_pid"] <= 0:
+        raise RuntimeError("budget event has an invalid process identity")
+
+
 class BudgetLedger:
-    """Durable record of every dollar the shadow service estimates it spent.
+    """Append-only usage and durable pre-dispatch obligations.
 
-    Append-only, like the calibration ledger and for the same reason: a
-    spend total that can be edited is a spend total that cannot bound
-    anything. Windows are recomputed from the rows on every check, so a
-    restart cannot reset the daily cap -- which is the failure mode a
-    purely in-memory counter has.
-
-    RA-06 -- THE SAME DURABLE APPEND PROTOCOL AS EVERY OTHER LEDGER
-        AA-12 and AA-14 were applied to two of the three append-only files in
-        this subsystem. The calibration ledger learned the protocol; the
-        processed store learned it in v3; this one kept its own `os.open` plus
-        a SINGLE `os.write` plus `fsync`, with no short-write loop, no
-        torn-tail separation and no writer lock -- in the one file every cost
-        cap is enforced against.
-
-        The consequences were not cosmetic:
-
-          * `os.write` may write short. A truncated row read back as a torn
-            tail, which `rows()` treated as the end of the file.
-          * with no torn-tail separation, the NEXT row was spliced onto the
-            broken one, so both became one unparsable line -- and because it
-            was the LAST line, `rows()` `break`-ed and silently dropped the
-            spend. The daily cap was then enforced against a number that was
-            too small.
-          * two writers could interleave the check-then-append the torn-tail
-            test performs.
-
-        Under-counting spend is not a conservative failure: it is the one
-        direction in which a budget guard stops guarding. So this now goes
-        through `durable_append.serialized_append`, and `rows()` refuses to
-        return a total it cannot defend.
+    RESERVATION (durable before dispatch) -> USAGE (durable completion).
+    Readability is not durability: reconstruction performs a real file and
+    directory barrier under the append lock. Failed/absent usage leaves the
+    reservation unresolved across restart. Historical rows are never rewritten.
     """
 
     def __init__(self, path: str = None):
         self.path = path or _p(BUDGET_LEDGER_FILE)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._observed_exists = False
 
-    def record(self, row: dict) -> dict:
-        entry = {"at": _iso(), "ts": _now(), **row}
-        line = json.dumps(entry, sort_keys=True, separators=(",", ":"),
-                          ensure_ascii=False, default=str) + "\n"
-        try:
-            # The in-process lock AND the cross-process one: `flock` is what
-            # makes two writers safe, and holding the thread lock outside it
-            # keeps one process from queueing on its own file descriptor.
-            with self._lock:
-                with serialized_append(self.path) as append:
-                    append(line)
-        except (OSError, TimeoutError) as e:
-            # A budget row that cannot be written means the next check would
-            # under-count spend. Log loudly; the caller treats an unwritable
-            # budget ledger as exhausted (see BudgetGuard.check).
-            log.error(f"[ALPHA_BUDGET] row not durable: {e}")
-            raise
+    @staticmethod
+    def _entry(row):
+        now = _now()
+        entry = {"at": _iso(now), "ts": now, **row}
+        _validate_budget_row(entry)
         return entry
 
-    def rows(self, since_ts: float = None) -> list:
-        if not os.path.exists(self.path):
-            return []
-        out = []
+    @staticmethod
+    def _line(entry):
+        return json.dumps(entry, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False) + "\n"
+
+    def record(self, row: dict) -> dict:
+        """Explicit historical usage import, outside provider dispatch."""
+        entry = self._entry(row)
+        with self._lock:
+            with serialized_append(self.path) as append:
+                append(self._line(entry))
+                self._observed_exists = True
+        return entry
+
+    def _rows_locked(self):
         try:
-            with open(self.path, encoding="utf-8") as fh:
-                lines = fh.read().splitlines()
-        except OSError as e:
-            raise RuntimeError(f"budget ledger unreadable: {e}")
-        for i, line in enumerate(lines):
+            try:
+                with open(self.path, encoding="utf-8") as fh:
+                    initial = os.fstat(fh.fileno())
+                    raw = fh.read()
+                    final = os.fstat(fh.fileno())
+            except FileNotFoundError:
+                try:
+                    os.stat(self.path)
+                except FileNotFoundError:
+                    if self._observed_exists:
+                        raise RuntimeError("previously observed budget history disappeared")
+                    return []
+                raise RuntimeError("budget history metadata is inconsistent")
+            self._observed_exists = True
+            # Synchronize the observed generation, then ensure that neither
+            # the read nor the barrier interval admitted different bytes.
+            # Capturing generation only AFTER a barrier could promote bytes
+            # appended after that barrier to confirmed accounting.
+            if not sync_path(self.path):
+                raise RuntimeError("budget history disappeared before synchronization")
+            observed = os.stat(self.path)
+            generation = lambda st: (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+            if generation(initial) != generation(final) or generation(final) != generation(observed):
+                raise RuntimeError("budget history changed during synchronized read")
+        except (OSError, TimeoutError, UnicodeError) as exc:
+            raise RuntimeError(f"budget ledger durability is unknown: {exc}") from exc
+        if raw and not raw.endswith("\n"):
+            raise RuntimeError("budget ledger has an incomplete tail")
+        out = []
+        for i, line in enumerate(raw.splitlines()):
             if not line.strip():
                 continue
             try:
                 row = json.loads(line)
-            except ValueError:
-                # RA-06 -- AN UNREADABLE ROW MAKES THE TOTAL UNKNOWN, NOT
-                # SMALLER.
-                #
-                # Before, a torn LAST line ended the read (`break`) and an
-                # unparsable line anywhere else was logged and SKIPPED. Both
-                # produce the same thing: a spend total that is too low, in
-                # the file the daily cap is enforced against. A guard that
-                # under-counts is a guard that does not bind.
-                #
-                # `check()` already refuses when the ledger cannot be READ.
-                # It has to refuse just as firmly when the ledger can be read
-                # and not believed, so this raises the same exception.
-                raise RuntimeError(
-                    f"budget ledger row {i + 1} of {self.path} is not "
-                    f"readable JSON, so total spend cannot be established; "
-                    f"no provider call is made until an operator reconciles "
-                    f"it. The row is PRESERVED, never rewritten.")
-            if isinstance(row, dict) and (since_ts is None
-                                          or float(row.get("ts") or 0) >= since_ts):
-                out.append(row)
+                _validate_budget_row(row)
+            except (ValueError, TypeError, RuntimeError) as exc:
+                raise RuntimeError(f"budget ledger row {i + 1} is invalid: {exc}") from exc
+            out.append(row)
+        self._state(out)
         return out
 
-    def spent(self, *, window_s: float, provider: str = None) -> float:
-        cutoff = _now() - float(window_s)
-        total = 0.0
-        for row in self.rows(since_ts=cutoff):
-            if provider and row.get("provider") != provider:
+    @staticmethod
+    def _state(rows):
+        reservations, completions, legacy = {}, {}, []
+        identity = ("provider", "model", "owner_id", "owner_pid", "reservation_group")
+        for row in rows:
+            if "event" not in row:
+                legacy.append(row)
                 continue
-            value = row.get("api_cost_usd")
-            if _finite(value):
-                total += float(value)
+            rid = row["reservation_id"]
+            if row["event"] == "RESERVATION":
+                if rid in reservations:
+                    raise RuntimeError("duplicate budget reservation")
+                reservations[rid] = row
+            else:
+                reserved = reservations.get(rid)
+                if reserved is None or any(row[key] != reserved[key] for key in identity):
+                    raise RuntimeError("budget completion does not bind its reservation")
+                if rid in completions:
+                    raise RuntimeError("duplicate budget completion")
+                if row["ts"] < reserved["ts"]:
+                    raise RuntimeError("budget usage predates its reservation")
+                completions[rid] = row
+        pending = {rid: row for rid, row in reservations.items() if rid not in completions}
+        return pending, legacy + list(completions.values()) + list(pending.values())
+
+    def rows(self, since_ts: float = None) -> list:
+        with self._lock:
+            with serialized_append(self.path):
+                rows = self._rows_locked()
+        return [row for row in rows if since_ts is None or row["ts"] >= since_ts]
+
+    @staticmethod
+    def _total(rows, cutoff, provider=None):
+        _, charges = BudgetLedger._state(rows)
+        total = sum(float(row["api_cost_usd"]) for row in charges
+                    if row["ts"] >= cutoff and (provider is None or row["provider"] == provider))
+        if not math.isfinite(total):
+            raise RuntimeError("budget total is not finite")
         return round(total, 8)
 
+    def spent(self, *, window_s: float, provider: str = None) -> float:
+        return self._total(self.rows(), _now() - float(window_s), provider)
+
     def spent_today(self) -> float:
-        start = datetime.now(timezone.utc).replace(
-            hour=0, minute=0, second=0, microsecond=0).timestamp()
-        total = 0.0
-        for row in self.rows(since_ts=start):
-            value = row.get("api_cost_usd")
-            if _finite(value):
-                total += float(value)
-        return round(total, 8)
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+                                                   microsecond=0).timestamp()
+        return self._total(self.rows(), start)
 
 
 class BudgetGuard:
@@ -501,6 +588,10 @@ class BudgetGuard:
         #: an operator reconciles. Clearing it on the next successful write
         #: would hide exactly the gap it exists to report.
         self.accounting_uncertain = ""
+        self._owner_id = uuid.uuid4().hex
+        self._owner_pid = os.getpid()
+        self._reservations = {}
+        self._uncertain_reservations = set()
 
     def check(self, provider: str, model: str, *,
               analysis_spent_usd: float = 0.0,
@@ -533,21 +624,19 @@ class BudgetGuard:
             log.warning(f"[ALPHA_BUDGET] calling UNPRICED {provider}/{model}: "
                         f"cost caps cannot bind this call")
 
-        if self.accounting_uncertain:
-            # RA-06: a spend we could not record is a spend no cap can see.
-            result.update(
-                allowed=False, reason=REASON_BUDGET,
-                detail=f"a previous provider call was made and its cost row "
-                       f"could not be made durable ({self.accounting_uncertain}); "
-                       f"recorded spend is now known to be understated, so no "
-                       f"further call is made")
-            return result
         try:
-            spent_hour = self.ledger.spent(window_s=3600.0, provider=provider)
-            spent_day = self.ledger.spent_today()
-        except RuntimeError as e:
-            # Unreadable ledger: we cannot prove we are under budget, so we
-            # are not. Same posture as an unreadable continuity chain.
+            rows = self.ledger.rows()
+            pending, _ = self.ledger._state(rows)
+            if pending:
+                raise RuntimeError("unresolved pre-dispatch accounting reservation")
+            if self.accounting_uncertain.startswith("unreserved"):
+                raise RuntimeError(self.accounting_uncertain)
+            self.accounting_uncertain = ""
+            spent_hour = self.ledger._total(rows, _now() - 3600.0, provider)
+            start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+                                                       microsecond=0).timestamp()
+            spent_day = self.ledger._total(rows, start)
+        except (RuntimeError, OSError, TimeoutError) as e:
             result.update(allowed=False, reason=REASON_BUDGET,
                           detail=f"budget ledger unreadable ({e}); spend "
                                  f"cannot be bounded, so no call is made")
@@ -574,51 +663,151 @@ class BudgetGuard:
                 return result
         return result
 
-    def record_actual(self, cost_row: dict) -> None:
-        """Charge what was really spent, after the answer arrived.
+    def reserve(self, provider: str, model: str, *,
+                analysis_spent_usd: float = 0.0, prompt_chars: int = None,
+                reservation_group: str = None) -> dict:
+        """Atomic admission + durable obligation, BEFORE any provider call.
 
-        `api_cost_usd` on the ledger row is the BUDGETED figure -- the
-        vendor's billed amount when it supplied one, our estimate otherwise
-        -- so the cap is enforced against the money that will actually be
-        invoiced. The raw token and tool counts travel with it so any row
-        can be re-costed under a later rate card.
+        Only this guard's live process can add parallel reservations to the
+        same analysis. An orphan, timeout, fork or prior analysis blocks new
+        admission. Estimated pending usage consumes the shared caps.
         """
+        group = reservation_group or uuid.uuid4().hex
+        estimate = self.pricing.estimate(provider, model, prompt_chars=prompt_chars)
+        result = {"allowed": False, "reason": REASON_BUDGET, "detail": "",
+                  "estimate": estimate, "estimated_cost_usd": estimate.get("api_cost_usd", 0.0)}
         try:
-            self.ledger.record({
-                "provider": cost_row.get("provider"),
-                "model": cost_row.get("model"),
-                "input_tokens": cost_row.get("input_tokens", 0),
-                "cached_input_tokens": cost_row.get("cached_input_tokens", 0),
-                "output_tokens": cost_row.get("output_tokens", 0),
-                "tool_calls": cost_row.get("tool_calls", 0),
-                "search_queries": cost_row.get("search_queries", 0),
-                "api_cost_usd": budgeted_cost(cost_row),
-                "estimated_cost_usd": cost_row.get("api_cost_usd", 0.0),
-                "billed_cost_usd": cost_row.get("billed_cost_usd"),
-                "billed_cost_raw": cost_row.get("billed_cost_raw"),
-                "cost_source": ("vendor_billed"
-                                if cost_row.get("billed_cost_usd") is not None
-                                else "rate_card_estimate"),
-                "cost_reconciliation": cost_row.get("cost_reconciliation"),
-                "cost_priced": cost_row.get("cost_priced", False),
-                "pricing_version": cost_row.get("pricing_version", ""),
-                "pricing_source": cost_row.get("pricing_source", ""),
-                "pricing_asof": cost_row.get("pricing_asof", ""),
-                "latency_ms": cost_row.get("latency_ms", 0),
-                "outcome": cost_row.get("outcome", ""),
-            })
-        except (OSError, TimeoutError) as exc:
-            # RA-06: already logged, and now REMEMBERED. Swallowing this made
-            # money that had genuinely been spent invisible to every later
-            # check, which is the under-count the caps cannot survive.
+            if self._owner_pid != os.getpid():
+                raise RuntimeError("budget reservation authority does not survive fork")
+            if self.accounting_uncertain.startswith("unreserved"):
+                raise RuntimeError(self.accounting_uncertain)
+            if not all(_budget_text(v) for v in (provider, model, group)):
+                raise RuntimeError("invalid budget reservation identity")
+            if not estimate.get("cost_priced") and not CFG.ALPHA_ALLOW_UNPRICED_CALLS:
+                reason = (REASON_EXPIRED if "expired" in str(estimate.get("pricing_missing_reason"))
+                          else REASON_UNPRICED)
+                result.update(reason=reason, detail="pricing_unconfigured; no provider call is made")
+                return result
+            estimated = estimate.get("api_cost_usd")
+            if not _finite(estimated) or estimated < 0 or not _finite(analysis_spent_usd) or analysis_spent_usd < 0:
+                raise RuntimeError("provider cost cannot be bounded")
+            with self.ledger._lock:
+                with serialized_append(self.ledger.path) as append:
+                    rows = self.ledger._rows_locked()
+                    pending, charges = self.ledger._state(rows)
+                    self._uncertain_reservations.intersection_update(pending)
+                    if self._uncertain_reservations:
+                        raise RuntimeError("usage accounting remains unresolved")
+                    group_spend = sum(float(row["api_cost_usd"]) for row in charges
+                                      if row.get("reservation_group") == group)
+                    for rid, row in pending.items():
+                        if (rid not in self._reservations or row["owner_id"] != self._owner_id
+                                or row["owner_pid"] != self._owner_pid
+                                or row["reservation_group"] != group):
+                            raise RuntimeError("unresolved pre-dispatch accounting reservation")
+                        if row["provider"] == provider and row["model"] == model:
+                            raise RuntimeError("duplicate unresolved provider reservation")
+                    hourly = self.ledger._total(rows, _now() - 3600.0, provider)
+                    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+                                                               microsecond=0).timestamp()
+                    daily = self.ledger._total(rows, start)
+                    for name, cap, projected in (
+                        ("per-analysis", CFG.ALPHA_MAX_COST_PER_ANALYSIS_USD,
+                         max(analysis_spent_usd, group_spend) + estimated),
+                        (f"{provider} hourly", CFG.ALPHA_MAX_PROVIDER_COST_PER_HOUR_USD, hourly + estimated),
+                        ("daily", CFG.ALPHA_MAX_COST_PER_DAY_USD, daily + estimated)):
+                        if not _finite(projected):
+                            raise RuntimeError("projected budget total is not finite")
+                        if not _finite(cap) or cap < 0:
+                            raise RuntimeError("invalid budget cap")
+                        if cap > 0 and projected > cap:
+                            result["detail"] = f"{name} cap would be exceeded; no provider call is made"
+                            return result
+                    rid = uuid.uuid4().hex
+                    entry = self.ledger._entry({
+                        "schema": BUDGET_EVENT_SCHEMA, "event": "RESERVATION",
+                        "reservation_id": rid, "provider": provider, "model": model,
+                        "owner_id": self._owner_id, "owner_pid": self._owner_pid,
+                        "reservation_group": group, "api_cost_usd": estimated})
+                    append(self.ledger._line(entry))
+                    self.ledger._observed_exists = True
+                    self._reservations[rid] = entry
+                    result.update(allowed=True, reason=None, reservation_id=rid,
+                                  spent_hour_usd=hourly, spent_today_usd=daily)
+        except (RuntimeError, OSError, TimeoutError, TypeError, ValueError) as exc:
+            result["detail"] = f"budget reservation refused: {exc}"
+        return result
+
+    def record_actual(self, cost_row: dict, *, reservation_id: str = None) -> dict:
+        """Complete an exact durable reservation; never create one after spend.
+
+        Unreserved usage is refused by this API. Historical imports use
+        BudgetLedger.record explicitly, outside provider dispatch. A failed
+        completion leaves the already-durable obligation outstanding; even
+        a zero-byte write and immediate process death cannot erase it.
+        """
+        if (self._owner_pid != os.getpid() or not reservation_id
+                or reservation_id not in self._reservations):
+            self.accounting_uncertain = "unreserved actual usage refused: durable pre-dispatch reservation required"
+            return {"recorded": False, "reason": "reservation_required",
+                    "detail": self.accounting_uncertain}
+        try:
+            reserved = self._reservations[reservation_id]
+            if not isinstance(cost_row, dict) or any(cost_row.get(key) != reserved[key]
+                                                     for key in ("provider", "model")):
+                raise RuntimeError("usage identity does not match reservation")
+            amount = cost_row.get("billed_cost_usd")
+            if amount is None:
+                amount = cost_row.get("api_cost_usd")
+            if not _finite(amount) or amount < 0:
+                raise RuntimeError("actual usage has no known nonnegative cost")
+            payload = {key: value for key, value in cost_row.items()
+                       if key not in ("at", "ts")}
+            payload.update({key: reserved[key] for key in (
+                "schema", "reservation_id", "owner_id", "owner_pid", "reservation_group")})
+            payload.update(event="USAGE", api_cost_usd=amount,
+                           estimated_cost_usd=cost_row.get("api_cost_usd"),
+                           cost_source="vendor_billed" if cost_row.get("billed_cost_usd") is not None
+                           else "rate_card_estimate")
+            entry = self.ledger._entry(payload)
+            with self.ledger._lock:
+                with serialized_append(self.ledger.path) as append:
+                    rows = self.ledger._rows_locked()
+                    prior = next((row for row in rows if row.get("event") == "USAGE"
+                                  and row.get("reservation_id") == reservation_id), None)
+                    if prior is not None:
+                        comparable = lambda row: {k: v for k, v in row.items() if k not in ("at", "ts")}
+                        if comparable(prior) != comparable(entry):
+                            raise RuntimeError("conflicting duplicate usage completion")
+                        return {"recorded": True, "reservation_id": reservation_id, "recovered": True}
+                    pending, _ = self.ledger._state(rows)
+                    if pending.get(reservation_id) != reserved:
+                        raise RuntimeError("durable reservation is missing or changed")
+                    if entry["ts"] < reserved["ts"]:
+                        raise RuntimeError("usage timestamp precedes reservation")
+                    append(self.ledger._line(entry))
+                    self.accounting_uncertain = ""
+                    self._uncertain_reservations.discard(reservation_id)
+            return {"recorded": True, "reservation_id": reservation_id}
+        except (RuntimeError, OSError, TimeoutError, ValueError, TypeError) as exc:
+            self._uncertain_reservations.add(reservation_id)
             self.accounting_uncertain = f"{type(exc).__name__}: {exc}"
-            log.error(f"[ALPHA_BUDGET] a provider call was made and its cost "
-                      f"row is NOT durable ({exc}); further calls are refused "
-                      f"until an operator reconciles the budget ledger")
+            return {"recorded": False, "reason": "accounting_uncertain",
+                    "detail": self.accounting_uncertain}
 
     def snapshot(self) -> dict:
         try:
-            return {"spent_today_usd": self.ledger.spent_today(),
+            rows = self.ledger.rows()
+            pending, _ = self.ledger._state(rows)
+            start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0,
+                                                       microsecond=0).timestamp()
+            spent = self.ledger._total(rows, start)
+            uncertain = bool(pending or self.accounting_uncertain.startswith("unreserved"))
+            daily_cap = float(CFG.ALPHA_MAX_COST_PER_DAY_USD)
+            return {"spent_today_usd": spent,
+                    "accounting_uncertain": uncertain,
+                    "unresolved_reservations": len(pending),
+                    "exhausted": uncertain or (daily_cap > 0 and spent >= daily_cap),
                     "caps": {
                         "per_analysis_usd": float(CFG.ALPHA_MAX_COST_PER_ANALYSIS_USD),
                         "provider_hourly_usd": float(CFG.ALPHA_MAX_PROVIDER_COST_PER_HOUR_USD),
@@ -627,8 +816,9 @@ class BudgetGuard:
                     "priced_models": sorted(self.pricing.configured_models()),
                     "expired_models": self.pricing.expired_models(),
                     "pricing_error": self.pricing.error}
-        except RuntimeError as e:
-            return {"error": str(e)}
+        except (RuntimeError, OSError, TimeoutError) as e:
+            return {"error": str(e), "exhausted": True,
+                    "accounting_uncertain": True}
 
 
 def recost(rows, pricing: PricingTable) -> dict:

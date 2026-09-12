@@ -49,6 +49,21 @@ except ImportError:                                    # pragma: no cover
 LOCK_SUFFIX = ".lock"
 
 
+def file_generation(info) -> tuple:
+    """Identity and mutation generation of one observed regular file."""
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_nlink)
+
+
+def _single_name(path: str) -> None:
+    """Hardlinked authority files are refused, not given independent locks."""
+    try:
+        if os.stat(path).st_nlink > 1:
+            raise DurabilityUnknown("append-only authority files must not have hardlink aliases")
+    except FileNotFoundError:
+        return
+
+
 class DurabilityUnknown(OSError):
     """We cannot establish whether an append is durable, so we do not say it is.
 
@@ -151,7 +166,10 @@ def exclusive_lock(path: str, *, timeout: float = 10.0):
     if fcntl is None:                                  # pragma: no cover
         yield None
         return
-    lock_path = path + LOCK_SUFFIX
+    _single_name(path)
+    # Symlink and relative aliases must contend on the same sidecar. Multiple
+    # hardlink names have no unique canonical path, so authority refuses them.
+    lock_path = os.path.realpath(path) + LOCK_SUFFIX
     parent = os.path.dirname(os.path.abspath(lock_path))
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -197,10 +215,10 @@ def append_line(path: str, line: str) -> None:
     """
     if not line.endswith("\n"):
         line += "\n"
+    _single_name(path)
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    created = not os.path.exists(path)
     separator = b"\n" if tail_is_torn(path) else b""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
@@ -213,13 +231,67 @@ def append_line(path: str, line: str) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    if created and parent:
+    if parent:
         # The bytes are durable; the NAME they live under is a separate
         # write. Without this a crash can leave a fsynced file that no
         # directory entry points at, which reads afterwards as a ledger that
         # never existed. RA-05: a failure here RAISES, because a name that is
         # not durable is not a durable append.
-        fsync_directory(parent)
+        # Existence cannot establish that an earlier attempt synchronized
+        # this name. In particular, an earlier directory fsync may have
+        # failed after the file became readable. Every successful retry must
+        # cross the directory barrier itself.
+        fsync_parent_chain(parent)
+        target_parent = os.path.dirname(os.path.realpath(path))
+        if target_parent != parent:
+            # Opening follows symlinks; the durable bytes may live under a
+            # different directory name than the configured alias. Both name
+            # chains must survive restart.
+            fsync_parent_chain(target_parent)
+
+
+def sync_path(path: str, *, expected_generation=None) -> bool:
+    """Confirm existing bytes and their name with actual barriers.
+
+    The caller holds ``exclusive_lock(path)`` for the whole read/check/sync
+    operation. This function deliberately takes no second lock. ``False``
+    means the initial open found no file; callers that previously observed a
+    file must treat that disappearance as uncertainty. Other failures raise.
+
+    This is the recovery transition READABLE_UNCONFIRMED -> CONFIRMED. No
+    receipt, cached flag, or fresh process can substitute for this transition.
+    Failure leaves the state READABLE_UNCONFIRMED and permits no terminal
+    acknowledgement. It writes no receipt and never changes historical bytes.
+    """
+    _single_name(path)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DurabilityUnknown(f"cannot open {path} for synchronization: {exc}") from exc
+    try:
+        before = file_generation(os.fstat(fd))
+        if expected_generation is not None and before != expected_generation:
+            raise DurabilityUnknown("ledger changed between read and synchronization")
+        os.fsync(fd)
+        if file_generation(os.fstat(fd)) != before:
+            raise DurabilityUnknown("ledger changed during synchronization")
+    except OSError as exc:
+        raise DurabilityUnknown(f"cannot synchronize {path}: {exc}") from exc
+    finally:
+        os.close(fd)
+    parent = os.path.dirname(os.path.abspath(path))
+    fsync_parent_chain(parent)
+    target_parent = os.path.dirname(os.path.realpath(path))
+    if target_parent != parent:
+        fsync_parent_chain(target_parent)
+    try:
+        if file_generation(os.stat(path)) != before:
+            raise DurabilityUnknown("ledger name changed during synchronization")
+    except OSError as exc:
+        raise DurabilityUnknown(f"cannot verify synchronized ledger identity: {exc}") from exc
+    return True
 
 
 def fsync_directory(parent: str) -> None:
@@ -250,6 +322,22 @@ def fsync_directory(parent: str) -> None:
             f"live under is not: {exc}") from exc
     finally:
         os.close(fd)
+
+
+def fsync_parent_chain(parent: str) -> None:
+    """Persist every ancestor name, including parents created by a retry.
+
+    ``makedirs`` may have created more than the immediate parent. Even after
+    restart, existence cannot prove those names reached storage. Synchronize
+    the chain through the filesystem root instead of trusting a created flag.
+    """
+    current = os.path.abspath(parent)
+    while True:
+        fsync_directory(current)
+        ancestor = os.path.dirname(current)
+        if ancestor == current:
+            break
+        current = ancestor
 
 
 #: The private spelling kept as an alias: `research_spool` and the mutation

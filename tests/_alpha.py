@@ -172,6 +172,8 @@ class AlphaCase(unittest.TestCase):
                 "OPENAI_API_KEY", "ALPHA_GATEWAY_ENABLED")
 
     def setUp(self):
+        from alpha_providers import set_pricing_table
+        set_pricing_table(None)
         self._saved_env = {k: os.environ.get(k) for k in self.ENV_KEYS}
         for key in self.ENV_KEYS:
             os.environ.pop(key, None)

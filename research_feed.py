@@ -94,181 +94,26 @@ def _diagnostic(value) -> str:
     are different claims, and a diagnostic that flattens them would leave an
     operator unable to see which the exchange actually sent.
     """
-    text = value if isinstance(value, str) \
-        else f"{type(value).__name__}:{value!r}"
-    return text if len(text) <= 200 else text[:197] + "..."
+    # Diagnostics are deliberately bounded before rendering. In particular,
+    # repr(10**4400) may itself raise, and user-defined repr can block.
+    if type(value) is str:
+        return value if len(value) <= 200 else value[:197] + "..."
+    if type(value) is int:
+        return (f"int:{value}" if value.bit_length() <= 512
+                else f"int:<{value.bit_length()} bits>")
+    if type(value) in (float, bool, type(None)):
+        return f"{type(value).__name__}:{value!r}"
+    if type(value) in (dict, list, tuple):
+        return f"{type(value).__name__}:<{len(value)} members>"
+    return "unsupported value"
 
 
-#: The identity keys a settlement-source OBJECT may carry. Both are text and
-#: both belong to the authority's identity: `name` says WHO settles the
-#: market, `url` says WHERE that authority publishes the number. RA-02: a
-#: normalization that keeps the first and drops the second is not a
-#: canonical identity, it is a lossy rendering.
-SOURCE_IDENTITY_KEYS = ("name", "url")
-
-#: Characters the rendering below escapes so that the text form is INJECTIVE:
-#: distinct structured identities must never render to the same string, or the
-#: comparison that detects contradictory aliases is comparing renderings
-#: rather than facts (RA-02).
-_RENDER_ESCAPES = {"\\": "\\\\", "|": "\\|", "<": "\\<", ">": "\\>"}
-
-
-class MalformedSettlementSource(Exception):
-    """A settlement-source container this producer cannot claim to understand.
-
-    Raised rather than returned so that "the exchange published nothing" and
-    "the exchange published something we cannot read" stay different facts
-    inside this module, even though both end as an ABSENT `resolution_source`
-    in the record. The distinction is what stops a partly-read member from
-    being reported as a fully-read one (RA-01).
-    """
-
-
-def _identity_text(value, key: str):
-    """Non-blank text for one identity key, `None` when JSON-absent, or raise.
-
-    A JSON `null` is how a feed says "not published", so it reads as ABSENT.
-    Anything else that is not non-blank text is MALFORMED: an integer URL is
-    a plausible internal field and a wholly implausible publication location,
-    and a blank one is "published an empty URL", which is not "published no
-    URL".
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, str):
-        raise MalformedSettlementSource(
-            f"{key} is {type(value).__name__}, not text")
-    text = value.strip()
-    if not text:
-        raise MalformedSettlementSource(f"{key} is blank")
-    return text
-
-
-def settlement_source_identity(value):
-    """The CANONICAL STRUCTURED identity of a settlement source, or None.
-
-    Returns a tuple of MEMBERS, each member a tuple of sorted `(key, text)`
-    pairs -- so collection boundaries and per-member URLs both survive into
-    the value that gets compared and rendered.
-
-    RA-01: EVERY MEMBER, AND THE WHOLE CONTAINER, BEFORE NORMALIZATION.
-        The previous version looped `for key in ("name", "url")` and RETURNED
-        on the first key that was present and readable. With `name` present,
-        `url` was never examined at all, so
-
-            {"name": "CF Benchmarks RTI", "url": 8080}
-
-        was accepted as the authority "CF Benchmarks RTI" while the malformed
-        half of the same object went unread. AA-02's own rule -- one malformed
-        member taints the collection -- was correct and simply never reached.
-
-        Here there is no early return. Every identity key present on a member
-        is validated, every member of a list is validated, and a container
-        whose shape this producer does not recognise -- a mapping with no
-        identity key, a bare number, a boolean -- is MALFORMED rather than
-        quietly empty.
-
-    RA-02: STRUCTURE IS THE IDENTITY.
-        `", ".join(names)` destroyed exactly the two things that distinguish
-        two authorities. `[{"name": "A"}, {"name": "B"}]` (two authorities)
-        and `[{"name": "A, B"}]` (one authority whose name contains a comma)
-        rendered identically, and the URL was dropped altogether -- so two
-        alias keys naming one authority at two DIFFERENT locations compared
-        EQUAL, and `resolve_alias` resolved a real contradiction silently.
-    """
-    if isinstance(value, bool):
-        raise MalformedSettlementSource("a boolean is not a settlement source")
-    if isinstance(value, str):
-        text = _identity_text(value, "name")
-        return ((("name", text),),) if text else ()
-    if isinstance(value, dict):
-        fields = []
-        for key in SOURCE_IDENTITY_KEYS:
-            if key not in value:
-                continue
-            text = _identity_text(value[key], key)
-            if text is not None:
-                fields.append((key, text))
-        if not fields:
-            raise MalformedSettlementSource(
-                f"no settlement-source identity among "
-                f"{sorted(value)[:8]!r}; a container with no name and no url "
-                f"is not an empty source, it is an unrecognised one")
-        return (tuple(sorted(fields)),)
-    if isinstance(value, (list, tuple)):
-        members = []
-        for item in value:
-            # No early exit on success and none on failure either: a
-            # malformed member raises, which taints the whole collection,
-            # because a settlement source list that is half readable is not
-            # half true.
-            members.extend(settlement_source_identity(item))
-        return tuple(members)
-    raise MalformedSettlementSource(
-        f"{type(value).__name__} is not a settlement source")
-
-
-def _escape_identity(text: str) -> str:
-    return "".join(_RENDER_ESCAPES.get(ch, ch) for ch in text)
-
-
-def render_settlement_source(identity) -> str:
-    """Readable AND injective text for a canonical structured identity.
-
-    `name <url>`, members joined by ` | `, with the backslash, pipe and
-    angle-bracket characters escaped inside every name and URL. The escaping is what makes the
-    rendering injective: without it, one authority literally named `A | B`
-    and two authorities `A` and `B` would produce the same record field, and
-    RA-02 would be re-opened in the rendering after being closed in the
-    comparison.
-    """
-    parts = []
-    for member in identity:
-        fields = dict(member)
-        name = fields.get("name")
-        url = fields.get("url")
-        if name and url:
-            parts.append(f"{_escape_identity(name)} "
-                         f"<{_escape_identity(url)}>")
-        elif url:
-            parts.append(f"<{_escape_identity(url)}>")
-        elif name:
-            parts.append(_escape_identity(name))
-    return " | ".join(parts)
-
-
-def settlement_source_comparator(value):
-    """What `resolve_alias` compares two `resolution_source` aliases BY.
-
-    The STRUCTURED identity, never the rendering: a comparator that flattens
-    is a comparator that reports disagreement as agreement.
-
-    Every malformed container compares equal (to `None`), because "we cannot
-    read this" is one fact however it is misspelled -- and a field both
-    aliases agree is unreadable is ABSENT, which the contract refuses anyway.
-    """
-    try:
-        return settlement_source_identity(value) or None
-    except MalformedSettlementSource:
-        return None
-
-
-def _settlement_source_name(value):
-    """The settlement authority the exchange PUBLISHED, as text, or None.
-
-    Kalshi records settlement sources as a list of objects. This reads what it
-    published -- every member, and the URL as well as the name -- and never
-    invents one, never falls back to the exchange's own name because the
-    market is listed there, and never treats an empty name as a reason to
-    report the URL as the name.
-    """
-    try:
-        identity = settlement_source_identity(value)
-    except MalformedSettlementSource:
-        return None
-    if not identity:
-        return None
-    return render_settlement_source(identity) or None
+# Shared neutral identity rules are also replayed at settlement. Re-export
+# these names for callers of the original producer API.
+from source_identity import (MalformedSettlementSource, SOURCE_IDENTITY_KEYS,
+                             SOURCE_CONTAINER_SCHEMA, settlement_source_identity,
+                             render_settlement_source, settlement_source_comparator,
+                             _settlement_source_name, source_evidence_from_market)
 
 
 def observed_cents(source: dict, key: str):
@@ -327,6 +172,31 @@ class ResearchFeed:
         # testing nothing. That is the false-green class AA-17 exists for, so
         # the indirection is deliberate rather than incidental.
         self.writer.finalizer = lambda candidate: self._finalize(candidate)
+        self.writer.observation_finalizer = lambda observation: self._finalize(
+            candidate_from_market(**observation))
+
+    def emit_market(self, market, book, *, cycle_id="") -> bool:
+        """Capture a bounded immutable observation; normalize on the worker.
+
+        Only built-in JSON values are copied. Depth, node count, string bytes
+        and integer size are bounded before traversal or rendering. Mutable
+        source containers are never shared with the worker after return.
+        Admission drops on pressure; no diagnostic invokes a handler here.
+        """
+        if not CFG.RESEARCH_FEED_ENABLED:
+            return False
+        try:
+            observation = self._capture({
+                "market": market, "book": book, "raw_book": market,
+                "cycle_id": cycle_id,
+                "observed_at_utc": iso_second(datetime.now(timezone.utc))})
+            return self.writer.offer_observation(
+                observation, approx_bytes=self._size(observation))
+        except Exception:                                    # noqa: BLE001
+            self.rejected += 1
+            self._note(logging.WARNING,
+                       "[RESEARCH_FEED] raw observation admission refused")
+            return False
 
     # ── the one method the engine calls ─────────────────────────────────
     def emit_candidate(self, candidate: dict) -> bool:
@@ -365,14 +235,13 @@ class ResearchFeed:
                 return False
             return self.writer.offer_candidate(
                 admitted, approx_bytes=self._size(admitted))
-        except Exception as e:                                # noqa: BLE001
+        except Exception:                                     # noqa: BLE001
             self.rejected += 1
             # AA-10 (re-audit): DEFERRED, not logged. `log.warning` here runs
             # the handler on the engine's thread, and the handler writes to
             # the same volume the fsync was moved off.
             self._note(logging.WARNING,
-                       f"[RESEARCH_FEED] candidate dropped: "
-                       f"{type(e).__name__}: {e}")
+                       "[RESEARCH_FEED] candidate admission refused")
             return False
 
     def _note(self, level: int, message: str) -> None:
@@ -398,7 +267,63 @@ class ResearchFeed:
         encoding of the full record back inside the decision cycle, which is
         the whole of RA-03.
         """
-        return 512 + 2 * sum(len(str(v)) for v in record.values())
+        remaining = [record]
+        size, visited = 512, 0
+        while remaining:
+            value = remaining.pop()
+            visited += 1
+            if visited > 2048:
+                raise ValueError("observation node limit")
+            if type(value) is str:
+                size += 64 + 4 * len(value)
+            elif type(value) is dict:
+                size += 128 + 64 * len(value)
+                remaining.extend(value.keys())
+                remaining.extend(value.values())
+            elif type(value) is list:
+                size += 64 + 16 * len(value)
+                remaining.extend(value)
+            else:
+                size += 64
+        return size
+
+    @staticmethod
+    def _capture(value):
+        """Bounded JSON snapshot without calling external conversion hooks."""
+        budget = [2048, 256 * 1024]
+
+        def copy(item, depth):
+            budget[0] -= 1
+            if budget[0] < 0 or depth > 8:
+                raise ValueError("observation structure limit")
+            kind = type(item)
+            if kind is str:
+                budget[1] -= 64 + 4 * len(item)
+                if budget[1] < 0:
+                    raise ValueError("observation byte limit")
+                return item
+            if kind is int:
+                if item.bit_length() > 1024:
+                    raise ValueError("observation integer limit")
+                return item
+            if kind in (type(None), bool, float):
+                return item
+            if kind is dict:
+                if len(item) > budget[0]:
+                    raise ValueError("observation member limit")
+                result = {}
+                for key, member in item.items():
+                    if type(key) is not str:
+                        raise ValueError("observation key type")
+                    result[copy(key, depth + 1)] = copy(member, depth + 1)
+                return result
+            if kind is list:
+                if len(item) > budget[0]:
+                    raise ValueError("observation member limit")
+                return [copy(member, depth + 1) for member in item]
+            raise ValueError("observation value type")
+
+        return copy(value, 0)
 
     # ── observer side: admission, and nothing else (RA-03) ───────────
     def _admit(self, candidate):
@@ -415,8 +340,15 @@ class ResearchFeed:
         fields could change underneath the digest that covers them would make
         the digest a claim about nothing.
         """
-        if not isinstance(candidate, dict):
+        if type(candidate) is not dict:
             self.rejected += 1
+            return None
+        try:
+            candidate = self._capture(candidate)
+        except (TypeError, ValueError, RuntimeError):
+            self.rejected += 1
+            self._note(logging.DEBUG,
+                       "[RESEARCH_FEED] candidate structure admission refused")
             return None
         provenance = candidate.get("field_provenance")
         unavailable = candidate.get("unavailable_fields")
@@ -515,6 +447,7 @@ class ResearchFeed:
             "question": candidate.get("question"),
             "resolution_rules": candidate.get("resolution_rules"),
             "resolution_source": candidate.get("resolution_source"),
+            "settlement_source_evidence": candidate.get("settlement_source_evidence"),
             "market_close_time_utc": candidate.get("market_close_time_utc"),
             "expected_resolution_time_utc":
                 candidate.get("expected_resolution_time_utc"),
@@ -688,7 +621,13 @@ def candidate_from_market(market: dict, book: dict, *, raw_book: dict = None,
     provenance["emitted_at_utc"] = provenance_path("emitted_at_utc",
                                                    "emitted_at_utc")
 
+    try:
+        source_evidence = source_evidence_from_market(market)
+    except MalformedSettlementSource:
+        source_evidence = None
+
     return {**facts, "source": "scanner", "cycle_id": cycle_id,
+            "settlement_source_evidence": source_evidence,
             "field_provenance": provenance,
             "quote_observation": observation,
             "contradictory_fields": contradictions,

@@ -12,6 +12,7 @@ from alpha_ledger import (AlphaLedger, ROW_PREDICTION,        # noqa: E402
                           ROW_RESOLUTION)
 from alpha_resolution_ingest import ingest_settlements        # noqa: E402
 from candidate_contract import FEED_SCHEMA, canonical_content  # noqa: E402
+from _settlement import qualified_fixture                     # noqa: E402
 
 
 #: The binding a real prediction is committed with. The fixtures carry it
@@ -26,13 +27,8 @@ from candidate_contract import FEED_SCHEMA, canonical_content  # noqa: E402
 #: copies of the claim about it. So the fixture carries a real record: a
 #: synthetic `"f" * 64` cannot be re-derived from anything, and a prediction
 #: whose evidence does not recompute is quarantined rather than settled.
-RECORD = valid_record()
-BINDING = {"contract_id": "KX-FIXTURE",
-           "market_snapshot_id": "snap-fixture",
-           "record_sha256": RECORD["record_sha256"],
-           "environment": "test",
-           "contract_schema": FEED_SCHEMA,
-           "source_evidence": canonical_content(RECORD)}
+RECORD, SNAPSHOT, PREDICTION, SETTLEMENT = qualified_fixture()
+BINDING = PREDICTION["source_binding"]
 
 #: The operator's statement of which settlement feed they verified. Required
 #: since the re-audit: with no allow-list no authority has been qualified and
@@ -50,7 +46,7 @@ def settlement(source="trusted-settlement-feed", **over):
            # RA-11: the ACTUAL resolution instant and the evidence identity.
            # Absent, `resolve()` used to fill in the ingestion time, so every
            # time-ordered statistic measured when a script ran.
-           "resolved_at": "2026-09-12T20:10:00+00:00",
+           "resolved_at": SETTLEMENT["resolved_at"],
            "settlement_evidence_id": "fixture-settlement-0001"}
     row.update(over)
     return row
@@ -63,8 +59,7 @@ class AlphaResolutionIngestTests(unittest.TestCase):
             path=os.path.join(self.tmp.name, "alpha.jsonl"),
             cost_path=os.path.join(self.tmp.name, "cost.jsonl"),
         )
-        self.ledger.record_prediction({"prediction_id": "p1",
-                                       "source_binding": dict(BINDING)})
+        self.ledger.record_prediction(dict(PREDICTION))
 
     def ingest(self, rows, **kw):
         kw.setdefault("trusted_sources", TRUSTED)

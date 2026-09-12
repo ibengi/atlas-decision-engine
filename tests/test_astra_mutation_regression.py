@@ -362,3 +362,38 @@ class M10_OverwriteHistoricalBytes(EffectCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class M28_StructuredIdentityConsumerWitness(EffectCase):
+    """A source contradiction must not disappear on its route to the consumer."""
+
+    def test_same_named_sources_at_different_urls_mint_nothing(self):
+        market = raw_market(
+            settlement_sources=[{"name": "A", "url": "https://synthetic-a.invalid"}],
+            settlement_source=[{"name": "A", "url": "https://synthetic-b.invalid"}])
+        feed = ResearchFeed(start_writer=False)
+        record = feed._build(candidate_from_market(market, {}, raw_book=market))
+        if record is not None:
+            self.place(record)
+        _consumer, pending = self.consume()
+        self.assertNothingMinted(pending, "from contradictory structured source identities")
+
+
+class M35_RefusalAcknowledgementWitness(EffectCase):
+    """Historical refusals remain nonterminal even in the recovery helper."""
+
+    def test_explicit_recovery_helper_never_acknowledges_budget_refusal_as_analyzed(self):
+        from alpha_service import AlphaShadowService
+        consumer = SpoolConsumer(source=LocalSpoolSource(self.spool),
+                                 store=ProcessedStore(os.path.join(self._tmp, "processed.jsonl")))
+        record = valid_record()
+        snapshot = consumer.mint(record)
+        prediction = self.ledger.record_prediction({
+            "prediction_id": "synthetic-historical-budget-refusal",
+            "market_snapshot_id": snapshot.market_snapshot_id,
+            "contract_id": snapshot.contract_id, "state": "BUDGET_EXHAUSTED"})
+        service = AlphaShadowService(providers=[], ledger=self.ledger, consumer=consumer)
+        result = service._acknowledge_recovered(snapshot, prediction)
+        self.assertTrue(result["deferred"])
+        self.assertFalse(consumer.store.seen(snapshot.market_snapshot_id))
+        self.assertEqual(len(self.ledger.predictions()), 1)
