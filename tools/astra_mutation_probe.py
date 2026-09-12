@@ -742,6 +742,94 @@ MUTATIONS = {
          "tests/test_astra_v4_ra01_ra04.py::V4RA03_TheObserverErrorPathLoggedSynchronously",
         ],
     ),
+    # ── Batch B of the v4 counter-audit, V4-RA-05..V4-RA-07 ─────────────
+    "M47": (
+        "infer pathname durability from os.path existence again, so a retry "
+        "after a directory-barrier failure acknowledges success without "
+        "attempting the barrier (V4-RA-05)",
+        "durable_append.py",
+        "    needs_barrier = bool(parent) and (created\n"
+        "                                      or not pathname_durability_proven(path))\n",
+        "    needs_barrier = bool(parent) and created\n",
+        [
+         "tests/test_astra_v4_ra05_ra07.py::V4RA05_ExistenceWasMistakenForDirectoryDurability",
+         "tests/test_astra_v4_ra05_ra07.py::V4RA05to07_TheProtocolsAgree",
+        ],
+    ),
+    "M48": (
+        "keep a durability proof even after the barrier that would justify "
+        "it has failed (V4-RA-05)",
+        "durable_append.py",
+        "        forget_pathname_durability(path)\n"
+        "        fsync_directory(parent)\n",
+        "        _PROVEN_PATHNAMES.add(_pathname_key(path))\n"
+        "        fsync_directory(parent)\n",
+        [
+         "tests/test_astra_v4_ra05_ra07.py::V4RA05_ExistenceWasMistakenForDirectoryDurability",
+        ],
+    ),
+    "M49": (
+        "announce the spend AFTER the provider call instead of before, so a "
+        "failed cost row leaves no durable trace (V4-RA-06)",
+        "alpha_cost.py",
+        "        reservation = self._reserve(provider, model,\n"
+        "                                    estimate[\"api_cost_usd\"])\n"
+        "        if reservation is None:\n",
+        "        reservation = \"not-announced\"\n"
+        "        if False:\n",
+        [
+         "tests/test_astra_v4_ra05_ra07.py::V4RA06_UnaccountedSpendVanishedAcrossRestart",
+         "tests/test_astra_v4_ra05_ra07.py::V4RA05to07_TheProtocolsAgree",
+        ],
+    ),
+    "M50": (
+        "treat an orphaned reservation as in-flight, so a restart restores "
+        "admission for money that was never accounted for (V4-RA-06)",
+        "alpha_cost.py",
+        "                if reservation[\"owner_instance\"] != INSTANCE_ID:\n"
+        "                    orphaned.append(reservation)\n",
+        "                if False:\n"
+        "                    orphaned.append(reservation)\n",
+        [
+         "tests/test_astra_v4_ra05_ra07.py::V4RA06_UnaccountedSpendVanishedAcrossRestart",
+         "tests/test_astra_v4_ra05_ra07.py::V4RA05to07_TheProtocolsAgree",
+        ],
+    ),
+    "M51": (
+        "skip a budget row that cannot be validated instead of refusing, so "
+        "malformed accounting history makes spend SMALLER (V4-RA-07)",
+        "alpha_cost.py",
+        "            record = _validated_row(row, i, self.path)\n",
+        "            try:\n"
+        "                record = _validated_row(row, i, self.path)\n"
+        "            except BudgetLedgerInvalid:\n"
+        "                continue\n",
+        [
+         "tests/test_astra_v4_ra05_ra07.py::V4RA07_MalformedRowsSilentlyReducedSpend",
+        ],
+    ),
+    "M52": (
+        "accept a negative cost on any row kind, so appending a large refund "
+        "defeats every cap (V4-RA-07)",
+        "alpha_cost.py",
+        "    if number < 0 and not allow_negative:\n",
+        "    if False:\n",
+        [
+         "tests/test_astra_v4_ra05_ra07.py::V4RA07_MalformedRowsSilentlyReducedSpend",
+        ],
+    ),
+    "M53": (
+        "read a row's timestamp with float() again, so an invalid one escapes "
+        "the guard's structured refusal path (V4-RA-07)",
+        "alpha_cost.py",
+        "    if isinstance(value, bool) or not isinstance(value, (int, float)):\n"
+        "        raise BudgetLedgerInvalid(\n"
+        "            f\"{where}: ts is {type(value).__name__}, not an epoch number\")\n",
+        "    value = float(value)\n",
+        [
+         "tests/test_astra_v4_ra05_ra07.py::V4RA07_MalformedRowsSilentlyReducedSpend",
+        ],
+    ),
 }
 
 

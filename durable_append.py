@@ -48,6 +48,54 @@ except ImportError:                                    # pragma: no cover
 
 LOCK_SUFFIX = ".lock"
 
+#: V4-RA-05. Pathnames whose parent-directory barrier this PROCESS has
+#: confirmed. See `docs/design/budget-durability-protocol.md` §1.
+#:
+#: WHY A SET IS ENOUGH, AND WHY IT MAY BE PROCESS-LOCAL
+#:   It is only ever consulted to SKIP a barrier that has already succeeded,
+#:   never to skip one that has not. So every way of losing it -- a restart, a
+#:   crash, a race between two threads -- costs a REDUNDANT barrier and can
+#:   never cause a missing one. That is the opposite of the memory-only latch
+#:   V4-RA-06 is about, where losing the state restored admission; the two
+#:   look alike and differ in the sign of their failure, which is why this one
+#:   is safe in memory and that one is not.
+#:
+#:   No lock is taken for the same reason. `set.add` and `set.discard` of a
+#:   single element are atomic under the GIL, and the only interleaving a
+#:   reader can observe is "not yet proven", which costs an extra fsync. A
+#:   lock here would also mean importing `threading` into a module whose
+#:   import list is pinned by `tests/test_research_feed_boundary.py`, and
+#:   widening a pinned boundary to buy nothing is not a trade worth making.
+_PROVEN_PATHNAMES = set()
+
+
+def _pathname_key(path: str) -> str:
+    return os.path.abspath(path)
+
+
+def pathname_durability_proven(path: str) -> bool:
+    """Has THIS PROCESS confirmed the directory barrier for `path`?
+
+    V4-RA-05. The question `os.path.exists` was standing in for, asked
+    honestly. Existence answers "are there bytes under this name"; this
+    answers "did a parent-directory fsync that covers this name actually
+    succeed", and only a successful `fsync_directory` can make it true.
+    """
+    return _pathname_key(path) in _PROVEN_PATHNAMES
+
+
+def forget_pathname_durability(path: str = None) -> None:
+    """Return `path` (or everything) to UNPROVEN.
+
+    Called when a barrier fails, so a proof recorded earlier cannot outlive
+    the evidence for it, and available to tests that need to simulate the
+    restart in which every pathname is unproven again.
+    """
+    if path is None:
+        _PROVEN_PATHNAMES.clear()
+        return
+    _PROVEN_PATHNAMES.discard(_pathname_key(path))
+
 
 class DurabilityUnknown(OSError):
     """We cannot establish whether an append is durable, so we do not say it is.
@@ -200,7 +248,29 @@ def append_line(path: str, line: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
+    # V4-RA-05 -- EXISTENCE IS NOT PROOF THAT THE NAME WAS EVER PERSISTED.
+    #
+    # This used to be `created = not os.path.exists(path)`, and the barrier
+    # below ran only when `created` was true. The bytes reach the disk BEFORE
+    # the barrier, so the sequence
+    #
+    #     append #1: file created, bytes fsynced, dir fsync FAILS -> raise
+    #     append #2: os.path.exists(path) is now True -> created=False
+    #                -> no barrier is even ATTEMPTED -> returns "durable"
+    #
+    # acknowledged an append whose pathname had never been persisted, while
+    # the very fault that prevented it was still present. The file existing
+    # was evidence that append #1 wrote bytes; it was never evidence that
+    # append #1's directory entry survived.
+    #
+    # So the obligation is tracked as what it is: a barrier this process has
+    # CONFIRMED. A pathname that does not exist yet certainly owes one; a
+    # pathname that exists but has never been proven owes one too, which is
+    # exactly the retry above and exactly the state every pathname is in
+    # after a restart.
     created = not os.path.exists(path)
+    needs_barrier = bool(parent) and (created
+                                      or not pathname_durability_proven(path))
     separator = b"\n" if tail_is_torn(path) else b""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     try:
@@ -213,13 +283,19 @@ def append_line(path: str, line: str) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-    if created and parent:
+    if needs_barrier:
         # The bytes are durable; the NAME they live under is a separate
         # write. Without this a crash can leave a fsynced file that no
         # directory entry points at, which reads afterwards as a ledger that
         # never existed. RA-05: a failure here RAISES, because a name that is
         # not durable is not a durable append.
+        #
+        # The proof is dropped FIRST. If the barrier raises, the pathname must
+        # be left UNPROVEN -- and if it was somehow proven earlier, that proof
+        # is now contradicted by evidence and must not survive the failure.
+        forget_pathname_durability(path)
         fsync_directory(parent)
+        _PROVEN_PATHNAMES.add(_pathname_key(path))
 
 
 def fsync_directory(parent: str) -> None:
