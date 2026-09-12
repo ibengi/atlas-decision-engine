@@ -1196,6 +1196,22 @@ class RA10_ABudgetRefusalTurnedTerminalOnRecovery(ServiceCase):
                             caps={"ALPHA_MAX_COST_PER_ANALYSIS_USD": 1e-9,
                                   "ALPHA_MAX_COST_PER_DAY_USD": 1e-9})
 
+    def test_the_refusal_still_reports_itself_as_a_budget_refusal(self):
+        """DEFERRED is the processed-store answer, not the whole answer.
+
+        "Must this be retried" and "why did nothing happen" are different
+        questions. Collapsing them would tell an operator reading a day of
+        results that the cap was never hit.
+        """
+        from alpha_service import STATE_BUDGET_EXHAUSTED
+        service = self.refusing_service()
+        result = service._analyze_one(self.snapshot(), self.record())
+        self.assertEqual(result["state"], STATE_BUDGET_EXHAUSTED)
+        self.assertIn("budget_refused_before_dispatch",
+                      result["state_reason"])
+        self.assertTrue(result["deferred"])
+        self.assertIsNone(result["p_meta"])
+
     def test_a_budget_refusal_is_deferred_on_the_first_pass(self):
         """Anti-vacuity: v3 already got this half right."""
         from alpha_consumer import STATUS_DEFERRED
@@ -1984,9 +2000,31 @@ class RA_HostedCITargetsThisBranch(unittest.TestCase):
         with open(path, encoding="utf-8") as fh:
             return fh.read()
 
+    def test_the_branch_name_is_in_the_workflow_at_all(self):
+        """The cheap half, which always runs.
+
+        `pyyaml` is a test-only dependency and `requirements-dev.txt` now
+        names it -- but a bare environment must still fail loudly here rather
+        than quietly skipping the only check that the workflow mentions this
+        branch.
+        """
+        self.assertIn(self.BRANCH, self.text())
+
     def test_the_workflow_triggers_on_this_branch(self):
-        import yaml
+        """The half that PARSES it.
+
+        A textual match would pass on a file whose YAML does not say what it
+        looks like it says -- a branch named in a comment, or under the wrong
+        key. AA-18's own test parses for that reason.
+        """
+        try:
+            import yaml
+        except ImportError:                                # pragma: no cover
+            self.skipTest("pyyaml unavailable; the parse is not verified "
+                          "here. `pip install -r requirements-dev.txt`.")
         parsed = yaml.safe_load(self.text())
+        # `on:` parses as the boolean True in YAML 1.1, which is why this is
+        # keyed on `True` rather than on the string.
         triggers = parsed.get(True) or parsed.get("on")
         self.assertIn(self.BRANCH, triggers["push"]["branches"])
         self.assertIn(self.BRANCH, triggers["pull_request"]["branches"])

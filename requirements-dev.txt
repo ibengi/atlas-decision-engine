@@ -9,3 +9,10 @@
 # paquet systeme casse (cffi/_cffi_backend absent) produit des
 # PanicException pyo3 trompeuses — installer via pip regle le probleme.
 pytest>=8
+# Le workflow hote est verifie en le PARSANT, pas en cherchant une chaine :
+# `tests/test_astra_v4_remediation.py::RA_HostedCITargetsThisBranch` lit la
+# liste de branches de `on.push`, et une assertion textuelle passerait sur un
+# fichier dont le YAML ne dit pas ce qu'il a l'air de dire. Sans ce paquet le
+# cas se met en skip, donc l'absence de pyyaml rendait la verification
+# silencieuse en CI (AA-18, reposee pour v4).
+pyyaml>=6

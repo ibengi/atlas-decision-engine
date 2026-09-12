@@ -181,15 +181,15 @@ All figures from runs on this branch, Python 3.11, no network (`tests/_netblock.
 
 | Suite | Result |
 |---|---|
-| Full repository suite | **2017 passed, 699 subtests passed**, 0 failed, 0 errors, 0 skipped |
-| `tests/test_astra_v4_remediation.py` (RA-01..RA-15) | 100 passed, 57 subtests passed |
+| Full repository suite | **2019 passed, 699 subtests passed**, 0 failed, 0 errors, 0 skipped |
+| `tests/test_astra_v4_remediation.py` (RA-01..RA-15) | 102 passed, 57 subtests passed |
 | `tests/test_astra_v3_remediation.py` (AA-02/03/10..17, NEW-01) | 92 passed, 23 subtests passed |
 | `tests/test_astra_aa01_aa18_remediation.py` (AA-01..AA-18) | 121 passed, 148 subtests passed |
 | `tests/test_astra_mutation_regression.py` (effect-based) | 26 passed, 23 subtests passed |
 
-The suite grew from **1916** at the v3 head to **2017**: +101 tests, of which
-100 are the RA reproductions and 1 is the writer-side companion added to
-`test_alpha_automatic_feed` (§4).
+The suite grew from **1916** at the v3 head to **2019**: +103 tests, of which
+102 are the RA reproductions and the hosted-CI checks, and 1 is the
+writer-side companion added to `test_alpha_automatic_feed` (§4).
 
 ### Mutation probe
 
@@ -203,6 +203,10 @@ The suite grew from **1916** at the v3 head to **2017**: +101 tests, of which
 | Inconclusive | 0 |
 | Not applied (anchor drifted) | 0 |
 | **`SURVIVING_EFFECTIVE_SAFETY_MUTATIONS`** | **0** |
+
+The probe found two survivors on its first full run against this work, both
+of which were real gaps and both of which are recorded in §5. The zero above
+is the run after they were closed, not the run that was hoped for.
 
 `M01`..`M11`, `M07P`, `M12`..`M25` are the v1–v3 set, unchanged. `M26` is
 RA-15's named addition — the directory-fsync barrier. `M27`..`M40` add one
@@ -247,8 +251,18 @@ silently reporting a kill for a mutation it never managed to apply
 
 ### Hosted CI
 
-Recorded in `release_evidence.json` on this branch and in the final commit
-message: the workflow run id, its conclusion, and the exact SHA it ran on.
+Run **34702602076** on `fc23f15` **FAILED**, and that is recorded here rather
+than quietly re-run: `RA_HostedCITargetsThisBranch` parsed the workflow with
+`pyyaml`, which `requirements-dev.txt` did not name, so the case raised
+`ModuleNotFoundError` in CI while passing locally. This is the third time in
+this remediation's history that hosted CI has caught something the local
+suite structurally could not see (v3 caught a library/CLI divergence twice).
+The fix names the dependency, keeps an always-running textual half, and skips
+the parse loudly rather than failing on a bare environment — because the v3
+AA-18 case skipped silently, which is why the gap existed at all.
+
+The green run and the exact SHA it ran on are recorded below and in
+`release_evidence.json` on this branch.
 The workflow triggers on this branch (`AA-18`, re-asserted for v4 by
 `RA_HostedCITargetsThisBranch`) and its mutation-probe step asserts
 `surviving_effective_safety_mutations == 0` and `inconclusive == 0` rather
@@ -272,5 +286,21 @@ than only a zero exit code.
   cannot be tied to a market stay in `resolved()` as audit evidence and are
   counted as excluded. That is deliberate: repairing them would be the
   retroactive edit this subsystem exists to prevent.
+* **RA-05 changed a runtime behaviour, deliberately, and it is worth
+  stating.** `fsync_directory` now raises on every failure, including ones a
+  platform might consider benign — an `EINVAL` from a filesystem that cannot
+  fsync a directory at all. On such a filesystem a spool write and a
+  first-append to a ledger would now REFUSE rather than silently report
+  success. That is the required direction ("must never be reported as
+  successful durable append") and it is the honest one: a name that cannot be
+  persisted has not been persisted. It is called out here because it is a
+  behaviour change on a path that used to be silent, and because nothing on
+  this branch is deployed (`PRODUCTION_DEPLOYS = 0`), so the first place it
+  would be observed is a deployment an operator chooses to make.
+* **Settlement qualification recomputes a sha256 per resolved row, at read
+  time.** That is on purpose — a stored flag is a claim, and RA-12 is about
+  the difference — and it makes `resolved()` proportionally more expensive.
+  For a shadow ledger of this size it is not measurable; for a much larger
+  one it would want a per-row memo keyed on the row's own digest.
 * **Not production-ready. Not CAPITAL-ready.** The only verdict this report
   supports is `SAFE_FOR_INDEPENDENT_REAUDIT`.

@@ -455,12 +455,20 @@ class AlphaShadowService:
                 "shadow_net_edge": prediction.get("shadow_net_edge"),
                 "recovered": True, "deferred": non_terminal}
 
-    def _defer_without_dispatch(self, snapshot, reason: str) -> dict:
+    def _defer_without_dispatch(self, snapshot, reason: str,
+                                state: str = "DEFERRED") -> dict:
         """Nothing was asked and nothing was spent (correction 8).
 
         `prediction_id` is deliberately EMPTY. There is no prediction, so
         naming one would be an acknowledgement of something that does not
         exist -- the exact failure correction 8 names in its second half.
+
+        `state` exists so a spend refusal can still REPORT itself as
+        `BUDGET_EXHAUSTED` (RA-10). The refusal is a deferral in the
+        processed store, where the question is "must this be retried"; it is
+        a budget refusal in the returned record, where the question is "why
+        did nothing happen". Collapsing the two would tell an operator the
+        cap was never hit.
         """
         try:
             self.consumer.store.mark(
@@ -471,7 +479,7 @@ class AlphaShadowService:
             self.telemetry.record_error(str(e))
             log.error(f"[ALPHA_SERVICE] {e}")
         return {"prediction_id": "", "contract_id": snapshot.contract_id,
-                "state": "DEFERRED", "state_reason": reason, "p_meta": None,
+                "state": state, "state_reason": reason, "p_meta": None,
                 "shadow_net_edge": None, "deferred": True}
 
     def _analyze_one(self, snapshot, record) -> dict:
@@ -615,12 +623,15 @@ class AlphaShadowService:
                 f"analysed, so nothing is recorded and the snapshot is "
                 f"DEFERRED for a later poll")
             return self._defer_without_dispatch(
-                snapshot, f"budget_refused_before_dispatch: {reason}")
+                snapshot, f"budget_refused_before_dispatch: {reason}",
+                state=STATE_BUDGET_EXHAUSTED)
 
         self.telemetry.record_state(opportunity["state"])
         if opportunity["p_meta"] is not None:
             self.telemetry.incr("p_meta_generated")
 
+        # RA-10: a spend refusal returned above, so the only remaining
+        # reason to defer is a prediction that is not durably committed.
         deferred = False
 
         # AA-13 step 3. The TERMINAL acknowledgement is published only after
