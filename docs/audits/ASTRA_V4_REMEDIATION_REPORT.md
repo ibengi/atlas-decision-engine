@@ -261,8 +261,43 @@ The fix names the dependency, keeps an always-running textual half, and skips
 the parse loudly rather than failing on a bare environment — because the v3
 AA-18 case skipped silently, which is why the gap existed at all.
 
-The green run and the exact SHA it ran on are recorded below and in
-`release_evidence.json` on this branch.
+**Run `34703125714` is GREEN on
+`f3ffc74d10a6e9cd09512c4f68375dda875034da`.** All eighteen steps succeeded.
+From the runner's own log:
+
+```
+2020 passed, 699 subtests passed in 103.10s          # full repository suite
+SHADOW boundary PASS: candidate_contract.py, research_spool.py, ...
+memory CLI PASS
+durable report CLI PASS
+CI settlement fixture built from the production producer
+incomplete versioned binding QUARANTINED, as designed   # RA-11
+unqualified settlement source REFUSED, as designed      # AA-15
+resolution ingest CLI PASS                              # RA-11/12/13 asserted
+feed readiness CLI fail-closed PASS
+```
+
+The mutation-probe step asserted
+`surviving_effective_safety_mutations == 0`, `inconclusive == 0`,
+`not_applied == 0` and `behavioural_kills == mutations_run` on the runner, not
+only locally.
+
+| Run | SHA | Conclusion |
+|---|---|---|
+| `34702602076` | `fc23f15` | **failure** — the pyyaml gap, see above |
+| `34702857036` | `6257461` | success |
+| `34703125714` | `f3ffc74` | **success** — the run this report is evidence for |
+
+`release_evidence.json` at the repository root is NOT updated by this
+branch: it is the release record for a DEMO deployment on a different branch
+lineage, and nothing here is deployed. Writing a v4 CI result into it would
+conflate a code audit with a release.
+
+A note on the final SHA. Recording a CI run id inside the commit the run
+tested is impossible, so the commit that adds this section is
+documentation-only and its own CI run is reported to the operator rather than
+written here. The diff between `f3ffc74` and this branch's head is exactly
+this file.
 The workflow triggers on this branch (`AA-18`, re-asserted for v4 by
 `RA_HostedCITargetsThisBranch`) and its mutation-probe step asserts
 `surviving_effective_safety_mutations == 0` and `inconclusive == 0` rather
