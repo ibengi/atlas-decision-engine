@@ -1000,10 +1000,19 @@ class AA13_PredictionCommitVersusProcessedAck(RemediationCase):
                             analysis_identity("snap-Y"))
 
     def test_prepare_is_durable_before_the_prediction(self):
+        """RA-08 added the PREPARE receipt, so the row list is now two long.
+
+        The property is unchanged and is asserted directly instead of through
+        an exact list: an announcement exists, it is DURABLE (its receipt is
+        on disk), and no prediction has been committed for the snapshot yet.
+        """
+        from alpha_ledger import analysis_identity
         ledger = self.ledger()
         ledger.prepare("snap-1", contract_id="C1", source_record_sha256="a" * 64)
         kinds = [r["kind"] for r in ledger.rows()]
-        self.assertEqual(kinds, ["PREPARE"])
+        self.assertEqual(kinds, ["PREPARE", "PREPARE_COMMIT"])
+        self.assertTrue(ledger.prepare_is_durable(analysis_identity("snap-1")))
+        self.assertNotIn("PREDICTION", kinds)
         self.assertFalse(ledger.prediction_is_committed("snap-1"))
 
     def test_prepare_is_idempotent_across_a_retry(self):

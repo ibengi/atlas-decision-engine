@@ -113,6 +113,30 @@ class ProcessedStore:
         marks were invisible to the first for the life of the process. The
         cache is now keyed on a GENERATION (the file's size and mtime); when
         the file moves under us the cache is rebuilt instead of lying.
+
+    RA-09 -- AND NOTICES THEM AT THE RIGHT MOMENT
+        The generation was re-stamped AFTER the append lock was released:
+
+            with serialized_append(self.path) as append:
+                append(line)                  # lock released here
+            if self._cache is not None:
+                self._cache[snapshot_id] = row
+                self._generation = self._current_generation()
+
+        Any row another writer appended between those two moments was inside
+        the generation this store stamped and outside the cache it stamped it
+        for. The cache then looked FRESH -- size, mtime and inode all matching
+        -- while missing a row that was on disk, and stayed that way until
+        something else changed the file.
+
+        A missing processed row reads as "this snapshot was never analysed",
+        so the service pays for an analysis another writer has already
+        committed. That is the AA-13 double-spend reached through the cache
+        instead of through a crash.
+
+        The cache is therefore INVALIDATED inside the lock, before the
+        generation can advance. The next read costs one re-read of a small
+        bounded file; the alternative costs an analysis.
     """
 
     def __init__(self, path: str = None):
@@ -187,16 +211,18 @@ class ProcessedStore:
         try:
             with serialized_append(self.path) as append:
                 append(line)
+                # RA-09: inside the lock, and an INVALIDATION rather than a
+                # patch. While this lock is held no other writer can append,
+                # so clearing the generation here cannot be stamped past
+                # somebody else's row. Patching the cache and re-stamping
+                # afterwards could, and did.
+                self._cache = None
+                self._generation = None
         except (OSError, TimeoutError) as e:
             # If we cannot remember that we processed this, a restart will
             # process it again and pay for it again. Loud, and the caller
             # stops consuming this cycle.
             raise RuntimeError(f"processed status not durable: {e}")
-        if self._cache is not None:
-            self._cache[snapshot_id] = row
-            # The file changed; re-stamp the generation so the in-memory
-            # patch above is not mistaken for a stale cache on the next read.
-            self._generation = self._current_generation()
         return row
 
     def counts(self) -> dict:

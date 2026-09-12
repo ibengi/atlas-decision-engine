@@ -71,8 +71,31 @@ ROW_PREPARE = "PREPARE"
 #: presence is evidence of a completed durable sequence rather than of a
 #: readable page.
 ROW_COMMIT = "COMMIT"
-ROW_KINDS = (ROW_PREPARE, ROW_PREDICTION, ROW_COMMIT, ROW_RESOLUTION,
-             ROW_COST, ROW_INVALIDATION, ROW_OBSERVATION)
+
+#: RA-08 -- THE SAME RECEIPT, FOR THE SAME REASON, ONE STEP EARLIER.
+#:
+#: `prepare()` was idempotent by LOOKUP: `find_prepare(analysis_id)` and, if a
+#: row came back, return it. That row is READ from the file, which is exactly
+#: what the AA-13 re-audit established is not proof of durability -- and the
+#: reason `ROW_COMMIT` exists for predictions.
+#:
+#: The failure is the ordinary one. An append whose `write` landed and whose
+#: `fsync` failed leaves bytes that read back perfectly while still being one
+#: power cut from never having existed. `prepare()` raised on that attempt, so
+#: the service deferred and spent nothing -- correct. On the NEXT poll
+#: `find_prepare` returned those same readable bytes, `prepare()` returned
+#: without touching the device, the dispatch precondition was declared
+#: satisfied, and every provider was paid against a ledger that was still not
+#: writable, so the prediction that followed could not be committed either.
+#:
+#: A PREPARE is durable when its receipt is, and appending the receipt is what
+#: makes the row before it durable: an fsync flushes the whole file. So a
+#: retry that finds a receipt-less PREPARE FINISHES it rather than trusting
+#: the read, and dispatch is gated on the receipt.
+ROW_PREPARE_COMMIT = "PREPARE_COMMIT"
+
+ROW_KINDS = (ROW_PREPARE, ROW_PREPARE_COMMIT, ROW_PREDICTION, ROW_COMMIT,
+             ROW_RESOLUTION, ROW_COST, ROW_INVALIDATION, ROW_OBSERVATION)
 
 
 def analysis_identity(market_snapshot_id: str) -> str:
@@ -158,11 +181,17 @@ class _AppendOnlyLog:
         """
         line = json.dumps(row, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, default=str) + "\n"
-        if tail_is_torn(self.path):
-            log.error(f"[ALPHA_LEDGER] torn tail detected in {self.path}; the "
-                      f"damaged fragment is PRESERVED and separated, not "
-                      f"truncated -- it will be reported as an unparsable row")
         try:
+            # RA-05: `tail_is_torn` now RAISES `DurabilityUnknown` when it
+            # cannot read the tail, so it belongs inside the guard. Outside
+            # it, an unreadable tail escaped as a bare `OSError` and a caller
+            # that only handles `LedgerError` would have seen a different
+            # exception type for the same failure.
+            if tail_is_torn(self.path):
+                log.error(
+                    f"[ALPHA_LEDGER] torn tail detected in {self.path}; the "
+                    f"damaged fragment is PRESERVED and separated, not "
+                    f"truncated -- it will be reported as an unparsable row")
             append_line(self.path, line)
         except OSError as e:
             raise LedgerError(f"alpha ledger row not durable: {e}")
@@ -254,21 +283,74 @@ class AlphaLedger:
         Idempotent per snapshot: a retry after a crash re-announces the SAME
         `analysis_id`, because that identity is derived from the snapshot's
         content and not from the clock.
+
+        RA-08: idempotent, and DURABLE ON EVERY PATH. A receipt-less PREPARE
+        found by a retry is COMPLETED here rather than believed -- see
+        `ROW_PREPARE_COMMIT`. Either this returns a row whose receipt is on
+        disk, or it raises; there is no outcome in which a caller may treat
+        readable bytes as an announced analysis.
         """
         analysis_id = analysis_identity(market_snapshot_id)
         with self.log.lock():
             existing = self.find_prepare(analysis_id)
             if existing is not None:
+                if analysis_id in self.prepare_commits():
+                    return existing
+                # Readable bytes with no receipt: the previous attempt's
+                # append landed and its fsync did not. Refusing here would
+                # strand the snapshot forever, and returning would repeat the
+                # defect. Finish the durability instead: this append fsyncs
+                # the whole file, so the row above becomes durable at the same
+                # moment its receipt does. If that fails too, it raises and
+                # nothing is dispatched.
+                log.warning(
+                    f"[ALPHA_LEDGER] {analysis_id} has a PREPARE row with no "
+                    f"receipt; completing its durability instead of trusting "
+                    f"the bytes")
+                self._commit_prepare(analysis_id, market_snapshot_id)
                 return existing
-            return self.log.append({
+            row = self.log.append({
                 "schema": LEDGER_SCHEMA, "kind": ROW_PREPARE,
                 "at": _now_iso(), "analysis_id": analysis_id,
                 "market_snapshot_id": market_snapshot_id,
                 "contract_id": contract_id,
                 "source_record_sha256": source_record_sha256,
                 "environment": environment})
+            self._commit_prepare(analysis_id, market_snapshot_id)
+            return row
+
+    def _commit_prepare(self, analysis_id: str, snapshot_id: str) -> dict:
+        """Append the receipt that makes a PREPARE durably announced (RA-08).
+
+        Caller holds the writer lock.
+        """
+        return self.log.append({
+            "schema": LEDGER_SCHEMA, "kind": ROW_PREPARE_COMMIT,
+            "at": _now_iso(), "analysis_id": analysis_id,
+            "market_snapshot_id": snapshot_id})
+
+    def prepare_commits(self) -> dict:
+        """analysis_id -> the first PREPARE receipt for it (RA-08)."""
+        out = {}
+        for row in self.rows():
+            if row.get("kind") == ROW_PREPARE_COMMIT \
+                    and row.get("analysis_id"):
+                out.setdefault(row["analysis_id"], row)
+        return out
+
+    def prepare_is_durable(self, analysis_id: str) -> bool:
+        """RA-08: is this analysis DURABLY announced, receipt and all?
+
+        The dispatch precondition. Answered by the receipt, never by the
+        readability of the PREPARE row.
+        """
+        return bool(analysis_id) and analysis_id in self.prepare_commits()
 
     def find_prepare(self, analysis_id: str):
+        """The PREPARE ROW for an analysis identity, if any.
+
+        Says nothing about durability -- see `prepare_is_durable`.
+        """
         for row in self.rows():
             if row.get("kind") == ROW_PREPARE \
                     and row.get("analysis_id") == analysis_id:

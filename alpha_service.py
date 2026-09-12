@@ -54,6 +54,16 @@ log = logging.getLogger("ALPHA")
 #: called. Not a probability, not a failure of the models -- a spend limit.
 STATE_BUDGET_EXHAUSTED = "BUDGET_EXHAUSTED"
 
+#: RA-10. States that mean NO ANALYSIS WAS PERFORMED. An acknowledgement of
+#: one of them must stay NON-TERMINAL and retryable, including when it is
+#: reached by recovering a row a previous run wrote.
+#:
+#: `p_meta is None` is deliberately NOT the test. An analysis in which every
+#: provider was called and every answer was rejected also has no `p_meta`, and
+#: that one IS terminal: the money was spent and the result is a fact about
+#: the models. The distinction is whether a provider was ever asked.
+NON_TERMINAL_STATES = (STATE_BUDGET_EXHAUSTED,)
+
 #: Environment variables whose presence means this process can move money.
 #: Modules that constitute the money path. None may be loaded in this
 #: process; `loaded_execution_modules()` checks that at runtime.
@@ -400,25 +410,50 @@ class AlphaShadowService:
         from a settlement back to the prediction it settles.
         """
         prediction_id = str(prediction.get("prediction_id") or "")
+        state = str(prediction.get("state") or "RECOVERED")
         self.telemetry.incr("predictions_recovered")
         log.info(f"[ALPHA_SERVICE] {snapshot.contract_id} was already "
                  f"committed as {prediction_id}; recovered without calling "
                  f"any provider")
+
+        # RA-10 -- RECOVERY REPUBLISHES, IT DOES NOT PROMOTE.
+        #
+        # This marked `STATUS_ANALYZED` unconditionally. A row whose state
+        # says no provider was ever asked -- a spend refusal -- was therefore
+        # DEFERRED by `_analyze_one` on the pass that produced it and
+        # TERMINAL on the next pass that recovered it. `seen()` then returned
+        # True and the observation was never retried: a cap meant to defer
+        # work had silently discarded it.
+        #
+        # Ledger history is append-only, so rows like that exist in it
+        # already; they stay in the audit history and they stay retryable.
+        non_terminal = state in NON_TERMINAL_STATES
+        if non_terminal:
+            self.telemetry.incr("recovered_non_terminal")
+            log.warning(
+                f"[ALPHA_SERVICE] the committed row for "
+                f"{snapshot.contract_id} is {state}, which means no provider "
+                f"was ever asked; it is acknowledged DEFERRED, not ANALYZED, "
+                f"so the observation is retried rather than discarded")
         try:
             self.consumer.store.mark(
-                snapshot.market_snapshot_id, STATUS_ANALYZED,
+                snapshot.market_snapshot_id,
+                STATUS_DEFERRED if non_terminal else STATUS_ANALYZED,
                 contract_id=snapshot.contract_id,
-                detail="recovered_committed_prediction",
+                detail=(f"recovered_non_terminal: {state}" if non_terminal
+                        else "recovered_committed_prediction"),
                 prediction_id=prediction_id)
         except RuntimeError as e:
             self.telemetry.record_error(str(e))
             log.error(f"[ALPHA_SERVICE] {e}")
         return {"prediction_id": prediction_id,
                 "contract_id": snapshot.contract_id,
-                "state": str(prediction.get("state") or "RECOVERED"),
+                "state": state,
+                "state_reason": (f"recovered a {state} row; no provider was "
+                                 f"ever asked" if non_terminal else ""),
                 "p_meta": prediction.get("p_meta"),
                 "shadow_net_edge": prediction.get("shadow_net_edge"),
-                "recovered": True, "deferred": False}
+                "recovered": True, "deferred": non_terminal}
 
     def _defer_without_dispatch(self, snapshot, reason: str) -> dict:
         """Nothing was asked and nothing was spent (correction 8).
@@ -504,12 +539,26 @@ class AlphaShadowService:
         # prediction that follows cannot be committed either -- so the spend
         # on providers is guaranteed unrecoverable BEFORE it is incurred.
         # Nothing is dispatched without a durable PREPARE.
+        #
+        # RA-08: and it is a precondition on EVERY dispatch, including a
+        # retry. `prepare()` used to return a PREPARE row it had merely READ,
+        # so an append whose fsync had failed satisfied the precondition on
+        # the next poll and every provider was paid against a ledger that was
+        # still not writable. The receipt is what is checked now, and the
+        # check is a fresh read of the ledger rather than the return value of
+        # the call that was supposed to produce it.
+        from alpha_ledger import analysis_identity
         try:
             self.ledger.prepare(
                 snapshot.market_snapshot_id,
                 contract_id=snapshot.contract_id,
                 source_record_sha256=source_binding.get("record_sha256", ""),
                 environment=source_binding.get("environment", ""))
+            if not self.ledger.prepare_is_durable(
+                    analysis_identity(snapshot.market_snapshot_id)):
+                raise RuntimeError(
+                    "the PREPARE row left no durable receipt, so this "
+                    "analysis is not announced and must not be dispatched")
         except Exception as e:                                # noqa: BLE001
             self.telemetry.record_error(f"prepare: {type(e).__name__}: {e}")
             self.telemetry.incr("prepare_not_durable")
@@ -519,25 +568,60 @@ class AlphaShadowService:
             return self._defer_without_dispatch(
                 snapshot, f"prepare_not_durable: {type(e).__name__}")
 
+        # RA-10 -- A SPEND REFUSAL IS NOT A PREDICTION, SO IT IS NOT WRITTEN.
+        #
+        # Every provider refused before being called means nothing was
+        # analysed: no token was spent, no model had an opinion, `p_meta` is
+        # None. The refusal used to be written as a PREDICTION row anyway,
+        # and that row is what made the snapshot recoverable -- and therefore
+        # promotable to a terminal ANALYZED on the next poll, which is the
+        # defect `_acknowledge_recovered` above also had to be taught about.
+        #
+        # The classification happens BEFORE anything is recorded, and a
+        # refusal records nothing at all: no PREDICTION row, no COMMIT
+        # receipt, so `committed_prediction` finds nothing and the next poll
+        # analyses the snapshot for real once the cap allows it. The PREPARE
+        # row and its receipt remain, so the audit trail still says the
+        # analysis was announced and then deferred.
+        #
+        # The gateway is handed a PREDICATE rather than a flag, so it still
+        # does not interpret spend policy -- it asks.
+        refused_on_spend = {"reasons": ()}
+
+        def commit_the_prediction(opportunity):
+            reasons = {e.get("reason") for e in
+                       opportunity["dispatch"]["excluded"]}
+            if opportunity["p_meta"] is None and reasons and \
+                    reasons.issubset({REASON_BUDGET, "pricing_unconfigured",
+                                      REASON_EXPIRED}):
+                refused_on_spend["reasons"] = tuple(sorted(reasons))
+                return False
+            return True
+
         opportunity = self.gateway.analyze(
             snapshot, quote_fn=self.quote_fn, gate=gate, on_signal=on_signal,
-            source_binding=source_binding)
+            source_binding=source_binding, record=commit_the_prediction)
 
-        # Every provider refused on spend is its own terminal state: the
-        # models were never asked, so "no valid signal" would be misleading.
-        refusals = {e.get("reason") for e in
-                    opportunity["dispatch"]["excluded"]}
-        if opportunity["p_meta"] is None and refusals and refusals.issubset(
-                {REASON_BUDGET, "pricing_unconfigured", REASON_EXPIRED}):
+        if refused_on_spend["reasons"]:
+            reason = ", ".join(refused_on_spend["reasons"])
             opportunity["state"] = STATE_BUDGET_EXHAUSTED
             opportunity["state_reason"] = (
-                "every provider was refused before being called: "
-                + ", ".join(sorted(refusals)))
+                "every provider was refused before being called: " + reason)
+            self.telemetry.record_state(opportunity["state"])
+            self.telemetry.incr("budget_refused_before_dispatch")
+            log.warning(
+                f"[ALPHA_SERVICE] {snapshot.contract_id}: every provider was "
+                f"refused before being called ({reason}); nothing was "
+                f"analysed, so nothing is recorded and the snapshot is "
+                f"DEFERRED for a later poll")
+            return self._defer_without_dispatch(
+                snapshot, f"budget_refused_before_dispatch: {reason}")
+
         self.telemetry.record_state(opportunity["state"])
         if opportunity["p_meta"] is not None:
             self.telemetry.incr("p_meta_generated")
 
-        deferred = opportunity["state"] == STATE_BUDGET_EXHAUSTED
+        deferred = False
 
         # AA-13 step 3. The TERMINAL acknowledgement is published only after
         # the prediction is confirmed durable, and the confirmation is a fresh
@@ -546,15 +630,22 @@ class AlphaShadowService:
         # findable. If the prediction is NOT committed, the snapshot is marked
         # DEFERRED (non-terminal) so a later poll retries it, instead of
         # ANALYZED, which would lose the observation permanently.
-        committed = False
+        #
+        # RA-07: the confirmation also YIELDS THE IDENTITY. Reading back the
+        # committed row and using its `prediction_id` is what makes the
+        # acknowledgement and the scheduled observations name a row that
+        # exists, whatever id the gateway happened to generate in memory.
+        committed_row = None
         try:
-            committed = self.ledger.prediction_is_committed(
+            committed_row = self.ledger.committed_prediction(
                 snapshot.market_snapshot_id)
         except Exception as e:                                # noqa: BLE001
             self.telemetry.record_error(
                 f"commit_check: {type(e).__name__}: {e}")
             log.error(f"[ALPHA_SERVICE] could not confirm the prediction for "
                       f"{snapshot.contract_id} reached the disk: {e}")
+        committed = committed_row is not None
+        durable_id = str((committed_row or {}).get("prediction_id") or "")
         if not committed:
             self.telemetry.record_error(
                 f"prediction_not_committed: {snapshot.market_snapshot_id}")
@@ -576,15 +667,18 @@ class AlphaShadowService:
                 # that was not durably committed. The attempted id is kept in
                 # `detail`, where it reads as a diagnostic rather than as a
                 # row anyone can join to.
-                prediction_id=opportunity["prediction_id"] if committed else "")
+                #
+                # RA-07: and when one IS committed, the id written here comes
+                # from the ledger row, not from memory.
+                prediction_id=durable_id if committed else "")
         except RuntimeError as e:
             self.telemetry.record_error(str(e))
             log.error(f"[ALPHA_SERVICE] {e}")
 
         if terminal:
-            self._schedule_observations(opportunity["prediction_id"])
+            self._schedule_observations(durable_id)
         deferred = not terminal
-        return {"prediction_id": opportunity["prediction_id"],
+        return {"prediction_id": durable_id or opportunity["prediction_id"],
                 "contract_id": snapshot.contract_id,
                 "state": opportunity["state"],
                 "p_meta": opportunity["p_meta"],

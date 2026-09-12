@@ -46,6 +46,16 @@ COUNTERS = (
     "catalyst_invalidated",
     "observations_recorded",
     "resolved_predictions",
+    # AA-13 / RA-07 / RA-08 / RA-10: the durability and recovery counters the
+    # service has been incrementing. They were missing from this tuple, so
+    # every one of them logged "unknown counter" and was absent from the
+    # flushed report -- the numbers an operator needs to see a ledger going
+    # unwritable were the ones not being reported.
+    "predictions_recovered",
+    "predictions_not_committed",
+    "prepare_not_durable",
+    "budget_refused_before_dispatch",
+    "recovered_non_terminal",
     "cycles",
     "errors",
 )

@@ -98,6 +98,12 @@ class AlphaGateway:
         `gate` and `on_signal` are passed straight to the dispatcher: the
         gateway does not interpret spend policy, it only carries it to the
         place where a provider is about to be called.
+
+        `record` may also be a CALLABLE `f(opportunity) -> bool`, consulted
+        after the analysis and before anything is written. That is how the
+        caller says "nothing was analysed, so record nothing" without this
+        module learning what a budget is (RA-10): the gateway still does not
+        interpret spend policy, it asks.
         """
         if not isinstance(snapshot, MarketSnapshot):
             raise TypeError("analyze() requires a MarketSnapshot built by "
@@ -120,10 +126,11 @@ class AlphaGateway:
         opportunity = self._record(snapshot, result, meta, edge, movement,
                                    state, reason, cost_usd, now,
                                    source_binding=source_binding)
-        if record:
+        commit = record(opportunity) if callable(record) else bool(record)
+        if commit:
             try:
                 self.ledger.record_costs(snapshot, result)
-                self.ledger.record_prediction(opportunity)
+                durable = self.ledger.record_prediction(opportunity)
             except Exception as e:                            # noqa: BLE001
                 # A ledger failure loses evidence; it must be loud. It does
                 # NOT change the verdict, because there is no verdict to
@@ -132,6 +139,34 @@ class AlphaGateway:
                           f"{opportunity['prediction_id']}: "
                           f"{type(e).__name__}: {e}")
                 opportunity["persisted"] = False
+            else:
+                # RA-07 -- THE ID THAT SURVIVES IS THE ONE ON DISK.
+                #
+                # `record_prediction` has a recovery branch: a PREDICTION row
+                # for this analysis with no COMMIT receipt -- the previous
+                # attempt's append landed, its fsync failed -- is COMPLETED
+                # and returned, so one analysis keeps one identity. Right,
+                # and the return value was discarded here, so
+                # `opportunity["prediction_id"]` stayed the freshly generated
+                # `pred-<sha of snapshot|now>`: an id the ledger deliberately
+                # never wrote.
+                #
+                # The service then acknowledged the snapshot with that id and
+                # scheduled follow-up observations against it, so every later
+                # join from a settlement back to its prediction found nothing.
+                # `prediction_is_committed` said True throughout and was
+                # right: a prediction for this snapshot IS committed. It was
+                # simply not the one being talked about.
+                durable_id = str((durable or {}).get("prediction_id") or "")
+                if durable_id and durable_id != opportunity["prediction_id"]:
+                    log.warning(
+                        f"[ALPHA_LEDGER] this analysis is already recorded as "
+                        f"{durable_id}; the generated id "
+                        f"{opportunity['prediction_id']} names no row and is "
+                        f"kept only as a diagnostic")
+                    opportunity["generated_prediction_id"] = \
+                        opportunity["prediction_id"]
+                    opportunity["prediction_id"] = durable_id
         else:
             opportunity["persisted"] = False
         log.info(f"[ALPHA_SHADOW] {snapshot.contract_id} state={state} "

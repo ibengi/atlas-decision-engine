@@ -705,3 +705,505 @@ class RA06_TheBudgetLedgerBypassedTheDurableProtocol(AlphaCase):
 
 if __name__ == "__main__":                                # pragma: no cover
     unittest.main()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Shared service harness for RA-07..RA-10
+# ════════════════════════════════════════════════════════════════════════
+class _CountingProvider:
+    """A provider double that records whether it was called at all."""
+
+    def __init__(self, name="grok"):
+        from _alpha import FakeProvider
+        self._inner = FakeProvider(name)
+        self.name = name
+        self.model = name
+        self.calls = 0
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+    def analyze(self, snapshot, timeout):
+        self.calls += 1
+        return self._inner.analyze(snapshot, timeout)
+
+
+class _EmptySource:
+    directory = None
+
+    def records(self):
+        return []
+
+
+class ServiceCase(AlphaCase):
+    """One AlphaShadowService on throwaway files, no network, no broker."""
+
+    def setUp(self):
+        super().setUp()
+        self._patches.append(patch.object(CFG, "ALPHA_GATEWAY_ENABLED", True))
+        self._patches[-1].start()
+
+    def service(self, providers, *, caps=None):
+        from _alpha import write_pricing
+        from alpha_consumer import ProcessedStore, SpoolConsumer
+        from alpha_cost import BudgetGuard, BudgetLedger, PricingTable
+        from alpha_ledger import AlphaLedger
+        from alpha_service import AlphaShadowService
+        self.ledger = AlphaLedger(
+            path=os.path.join(self._tmp, "ledger.jsonl"),
+            cost_path=os.path.join(self._tmp, "cost.jsonl"))
+        self.store = ProcessedStore(path=os.path.join(self._tmp, "p.jsonl"))
+        pricing = PricingTable(write_pricing(
+            os.path.join(self._tmp, "pricing.json"),
+            models=[p.name for p in providers]))
+        for key, value in (caps or {}).items():
+            patcher = patch.object(CFG, key, value)
+            self._patches.append(patcher)
+            patcher.start()
+        return AlphaShadowService(
+            providers=providers, ledger=self.ledger,
+            consumer=SpoolConsumer(source=_EmptySource(), store=self.store),
+            budget=BudgetGuard(pricing=pricing, ledger=BudgetLedger(
+                os.path.join(self._tmp, "budget.jsonl"))),
+            quote_fn=lambda: {"yes_bid": 0.44, "yes_ask": 0.46,
+                              "no_bid": 0.54, "no_ask": 0.56})
+
+    def record(self):
+        from _candidate import valid_record
+        return valid_record()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-07 — the acknowledgement named an id the ledger had never written
+# ════════════════════════════════════════════════════════════════════════
+class RA07_TheGeneratedIdWasAcknowledgedInsteadOfTheDurableOne(ServiceCase):
+    """AA-13 correction 7 closed one door and left the adjacent one open.
+
+    `record_prediction` has a recovery branch: when a PREDICTION row exists
+    for this analysis with no COMMIT receipt -- the previous attempt's append
+    landed and its fsync failed -- it FINISHES that commit and returns the
+    ORIGINAL row, so one analysis keeps one identity. That part is right.
+
+    Nothing reads the return value. `AlphaGateway.analyze` calls
+    `self.ledger.record_prediction(opportunity)` and discards the row, so
+    `opportunity["prediction_id"]` is still the freshly generated
+    `pred-<sha of snapshot|now>` -- an id that was never written to the
+    ledger, because the recovery branch deliberately did not write it.
+
+    `alpha_service` then:
+
+      * marks the snapshot ANALYZED and STORES that generated id, so every
+        later join from a settlement back to the prediction it settles finds
+        nothing;
+      * schedules follow-up price observations against it, so the
+        OBSERVATION rows name a prediction that does not exist either.
+
+    `prediction_is_committed` says True throughout, and it is right: a
+    prediction for this snapshot IS committed. It is simply not the one the
+    service is talking about.
+    """
+
+    def uncommitted_prediction(self, snapshot, prediction_id="pred-crashed"):
+        """A PREDICTION row with no receipt: the crash RA-07 is about."""
+        from alpha_ledger import (LEDGER_SCHEMA, ROW_PREDICTION,
+                                  analysis_identity)
+        self.ledger.log.append({
+            "schema": LEDGER_SCHEMA, "kind": ROW_PREDICTION,
+            "at": "2026-01-01T00:00:00+00:00",
+            "analysis_id": analysis_identity(snapshot.market_snapshot_id),
+            "prediction_id": prediction_id,
+            "market_snapshot_id": snapshot.market_snapshot_id,
+            "contract_id": snapshot.contract_id})
+        self.assertFalse(
+            self.ledger.prediction_is_committed(snapshot.market_snapshot_id),
+            "the fixture is wrong: this row must have no receipt")
+        return prediction_id
+
+    def test_the_acknowledgement_names_the_row_that_is_actually_on_disk(self):
+        service = self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        durable = self.uncommitted_prediction(snapshot)
+
+        service._analyze_one(snapshot, self.record())
+
+        row = self.store._load()[snapshot.market_snapshot_id]
+        self.assertEqual(
+            row["prediction_id"], durable,
+            "the snapshot was acknowledged with a prediction id the ledger "
+            "never wrote")
+        self.assertIsNotNone(self.ledger.find_prediction(row["prediction_id"]),
+                             "the acknowledged prediction id is not in the "
+                             "ledger at all")
+
+    def test_the_result_reports_the_durable_identity(self):
+        service = self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        durable = self.uncommitted_prediction(snapshot)
+        result = service._analyze_one(snapshot, self.record())
+        self.assertEqual(result["prediction_id"], durable)
+
+    def test_observations_are_scheduled_against_the_durable_identity(self):
+        service = self.service(
+            [_CountingProvider()],
+            caps={"ALPHA_OBSERVATION_INTERVALS_S": "60,300"})
+        snapshot = self.snapshot()
+        durable = self.uncommitted_prediction(snapshot)
+        service._analyze_one(snapshot, self.record())
+        scheduled = {pid for _due, pid, _interval
+                     in service._pending_observations}
+        self.assertEqual(
+            scheduled, {durable},
+            "follow-up observations were scheduled against a prediction the "
+            "ledger does not contain")
+
+    def test_exactly_one_prediction_row_survives_the_recovery(self):
+        service = self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        self.uncommitted_prediction(snapshot)
+        service._analyze_one(snapshot, self.record())
+        self.assertEqual(len(self.ledger.predictions()), 1)
+
+    def test_an_ordinary_analysis_still_reports_its_own_id(self):
+        """Anti-vacuity: the normal path must not be rewritten by this."""
+        service = self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        result = service._analyze_one(snapshot, self.record())
+        self.assertTrue(result["prediction_id"].startswith("pred-"))
+        self.assertIsNotNone(
+            self.ledger.find_prediction(result["prediction_id"]))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-08 — a retry treated readable PREPARE bytes as a durable PREPARE
+# ════════════════════════════════════════════════════════════════════════
+class RA08_PrepareDurabilityWasNotRecheckedOnRetry(ServiceCase):
+    """AA-13 made PREPARE a precondition for dispatch. It is checked once.
+
+    `AlphaLedger.prepare` is idempotent by LOOKUP: `find_prepare(analysis_id)`
+    and, if a row comes back, return it. That row is READ from the file --
+    which is precisely the thing AA-13's re-audit established is not proof of
+    durability, and the reason the COMMIT receipt exists for predictions.
+
+    The failure is the ordinary one. An append whose `write` landed and whose
+    `fsync` failed leaves bytes that read back perfectly while still being one
+    power cut from never having existed. `prepare()` raised on that attempt,
+    so the service correctly deferred and spent nothing. On the NEXT poll
+    `find_prepare` returns those same readable bytes, `prepare()` returns
+    without touching the device, the precondition is declared satisfied, and
+    every provider is paid -- on a ledger that is still not writable, so the
+    prediction that follows cannot be committed either.
+
+    PREPARE now carries its own receipt, exactly as a prediction does, and
+    the receipt's append is what makes the row durable (an fsync flushes the
+    whole file). No receipt, no dispatch, on the first attempt and on every
+    retry.
+    """
+
+    def hostile_fsync(self):
+        """Every fsync on a regular file fails; directory fsyncs still work.
+
+        That is the shape of the real failure: the bytes are accepted by the
+        page cache and the device refuses to commit them.
+        """
+        real = durable_append.os.fsync
+
+        def refuse(fd):
+            if stat_module.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "the device will not commit")
+            return real(fd)
+        return patch.object(durable_append.os, "fsync", refuse)
+
+    def test_a_retry_does_not_dispatch_on_readable_prepare_bytes(self):
+        provider = _CountingProvider()
+        service = self.service([provider])
+        snapshot = self.snapshot()
+        record = self.record()
+        with self.hostile_fsync():
+            first = service._analyze_one(snapshot, record)
+            second = service._analyze_one(snapshot, record)
+        self.assertTrue(first["deferred"])
+        self.assertTrue(
+            second["deferred"],
+            "the retry declared PREPARE satisfied from bytes it only read")
+        self.assertEqual(
+            provider.calls, 0,
+            "a provider was paid on a retry whose PREPARE was never durable")
+
+    def test_the_prepare_bytes_really_are_readable_after_the_failure(self):
+        """Anti-vacuity: if nothing was written, the case above proves nothing."""
+        service = self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        with self.hostile_fsync():
+            service._analyze_one(snapshot, self.record())
+        from alpha_ledger import analysis_identity
+        self.assertIsNotNone(
+            self.ledger.find_prepare(
+                analysis_identity(snapshot.market_snapshot_id)),
+            "the PREPARE row is not on disk, so this scenario is not the one "
+            "RA-08 describes")
+
+    def test_a_durable_prepare_carries_a_receipt(self):
+        service = self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        service._analyze_one(snapshot, self.record())
+        from alpha_ledger import analysis_identity
+        self.assertTrue(
+            self.ledger.prepare_is_durable(
+                analysis_identity(snapshot.market_snapshot_id)),
+            "a successful PREPARE left no proof that it completed")
+
+    def test_a_retry_after_the_device_recovers_completes_the_prepare(self):
+        provider = _CountingProvider()
+        service = self.service([provider])
+        snapshot = self.snapshot()
+        record = self.record()
+        with self.hostile_fsync():
+            service._analyze_one(snapshot, record)
+        result = service._analyze_one(snapshot, record)
+        self.assertFalse(result["deferred"])
+        self.assertGreater(provider.calls, 0)
+        from alpha_ledger import ROW_PREPARE, analysis_identity
+        prepares = [r for r in self.ledger.rows()
+                    if r.get("kind") == ROW_PREPARE]
+        self.assertEqual(len(prepares), 1,
+                         "the retry announced the analysis a second time")
+        self.assertTrue(self.ledger.prepare_is_durable(
+            analysis_identity(snapshot.market_snapshot_id)))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-09 — the processed cache was refreshed outside the append lock
+# ════════════════════════════════════════════════════════════════════════
+class RA09_TheProcessedCacheAdvancedPastAnotherWritersRow(AlphaCase):
+    """AA-14 gave `ProcessedStore` a generation-keyed cache. The order is wrong.
+
+    `mark()` appends under `serialized_append`, RELEASES the lock, and only
+    then patches `_cache` and re-stamps `_generation`:
+
+        with serialized_append(self.path) as append:
+            append(line)                      # lock released here
+        if self._cache is not None:
+            self._cache[snapshot_id] = row
+            self._generation = self._current_generation()
+
+    Any row another writer appends between those two moments is inside the
+    generation this store stamps and outside the cache it stamped it for. The
+    cache then looks FRESH -- size, mtime and inode all match -- while missing
+    a row that is on disk, and it stays that way until something else changes
+    the file.
+
+    A missing processed row reads as "this snapshot was never analysed", so
+    the service pays for an analysis another writer has already committed --
+    which is the AA-13 double-spend, reached through the cache instead of
+    through the crash.
+    """
+
+    def store(self, name="p.jsonl"):
+        from alpha_consumer import ProcessedStore
+        return ProcessedStore(path=os.path.join(self._tmp, name))
+
+    def test_a_row_written_by_another_store_is_not_hidden_by_our_mark(self):
+        from alpha_consumer import STATUS_ANALYZED
+        mine, theirs = self.store(), self.store()
+        mine.mark("snap-mine-0", STATUS_ANALYZED)      # fills my cache
+        self.assertIsNotNone(mine.status("snap-mine-0"))
+
+        theirs.mark("snap-theirs", STATUS_ANALYZED)    # another writer
+        mine.mark("snap-mine-1", STATUS_ANALYZED)      # my next append
+
+        self.assertIsNotNone(
+            mine.status("snap-theirs"),
+            "my cache was stamped with a generation that includes another "
+            "writer's row while not containing it")
+        self.assertIsNotNone(mine.status("snap-mine-1"))
+
+    def test_the_row_really_is_on_disk(self):
+        """Anti-vacuity."""
+        from alpha_consumer import STATUS_ANALYZED
+        mine, theirs = self.store(), self.store()
+        mine.mark("snap-mine-0", STATUS_ANALYZED)
+        theirs.mark("snap-theirs", STATUS_ANALYZED)
+        mine.mark("snap-mine-1", STATUS_ANALYZED)
+        with open(mine.path, encoding="utf-8") as fh:
+            ids = [json.loads(line)["market_snapshot_id"]
+                   for line in fh if line.strip()]
+        self.assertEqual(ids, ["snap-mine-0", "snap-theirs", "snap-mine-1"])
+
+    def test_a_concurrent_writer_in_another_process_is_seen(self):
+        """The real shape of it: a second OS process, not a second object."""
+        import subprocess
+        from alpha_consumer import STATUS_ANALYZED
+        mine = self.store()
+        mine.mark("snap-mine-0", STATUS_ANALYZED)
+        program = (
+            "import sys; sys.path.insert(0, %r);\n"
+            "import _bootstrap\n"
+            "from alpha_consumer import ProcessedStore\n"
+            "ProcessedStore(path=%r).mark('snap-other-process', 'ANALYZED')\n"
+            % (os.path.dirname(os.path.abspath(__file__)), mine.path))
+        subprocess.run([sys.executable, "-c", program], check=True,
+                       cwd=os.path.dirname(os.path.dirname(
+                           os.path.abspath(__file__))))
+        mine.mark("snap-mine-1", STATUS_ANALYZED)
+        self.assertIsNotNone(mine.status("snap-other-process"))
+
+    def test_the_cache_is_invalidated_inside_the_lock(self):
+        """Static: the ordering is the finding, not the symptom."""
+        import ast
+        with open("alpha_consumer.py", encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        mark = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "mark")
+        appends = [n for n in ast.walk(mark) if isinstance(n, ast.With)]
+        self.assertTrue(appends, "mark() no longer takes the append lock")
+        inside = {getattr(t, "attr", None)
+                  for w in appends for n in ast.walk(w)
+                  for t in ast.walk(n) if isinstance(t, ast.Attribute)}
+        self.assertIn("_generation", inside,
+                      "the generation is stamped outside the append lock, "
+                      "which is the whole of RA-09")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-10 — a budget refusal became a completed analysis during recovery
+# ════════════════════════════════════════════════════════════════════════
+class RA10_ABudgetRefusalTurnedTerminalOnRecovery(ServiceCase):
+    """`_acknowledge_recovered` marks `STATUS_ANALYZED`. Unconditionally.
+
+    A snapshot refused on spend is not an analysis. Every provider was
+    EXCLUDED before being called, `p_meta` is None, the state is
+    `BUDGET_EXHAUSTED`, and `_analyze_one` correctly marks it DEFERRED --
+    non-terminal, so a later poll retries it when the cap resets.
+
+    A prediction ROW is still written for it, because the refusal itself is
+    evidence worth keeping. So on the next poll `committed_prediction` finds
+    that row, recovery fires, and `_acknowledge_recovered` marks the snapshot
+    ANALYZED. `seen()` then returns True and the observation is never
+    retried: a cap that was meant to defer work has silently discarded it,
+    and the ledger now contains a terminal analysis whose `p_meta` is None.
+
+    Recovery may only re-publish the state the recovered row actually has. A
+    refusal stays a refusal.
+    """
+
+    def refusing_service(self):
+        """Caps set so low that every provider is refused before the call."""
+        return self.service([_CountingProvider()],
+                            caps={"ALPHA_MAX_COST_PER_ANALYSIS_USD": 1e-9,
+                                  "ALPHA_MAX_COST_PER_DAY_USD": 1e-9})
+
+    def test_a_budget_refusal_is_deferred_on_the_first_pass(self):
+        """Anti-vacuity: v3 already got this half right."""
+        from alpha_consumer import STATUS_DEFERRED
+        service = self.refusing_service()
+        snapshot = self.snapshot()
+        result = service._analyze_one(snapshot, self.record())
+        self.assertTrue(result["deferred"])
+        self.assertEqual(self.store.status(snapshot.market_snapshot_id),
+                         STATUS_DEFERRED)
+        self.assertFalse(self.store.seen(snapshot.market_snapshot_id))
+
+    def test_recovery_does_not_promote_a_refusal_to_terminal(self):
+        from alpha_consumer import STATUS_DEFERRED
+        service = self.refusing_service()
+        snapshot = self.snapshot()
+        service._analyze_one(snapshot, self.record())
+        recovered = service._analyze_one(snapshot, self.record())
+        self.assertEqual(
+            self.store.status(snapshot.market_snapshot_id), STATUS_DEFERRED,
+            "a budget refusal became a completed analysis merely by being "
+            "recovered")
+        self.assertFalse(
+            self.store.seen(snapshot.market_snapshot_id),
+            "the refused snapshot is now terminal and will never be retried")
+        self.assertTrue(recovered["deferred"])
+
+    def test_no_observations_are_scheduled_for_a_recovered_refusal(self):
+        service = self.refusing_service()
+        snapshot = self.snapshot()
+        service._analyze_one(snapshot, self.record())
+        service._analyze_one(snapshot, self.record())
+        self.assertEqual(service._pending_observations, [],
+                         "follow-up observations were scheduled for an "
+                         "analysis that was never performed")
+
+    def test_the_refusal_is_retried_once_the_cap_allows_it(self):
+        """The point of DEFERRED: the work comes back."""
+        provider = _CountingProvider()
+        service = self.service([provider])
+        snapshot = self.snapshot()
+        with patch.object(CFG, "ALPHA_MAX_COST_PER_DAY_USD", 1e-9):
+            service._analyze_one(snapshot, self.record())
+        self.assertEqual(provider.calls, 0)
+        service._analyze_one(snapshot, self.record())
+        self.assertGreater(provider.calls, 0,
+                           "the deferred snapshot was never re-analysed")
+
+    def test_a_genuine_analysis_is_still_recovered_as_terminal(self):
+        """Anti-vacuity: RA-10 must not make recovery useless."""
+        from alpha_consumer import STATUS_ANALYZED
+        provider = _CountingProvider()
+        service = self.service([provider])
+        snapshot = self.snapshot()
+        service._analyze_one(snapshot, self.record())
+        calls = provider.calls
+        self.assertGreater(calls, 0)
+        recovered = service._analyze_one(snapshot, self.record())
+        self.assertEqual(provider.calls, calls, "it was analysed twice")
+        self.assertFalse(recovered["deferred"])
+        self.assertEqual(self.store.status(snapshot.market_snapshot_id),
+                         STATUS_ANALYZED)
+
+    def test_a_refusal_already_in_the_ledger_is_recovered_as_deferred(self):
+        """The append-only half of RA-10.
+
+        A spend refusal is no longer WRITTEN as a prediction, so the primary
+        path cannot reach `_acknowledge_recovered` with one. History is
+        append-only, though: rows like that are already on disk from earlier
+        runs, and recovery must not promote them either. Without this case the
+        guard in `_acknowledge_recovered` would be unreachable code that reads
+        as a safety property.
+        """
+        from alpha_consumer import STATUS_DEFERRED
+        from alpha_service import STATE_BUDGET_EXHAUSTED
+        service = self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        self.ledger.record_prediction({
+            "prediction_id": "pred-legacy-refusal",
+            "market_snapshot_id": snapshot.market_snapshot_id,
+            "contract_id": snapshot.contract_id,
+            "state": STATE_BUDGET_EXHAUSTED,
+            "state_reason": "every provider was refused before being called",
+            "p_meta": None})
+
+        result = service._analyze_one(snapshot, self.record())
+
+        self.assertTrue(result["recovered"])
+        self.assertTrue(result["deferred"])
+        self.assertEqual(self.store.status(snapshot.market_snapshot_id),
+                         STATUS_DEFERRED)
+        self.assertFalse(self.store.seen(snapshot.market_snapshot_id))
+        self.assertEqual(service._pending_observations, [])
+
+    def test_a_spend_refusal_writes_no_prediction_row(self):
+        """Nothing was analysed, so there is nothing to record."""
+        service = self.refusing_service()
+        snapshot = self.snapshot()
+        service._analyze_one(snapshot, self.record())
+        self.assertEqual(self.ledger.predictions(), [],
+                         "a refusal in which no provider was asked was "
+                         "recorded as a prediction")
+        self.assertIsNone(self.ledger.committed_prediction(
+            snapshot.market_snapshot_id))
+
+    def test_the_announcement_survives_the_refusal(self):
+        """The audit trail still says the analysis was announced and deferred."""
+        from alpha_ledger import ROW_PREPARE, analysis_identity
+        service = self.refusing_service()
+        snapshot = self.snapshot()
+        service._analyze_one(snapshot, self.record())
+        prepares = [r for r in self.ledger.rows()
+                    if r.get("kind") == ROW_PREPARE]
+        self.assertEqual(len(prepares), 1)
+        self.assertTrue(self.ledger.prepare_is_durable(
+            analysis_identity(snapshot.market_snapshot_id)))
