@@ -257,8 +257,10 @@ class M09_ProducerExceptionPropagation(EffectCase):
     """A research failure must never reach the decision cycle."""
 
     def test_a_producer_bug_never_raises_into_the_caller(self):
+        # RA-03: `_admit` is what the caller's thread runs now. `_build` is
+        # the writer's, and the case below covers that half.
         feed = ResearchFeed(directory=self.spool, start_writer=False)
-        with patch.object(ResearchFeed, "_build",
+        with patch.object(ResearchFeed, "_admit",
                           side_effect=RuntimeError("boom")):
             self.assertFalse(feed.emit_candidate({"anything": True}))
 
@@ -269,12 +271,25 @@ class M09_ProducerExceptionPropagation(EffectCase):
                 self.assertFalse(feed.emit_candidate(payload))
 
     def test_a_checksum_failure_never_raises(self):
+        """RA-03: the digest is computed on the WRITER's thread now.
+
+        So the assertion moves with it. The caller must still not see the
+        exception, the writer must survive it, and nothing may be spooled --
+        which is what an unhashable record must produce.
+        """
         feed = ResearchFeed(directory=self.spool, start_writer=False)
+        self.addCleanup(feed.writer.stop)
         with patch("research_feed.compute_checksum",
                    side_effect=TypeError("unserializable")):
-            self.assertFalse(feed.emit_candidate({
-                "field_provenance": {}, "unavailable_fields": [],
-                "quote_observation": {}}))
+            feed.emit_candidate({"field_provenance": {},
+                                 "unavailable_fields": [],
+                                 "quote_observation": {}})
+            feed.writer.start()
+            self.assertTrue(feed.writer.drain(timeout=5.0))
+        self.assertEqual(feed.writer.spool.stats["written"], 0)
+        self.assertEqual([n for n in os.listdir(self.spool)
+                          if n.endswith(".json")] if
+                         os.path.isdir(self.spool) else [], [])
 
 
 class M10_OverwriteHistoricalBytes(EffectCase):

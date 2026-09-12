@@ -308,7 +308,13 @@ class AnAbsentFactIsNeverReconstructed(TruthCase):
 
     def assertRefused(self, source, *, field, book=None):
         before = self.witness()
-        self.assertFalse(self.emit(source, book))
+        # RA-03 moved the contract walk onto the writer's thread, so
+        # `emit_candidate` reports ADMISSION and the verdict is read after the
+        # drain. The refusal itself is asserted exactly as before -- and on
+        # the two things that can actually prove it: the spool is the only
+        # place that can say whether evidence was accepted, and
+        # `refused_incomplete` is the producer's own count of why.
+        self.emit(source, book)
         self.assertEqual(self.spool_bytes(), {},
                          f"{field} was absent and a record was written anyway")
         self.assertEqual(self.feed.stats()["refused_incomplete"], 1)
@@ -393,27 +399,46 @@ class MalformedObservationsFailClosed(TruthCase):
 
     def candidate(self, **over):
         """A structurally complete candidate whose ONE field is poisoned,
-        built directly so the poison reaches `_build` rather than being
+        built directly so the poison reaches the contract rather than being
         filtered out while shaping."""
         base = candidate_from_market(market(), BOOK, cycle_id="c1")
         base.update(over)
         return base
 
+    def assertRefused(self, candidate):
+        """The contract refused it and nothing was spooled.
+
+        RA-03: `emit_candidate` returns ADMISSION now -- type-checked and
+        queued -- because serializing, hashing and validating a record is
+        work the engine's observer thread must not do. So the verdict is
+        asserted after a drain, on the spool and on the producer's own
+        refusal counters. That is a stronger assertion than the return value
+        ever was: a return value can be True while a record is quietly
+        written, and an empty spool cannot.
+        """
+        refusals = lambda: sum(self.feed.stats()[k] for k in    # noqa: E731
+                               ("rejected", "refused_incomplete",
+                                "refused_derived"))
+        before = refusals()
+        self.feed.emit_candidate(candidate)
+        self.feed.writer.drain(timeout=5.0)
+        self.assertGreater(refusals(), before,
+                           "the producer did not refuse it")
+        self.assertEqual(self.spool_bytes(), {},
+                         "a refused candidate reached the spool")
+
     def test_a_price_above_one_is_refused(self):
-        self.assertFalse(self.feed.emit_candidate(self.candidate(yes_ask=1.5)))
-        self.assertEqual(self.spool_bytes(), {})
+        self.assertRefused(self.candidate(yes_ask=1.5))
 
     def test_a_negative_price_is_refused(self):
-        self.assertFalse(self.feed.emit_candidate(self.candidate(no_bid=-0.1)))
-        self.assertEqual(self.spool_bytes(), {})
+        self.assertRefused(self.candidate(no_bid=-0.1))
 
     def test_nan_and_infinity_are_refused_on_every_numeric_field(self):
         for field in ("yes_bid", "yes_ask", "no_bid", "no_ask", "volume",
                       "open_interest"):
             for bad in (float("nan"), float("inf"), float("-inf")):
                 with self.subTest(field=field, value=bad):
-                    self.assertFalse(self.feed.emit_candidate(
-                        self.candidate(**{field: bad})))
+                    self.assertRefused(self.candidate(**{field: bad}))
         self.assertEqual(self.spool_bytes(), {})
 
     def test_a_nan_price_in_the_book_never_reaches_the_candidate(self):
@@ -428,7 +453,7 @@ class MalformedObservationsFailClosed(TruthCase):
         self.assertNotIn("yes_ask", candidate["field_provenance"])
 
     def test_a_negative_size_is_refused(self):
-        self.assertFalse(self.feed.emit_candidate(self.candidate(volume=-1)))
+        self.assertRefused(self.candidate(volume=-1))
 
     def test_a_candidate_with_no_provenance_at_all_is_refused(self):
         candidate = self.candidate()
@@ -439,7 +464,7 @@ class MalformedObservationsFailClosed(TruthCase):
     def test_a_candidate_whose_provenance_omits_one_field_is_refused(self):
         candidate = self.candidate()
         candidate["field_provenance"].pop("resolution_source")
-        self.assertFalse(self.feed.emit_candidate(candidate))
+        self.assertRefused(candidate)
         self.assertEqual(self.feed.stats()["refused_incomplete"], 1)
 
     def test_a_field_both_present_and_listed_unavailable_is_refused(self):
@@ -447,7 +472,7 @@ class MalformedObservationsFailClosed(TruthCase):
         value: the contradiction IS the incompleteness."""
         candidate = self.candidate()
         candidate["unavailable_fields"] = ["volume"]
-        self.assertFalse(self.feed.emit_candidate(candidate))
+        self.assertRefused(candidate)
 
     def test_a_non_dict_candidate_is_refused_without_raising(self):
         for junk in (None, [], "KXBTC", 7):
@@ -888,11 +913,17 @@ class EveryFailurePathLeavesTheEngineUntouched(TruthCase):
         junk = [None, [], "", {"ticker": None}, {"volume": object()}]
         for payload in junk:
             with self.subTest(payload=repr(payload)[:40]):
-                result, mutations = self.under_tripwire(
+                _result, mutations = self.under_tripwire(
                     self.feed.emit_candidate,
                     candidate_from_market(payload, BOOK, raw_book=payload))
-                self.assertFalse(result)
+                # RA-03: the verdict is the writer's, so the assertion is on
+                # what survived the whole path rather than on the admission
+                # `emit_candidate` reports. The broker count is the point of
+                # this case either way.
                 self.assertEqual(mutations, 0)
+                self.feed.writer.drain(timeout=5.0)
+                self.assertEqual(self.spool_bytes(), {},
+                                 "a junk payload produced a record")
         self.assertNothingUnsafeMoved(before)
 
     def test_an_unreadable_spool_record_does_not_stop_the_batch(self):

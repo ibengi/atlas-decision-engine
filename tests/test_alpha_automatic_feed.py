@@ -145,7 +145,11 @@ class TheProducerEmitsUsableCandidates(FeedCase):
                     {**candidate_from_market(market(), BOOK),
                      "yes_ask": float("nan")}):
             with self.subTest(candidate=str(bad)[:40]):
-                self.assertFalse(self.feed.emit_candidate(bad))
+                self.feed.emit_candidate(bad)
+                self.feed.writer.drain(timeout=5.0)
+        # RA-03: the contract verdict belongs to the writer, so the assertion
+        # is on the spool -- which is the only place that can say whether a
+        # malformed candidate became evidence.
         self.assertEqual(self.spool_bytes(), {})
 
 
@@ -155,20 +159,37 @@ class TheProducerCannotHurtTheEngine(FeedCase):
         """Neither a dead filesystem nor a bug in the producer may reach the
         caller, which is a decision cycle.
 
-        AA-10 moved the filesystem out of `emit_candidate`, so the two halves
-        are now asserted separately: a `_build` failure is still visible to the
-        caller as a refusal, while a filesystem failure happens on the writer
-        thread and shows up as "nothing was spooled" rather than as a False
-        return. The engine never learns about the disk -- by design.
+        AA-10 moved the filesystem out of `emit_candidate`, and RA-03 moved
+        the hashing and the contract walk out too, so the halves are asserted
+        separately: an ADMISSION failure is still visible to the caller as a
+        refusal, while anything that happens on the writer thread -- a dead
+        filesystem, a bug in the finalizer -- shows up as "nothing was
+        spooled" rather than as a False return. The engine never learns about
+        the disk, or about the contract, by design.
         """
         with patch("research_spool.os.makedirs",
                    side_effect=PermissionError("read-only volume")):
             self.emit()                      # must not raise
         self.assertEqual(self.spool_bytes(), {})
         self.assertEqual(self.feed.writer.spool.stats["written"], 0)
-        with patch.object(ResearchFeed, "_build",
+        with patch.object(ResearchFeed, "_admit",
                           side_effect=RuntimeError("boom")):
             self.assertFalse(self.emit())
+
+    def test_a_finalizer_bug_kills_neither_the_cycle_nor_the_writer(self):
+        """RA-03's other half: the work moved, the promise did not.
+
+        A bug in the code that now runs on the writer thread must not reach
+        the caller, must not spool anything, and must not stop the writer
+        from draining the next record.
+        """
+        with patch.object(ResearchFeed, "_finalize",
+                          side_effect=RuntimeError("boom")):
+            self.assertTrue(self.emit())     # admitted, and never raised
+        self.assertEqual(self.spool_bytes(), {})
+        self.assertTrue(self.emit())
+        self.assertEqual(len(self.spool_bytes()), 1,
+                         "the writer thread did not survive the bad record")
 
     def test_a_feed_failure_never_trips_the_persistence_sentinel(self):
         """A failed research write is not a critical persistence failure and

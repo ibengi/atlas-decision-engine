@@ -99,54 +99,176 @@ def _diagnostic(value) -> str:
     return text if len(text) <= 200 else text[:197] + "..."
 
 
+#: The identity keys a settlement-source OBJECT may carry. Both are text and
+#: both belong to the authority's identity: `name` says WHO settles the
+#: market, `url` says WHERE that authority publishes the number. RA-02: a
+#: normalization that keeps the first and drops the second is not a
+#: canonical identity, it is a lossy rendering.
+SOURCE_IDENTITY_KEYS = ("name", "url")
+
+#: Characters the rendering below escapes so that the text form is INJECTIVE:
+#: distinct structured identities must never render to the same string, or the
+#: comparison that detects contradictory aliases is comparing renderings
+#: rather than facts (RA-02).
+_RENDER_ESCAPES = {"\\": "\\\\", "|": "\\|", "<": "\\<", ">": "\\>"}
+
+
+class MalformedSettlementSource(Exception):
+    """A settlement-source container this producer cannot claim to understand.
+
+    Raised rather than returned so that "the exchange published nothing" and
+    "the exchange published something we cannot read" stay different facts
+    inside this module, even though both end as an ABSENT `resolution_source`
+    in the record. The distinction is what stops a partly-read member from
+    being reported as a fully-read one (RA-01).
+    """
+
+
+def _identity_text(value, key: str):
+    """Non-blank text for one identity key, `None` when JSON-absent, or raise.
+
+    A JSON `null` is how a feed says "not published", so it reads as ABSENT.
+    Anything else that is not non-blank text is MALFORMED: an integer URL is
+    a plausible internal field and a wholly implausible publication location,
+    and a blank one is "published an empty URL", which is not "published no
+    URL".
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, str):
+        raise MalformedSettlementSource(
+            f"{key} is {type(value).__name__}, not text")
+    text = value.strip()
+    if not text:
+        raise MalformedSettlementSource(f"{key} is blank")
+    return text
+
+
+def settlement_source_identity(value):
+    """The CANONICAL STRUCTURED identity of a settlement source, or None.
+
+    Returns a tuple of MEMBERS, each member a tuple of sorted `(key, text)`
+    pairs -- so collection boundaries and per-member URLs both survive into
+    the value that gets compared and rendered.
+
+    RA-01: EVERY MEMBER, AND THE WHOLE CONTAINER, BEFORE NORMALIZATION.
+        The previous version looped `for key in ("name", "url")` and RETURNED
+        on the first key that was present and readable. With `name` present,
+        `url` was never examined at all, so
+
+            {"name": "CF Benchmarks RTI", "url": 8080}
+
+        was accepted as the authority "CF Benchmarks RTI" while the malformed
+        half of the same object went unread. AA-02's own rule -- one malformed
+        member taints the collection -- was correct and simply never reached.
+
+        Here there is no early return. Every identity key present on a member
+        is validated, every member of a list is validated, and a container
+        whose shape this producer does not recognise -- a mapping with no
+        identity key, a bare number, a boolean -- is MALFORMED rather than
+        quietly empty.
+
+    RA-02: STRUCTURE IS THE IDENTITY.
+        `", ".join(names)` destroyed exactly the two things that distinguish
+        two authorities. `[{"name": "A"}, {"name": "B"}]` (two authorities)
+        and `[{"name": "A, B"}]` (one authority whose name contains a comma)
+        rendered identically, and the URL was dropped altogether -- so two
+        alias keys naming one authority at two DIFFERENT locations compared
+        EQUAL, and `resolve_alias` resolved a real contradiction silently.
+    """
+    if isinstance(value, bool):
+        raise MalformedSettlementSource("a boolean is not a settlement source")
+    if isinstance(value, str):
+        text = _identity_text(value, "name")
+        return ((("name", text),),) if text else ()
+    if isinstance(value, dict):
+        fields = []
+        for key in SOURCE_IDENTITY_KEYS:
+            if key not in value:
+                continue
+            text = _identity_text(value[key], key)
+            if text is not None:
+                fields.append((key, text))
+        if not fields:
+            raise MalformedSettlementSource(
+                f"no settlement-source identity among "
+                f"{sorted(value)[:8]!r}; a container with no name and no url "
+                f"is not an empty source, it is an unrecognised one")
+        return (tuple(sorted(fields)),)
+    if isinstance(value, (list, tuple)):
+        members = []
+        for item in value:
+            # No early exit on success and none on failure either: a
+            # malformed member raises, which taints the whole collection,
+            # because a settlement source list that is half readable is not
+            # half true.
+            members.extend(settlement_source_identity(item))
+        return tuple(members)
+    raise MalformedSettlementSource(
+        f"{type(value).__name__} is not a settlement source")
+
+
+def _escape_identity(text: str) -> str:
+    return "".join(_RENDER_ESCAPES.get(ch, ch) for ch in text)
+
+
+def render_settlement_source(identity) -> str:
+    """Readable AND injective text for a canonical structured identity.
+
+    `name <url>`, members joined by ` | `, with the backslash, pipe and
+    angle-bracket characters escaped inside every name and URL. The escaping is what makes the
+    rendering injective: without it, one authority literally named `A | B`
+    and two authorities `A` and `B` would produce the same record field, and
+    RA-02 would be re-opened in the rendering after being closed in the
+    comparison.
+    """
+    parts = []
+    for member in identity:
+        fields = dict(member)
+        name = fields.get("name")
+        url = fields.get("url")
+        if name and url:
+            parts.append(f"{_escape_identity(name)} "
+                         f"<{_escape_identity(url)}>")
+        elif url:
+            parts.append(f"<{_escape_identity(url)}>")
+        elif name:
+            parts.append(_escape_identity(name))
+    return " | ".join(parts)
+
+
+def settlement_source_comparator(value):
+    """What `resolve_alias` compares two `resolution_source` aliases BY.
+
+    The STRUCTURED identity, never the rendering: a comparator that flattens
+    is a comparator that reports disagreement as agreement.
+
+    Every malformed container compares equal (to `None`), because "we cannot
+    read this" is one fact however it is misspelled -- and a field both
+    aliases agree is unreadable is ABSENT, which the contract refuses anyway.
+    """
+    try:
+        return settlement_source_identity(value) or None
+    except MalformedSettlementSource:
+        return None
+
+
 def _settlement_source_name(value):
     """The settlement authority the exchange PUBLISHED, as text, or None.
 
-    Kalshi records settlement sources as a list of objects. This reads the
-    name it published; it never invents one, and it never falls back to the
-    exchange's own name just because the market is listed there.
-
-    AA-02 (re-audit): TYPE FIRST, NEVER COERCE FIRST.
-        The previous version reached `str(name).strip()` after excluding only
-        dicts, lists and booleans, so `{"name": 12345}` became the settlement
-        source `"12345"`. An integer is a plausible internal identifier and a
-        wholly implausible settlement authority; once it is a string nothing
-        downstream can tell it apart from a name somebody published. The same
-        held for `{"url": 8080}`.
-
-        A member whose name is not TEXT is malformed, and one malformed member
-        taints the whole collection: a settlement source list that is half
-        readable is not half true.
-
-    The `name or url` fallback is also gone. `or` fires on the empty string,
-    so a member carrying `{"name": "", "url": ...}` silently reported the URL
-    as the authority's name -- "published an empty name" and "published no
-    name at all" are different facts and neither of them is the URL.
+    Kalshi records settlement sources as a list of objects. This reads what it
+    published -- every member, and the URL as well as the name -- and never
+    invents one, never falls back to the exchange's own name because the
+    market is listed there, and never treats an empty name as a reason to
+    report the URL as the name.
     """
-    if isinstance(value, bool):
+    try:
+        identity = settlement_source_identity(value)
+    except MalformedSettlementSource:
         return None
-    if isinstance(value, str):
-        return value.strip() or None
-    if isinstance(value, dict):
-        for key in ("name", "url"):
-            if key not in value:
-                continue
-            candidate = value[key]
-            # The type check happens HERE, before any string conversion.
-            if not isinstance(candidate, str):
-                return None
-            text = candidate.strip()
-            return text or None
+    if not identity:
         return None
-    if isinstance(value, (list, tuple)):
-        names = []
-        for item in value:
-            name = _settlement_source_name(item)
-            if name is None:
-                return None       # one malformed entry taints the collection
-            names.append(name)
-        return ", ".join(names) or None
-    return None
+    return render_settlement_source(identity) or None
 
 
 def observed_cents(source: dict, key: str):
@@ -193,6 +315,18 @@ class ResearchFeed:
                 max_queue=int(CFG.RESEARCH_FEED_QUEUE_MAX),
                 max_queue_bytes=int(CFG.RESEARCH_FEED_QUEUE_MAX_BYTES),
                 start=start_writer)
+        # RA-03: the writer thread is what assembles, hashes and validates.
+        # Wired after BOTH branches, on purpose: an INJECTED writer -- which
+        # is how most tests and the readiness gate drive this -- must get the
+        # same finalizer, and therefore the same verdicts, as production.
+        #
+        # Bound LATE, through the instance, and not as `self._finalize`. A
+        # bound method captured here would freeze the original function, so a
+        # test -- or a mutation -- that replaces `_finalize` on the class
+        # would leave the writer calling the unpatched one and pass while
+        # testing nothing. That is the false-green class AA-17 exists for, so
+        # the indirection is deliberate rather than incidental.
+        self.writer.finalizer = lambda candidate: self._finalize(candidate)
 
     # ── the one method the engine calls ─────────────────────────────────
     def emit_candidate(self, candidate: dict) -> bool:
@@ -202,17 +336,35 @@ class ResearchFeed:
         a research feed that can propagate an exception -- or an fsync -- into
         it has become part of the money path by the back door.
 
-        True means "queued", not "durable". The producer deliberately has no
-        way to learn whether the bytes reached the disk, because there is no
-        action the engine could take on that answer.
+        RA-03 -- AND IT NEVER HASHES, SERIALIZES OR VALIDATES EITHER
+            AA-10 moved `write`, `fsync` and `prune` off this thread, and its
+            re-audit moved `log` off too. The CPU work stayed: every candidate
+            of every cycle was serialized with `json.dumps`, hashed with
+            sha256 and walked field-by-field against the full contract on the
+            engine's own thread, and a refusal then interpolated the whole
+            error list into a diagnostic string before handing it over.
+
+            None of that is free and none of it is the observer's business.
+            What happens here is ADMISSION: type checks, and a shallow copy of
+            the containers the writer will read. Assembly, hashing and
+            validation happen on the writer's thread, where a slow record
+            costs research latency and nothing else.
+
+        True means "ADMITTED", not "valid" and not "durable". The producer
+        deliberately has no way to learn whether the bytes reached the disk,
+        because there is no action the engine could take on that answer -- and
+        since RA-03 it has no way to learn the contract verdict either, for
+        exactly the same reason. `rejected`, `refused_incomplete` and
+        `refused_derived` in `stats()` are how the verdicts are reported.
         """
         if not CFG.RESEARCH_FEED_ENABLED:
             return False
         try:
-            record = self._build(candidate)
-            if record is None:
+            admitted = self._admit(candidate)
+            if admitted is None:
                 return False
-            return self.writer.offer(record, approx_bytes=self._size(record))
+            return self.writer.offer_candidate(
+                admitted, approx_bytes=self._size(admitted))
         except Exception as e:                                # noqa: BLE001
             self.rejected += 1
             # AA-10 (re-audit): DEFERRED, not logged. `log.warning` here runs
@@ -242,13 +394,97 @@ class ResearchFeed:
     def _size(record: dict) -> int:
         """Cheap in-memory size estimate for the queue's byte budget.
 
-        Deliberately an estimate: serializing twice to be exact would put JSON
-        encoding of the full record back inside the decision cycle.
+        Deliberately an estimate: serializing to be exact would put JSON
+        encoding of the full record back inside the decision cycle, which is
+        the whole of RA-03.
         """
         return 512 + 2 * sum(len(str(v)) for v in record.values())
 
-    # ── construction ────────────────────────────────────────────────────
+    # ── observer side: admission, and nothing else (RA-03) ───────────
+    def _admit(self, candidate):
+        """The ONLY work the observer's thread does: type checks and a copy.
+
+        No hashing, no serialization, no contract walk, no diagnostic
+        formatting and no device. `tests/test_astra_v4_remediation.py` pins
+        that statically as well as by timing, because a timing test can only
+        prove the calls that happened to run.
+
+        The copy is shallow and it is not an optimisation: the record is
+        assembled on ANOTHER thread now, so the caller must be free to reuse
+        or mutate its candidate the moment this returns. A record whose
+        fields could change underneath the digest that covers them would make
+        the digest a claim about nothing.
+        """
+        if not isinstance(candidate, dict):
+            self.rejected += 1
+            return None
+        provenance = candidate.get("field_provenance")
+        unavailable = candidate.get("unavailable_fields")
+        observation = candidate.get("quote_observation")
+        contradictions = candidate.get("contradictory_fields") or {}
+        if not isinstance(provenance, dict) \
+                or not isinstance(unavailable, list) \
+                or not isinstance(observation, dict) \
+                or not isinstance(contradictions, dict):
+            self.rejected += 1
+            self._note(logging.DEBUG,
+                       "[RESEARCH_FEED] candidate carries no provenance "
+                       "container")
+            return None
+        admitted = dict(candidate)
+        admitted["field_provenance"] = dict(provenance)
+        admitted["unavailable_fields"] = list(unavailable)
+        admitted["quote_observation"] = dict(observation)
+        admitted["contradictory_fields"] = {
+            key: (dict(value) if isinstance(value, dict) else value)
+            for key, value in contradictions.items()}
+        return admitted
+
+    # ── construction: WRITER THREAD ONLY (RA-03) ───────────────────
     def _build(self, candidate: dict):
+        """Admit and finalize in one call. The whole producer path.
+
+        Kept as one function because that is what a reader wants when
+        asking "what record does this candidate produce"; the engine
+        never calls it, because half of it belongs on the writer's
+        thread. `emit_candidate` calls `_admit`, and `ResearchWriter`
+        calls `_finalize` on its own thread (RA-03).
+        """
+        admitted = self._admit(candidate)
+        if admitted is None:
+            return None
+        return self._finalize(admitted)
+
+    def _finalize(self, candidate: dict):
+        """Assemble, hash and validate. TOTAL: it returns None, never raises.
+
+        RA-03 moved this onto the writer's thread, and that move changed who
+        catches its failures. `emit_candidate` used to wrap it, so a record
+        the contract could not even be HASHED -- a NaN quote, which
+        `canonical_json` refuses outright with `allow_nan=False` -- was
+        counted as a rejection and reported in `stats()`. On the writer's
+        thread the same exception would land in `ResearchWriter._handle`'s
+        general catch, which logs and moves on: the record would still be
+        refused, and the producer's own refusal counters would say nothing
+        happened.
+
+        This is NEW-01's lesson arriving by a different route -- a function
+        that raises instead of refusing pushes the decision to a caller that
+        cannot classify it -- so the totality lives HERE, where the counters
+        are. `tests/test_astra_v4_remediation.py` patches internals to raise
+        and asserts the counters still move.
+        """
+        try:
+            return self._finalize_record(candidate)
+        except Exception as exc:                              # noqa: BLE001
+            self.rejected += 1
+            self._note(logging.WARNING,
+                       f"[RESEARCH_FEED] candidate could not be finalized "
+                       f"({type(exc).__name__}: {exc}); it is REFUSED, and "
+                       f"counted, rather than dropped silently")
+            return None
+
+    def _finalize_record(self, candidate: dict):
         """One spool record, or None. Never substitutes an absent fact.
 
         The candidate arriving here already carries its own provenance and its
@@ -259,21 +495,13 @@ class ResearchFeed:
         consumer and the readiness gate call, so a record that reaches the
         spool is one the consumer can mint from.
         """
-        if not isinstance(candidate, dict):
-            self.rejected += 1
+        candidate = self._admit(candidate)
+        if candidate is None:
             return None
-        provenance = candidate.get("field_provenance")
-        unavailable = candidate.get("unavailable_fields")
-        observation = candidate.get("quote_observation")
-        contradictions = candidate.get("contradictory_fields") or {}
-        if not isinstance(provenance, dict) or not isinstance(unavailable, list) \
-                or not isinstance(observation, dict) \
-                or not isinstance(contradictions, dict):
-            self.rejected += 1
-            self._note(logging.DEBUG,
-                       "[RESEARCH_FEED] candidate carries no provenance "
-                       "container")
-            return None
+        provenance = candidate["field_provenance"]
+        unavailable = candidate["unavailable_fields"]
+        observation = candidate["quote_observation"]
+        contradictions = candidate["contradictory_fields"]
 
         content = {
             "schema": FEED_SCHEMA,
@@ -381,7 +609,9 @@ def candidate_from_market(market: dict, book: dict, *, raw_book: dict = None,
 
     for field in MARKET_FIELDS:
         keys = SOURCE_BINDING[field][1]
-        comparator = (_settlement_source_name
+        # RA-02: the comparator compares STRUCTURE. Handing it the text
+        # rendering is what made two different authorities look like one.
+        comparator = (settlement_source_comparator
                       if field == "resolution_source" else None)
         try:
             value, key = resolve_alias(market, field, keys,

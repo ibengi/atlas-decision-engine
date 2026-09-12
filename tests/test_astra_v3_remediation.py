@@ -281,19 +281,27 @@ class _BlockingHandler(__import__("logging").Handler):
     30-second hold proves exactly the same thing while making the mutation
     probe, which runs this class against deliberately broken code, take
     twenty minutes for a single mutation.
+
+    RA-15 (v4): the gate used to be called `self.release`, which SHADOWS
+    `logging.Handler.release` -- the method `Handler.handle` calls to drop
+    the handler lock after `emit`. So every emit through this handler raised
+    `TypeError: 'Event' object is not callable` AFTER appending the record,
+    which killed the research writer thread and surfaced only as a pytest
+    warning. The assertions still held, for the wrong reason. It is named
+    `let_go` now, and the handler it stands in for is a real one again.
     """
 
     def __init__(self, hold: float = 0.25):
         super().__init__()
         self.hold = hold
         self.entered = __import__("threading").Event()
-        self.release = __import__("threading").Event()
+        self.let_go = __import__("threading").Event()
         self.records = []
 
     def emit(self, record):
         self.records.append(record)
         self.entered.set()
-        self.release.wait(self.hold)
+        self.let_go.wait(self.hold)
 
 
 class AA10_ResearchLoggingStillBlockedTheCycle(AlphaCase):
@@ -325,7 +333,7 @@ class AA10_ResearchLoggingStillBlockedTheCycle(AlphaCase):
         self.logger.setLevel(logging.DEBUG)
         self.addCleanup(self.logger.setLevel, previous)
         self.addCleanup(self.logger.removeHandler, self.handler)
-        self.addCleanup(self.handler.release.set)
+        self.addCleanup(self.handler.let_go.set)
 
     def feed(self):
         from research_spool import BoundedSpool, ResearchWriter
@@ -366,7 +374,7 @@ class AA10_ResearchLoggingStillBlockedTheCycle(AlphaCase):
         """Non-blocking must not mean silent: the writer thread emits them."""
         feed = self.feed()
         feed.emit_candidate(valid_candidate(raw_market(rules_primary=DROP)))
-        self.handler.release.set()            # let the handler run freely
+        self.handler.let_go.set()            # let the handler run freely
         feed.writer.start()
         self.addCleanup(feed.writer.stop)
         self.assertTrue(feed.writer.drain(timeout=5))
@@ -380,8 +388,16 @@ class AA10_ResearchLoggingStillBlockedTheCycle(AlphaCase):
         """Static, because a timing test can only prove the calls that ran."""
         import ast
         tree = ast.parse(open("research_feed.py", encoding="utf-8").read())
-        emit_path = {"emit_candidate", "_build", "_size",
-                     "candidate_from_market", "_settlement_source_name",
+        # RA-03 split the producer in two: `_admit` is what the observer's
+        # thread runs, `_build`/`_finalize` are the writer's. Both halves stay
+        # on this list -- the property AA-10 pins is that NOTHING on the path
+        # from the engine to the queue logs, and keeping the writer-side
+        # functions here as well is strictly stronger, not weaker.
+        emit_path = {"emit_candidate", "_admit", "_build", "_finalize",
+                     "_finalize_record", "_size", "candidate_from_market",
+                     "_settlement_source_name", "settlement_source_identity",
+                     "settlement_source_comparator", "_identity_text",
+                     "render_settlement_source", "_escape_identity",
                      "observed_cents", "_diagnostic"}
         offences = []
         for node in ast.walk(tree):
@@ -402,7 +418,7 @@ class AA10_ResearchLoggingStillBlockedTheCycle(AlphaCase):
         # This case is about the BOUND, not about blocking, so the handler is
         # let go first: a mutation that logs synchronously should fail the
         # timing cases above, not spend an hour here.
-        self.handler.release.set()
+        self.handler.let_go.set()
         feed = self.feed()
         for _ in range(2000):
             feed.emit_candidate(valid_candidate(raw_market(title=DROP)))

@@ -29,10 +29,12 @@ import logging
 import os
 import queue
 import re
+import stat
 import threading
 import time
 
-from durable_append import exclusive_lock
+from durable_append import (DurabilityUnknown, exclusive_lock,
+                            fsync_directory)
 
 log = logging.getLogger("RESEARCH_FEED")
 
@@ -179,7 +181,32 @@ class BoundedSpool:
             except OSError as exc:
                 raise SpoolCapacityUnknown(
                     f"cannot stat {name}: {exc}")
-            if not os.path.isfile(path):
+            # RA-04 -- ONE OBSERVATION, NOT TWO.
+            #
+            # This used to ask `os.path.isfile(path)` here, which stats the
+            # SAME path a second time. Two ways that went wrong, both of them
+            # in the unsafe direction:
+            #
+            #   * `os.path.isfile` swallows every `OSError` and returns False.
+            #     So the one case the stat above is careful to fail closed on
+            #     -- metadata we cannot read -- silently became "not a file,
+            #     do not count it" whenever it happened on the second look.
+            #   * between the two calls the entry can change. A record the
+            #     first stat counted could be absent from the second, and it
+            #     then occupied the volume while being invisible to every
+            #     budget meant to bound it.
+            #
+            # The mode is already in hand. It is used, and an entry carrying
+            # one of OUR suffixes that is not a regular file is metadata this
+            # class cannot account for, so capacity FAILS CLOSED rather than
+            # skipping it.
+            ours = name.endswith(TEMP_SUFFIX) or name.endswith(RECORD_SUFFIX)
+            if not stat.S_ISREG(st.st_mode):
+                if ours:
+                    raise SpoolCapacityUnknown(
+                        f"{name} carries a spool suffix but is not a regular "
+                        f"file (mode {st.st_mode:#o}); how much of the budget "
+                        f"it occupies cannot be established")
                 continue
             entry = (name, st.st_size, st.st_mtime)
             if name.endswith(TEMP_SUFFIX):
@@ -417,7 +444,7 @@ class BoundedSpool:
                 os.close(fd)
             os.replace(tmp, path)
             self._fsync_directory()
-        except OSError as exc:
+        except (OSError, DurabilityUnknown) as exc:
             self.stats["write_errors"] += 1
             log.warning(f"[RESEARCH_SPOOL] write failed: {exc}")
             try:
@@ -435,17 +462,15 @@ class BoundedSpool:
         gives those contents a name is a separate write. Without this a crash
         can leave a spool whose records are on the platter under no name at
         all -- which reads, on restart, as evidence that was never produced.
+
+        RA-05: this used to swallow both the open failure and the fsync
+        failure, so a record whose NAME never reached the device was counted
+        as written. It now delegates to `durable_append.fsync_directory`,
+        which raises `DurabilityUnknown`; `_reserve_and_write` catches it and
+        reports the write as FAILED, which is what "we cannot prove this is
+        durable" has to mean everywhere in this subsystem.
         """
-        try:
-            fd = os.open(self.directory, os.O_RDONLY)
-        except OSError:
-            return
-        try:
-            os.fsync(fd)
-        except OSError:
-            pass
-        finally:
-            os.close(fd)
+        fsync_directory(self.directory)
 
 
 #: Queue item kinds. A diagnostic travels the SAME bounded queue as a record,
@@ -453,6 +478,10 @@ class BoundedSpool:
 #: pressure policy to obey.
 ITEM_RECORD = "record"
 ITEM_NOTE = "note"
+
+#: RA-03. An ADMITTED candidate: type-checked by the observer, not yet
+#: assembled, hashed or validated. The finalizer runs on THIS thread.
+ITEM_CANDIDATE = "candidate"
 
 
 class ResearchWriter:
@@ -482,6 +511,12 @@ class ResearchWriter:
     def __init__(self, spool: BoundedSpool, *, max_queue=256,
                  max_queue_bytes=8 * 1024 * 1024, start=True):
         self.spool = spool
+        #: RA-03. Called ON THIS THREAD to turn an admitted candidate into a
+        #: spool record: JSON serialization, sha256 and the full contract
+        #: walk, none of which the engine's observer may pay for. `None`
+        #: means nobody wired one, and an admitted candidate is then DROPPED
+        #: rather than written unvalidated.
+        self.finalizer = None
         self.max_queue = int(max_queue)
         self.max_queue_bytes = int(max_queue_bytes)
         self._queue = queue.Queue(maxsize=self.max_queue)
@@ -494,7 +529,12 @@ class ResearchWriter:
                       # AA-10: diagnostics that never reached the writer.
                       # Counted rather than logged, because logging a dropped
                       # log on the engine thread would be the original bug.
-                      "notes": 0, "dropped_notes": 0}
+                      "notes": 0, "dropped_notes": 0,
+                      # RA-03: admitted candidates the contract refused after
+                      # the writer finalized them, and ones that could not be
+                      # finalized at all because no finalizer was wired.
+                      "finalized": 0, "refused_by_contract": 0,
+                      "unfinalizable": 0}
         if start:
             self.start()
 
@@ -516,6 +556,29 @@ class ResearchWriter:
                 return False
             try:
                 self._queue.put_nowait((ITEM_RECORD, record, size))
+            except queue.Full:
+                self.stats["dropped_queue_full"] += 1
+                return False
+            self._queued_bytes += size
+            self.stats["queued"] += 1
+        return True
+
+    def offer_candidate(self, candidate: dict, *,
+                        approx_bytes: int = 0) -> bool:
+        """Hand an ADMITTED candidate to the writer (RA-03).
+
+        Same bound, same drop policy and the same non-blocking guarantee as
+        `offer`; the only difference is how much work has been done to the
+        payload before it got here, and that is the entire point.
+        """
+        self.stats["offered"] += 1
+        size = int(approx_bytes or 0)
+        with self._lock:
+            if self._queued_bytes + size > self.max_queue_bytes:
+                self.stats["dropped_queue_bytes"] += 1
+                return False
+            try:
+                self._queue.put_nowait((ITEM_CANDIDATE, candidate, size))
             except queue.Full:
                 self.stats["dropped_queue_full"] += 1
                 return False
@@ -574,6 +637,21 @@ class ResearchWriter:
                 # research latency and nothing else.
                 level, message = payload
                 log.log(level, message)
+            elif kind == ITEM_CANDIDATE:
+                # RA-03: serialization, hashing, contract validation and the
+                # formatting of every diagnostic all happen HERE.
+                if self.finalizer is None:
+                    self.stats["unfinalizable"] += 1
+                    log.warning("[RESEARCH_WRITER] an admitted candidate "
+                                "arrived with no finalizer wired; it is "
+                                "DROPPED rather than spooled unvalidated")
+                else:
+                    record = self.finalizer(payload)
+                    self.stats["finalized"] += 1
+                    if record is None:
+                        self.stats["refused_by_contract"] += 1
+                    else:
+                        self.spool.write(record)
             else:
                 self.spool.write(payload)
         except Exception as exc:                              # noqa: BLE001

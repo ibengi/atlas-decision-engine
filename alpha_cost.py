@@ -40,6 +40,7 @@ import time
 from datetime import datetime, timezone
 
 from config import CFG, _p
+from durable_append import serialized_append
 
 log = logging.getLogger("ALPHA")
 
@@ -377,6 +378,31 @@ class BudgetLedger:
     anything. Windows are recomputed from the rows on every check, so a
     restart cannot reset the daily cap -- which is the failure mode a
     purely in-memory counter has.
+
+    RA-06 -- THE SAME DURABLE APPEND PROTOCOL AS EVERY OTHER LEDGER
+        AA-12 and AA-14 were applied to two of the three append-only files in
+        this subsystem. The calibration ledger learned the protocol; the
+        processed store learned it in v3; this one kept its own `os.open` plus
+        a SINGLE `os.write` plus `fsync`, with no short-write loop, no
+        torn-tail separation and no writer lock -- in the one file every cost
+        cap is enforced against.
+
+        The consequences were not cosmetic:
+
+          * `os.write` may write short. A truncated row read back as a torn
+            tail, which `rows()` treated as the end of the file.
+          * with no torn-tail separation, the NEXT row was spliced onto the
+            broken one, so both became one unparsable line -- and because it
+            was the LAST line, `rows()` `break`-ed and silently dropped the
+            spend. The daily cap was then enforced against a number that was
+            too small.
+          * two writers could interleave the check-then-append the torn-tail
+            test performs.
+
+        Under-counting spend is not a conservative failure: it is the one
+        direction in which a budget guard stops guarding. So this now goes
+        through `durable_append.serialized_append`, and `rows()` refuses to
+        return a total it cannot defend.
     """
 
     def __init__(self, path: str = None):
@@ -388,16 +414,13 @@ class BudgetLedger:
         line = json.dumps(entry, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, default=str) + "\n"
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(self.path)),
-                        exist_ok=True)
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                         0o644)
-            try:
-                os.write(fd, line.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        except OSError as e:
+            # The in-process lock AND the cross-process one: `flock` is what
+            # makes two writers safe, and holding the thread lock outside it
+            # keeps one process from queueing on its own file descriptor.
+            with self._lock:
+                with serialized_append(self.path) as append:
+                    append(line)
+        except (OSError, TimeoutError) as e:
             # A budget row that cannot be written means the next check would
             # under-count spend. Log loudly; the caller treats an unwritable
             # budget ledger as exhausted (see BudgetGuard.check).
@@ -420,10 +443,23 @@ class BudgetLedger:
             try:
                 row = json.loads(line)
             except ValueError:
-                if i == len(lines) - 1:
-                    break                       # torn tail, crash mid-append
-                log.error(f"[ALPHA_BUDGET] unparsable row at line {i + 1}")
-                continue
+                # RA-06 -- AN UNREADABLE ROW MAKES THE TOTAL UNKNOWN, NOT
+                # SMALLER.
+                #
+                # Before, a torn LAST line ended the read (`break`) and an
+                # unparsable line anywhere else was logged and SKIPPED. Both
+                # produce the same thing: a spend total that is too low, in
+                # the file the daily cap is enforced against. A guard that
+                # under-counts is a guard that does not bind.
+                #
+                # `check()` already refuses when the ledger cannot be READ.
+                # It has to refuse just as firmly when the ledger can be read
+                # and not believed, so this raises the same exception.
+                raise RuntimeError(
+                    f"budget ledger row {i + 1} of {self.path} is not "
+                    f"readable JSON, so total spend cannot be established; "
+                    f"no provider call is made until an operator reconciles "
+                    f"it. The row is PRESERVED, never rewritten.")
             if isinstance(row, dict) and (since_ts is None
                                           or float(row.get("ts") or 0) >= since_ts):
                 out.append(row)
@@ -458,6 +494,13 @@ class BudgetGuard:
                  ledger: BudgetLedger = None):
         self.pricing = pricing or PricingTable()
         self.ledger = ledger or BudgetLedger()
+        #: RA-06. Set when money was spent and the row recording it could NOT
+        #: be made durable. Sticky for the life of the process on purpose:
+        #: the spend really happened, the ledger really does not know about
+        #: it, and every total computed from that ledger is understated until
+        #: an operator reconciles. Clearing it on the next successful write
+        #: would hide exactly the gap it exists to report.
+        self.accounting_uncertain = ""
 
     def check(self, provider: str, model: str, *,
               analysis_spent_usd: float = 0.0,
@@ -490,6 +533,15 @@ class BudgetGuard:
             log.warning(f"[ALPHA_BUDGET] calling UNPRICED {provider}/{model}: "
                         f"cost caps cannot bind this call")
 
+        if self.accounting_uncertain:
+            # RA-06: a spend we could not record is a spend no cap can see.
+            result.update(
+                allowed=False, reason=REASON_BUDGET,
+                detail=f"a previous provider call was made and its cost row "
+                       f"could not be made durable ({self.accounting_uncertain}); "
+                       f"recorded spend is now known to be understated, so no "
+                       f"further call is made")
+            return result
         try:
             spent_hour = self.ledger.spent(window_s=3600.0, provider=provider)
             spent_day = self.ledger.spent_today()
@@ -555,8 +607,14 @@ class BudgetGuard:
                 "latency_ms": cost_row.get("latency_ms", 0),
                 "outcome": cost_row.get("outcome", ""),
             })
-        except OSError:
-            pass                       # already logged; check() fails closed
+        except (OSError, TimeoutError) as exc:
+            # RA-06: already logged, and now REMEMBERED. Swallowing this made
+            # money that had genuinely been spent invisible to every later
+            # check, which is the under-count the caps cannot survive.
+            self.accounting_uncertain = f"{type(exc).__name__}: {exc}"
+            log.error(f"[ALPHA_BUDGET] a provider call was made and its cost "
+                      f"row is NOT durable ({exc}); further calls are refused "
+                      f"until an operator reconciles the budget ledger")
 
     def snapshot(self) -> dict:
         try:

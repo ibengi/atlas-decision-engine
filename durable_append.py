@@ -49,6 +49,45 @@ except ImportError:                                    # pragma: no cover
 LOCK_SUFFIX = ".lock"
 
 
+class DurabilityUnknown(OSError):
+    """We cannot establish whether an append is durable, so we do not say it is.
+
+    RA-05 -- UNCERTAINTY IS NOT SUCCESS
+        `append_line`'s contract is the strongest promise in this subsystem:
+        it "either completes the whole sequence or raises -- there is no
+        outcome in which a caller is told 'written' without durability having
+        been attempted AND confirmed". Everything above it -- PREPARE, the
+        COMMIT receipt, the processed acknowledgement -- is built on that one
+        sentence being true.
+
+        Three paths inside it made the sentence false by swallowing the
+        uncertainty instead of reporting it:
+
+          `tail_is_torn`      returned False on ANY `OSError`. An unreadable
+                              tail is not an intact tail: if we cannot see
+                              whether the last record is complete, appending
+                              directly may splice the new row onto a broken
+                              one -- the exact AA-12 loss the separator
+                              exists to prevent -- and the caller was told it
+                              succeeded.
+
+          directory OPEN      returned silently, so the bytes became durable
+                              under a name that was not.
+
+          directory FSYNC     passed silently, with the same consequence: a
+                              crash then reads as a ledger that never
+                              existed, and the caller had already published a
+                              terminal acknowledgement for it.
+
+        It subclasses `OSError` deliberately. Every caller in this subsystem
+        already treats an `OSError` from an append as a failure to be
+        reported and retried, so closing these holes could not silently turn
+        a swallowed error into an unhandled crash somewhere -- while a caller
+        that wants to tell "the device refused" from "we cannot tell" still
+        can, by type.
+    """
+
+
 def write_all(fd, payload: bytes) -> int:
     """Write every byte or raise. See AA-12 above."""
     view = memoryview(payload)
@@ -74,19 +113,29 @@ def tail_is_torn(path: str) -> bool:
 
     That is the signature of an append interrupted partway: every complete row
     this module writes ends in `\\n`.
+
+    Raises `DurabilityUnknown` when the question cannot be answered (RA-05).
+    An unreadable tail is not an intact one.
     """
     try:
         size = os.path.getsize(path)
-    except OSError:
-        return False
+    except FileNotFoundError:
+        return False                 # no file, so certainly no torn tail
+    except OSError as exc:
+        # RA-05: the file exists and we cannot measure it. That is not "no
+        # tail"; it is "we do not know", and the difference decides whether
+        # the next append splices onto a broken row.
+        raise DurabilityUnknown(
+            f"cannot size {path} to check its tail: {exc}") from exc
     if size == 0:
         return False
     try:
         with open(path, "rb") as fh:
             fh.seek(-1, os.SEEK_END)
             return fh.read(1) != b"\n"
-    except OSError:
-        return False
+    except OSError as exc:
+        raise DurabilityUnknown(
+            f"cannot read the last byte of {path}: {exc}") from exc
 
 
 @contextlib.contextmanager
@@ -168,21 +217,44 @@ def append_line(path: str, line: str) -> None:
         # The bytes are durable; the NAME they live under is a separate
         # write. Without this a crash can leave a fsynced file that no
         # directory entry points at, which reads afterwards as a ledger that
-        # never existed.
-        _fsync_directory(parent)
+        # never existed. RA-05: a failure here RAISES, because a name that is
+        # not durable is not a durable append.
+        fsync_directory(parent)
 
 
-def _fsync_directory(parent: str) -> None:
+def fsync_directory(parent: str) -> None:
+    """Persist a DIRECTORY ENTRY, or raise `DurabilityUnknown` (RA-05).
+
+    An fsync on a file persists its contents; the name those contents live
+    under is a separate write in the parent directory. Both halves have to
+    land, and this used to swallow the failure of either -- so a caller could
+    be told an append succeeded while the file it wrote was reachable under no
+    name at all.
+
+    Every failure is reported, including the ones a platform might consider
+    benign. A filesystem that genuinely cannot fsync a directory has not made
+    the name durable, and this module's whole job is to refuse to pretend
+    otherwise.
+    """
     try:
         fd = os.open(parent, os.O_RDONLY)
-    except OSError:
-        return
+    except OSError as exc:
+        raise DurabilityUnknown(
+            f"cannot open {parent} to persist the directory entry: {exc}"
+        ) from exc
     try:
         os.fsync(fd)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise DurabilityUnknown(
+            f"cannot fsync {parent}; the bytes are durable but the NAME they "
+            f"live under is not: {exc}") from exc
     finally:
         os.close(fd)
+
+
+#: The private spelling kept as an alias: `research_spool` and the mutation
+#: probe both name it, and a rename is not what RA-05 is about.
+_fsync_directory = fsync_directory
 
 
 @contextlib.contextmanager

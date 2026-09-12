@@ -185,14 +185,13 @@ MUTATIONS = {
     "M12": (
         "coerce a numeric settlement-source member into a name (AA-02)",
         "research_feed.py",
-        "            candidate = value[key]\n"
-        "            # The type check happens HERE, before any string conversion.\n"
-        "            if not isinstance(candidate, str):\n"
-        "                return None\n"
-        "            text = candidate.strip()\n",
-        "            candidate = value[key]\n"
-        "            text = str(candidate).strip()\n",
-        ["tests/test_astra_v3_remediation.py::AA02_NumericSettlementMembersAreCoercedToText"],
+        "    if isinstance(value, bool) or not isinstance(value, str):\n"
+        "        raise MalformedSettlementSource(\n"
+        "            f\"{key} is {type(value).__name__}, not text\")\n"
+        "    text = value.strip()\n",
+        "    text = str(value).strip()\n",
+        ["tests/test_astra_v3_remediation.py::AA02_NumericSettlementMembersAreCoercedToText",
+         "tests/test_astra_v4_remediation.py::RA01_ValidNameSkippedTheRestOfTheContainer"],
     ),
     "M13": (
         "file a contradiction as an ordinary absence (AA-03)",

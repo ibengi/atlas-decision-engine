@@ -55,11 +55,13 @@ NEUTRAL_MODULES = {
     "candidate_contract.py": frozenset({"hashlib", "json", "math", "datetime"}),
     # `re` parses the owner pid out of a partial's name; `durable_append`
     # supplies the advisory lock the capacity RESERVATION is serialized on
-    # (AA-11 re-audit). `durable_append` is itself pinned below, so reaching
-    # it widens nothing: it imports contextlib, errno, os, fcntl and time,
-    # and no repository module at all.
+    # (AA-11 re-audit) and, since RA-05, the ONE honest directory fsync.
+    # `stat` is RA-04: the scan classifies each entry from the `st_mode` it
+    # already has instead of taking a second, disagreeing look with
+    # `os.path.isfile`. Both are standard library; `durable_append` is itself
+    # pinned below, so reaching it widens nothing.
     "research_spool.py": frozenset({"errno", "json", "logging", "os", "queue",
-                                    "re", "threading", "time",
+                                    "re", "stat", "threading", "time",
                                     "durable_append"}),
     "durable_append.py": frozenset({"contextlib", "errno", "os", "fcntl",
                                     "time"}),
