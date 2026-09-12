@@ -207,13 +207,48 @@ class CostsAreRecorded(LedgerCase):
 class MetricsAreDerived(LedgerCase):
 
     def resolve_many(self, outcomes):
+        """Predictions resolved THE WAY PRODUCTION RESOLVES THEM.
+
+        RA-13: `calibration()` -- the number the Meta engine weights models
+        with -- reads QUALIFIED settlements only, and RA-11/RA-12 define what
+        qualified means: a complete versioned binding, a named trusted
+        authority, a real resolution instant, an evidence identity, and
+        retained source evidence whose digest independently recomputes.
+
+        So this fixture stops calling `ledger.resolve()` directly and goes
+        through `ingest_settlements`, the path a real settlement takes. A
+        fixture that wrote resolutions no production path can produce would
+        be testing calibration on rows calibration is no longer allowed to
+        read.
+        """
+        from _candidate import valid_record
+        from alpha_resolution_ingest import ingest_settlements
+        from alpha_service import source_binding_for
         ledger = AlphaLedger()
         ids = []
         for i, outcome in enumerate(outcomes):
             snapshot = self.snapshot(contract_id=f"KX-{i}")
-            opportunity = AlphaGateway(providers=self.agreeing_providers(),
-                                       ledger=ledger).analyze(snapshot)
-            ledger.resolve(opportunity["prediction_id"], outcome)
+            record = valid_record()
+            binding = source_binding_for(
+                record, contract_id=snapshot.contract_id,
+                market_snapshot_id=snapshot.market_snapshot_id,
+                digest_verified=True)
+            opportunity = AlphaGateway(
+                providers=self.agreeing_providers(),
+                ledger=ledger).analyze(snapshot, source_binding=binding)
+            result = ingest_settlements(ledger, [{
+                "prediction_id": opportunity["prediction_id"],
+                "outcome": outcome,
+                "source": "trusted-settlement-feed",
+                "resolved_at": "2026-09-12T20:10:00+00:00",
+                "settlement_evidence_id": f"fixture-settlement-{i}",
+                "contract_id": binding["contract_id"],
+                "market_snapshot_id": binding["market_snapshot_id"],
+                "source_record_sha256": binding["record_sha256"],
+                "environment": binding["environment"],
+                "contract_schema": binding["contract_schema"]}],
+                trusted_sources=["trusted-settlement-feed"])
+            self.assertEqual(result["appended"], 1, result["rejected"])
             ids.append(opportunity["prediction_id"])
         return ledger, ids
 

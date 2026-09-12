@@ -10,12 +10,14 @@ on:
       - alpha/astra-learning-v1
       - alpha/astra-candidate-feed-v2-remediation
       - alpha/astra-candidate-feed-v3-remediation
+      - alpha/astra-candidate-feed-v4-remediation
   pull_request:
     branches:
       - main
       - alpha/astra-learning-v1
       - alpha/astra-candidate-feed-v2-remediation
       - alpha/astra-candidate-feed-v3-remediation
+      - alpha/astra-candidate-feed-v4-remediation
 
 jobs:
   test-learning:
@@ -51,6 +53,22 @@ jobs:
       - name: Astra v3 re-audit regression suite
         run: python -m pytest tests/test_astra_v3_remediation.py -q
 
+      # RA-01..RA-15 from the independent counter-audit, each reproduced
+      # from its counterexample before it was closed. Its own step so a
+      # failure names the finding rather than being buried.
+      - name: Astra v4 counter-audit regression suite
+        run: python -m pytest tests/test_astra_v4_remediation.py -q
+
+      # The classes the counter-audit asked to see run: crash/restart and
+      # short/zero/EINTR/EIO writes, the stale-cache multiprocess case, the
+      # source-conflict cases, the settlement-binding missing/null matrix,
+      # the report-path overwrite matrix, budget-ledger durability, and the
+      # observer-blocking cases.
+      - name: v4 durability, cache, binding, report-path and observer tests
+        run: |
+          python -m pytest tests/test_astra_v4_remediation.py -q \
+            -k "RA03 or RA04 or RA05 or RA06 or RA08 or RA09 or RA11 or RA14 or RA15"
+
       # The specific classes the re-audit asked to see run: crash/restart,
       # mixed writers, spool partials and capacity, settlement omission,
       # and the M07P mutation.
@@ -66,8 +84,25 @@ jobs:
 
       # Every mutation applied to a throwaway copy of the repo and asserted
       # KILLED. Zero survivors is the claim; this is what backs it.
-      - name: Mutation probe (zero survivors)
-        run: python tools/astra_mutation_probe.py
+      #
+      # RA-15: a kill now requires a test BODY to have failed, with nothing
+      # inconclusive -- a non-zero pytest exit caused by a collection error
+      # is not evidence that the suite noticed anything.
+      - name: Mutation probe (zero surviving effective safety mutations)
+        run: |
+          python tools/astra_mutation_probe.py --json > mutation-probe.json
+          python - <<'PY'
+          import json
+          summary = json.load(open('mutation-probe.json', encoding='utf-8'))
+          assert summary['surviving_effective_safety_mutations'] == 0, [
+              r for r in summary['results']
+              if not r['status'].startswith('KILLED')]
+          assert summary['inconclusive'] == 0, summary['inconclusive']
+          assert summary['not_applied'] == 0, summary['not_applied']
+          assert summary['behavioural_kills'] == summary['mutations_run'], summary
+          print('mutation probe: %d/%d behavioural kills, 0 survivors'
+                % (summary['behavioural_kills'], summary['mutations_run']))
+          PY
 
       # AA-02. The strict shared contract, on its own.
       - name: Strict contract, crash and concurrency tests
@@ -151,23 +186,91 @@ jobs:
       # AA-15 (re-audit): the CLI now requires the operator to NAME the
       # settlement authority they verified, and the settlement to carry the
       # COMPLETE binding. Both halves are exercised, including the refusal.
+      #
+      # RA-11/RA-12: "complete" now means the full VERSIONED identity -- the
+      # environment and the contract version too -- plus the actual
+      # resolution instant and the settlement evidence identity, and
+      # qualification RECOMPUTES the source digest from the evidence the
+      # prediction retained. So the fixture is built by the PRODUCTION
+      # producer and `source_binding_for`, not by hand: a synthetic digest
+      # cannot be re-derived from anything, and this step is exactly where a
+      # library/CLI divergence has to be caught.
       - name: Resolution ingest CLI boundary smoke test
         run: |
           tmpdir="$(mktemp -d)"
           export DATA_DIR="$tmpdir"
           python - <<'PY'
+          import json, os
+          from datetime import datetime, timedelta, timezone
           from alpha_ledger import AlphaLedger
+          from alpha_service import source_binding_for
+          from research_feed import ResearchFeed, candidate_from_market
+
+          now = datetime.now(timezone.utc)
+          market = {
+              'ticker': 'KX-CI', 'event_ticker': 'KX-CI-EV',
+              'title': 'Will the CI step pass?',
+              'rules_primary': 'Settles to the CI log.',
+              'settlement_sources': [{'name': 'CI Reference Rate'}],
+              'volume': 10, 'open_interest': 20,
+              'close_time': (now + timedelta(hours=3)).isoformat(
+                  timespec='seconds'),
+              'expiration_time': (now + timedelta(hours=4)).isoformat(
+                  timespec='seconds'),
+              'yes_bid': 44, 'yes_ask': 46, 'no_bid': 54, 'no_ask': 56,
+          }
+          feed = ResearchFeed(start_writer=False)
+          record = feed._build(candidate_from_market(
+              market, {}, raw_book=market, cycle_id='ci'))
+          assert record is not None, feed.last_errors
+          binding = source_binding_for(record, contract_id='KX-CI',
+                                       market_snapshot_id='snap-ci',
+                                       digest_verified=True)
           AlphaLedger().record_prediction({
               'prediction_id': 'ci-p1',
               'contract_id': 'KX-CI',
               'market_snapshot_id': 'snap-ci',
-              'source_binding': {'contract_id': 'KX-CI',
-                                 'market_snapshot_id': 'snap-ci',
-                                 'record_sha256': 'a' * 64}})
+              'source_binding': binding})
+          row = {'prediction_id': 'ci-p1', 'outcome': 1,
+                 'source': 'ci-trusted-feed',
+                 'resolved_at': '2026-09-12T20:10:00+00:00',
+                 'settlement_evidence_id': 'ci-settlement-0001',
+                 'contract_id': binding['contract_id'],
+                 'market_snapshot_id': binding['market_snapshot_id'],
+                 'source_record_sha256': binding['record_sha256'],
+                 'environment': binding['environment'],
+                 'contract_schema': binding['contract_schema']}
+          with open(os.path.join(os.environ['DATA_DIR'],
+                                 'settlements.jsonl'), 'w',
+                    encoding='utf-8') as fh:
+              fh.write(json.dumps(row) + '\n')
+          # RA-11: the same settlement with the environment removed must be
+          # QUARANTINED, not resolved on the fields it happens to carry.
+          partial = {k: v for k, v in row.items() if k != 'environment'}
+          with open(os.path.join(os.environ['DATA_DIR'],
+                                 'partial.jsonl'), 'w',
+                    encoding='utf-8') as fh:
+              fh.write(json.dumps(partial) + '\n')
+          print('CI settlement fixture built from the production producer')
           PY
-          cat > "$tmpdir/settlements.jsonl" <<'EOF'
-          {"prediction_id":"ci-p1","outcome":1,"source":"ci-trusted-feed","contract_id":"KX-CI","market_snapshot_id":"snap-ci","source_record_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-          EOF
+          # RA-11: an INCOMPLETE versioned binding is quarantined.
+          set +e
+          python tools/alpha_resolution_ingest.py --input "$tmpdir/partial.jsonl" \
+            --strict --trusted-source ci-trusted-feed > "$tmpdir/partial.json"
+          rc=$?
+          set -e
+          test "$rc" -eq 2
+          python - <<'PY'
+          import json, os
+          from alpha_ledger import AlphaLedger
+          out = json.load(open(os.path.join(os.environ['DATA_DIR'],
+                                            'partial.json'), encoding='utf-8'))
+          assert out['appended'] == 0, out
+          assert len(out['quarantined']) == 1, out
+          assert 'environment' in json.dumps(out['quarantined']), out
+          assert AlphaLedger().find_resolution('ci-p1') is None, 'it resolved'
+          print('incomplete versioned binding QUARANTINED, as designed')
+          PY
           # An unqualified source is refused. This is the DEFAULT, so it is
           # asserted before the happy path rather than after it.
           set +e
@@ -197,11 +300,21 @@ jobs:
           assert result['appended'] == 1, result
           assert result['trusted_sources_enforced'] is True, result
           assert result['quarantined'] == [], result
+          assert result['evidence_unverified'] == [], result
           resolution = AlphaLedger().find_resolution('ci-p1')
           assert resolution and resolution['actual_outcome'] == 1, resolution
           # The trust decision travels with the outcome (correction 12).
           assert resolution['binding_verified'] is True, resolution
           assert resolution['source_trusted'] is True, resolution
+          # RA-11: the ACTUAL resolution instant, not the ingestion time.
+          assert resolution['resolved_at'] == '2026-09-12T20:10:00+00:00', resolution
+          assert resolution['settlement_evidence_id'] == 'ci-settlement-0001', resolution
+          # RA-12: the evidence was independently recomputed.
+          assert resolution['source_evidence_verified'] is True, resolution
+          # RA-13: and this outcome is admissible in learning.
+          qualified = AlphaLedger().qualified_resolved()
+          assert len(qualified) == 1, qualified
+          assert qualified[0]['settlement_qualified'] is True, qualified
           print('resolution ingest CLI PASS')
           PY
 

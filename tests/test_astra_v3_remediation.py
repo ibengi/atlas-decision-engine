@@ -1180,16 +1180,26 @@ class AA15_PartialBindingWasAcceptedAsVerified(AlphaCase):
             "contract_schema": self.record["schema"],
             "environment": "test",
             "digest_verified": True,
+            # RA-12: the retained evidence, because settlement qualification
+            # now recomputes the digest from it rather than comparing two
+            # copies of the claim about it.
+            "source_evidence": contract.canonical_content(self.record),
         }
         self.ledger.record_prediction({
             "prediction_id": "p-1", "market_snapshot_id": "snap-1",
             "contract_id": "KX-1", "source_binding": dict(self.binding)})
 
     def settlement(self, **over):
+        # RA-11 widened the required binding to the full versioned identity
+        # and made the resolution instant and the evidence identity required.
         row = {"prediction_id": "p-1", "outcome": 1,
                "source": "CF Benchmarks RTI",
                "contract_id": "KX-1", "market_snapshot_id": "snap-1",
-               "source_record_sha256": self.record["record_sha256"]}
+               "source_record_sha256": self.record["record_sha256"],
+               "environment": "test",
+               "contract_schema": self.record["schema"],
+               "resolved_at": "2026-09-12T20:10:00+00:00",
+               "settlement_evidence_id": "cf-rti-2026-09-12"}
         row.update(over)
         return {k: v for k, v in row.items() if v is not DROP}
 
@@ -1207,7 +1217,8 @@ class AA15_PartialBindingWasAcceptedAsVerified(AlphaCase):
 
     def test_each_required_binding_field_is_individually_required(self):
         for field in ("contract_id", "market_snapshot_id",
-                      "source_record_sha256"):
+                      "source_record_sha256", "environment",
+                      "contract_schema"):
             with self.subTest(missing=field):
                 self.setUp()
                 result = self.ingest([self.settlement(**{field: DROP})])
@@ -1270,17 +1281,31 @@ class AA15b_UnqualifiedSourcesWereTrustedByDefault(AlphaCase):
         self.ledger = AlphaLedger(
             path=os.path.join(self._tmp, "ledger.jsonl"),
             cost_path=os.path.join(self._tmp, "cost.jsonl"))
+        # RA-11/RA-12: a complete versioned identity, and evidence that
+        # really recomputes. The synthetic `"d" * 64` digest this fixture
+        # carried cannot be re-derived from anything, so it now lands in the
+        # evidence-unverified quarantine -- which would leave every case
+        # below asserting on a refusal that happens for the wrong reason.
+        self.record = valid_record()
         self.ledger.record_prediction({
             "prediction_id": "p-1", "market_snapshot_id": "snap-1",
             "contract_id": "KX-1", "p_yes": 0.6,
-            "source_binding": {"contract_id": "KX-1",
-                               "market_snapshot_id": "snap-1",
-                               "record_sha256": "d" * 64}})
+            "source_binding": {
+                "contract_id": "KX-1",
+                "market_snapshot_id": "snap-1",
+                "record_sha256": self.record["record_sha256"],
+                "environment": "test",
+                "contract_schema": self.record["schema"],
+                "source_evidence": contract.canonical_content(self.record)}})
 
     def settlement(self, source="CF Benchmarks RTI"):
         return {"prediction_id": "p-1", "outcome": 1, "source": source,
                 "contract_id": "KX-1", "market_snapshot_id": "snap-1",
-                "source_record_sha256": "d" * 64}
+                "source_record_sha256": self.record["record_sha256"],
+                "environment": "test",
+                "contract_schema": self.record["schema"],
+                "resolved_at": "2026-09-12T20:10:00+00:00",
+                "settlement_evidence_id": "cf-rti-2026-09-12"}
 
     def test_an_unqualified_source_is_refused_by_default(self):
         from alpha_resolution_ingest import ingest_settlements

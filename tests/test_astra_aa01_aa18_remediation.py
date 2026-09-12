@@ -1164,8 +1164,17 @@ class AA14_MultiWriterRaces(RemediationCase):
 
     def test_a_conflicting_resolution_is_surfaced_not_first_win_silently(self):
         ledger = self.ledger()
+        # RA-11/RA-12: a COMPLETE versioned identity and evidence that really
+        # recomputes. The synthetic `"c" * 64` digest this fixture used to
+        # carry cannot be re-derived from anything, so since RA-12 it lands in
+        # the evidence-unverified quarantine -- which would leave this case
+        # asserting on a conflict that never got the chance to happen.
+        record = valid_record()
         binding = {"contract_id": "KX-C", "market_snapshot_id": "snap-c",
-                   "record_sha256": "c" * 64}
+                   "record_sha256": record["record_sha256"],
+                   "environment": "demo",
+                   "contract_schema": contract.FEED_SCHEMA,
+                   "source_evidence": contract.canonical_content(record)}
         ledger.record_prediction({"prediction_id": "p1",
                                   "market_snapshot_id": "snap-c",
                                   "contract_id": "KX-C",
@@ -1175,7 +1184,11 @@ class AA14_MultiWriterRaces(RemediationCase):
         # quarantine path instead of the conflict path it names.
         settlement = {"prediction_id": "p1", "contract_id": "KX-C",
                       "market_snapshot_id": "snap-c",
-                      "source_record_sha256": "c" * 64}
+                      "source_record_sha256": record["record_sha256"],
+                      "environment": "demo",
+                      "contract_schema": contract.FEED_SCHEMA,
+                      "resolved_at": "2026-09-12T20:10:00+00:00",
+                      "settlement_evidence_id": "cf-rti-2026-09-12"}
         trusted = ["feed-a", "feed-b"]
         ingest_settlements(ledger, [dict(settlement, outcome=1,
                                          source="feed-a")],
@@ -1242,7 +1255,13 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
                 "contract_id": "KXBTCD-26SEP1200-T60000",
                 "market_snapshot_id": "snap-15",
                 "contract_schema": contract.FEED_SCHEMA,
-                "environment": "demo"},
+                "environment": "demo",
+                # RA-12: the RETAINED evidence, because production retains it
+                # and settlement qualification now recomputes the digest from
+                # it. A fixture without it would exercise the
+                # evidence-unverified quarantine rather than the mismatch
+                # path each case below names.
+                "source_evidence": contract.canonical_content(self.record)},
         })
         return ledger
 
@@ -1253,10 +1272,18 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
     TRUSTED = ["trusted-feed"]
 
     def settlement(self, **over):
+        # RA-11 widened the REQUIRED binding to the full versioned identity
+        # -- environment and contract version as well -- and made the
+        # resolution instant and the evidence identity required too. The
+        # fixture carries all of them, because production does.
         row = {"prediction_id": "p1", "outcome": 1, "source": "trusted-feed",
                "contract_id": "KXBTCD-26SEP1200-T60000",
                "market_snapshot_id": "snap-15",
-               "source_record_sha256": self.record["record_sha256"]}
+               "source_record_sha256": self.record["record_sha256"],
+               "environment": "demo",
+               "contract_schema": contract.FEED_SCHEMA,
+               "resolved_at": "2026-09-12T20:10:00+00:00",
+               "settlement_evidence_id": "cf-rti-2026-09-12"}
         row.update(over)
         return row
 
@@ -1296,7 +1323,9 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
                         "contract_id": "KXBTCD-26SEP1200-T60000",
                         "market_snapshot_id": "snap-15",
                         "contract_schema": contract.FEED_SCHEMA,
-                        "environment": "demo"}})
+                        "environment": "demo",
+                        "source_evidence": contract.canonical_content(
+                            self.record)}})
                 result = self.ingest(
                     ledger, [self.settlement(**{field: wrong})])
                 self.assertEqual(result["appended"], 0)
@@ -1322,7 +1351,11 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
                     "source_binding": {
                         "record_sha256": self.record["record_sha256"],
                         "contract_id": "KXBTCD-26SEP1200-T60000",
-                        "market_snapshot_id": "snap-15"}})
+                        "market_snapshot_id": "snap-15",
+                        "contract_schema": contract.FEED_SCHEMA,
+                        "environment": "demo",
+                        "source_evidence": contract.canonical_content(
+                            self.record)}})
                 result = self.ingest(
                     ledger, [self.settlement(resolved_at=bad)])
                 self.assertEqual(result["appended"], 0, bad)

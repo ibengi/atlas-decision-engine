@@ -152,6 +152,66 @@ def verify_source_evidence(prediction) -> dict:
             "reason": ""}
 
 
+#: RA-13. Every binding field a settlement must carry for its outcome to be
+#: admissible in LEARNING. The same list `alpha_resolution_ingest` enforces at
+#: ingestion, re-checked here: a resolution row could have been appended by an
+#: older build, by hand, or by a tool that did not go through that path, and
+#: learning has to be able to tell.
+QUALIFIED_BINDING_FIELDS = ("contract_id", "market_snapshot_id",
+                            "source_record_sha256", "environment",
+                            "contract_schema")
+
+
+def settlement_qualification(prediction, resolution) -> tuple:
+    """`(qualified, reason)` for one settled prediction (RA-13).
+
+    `resolved()` joins every RESOLUTION row it finds, and everything
+    downstream consumed that list -- `calibration()`, which the Meta engine
+    uses to WEIGHT each model, and `alpha_learning.learning_report`. A row
+    appended by any means at all was therefore scored: one written directly
+    through `resolve()` with no binding, no trusted source and no evidence
+    verification carries `binding_verified: False` and `source_trusted:
+    False`, and was still weighted and still reported as the model's
+    calibration. The trust metadata added in v3 was used for nothing.
+
+    A Brier score is only as good as the outcomes it was computed from, and an
+    outcome nobody can tie to a market is not an outcome. So learning reads
+    only rows this function qualifies. Unqualified rows stay in `resolved()`
+    -- that is the audit record, and removing them would be the retroactive
+    edit this whole subsystem forbids -- and the exclusion is counted.
+
+    The evidence digest is RECOMPUTED here rather than read off the row's
+    flag. A flag is a claim; the recomputation is the check, and it has to
+    hold at the moment learning reads the row, not only at the moment
+    somebody wrote it.
+    """
+    resolution = resolution if isinstance(resolution, dict) else {}
+    reasons = []
+    if not resolution.get("binding_verified"):
+        reasons.append("the settlement binding was never verified against "
+                       "the prediction")
+    if not resolution.get("source_trusted"):
+        reasons.append("the settlement authority was not on a qualified "
+                       "allow-list")
+    if not str(resolution.get("resolution_source") or "").strip():
+        reasons.append("no settlement authority is named")
+    if not str(resolution.get("settlement_evidence_id") or "").strip():
+        reasons.append("no settlement evidence identity is recorded")
+    if not str(resolution.get("resolved_at") or "").strip():
+        reasons.append("no resolution instant is recorded")
+    binding = resolution.get("settlement_binding") or {}
+    missing = [f for f in QUALIFIED_BINDING_FIELDS
+               if not str(binding.get(f) or "").strip()]
+    if missing:
+        reasons.append("the settlement binding is incomplete: "
+                       + ", ".join(missing))
+    verdict = verify_source_evidence(prediction)
+    if not verdict["verified"]:
+        reasons.append(f"the prediction's retained source evidence does not "
+                       f"recompute: {verdict['reason']}")
+    return (not reasons), "; ".join(reasons)
+
+
 class LedgerError(RuntimeError):
     """A ledger write could not be made durable, or would rewrite history."""
 
@@ -663,6 +723,16 @@ class AlphaLedger:
                 "settlement_evidence_id")
             row["binding_verified"] = bool(resolution.get("binding_verified"))
             row["source_trusted"] = bool(resolution.get("source_trusted"))
+            row["source_evidence_verified"] = bool(
+                resolution.get("source_evidence_verified"))
+            # RA-13: the one verdict that decides whether learning may read
+            # this row. Derived at read time, like every other score here,
+            # because a stored verdict is a verdict that can drift from the
+            # row it grades.
+            qualified, disqualification = settlement_qualification(prediction,
+                                                                   resolution)
+            row["settlement_qualified"] = qualified
+            row["settlement_disqualification"] = disqualification
             invalidation = invalidations.get(prediction.get("prediction_id"))
             row["invalidated"] = bool(invalidation)
             row["invalidation_reason"] = (invalidation or {}).get("reason")
@@ -672,6 +742,22 @@ class AlphaLedger:
             row.update(score_prediction(prediction, row["actual_outcome"]))
             joined.append(row)
         return joined
+
+    def qualified_resolved(self) -> list:
+        """Resolved predictions whose settlements are FULLY QUALIFIED (RA-13).
+
+        The only series learning and calibration may read. Everything
+        `resolved()` returns stays in the audit history; this is the subset
+        whose outcomes can be defended -- verified binding, qualified
+        authority, recorded evidence identity, real resolution instant, and a
+        source digest that independently recomputes.
+        """
+        return [r for r in self.resolved() if r.get("settlement_qualified")]
+
+    def unqualified_resolved(self) -> list:
+        """The complement, so the exclusion is never silent."""
+        return [r for r in self.resolved()
+                if not r.get("settlement_qualified")]
 
     def actionable_resolved(self) -> list:
         """Resolved predictions that were still valid when they resolved.
@@ -688,8 +774,11 @@ class AlphaLedger:
     def calibration(self, model: str, category: str = None):
         """`{"samples": n, "brier": x}` for one model, optionally within one
         market category. None when there is nothing to say."""
+        # RA-13: the Meta engine weights models with this number, so it
+        # reads QUALIFIED settlements only. An unqualified outcome stays in
+        # the audit history and out of the weights.
         samples, total = 0, 0.0
-        for row in self.resolved():
+        for row in self.qualified_resolved():
             if category and row.get("market_class") != category:
                 continue
             per_model = (row.get("per_model") or {}).get(model)
@@ -713,6 +802,17 @@ class AlphaLedger:
             "generated_at": _now_iso(),
             "predictions_recorded": len(self.predictions()),
             "predictions_resolved": len(rows),
+            # RA-13: BOTH series, always. The gap between them is itself the
+            # finding -- a large one means the settlement feed is not
+            # producing outcomes learning can use -- so it is reported rather
+            # than assumed away.
+            "settlements_qualified": sum(
+                1 for r in rows if r.get("settlement_qualified")),
+            "settlements_unqualified": sum(
+                1 for r in rows if not r.get("settlement_qualified")),
+            "ensemble_qualified": _score_group(
+                [r for r in rows if r.get("settlement_qualified")],
+                lambda r: r.get("p_meta")),
             "cost_priced": priced,
             "ensemble": _score_group(rows, lambda r: r.get("p_meta")),
             # Section 7: the same series with catalyst-invalidated estimates

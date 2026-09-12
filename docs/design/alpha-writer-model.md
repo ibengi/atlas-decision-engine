@@ -24,13 +24,14 @@ critical section:
 
 | Operation | What the lock covers |
 |---|---|
-| `AlphaLedger.prepare` | find existing PREPARE → append PREPARE |
+| `AlphaLedger.prepare` | find existing PREPARE → append PREPARE → append its `PREPARE_COMMIT` receipt |
 | `AlphaLedger.record_prediction` | uniqueness check (by `prediction_id` **and** by stable `analysis_id`) → append PREDICTION → append its COMMIT receipt |
 | `AlphaLedger.resolve` | prediction lookup → resolution-exists check → append RESOLUTION |
 | `AlphaLedger.invalidate` | already-invalidated check → append INVALIDATION |
 | `AlphaLedger.record_observation` | already-sampled check for this interval → append OBSERVATION |
 | `AlphaLedger.record_costs` | the whole cost batch, so two batches cannot interleave |
-| `ProcessedStore.mark` | torn-tail check → append processed row |
+| `ProcessedStore.mark` | torn-tail check → append processed row → **invalidate the cache** |
+| `BudgetLedger.record` | torn-tail check → append budget row |
 | `BoundedSpool.write` | prune → scan → capacity decision → reserve → write → fsync → rename |
 
 The lock is a sidecar rather than the ledger itself so that acquiring it never
@@ -69,6 +70,29 @@ cache is now keyed on a **generation** — `(size, mtime_ns, inode)` — and
 rebuilt whenever the file has moved underneath it. A false miss costs one
 re-read; a false hit cost a duplicated analysis.
 
+**RA-09 corrected *when*.** The generation was re-stamped after the append
+lock was released:
+
+```python
+with serialized_append(self.path) as append:
+    append(line)                      # lock released here
+if self._cache is not None:
+    self._cache[snapshot_id] = row
+    self._generation = self._current_generation()
+```
+
+Any row another writer appended between those two moments was *inside* the
+generation this store stamped and *outside* the cache it stamped it for. The
+cache then looked fresh — size, mtime and inode all matching — while missing
+a row that was on disk, and stayed that way until something else changed the
+file. A missing processed row reads as "this snapshot was never analysed", so
+the service pays for an analysis another writer has already committed: the
+AA-13 double-spend, reached through the cache instead of through a crash.
+
+The cache is now **invalidated inside the lock**, before the generation can
+move. While the lock is held no other writer can append, so the invalidation
+cannot be stamped past somebody else's row.
+
 `AlphaShadowService.reconcile_processed()` still compares the processed file
 against the committed predictions and reports disagreements without repairing
 them (AA-13).
@@ -80,6 +104,36 @@ receipt is written after the prediction's own append has returned, and that
 append returns only after its `fsync` succeeded — so a readable prediction row
 whose write failed mid-sequence is never mistaken for a commit. See AA-13 in
 the v3 remediation report.
+
+**RA-08 extended the same rule one step earlier.** `prepare()` was idempotent
+by *lookup*: find a PREPARE row, return it. That row is read from the file,
+which is exactly what AA-13's re-audit established is not proof of
+durability. An append whose `write` landed and whose `fsync` failed leaves
+bytes that read back perfectly; `prepare()` raised on that attempt, so the
+service deferred and spent nothing — but on the next poll the lookup returned
+those same bytes, the dispatch precondition was declared satisfied, and every
+provider was paid against a ledger that was still not writable.
+
+PREPARE now carries its own `PREPARE_COMMIT` receipt. A retry that finds a
+receipt-less PREPARE **finishes** its durability rather than trusting it (the
+receipt's own append fsyncs the whole file, so the row before it becomes
+durable at the same moment), and `alpha_service` gates dispatch on
+`prepare_is_durable`, re-read from the ledger.
+
+### Durability is never assumed (RA-05)
+
+`durable_append.append_line` promises that a caller is never told "written"
+without durability having been attempted **and confirmed**. Three paths inside
+it used to break that promise by swallowing the uncertainty rather than
+reporting it: `tail_is_torn` returned `False` on any `OSError`, and both the
+directory `open` and the directory `fsync` failures were discarded. All three
+now raise `DurabilityUnknown` (an `OSError` subclass, so every existing
+caller's error handling still applies), and `BoundedSpool` routes its own
+directory fsync through the same function and reports such a write as
+**failed**.
+
+An unreadable tail is not an intact tail, and bytes reachable under no name
+are not a durable append.
 
 ### Lock ordering
 
@@ -96,9 +150,10 @@ appends nothing.
 ## The limits, stated rather than assumed
 
 * **`flock` is advisory.** It binds only processes that ask for it. Every
-  writer in this subsystem goes through `AlphaLedger`, and no other module
-  opens these files for writing — but a hand-run script that appended directly
-  would not be serialized.
+  writer in this subsystem goes through `AlphaLedger`, `ProcessedStore`,
+  `BudgetLedger` or `BoundedSpool` — all four of which take the lock since
+  RA-06 — but a hand-run script that appended directly would not be
+  serialized.
 * **`flock` is per-host.** Two *machines* sharing one ledger over NFS or a
   similar network filesystem are **not** made safe by this mechanism. Do not
   deploy a second Alpha service against the same volume from another host.

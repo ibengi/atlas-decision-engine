@@ -375,6 +375,74 @@ class RA03_TheObserverThreadStillHashedAndValidated(AlphaCase):
         self.assertIsNone(feed._build(candidate))
         self.assertEqual(feed.rejected, before + 1)
 
+    def test_the_one_admission_diagnostic_still_never_blocks_the_caller(self):
+        """AA-10's control, re-pointed at where the caller can still speak.
+
+        RA-03 moved the refusal diagnostics onto the writer, which left
+        `_admit`'s "this candidate carries no provenance container" as the
+        ONLY thing the observer's thread still says. AA-10's timing cases
+        drive the refusal path, so after RA-03 they no longer exercise
+        `_note` at all -- and `astra_mutation_probe::M25`, which replaces
+        `self.writer.note(...)` with a synchronous `log.log(...)`, SURVIVED
+        the whole suite as a result.
+
+        A control that stops covering the code it was written for is not a
+        control. This drives the surviving branch, against a handler that
+        behaves like a file handler on a stalled volume.
+        """
+        import logging as logging_module
+        from test_astra_v3_remediation import _BlockingHandler
+        handler = _BlockingHandler()
+        logger = logging_module.getLogger("RESEARCH_FEED")
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging_module.DEBUG)
+        self.addCleanup(logger.setLevel, previous)
+        self.addCleanup(logger.removeHandler, handler)
+        self.addCleanup(handler.let_go.set)
+
+        feed = self.feed()
+        # `field_provenance` is present and is not a dict: the one shape that
+        # reaches `_note` from the observer's own thread.
+        hostile = {"field_provenance": "not a container",
+                   "unavailable_fields": [], "quote_observation": {}}
+        started = time.time()
+        for _ in range(50):
+            feed.emit_candidate(dict(hostile))
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 2.0,
+                        f"the engine thread waited {elapsed:.2f}s on a log "
+                        f"handler")
+        self.assertEqual(handler.records, [],
+                         "the engine thread emitted a log record itself")
+        self.assertEqual(feed.rejected, 50)
+
+    def test_that_admission_diagnostic_is_still_emitted_by_the_writer(self):
+        """Non-blocking must not mean silent."""
+        import logging as logging_module
+        from test_astra_v3_remediation import _BlockingHandler
+        handler = _BlockingHandler()
+        handler.let_go.set()
+        logger = logging_module.getLogger("RESEARCH_FEED")
+        logger.addHandler(handler)
+        previous = logger.level
+        logger.setLevel(logging_module.DEBUG)
+        self.addCleanup(logger.setLevel, previous)
+        self.addCleanup(logger.removeHandler, handler)
+
+        feed = self.feed()
+        feed.emit_candidate({"field_provenance": "not a container",
+                             "unavailable_fields": [],
+                             "quote_observation": {}})
+        feed.writer.start()
+        self.addCleanup(feed.writer.stop)
+        self.assertTrue(feed.writer.drain(timeout=5))
+        deadline = time.time() + 2
+        while time.time() < deadline and not handler.records:
+            time.sleep(0.01)
+        self.assertTrue(handler.records,
+                        "the admission refusal was silently discarded")
+
     def test_no_hashing_or_validation_is_reachable_from_the_emit_path(self):
         """Static, because a timing test can only prove the calls that ran."""
         import ast
@@ -863,6 +931,42 @@ class RA07_TheGeneratedIdWasAcknowledgedInsteadOfTheDurableOne(ServiceCase):
         service._analyze_one(snapshot, self.record())
         self.assertEqual(len(self.ledger.predictions()), 1)
 
+    def test_the_gateway_itself_reports_the_durable_identity(self):
+        """RA-07 asks for the id to travel THROUGH the gateway.
+
+        The service reading the committed row back is belt; this is braces,
+        and it is what every other caller of `AlphaGateway.analyze` sees. It
+        is also the assertion that makes the gateway change falsifiable:
+        `astra_mutation_probe::M32` restores the discarded return value and
+        the service-level cases above pass anyway, because the service
+        re-reads the ledger.
+        """
+        from alpha_gateway import AlphaGateway
+        self.service([_CountingProvider()])         # builds self.ledger
+        snapshot = self.snapshot()
+        durable = self.uncommitted_prediction(snapshot)
+        opportunity = AlphaGateway(providers=[_CountingProvider()],
+                                   ledger=self.ledger).analyze(snapshot)
+        self.assertEqual(
+            opportunity["prediction_id"], durable,
+            "the gateway reported a prediction id the ledger never wrote")
+        self.assertTrue(
+            opportunity["generated_prediction_id"].startswith("pred-"),
+            "the id that was generated and not written is not kept as a "
+            "diagnostic")
+        self.assertNotEqual(opportunity["generated_prediction_id"], durable)
+
+    def test_an_ordinary_gateway_analysis_keeps_its_generated_id(self):
+        """Anti-vacuity: the adoption fires only on the recovery branch."""
+        from alpha_gateway import AlphaGateway
+        self.service([_CountingProvider()])
+        snapshot = self.snapshot()
+        opportunity = AlphaGateway(providers=[_CountingProvider()],
+                                   ledger=self.ledger).analyze(snapshot)
+        self.assertNotIn("generated_prediction_id", opportunity)
+        self.assertIsNotNone(
+            self.ledger.find_prediction(opportunity["prediction_id"]))
+
     def test_an_ordinary_analysis_still_reports_its_own_id(self):
         """Anti-vacuity: the normal path must not be rewritten by this."""
         service = self.service([_CountingProvider()])
@@ -1207,3 +1311,706 @@ class RA10_ABudgetRefusalTurnedTerminalOnRecovery(ServiceCase):
         self.assertEqual(len(prepares), 1)
         self.assertTrue(self.ledger.prepare_is_durable(
             analysis_identity(snapshot.market_snapshot_id)))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Shared settlement harness for RA-11..RA-13
+# ════════════════════════════════════════════════════════════════════════
+TRUSTED = "kalshi-settlement-feed"
+
+
+class SettlementCase(AlphaCase):
+    """One committed prediction with a complete source binding, then
+    settlements offered against it from the outside."""
+
+    def ledger(self, name="ledger"):
+        from alpha_ledger import AlphaLedger
+        return AlphaLedger(
+            path=os.path.join(self._tmp, f"{name}.jsonl"),
+            cost_path=os.path.join(self._tmp, f"{name}-cost.jsonl"))
+
+    def fresh(self, **kw):
+        """A ledger with one committed prediction, on files of its own.
+
+        Each subTest below needs its own ledger: `record_prediction` refuses a
+        duplicate `prediction_id`, correctly, so reusing one path across a
+        matrix would make every case after the first fail for the wrong
+        reason.
+        """
+        self._ledgers = getattr(self, "_ledgers", 0) + 1
+        ledger = self.ledger(f"ledger-{self._ledgers}")
+        return ledger, self.committed(ledger, **kw)
+
+    def committed(self, ledger, *, evidence=True, tampered=False,
+                  binding_without=(), snapshot_id="snap-1"):
+        from _candidate import valid_record
+        from alpha_service import source_binding_for
+        record = valid_record()
+        binding = source_binding_for(record,
+                                     contract_id=record["contract_id"],
+                                     market_snapshot_id=snapshot_id,
+                                     digest_verified=True)
+        if not evidence:
+            binding["source_evidence"] = {}
+        if tampered:
+            binding["source_evidence"] = dict(binding["source_evidence"],
+                                              volume=999999.0)
+        stored = {k: v for k, v in binding.items()
+                  if k not in binding_without}
+        ledger.record_prediction({
+            "prediction_id": "pred-1",
+            "market_snapshot_id": snapshot_id,
+            "contract_id": record["contract_id"],
+            "source_binding": stored,
+            "p_meta": 0.62, "confidence": 0.8,
+            "side": "yes", "entry_price": 0.46,
+            "per_model": {"astra": {"p_yes": 0.62, "confidence": 0.8},
+                          "atlas_quant": {"p_yes": 0.55, "confidence": 0.6}},
+            "market_class": "MEDIUM", "time_to_resolution_s": 3600.0,
+            "state": "POSITIVE_EDGE_HIGH_CONFIDENCE"})
+        return binding
+
+    def settlement(self, binding, **over):
+        payload = {
+            "prediction_id": "pred-1",
+            "outcome": 1,
+            "source": TRUSTED,
+            "resolved_at": "2026-09-12T12:00:00+00:00",
+            "settlement_evidence_id": "kalshi-settlement-2026-09-12-0001",
+            "contract_id": binding["contract_id"],
+            "market_snapshot_id": binding["market_snapshot_id"],
+            "source_record_sha256": binding["record_sha256"],
+            "environment": binding["environment"],
+            "contract_schema": binding["contract_schema"],
+        }
+        payload.update(over)
+        return {k: v for k, v in payload.items() if v is not DROP}
+
+    def ingest(self, ledger, *rows):
+        from alpha_resolution_ingest import ingest_settlements
+        return ingest_settlements(ledger, list(rows),
+                                  trusted_sources=[TRUSTED])
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-11 — "required binding" stopped short of the identity it needs
+# ════════════════════════════════════════════════════════════════════════
+class RA11_TheRequiredSettlementBindingWasIncomplete(SettlementCase):
+    """AA-15's re-audit made a binding REQUIRED and then required three of it.
+
+    `REQUIRED_BINDING` is `contract_id`, `market_snapshot_id` and
+    `source_record_sha256`. `environment` and `contract_schema` were left
+    OPTIONAL with the reasoning that they "narrow a match when present and
+    their absence does not make the join ambiguous". Written out, that means:
+
+      * a settlement from DEMO could be attached to a prediction made in
+        PROD, or the reverse, and nothing in the chain would notice. The
+        environment is not a narrowing detail; it is which market this
+        outcome is about.
+      * a settlement could be attached across a CONTRACT VERSION boundary.
+        `contract_schema` is in the binding precisely because v2 and v3
+        records make different claims about the same fields -- that is the
+        whole reason v2 records are refused rather than migrated.
+
+    Two more fields were not required at all:
+
+      * `resolved_at`. Absent, `_normalise` left it None and `AlphaLedger.
+        resolve` filled in `_now_iso()` -- so the stored "resolution time"
+        was the INGESTION time, and every time-ordered calibration statistic
+        computed from it measured when somebody ran a script.
+      * `settlement_evidence_id`. Absent, the resolution recorded no external
+        identity at all, so the outcome could never be traced back to the
+        document that established it.
+
+    All of them are required, and a settlement missing any is QUARANTINED
+    with the missing names reported -- not rejected as malformed, because it
+    is not malformed: it is a settlement that cannot be tied to the
+    prediction it names.
+    """
+
+    def assertQuarantined(self, result, *, naming):
+        self.assertEqual(result["appended"], 0,
+                         "an incompletely bound settlement was written")
+        self.assertEqual(len(result["quarantined"]), 1,
+                         f"the row was not quarantined: {result}")
+        reported = json.dumps(result["quarantined"][0])
+        self.assertIn(naming, reported,
+                      f"the quarantine does not name {naming}: {reported}")
+
+    def test_every_required_identity_field_is_required(self):
+        for field in ("contract_id", "market_snapshot_id",
+                      "source_record_sha256", "environment",
+                      "contract_schema", "resolved_at",
+                      "settlement_evidence_id"):
+            for absent in (DROP, None, ""):
+                with self.subTest(field=field, absent=repr(absent)):
+                    ledger, binding = self.fresh()
+                    result = self.ingest(
+                        ledger, self.settlement(binding, **{field: absent}))
+                    self.assertQuarantined(result, naming=field)
+                    self.assertIsNone(ledger.find_resolution("pred-1"))
+
+    def test_a_complete_settlement_is_appended_and_verified(self):
+        """Anti-vacuity: the matrix above must not simply refuse everything."""
+        ledger, binding = self.fresh()
+        result = self.ingest(ledger, self.settlement(binding))
+        self.assertEqual(result["appended"], 1, result)
+        self.assertEqual(result["quarantined"], [])
+        row = ledger.find_resolution("pred-1")
+        self.assertTrue(row["binding_verified"])
+        self.assertTrue(row["source_trusted"])
+        self.assertEqual(row["resolved_at"], "2026-09-12T12:00:00+00:00")
+        self.assertEqual(row["settlement_evidence_id"],
+                         "kalshi-settlement-2026-09-12-0001")
+
+    def test_the_resolution_timestamp_is_never_the_ingestion_time(self):
+        ledger, binding = self.fresh()
+        self.ingest(ledger, self.settlement(binding))
+        row = ledger.find_resolution("pred-1")
+        self.assertNotEqual(row["resolved_at"], row["at"],
+                            "the stored resolution time is when the script "
+                            "ran, not when the market settled")
+
+    def test_a_prediction_that_cannot_supply_the_binding_is_quarantined(self):
+        """A field the PREDICTION lacks is as disqualifying as one the
+        settlement omits: there is nothing to corroborate against."""
+        ledger, binding = self.fresh(binding_without=("environment",))
+        result = self.ingest(ledger, self.settlement(binding))
+        self.assertQuarantined(result, naming="environment")
+
+    def test_an_environment_mismatch_is_a_mismatch_not_a_quarantine(self):
+        ledger, binding = self.fresh()
+        result = self.ingest(ledger,
+                             self.settlement(binding, environment="DEMO"))
+        self.assertEqual(result["appended"], 0)
+        self.assertEqual(len(result["binding_mismatches"]), 1, result)
+        self.assertIsNone(ledger.find_resolution("pred-1"))
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-12 — the retained evidence was never recomputed before qualifying
+# ════════════════════════════════════════════════════════════════════════
+class RA12_RetainedEvidenceWasNotVerifiedAtSettlement(SettlementCase):
+    """`verify_source_evidence` exists, and the ingest path never called it.
+
+    AA-15's re-audit persisted the canonical source content WITH the
+    prediction, because the spool is bounded and pruned and a digest whose
+    bytes are gone is a 64-character string nothing can check. It also added
+    `alpha_ledger.verify_source_evidence`, which recomputes the digest from
+    that retained content.
+
+    `ingest_settlements` compared the settlement's `source_record_sha256`
+    against the prediction's `record_sha256` -- two copies of the SAME claim.
+    Agreement between them says the settlement quoted the digest correctly.
+    It says nothing about whether that digest describes the evidence the
+    prediction carries, which is the only question the retained copy exists
+    to answer.
+
+    So a prediction whose evidence was dropped, or edited after the fact, was
+    settled and qualified exactly like one whose evidence recomputes. The
+    verification is now a PRECONDITION of qualification, and its verdict
+    travels into the resolution row.
+    """
+
+    def test_a_prediction_with_no_retained_evidence_is_quarantined(self):
+        ledger, binding = self.fresh(evidence=False)
+        result = self.ingest(ledger, self.settlement(binding))
+        self.assertEqual(result["appended"], 0,
+                         "a settlement qualified against evidence that is "
+                         "not there")
+        self.assertEqual(len(result["quarantined"]), 1, result)
+        self.assertIsNone(ledger.find_resolution("pred-1"))
+
+    def test_edited_evidence_is_quarantined_even_though_the_digest_matches(self):
+        ledger, binding = self.fresh(tampered=True)
+        result = self.ingest(ledger, self.settlement(binding))
+        self.assertEqual(result["appended"], 0,
+                         "the settlement quoted the digest correctly and the "
+                         "evidence behind it had been edited")
+        reported = json.dumps(result["quarantined"])
+        self.assertIn("evidence", reported.lower(), reported)
+
+    def test_the_recomputation_verdict_travels_into_the_resolution(self):
+        ledger, binding = self.fresh()
+        self.ingest(ledger, self.settlement(binding))
+        row = ledger.find_resolution("pred-1")
+        self.assertTrue(row["source_evidence_verified"],
+                        "the resolution does not record that the evidence "
+                        "was independently recomputed")
+        self.assertEqual(row["source_record_sha256_recomputed"],
+                         binding["record_sha256"])
+
+    def test_the_verification_is_independent_of_the_settlement(self):
+        """It recomputes from the LEDGER's evidence, not from anything the
+        settlement supplied -- otherwise the feed would be grading itself."""
+        from alpha_ledger import verify_source_evidence
+        ledger, binding = self.fresh()
+        verdict = verify_source_evidence(ledger.find_prediction("pred-1"))
+        self.assertTrue(verdict["verified"])
+        self.assertEqual(verdict["recomputed"], binding["record_sha256"])
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-13 — learning consumed every resolution, qualified or not
+# ════════════════════════════════════════════════════════════════════════
+class RA13_LearningConsumedUnqualifiedSettlements(SettlementCase):
+    """`resolved()` joins every RESOLUTION row it finds, and everything
+    downstream consumed that list.
+
+    `AlphaLedger.calibration` -- which the Meta engine uses to WEIGHT each
+    model -- and `alpha_learning.learning_report` both read `resolved()`. A
+    resolution appended by any means at all is therefore in both: a row
+    written directly through `ledger.resolve()` with no binding, no trusted
+    source and no evidence verification carries `binding_verified: False` and
+    `source_trusted: False`, and was still scored, still weighted, and still
+    reported as the model's calibration.
+
+    The trust metadata was added in v3 and then used for nothing. A Brier
+    score is only as good as the outcomes it was computed from, and an
+    outcome nobody can tie to a market is not an outcome.
+
+    The rule now: unqualified history stays in `resolved()` -- it is the
+    audit record and deleting it would be the retroactive edit this whole
+    subsystem forbids -- and learning reads `qualified_resolved()`, with the
+    exclusion COUNTED and reported so it cannot be silent.
+    """
+
+    def unqualified(self, ledger):
+        """A resolution appended the way nothing should append one."""
+        ledger.record_prediction({
+            "prediction_id": "pred-legacy",
+            "market_snapshot_id": "snap-legacy",
+            "contract_id": "KX-LEGACY",
+            "p_meta": 0.9, "confidence": 0.9, "side": "yes",
+            "entry_price": 0.5, "market_class": "MEDIUM",
+            "per_model": {"astra": {"p_yes": 0.9, "confidence": 0.9}}})
+        ledger.resolve("pred-legacy", 0, source="somebody's spreadsheet")
+
+    def test_an_unqualified_resolution_stays_in_the_audit_history(self):
+        ledger = self.ledger()
+        self.unqualified(ledger)
+        rows = ledger.resolved()
+        self.assertEqual(len(rows), 1,
+                         "history was deleted rather than excluded")
+        self.assertFalse(rows[0]["settlement_qualified"])
+        self.assertTrue(rows[0]["settlement_disqualification"],
+                        "the row does not say WHY it is not qualified")
+
+    def test_an_unqualified_resolution_is_excluded_from_learning(self):
+        ledger = self.ledger()
+        self.unqualified(ledger)
+        self.assertEqual(ledger.qualified_resolved(), [])
+        self.assertIsNone(
+            ledger.calibration("astra"),
+            "the Meta engine would weight a model on an outcome nobody can "
+            "tie to a market")
+        from alpha_learning import learning_report
+        report = learning_report(ledger, astra_selector="astra")
+        self.assertEqual(report["astra"]["samples"], 0, report["astra"])
+        self.assertEqual(report["settlements_excluded_unqualified"], 1)
+
+    def test_a_qualified_settlement_is_consumed_by_learning(self):
+        """Anti-vacuity: the exclusion must not empty learning entirely."""
+        ledger, binding = self.fresh()
+        self.assertEqual(self.ingest(ledger,
+                                     self.settlement(binding))["appended"], 1)
+        qualified = ledger.qualified_resolved()
+        self.assertEqual(len(qualified), 1)
+        self.assertTrue(qualified[0]["settlement_qualified"])
+        self.assertEqual(ledger.calibration("astra")["samples"], 1)
+        from alpha_learning import learning_report
+        report = learning_report(ledger, astra_selector="astra")
+        self.assertEqual(report["astra"]["samples"], 1)
+        self.assertEqual(report["settlements_excluded_unqualified"], 0)
+
+    def test_the_metrics_report_shows_both_series(self):
+        """The gap between them is the finding, so both are reported."""
+        ledger, binding = self.fresh()
+        self.ingest(ledger, self.settlement(binding))
+        self.unqualified(ledger)
+        metrics = ledger.metrics()
+        self.assertEqual(metrics["predictions_resolved"], 2)
+        self.assertEqual(metrics["settlements_qualified"], 1)
+        self.assertEqual(metrics["settlements_unqualified"], 1)
+        self.assertEqual(metrics["ensemble"]["samples"], 2)
+        self.assertEqual(metrics["ensemble_qualified"]["samples"], 1)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-14 — the report guard knew about two ledgers out of four
+# ════════════════════════════════════════════════════════════════════════
+class RA14_TheBudgetLedgerWasNotProtectedFromTheReport(AlphaCase):
+    """AA-16 protected the prediction ledger, the cost ledger and the store.
+
+    `_protected_source_paths` reads the prediction and cost paths off the
+    ledger object, and the processed-store path off the store (or off the
+    configured value, which is the AA-16 re-audit). The BUDGET ledger --
+    `alpha_budget_ledger.jsonl`, append-only, the file every cost cap is
+    enforced against -- is in neither list, and neither is the telemetry
+    file.
+
+    AA-16's own argument applies unchanged: `write_learning_report` finishes
+    with `os.replace(tmp, target)`, which destroys whatever is at `target` in
+    one syscall with no trace and no recovery. Publish a report named
+    `alpha_budget_ledger.jsonl` -- or anything that resolves to it, because
+    `filename` is caller-supplied -- and every dollar the service has
+    recorded spending is gone. The next `spent_today()` then returns 0.0, and
+    every cap silently means "unlimited" (RA-06's failure direction, reached
+    by deleting the evidence instead of by mis-reading it).
+
+    The aliasing matrix is the same one AA-16 already argued for: exact,
+    relative, `..`-traversal, symlink and hard link.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from alpha_cost import BUDGET_LEDGER_FILE, BudgetLedger
+        from alpha_consumer import ProcessedStore
+        from alpha_ledger import AlphaLedger
+        self.reports = os.path.join(self._tmp, "reports")
+        os.makedirs(self.reports, exist_ok=True)
+        self.led = AlphaLedger(
+            path=os.path.join(self._tmp, "ledger.jsonl"),
+            cost_path=os.path.join(self._tmp, "cost.jsonl"))
+        self.store = ProcessedStore(path=os.path.join(self._tmp, "p.jsonl"))
+        self.budget = BudgetLedger(os.path.join(self._tmp, "budget.jsonl"))
+        self.budget.record({"provider": "grok", "api_cost_usd": 1.25})
+        self.default_budget = os.path.join(self._tmp, BUDGET_LEDGER_FILE)
+        with open(self.default_budget, "w", encoding="utf-8") as fh:
+            fh.write('{"ts": 1, "api_cost_usd": 9.5}\n')
+
+    def publish(self, target, *, directory=None):
+        from alpha_learning_runtime import write_learning_report
+        return write_learning_report(
+            self.led, directory or self.reports, filename=target,
+            processed_store=self.store, budget_ledger=self.budget)
+
+    def assertRefused(self, target, *, directory=None):
+        before = open(os.path.join(directory or self.reports, target), "rb"
+                      ).read() if os.path.exists(
+            os.path.join(directory or self.reports, target)) else None
+        with self.assertRaises(ValueError) as caught:
+            self.publish(target, directory=directory)
+        self.assertIn("ledger", str(caught.exception).lower())
+        if before is not None:
+            with open(os.path.join(directory or self.reports, target),
+                      "rb") as fh:
+                self.assertEqual(fh.read(), before,
+                                 "the ledger was overwritten anyway")
+
+    def test_the_custom_budget_ledger_path_is_protected(self):
+        self.assertRefused("budget.jsonl", directory=self._tmp)
+        rows = self.budget.rows()
+        self.assertEqual(len(rows), 1, "the budget history was destroyed")
+
+    def test_the_default_budget_ledger_path_is_protected(self):
+        from alpha_cost import BUDGET_LEDGER_FILE
+        self.assertRefused(BUDGET_LEDGER_FILE, directory=self._tmp)
+
+    def test_a_relative_alias_of_the_budget_ledger_is_protected(self):
+        self.assertRefused(os.path.join("..", "budget.jsonl"))
+
+    def test_a_symlink_to_the_budget_ledger_is_protected(self):
+        link = os.path.join(self.reports, "report-link.json")
+        os.symlink(self.budget.path, link)
+        self.assertRefused("report-link.json")
+
+    def test_a_hard_link_to_the_budget_ledger_is_protected(self):
+        link = os.path.join(self.reports, "report-hard.json")
+        os.link(self.budget.path, link)
+        self.assertRefused("report-hard.json")
+
+    def test_the_telemetry_file_is_protected(self):
+        self.assertRefused(str(CFG.ALPHA_TELEMETRY_FILE), directory=self._tmp)
+
+    def test_the_previously_protected_ledgers_are_still_protected(self):
+        """Anti-regression: RA-14 widens the guard, it does not move it."""
+        for name in ("ledger.jsonl", "cost.jsonl", "p.jsonl"):
+            with self.subTest(name=name):
+                self.assertRefused(name, directory=self._tmp)
+
+    def test_an_ordinary_report_still_publishes(self):
+        """Anti-vacuity: the guard must not refuse the report itself."""
+        report = self.publish("alpha_learning_report.json")
+        self.assertEqual(report["mode"], "SHADOW_ONLY")
+        with open(os.path.join(self.reports,
+                               "alpha_learning_report.json"),
+                  encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["mode"], "SHADOW_ONLY")
+
+    def test_the_guard_names_every_persistence_path_it_knows(self):
+        """Discovery, not a list: a new append-only file is caught here."""
+        from alpha_learning_runtime import _protected_source_paths
+        protected = _protected_source_paths(
+            self.led, self.reports, self.store, self.budget)
+        self.assertEqual(
+            {os.path.realpath(p) for p in (
+                self.led.log.path, self.led.cost_log.path, self.store.path,
+                self.budget.path, self.default_budget)}
+            - set(protected), set())
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-15 — the directory-fsync barrier had no SEMANTIC test behind it
+# ════════════════════════════════════════════════════════════════════════
+class RA15_TheDirectoryFsyncBarrierIsAssertedBySemantics(ServiceCase):
+    """RA-05 made the barrier raise. RA-15 asks what BREAKS when it does not.
+
+    The unit cases above patch `os.open` and `os.fsync` and assert that
+    `append_line` raises. Necessary, and not sufficient: a mutation that
+    restores the old swallowing behaviour has to fail a test about an
+    OUTCOME, or the barrier is protected by an assertion about an exception
+    type and nothing else. That is the AA-17 lesson -- the two mutations that
+    survived 1,670 tests survived because the assertions were about counters
+    and diagnostics rather than about what ended up in the ledger.
+
+    So these are the outcomes. When the NAME a ledger lives under cannot be
+    made durable:
+
+      * `AlphaLedger` reports the row as not durable, and the prediction is
+        not committed -- so the AA-13 chain, which is built on "the append
+        returned, therefore it is durable", stays sound;
+      * the service does not dispatch and does not acknowledge; the snapshot
+        is DEFERRED, so the observation is retried rather than lost against
+        a ledger that may not exist after a crash.
+
+    `tools/astra_mutation_probe.py::M26` restores the swallowing and these
+    cases are what fail.
+    """
+
+    def blind_directory_fsync(self):
+        """The directory entry cannot be persisted. The bytes still can."""
+        real = durable_append.os.fsync
+
+        def refuse(fd):
+            if stat_module.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "directory fsync failed")
+            return real(fd)
+        return patch.object(durable_append.os, "fsync", refuse)
+
+    def test_a_ledger_whose_name_is_not_durable_reports_no_commit(self):
+        from alpha_ledger import AlphaLedger, LedgerError
+        path = os.path.join(self._tmp, "fresh", "ledger.jsonl")
+        ledger = AlphaLedger(path=path,
+                             cost_path=os.path.join(self._tmp, "c.jsonl"))
+        with self.blind_directory_fsync():
+            with self.assertRaises(LedgerError):
+                ledger.record_prediction({"prediction_id": "p1",
+                                          "market_snapshot_id": "snap-1"})
+        self.assertFalse(
+            ledger.prediction_is_committed("snap-1"),
+            "a prediction whose ledger has no durable name was reported as "
+            "committed")
+
+    def test_the_service_defers_when_the_ledger_name_is_not_durable(self):
+        from alpha_consumer import STATUS_DEFERRED
+        provider = _CountingProvider()
+        service = self.service([provider])
+        snapshot = self.snapshot()
+        with self.blind_directory_fsync():
+            result = service._analyze_one(snapshot, self.record())
+        self.assertTrue(result["deferred"])
+        self.assertEqual(
+            provider.calls, 0,
+            "a provider was paid against a ledger whose name may not exist "
+            "after a crash")
+        self.assertEqual(self.store.status(snapshot.market_snapshot_id),
+                         STATUS_DEFERRED)
+
+    def test_nothing_is_acknowledged_as_terminal(self):
+        provider = _CountingProvider()
+        service = self.service([provider])
+        snapshot = self.snapshot()
+        with self.blind_directory_fsync():
+            service._analyze_one(snapshot, self.record())
+        self.assertFalse(self.store.seen(snapshot.market_snapshot_id))
+        self.assertEqual(service._pending_observations, [])
+
+    def test_the_same_analysis_succeeds_once_the_directory_can_be_synced(self):
+        """Anti-vacuity: the barrier must not break the ordinary path."""
+        from alpha_consumer import STATUS_ANALYZED
+        provider = _CountingProvider()
+        service = self.service([provider])
+        snapshot = self.snapshot()
+        with self.blind_directory_fsync():
+            service._analyze_one(snapshot, self.record())
+        result = service._analyze_one(snapshot, self.record())
+        self.assertFalse(result["deferred"])
+        self.assertGreater(provider.calls, 0)
+        self.assertEqual(self.store.status(snapshot.market_snapshot_id),
+                         STATUS_ANALYZED)
+
+    def test_the_spool_reports_a_failed_write_rather_than_a_written_one(self):
+        """The same barrier, on the producer side of the boundary."""
+        spool = research_spool.BoundedSpool(
+            os.path.join(self._tmp, "spool"), max_records=10,
+            max_bytes=10 ** 7, max_record_bytes=10 ** 6, max_age_s=3600)
+        record = {"emitted_at_utc": "2026-09-12T12:00:00+00:00",
+                  "record_sha256": "a" * 64, "contract_id": "KX-1"}
+        with self.blind_directory_fsync():
+            self.assertFalse(
+                spool.write(record),
+                "the spool reported a record written under a name it could "
+                "not persist")
+        self.assertEqual(spool.stats["written"], 0)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# RA-15 (2) — a non-zero pytest exit was reported as a kill
+# ════════════════════════════════════════════════════════════════════════
+class RA15b_TheRunnerDistinguishesBehaviouralKills(unittest.TestCase):
+    """`killed = proc.returncode != 0` is not a measurement of anything.
+
+    pytest exits non-zero for several reasons that say nothing about whether
+    a mutation changed behaviour: a collection error because the mutation
+    broke an import the detecting module needs, a usage error because a
+    selector no longer resolves, an internal error, a fixture that raised in
+    setUp. Every one of those read as KILLED -- "the suite noticed" -- while
+    proving only that something somewhere went wrong.
+
+    That is AA-17's own failure class pointed at the negative control instead
+    of at the code: an assertion that fires for the wrong reason is worth
+    less than no assertion, because it is believed.
+
+    A kill now requires a test BODY to have failed, with nothing
+    inconclusive, and the runner reports the counts it decided on.
+    """
+
+    def proc(self, returncode, stdout):
+        class _Proc:
+            pass
+        proc = _Proc()
+        proc.returncode = returncode
+        proc.stdout = stdout
+        return proc
+
+    def test_a_real_failure_is_a_behavioural_kill(self):
+        from tools.astra_mutation_probe import _classify
+        status, counts = self._classify(2, "3 failed, 5 passed in 1.20s")
+        self.assertEqual(status, "KILLED")
+        self.assertEqual(counts["failed"], 3)
+
+    def _classify(self, returncode, stdout):
+        from tools.astra_mutation_probe import _classify
+        return _classify(self.proc(returncode, stdout))
+
+    def test_a_clean_run_is_a_survivor(self):
+        self.assertEqual(self._classify(0, "8 passed in 0.30s")[0], "SURVIVED")
+
+    def test_a_collection_error_is_not_a_kill(self):
+        status, _ = self._classify(
+            2, "ERROR tests/test_x.py\n1 error in 0.10s")
+        self.assertTrue(status.startswith("INCONCLUSIVE"), status)
+
+    def test_a_run_where_nothing_ran_is_not_a_kill(self):
+        status, _ = self._classify(4, "no tests ran in 0.01s")
+        self.assertTrue(status.startswith("INCONCLUSIVE"), status)
+
+    def test_a_usage_error_with_no_summary_is_not_a_kill(self):
+        status, _ = self._classify(
+            4, "ERROR: not found: tests/test_x.py::Nope")
+        self.assertEqual(status, "INCONCLUSIVE_NO_SUMMARY")
+
+    def test_setup_errors_alone_are_not_a_kill(self):
+        status, _ = self._classify(1, "2 errors, 4 passed in 0.50s")
+        self.assertEqual(status, "INCONCLUSIVE_ERRORS_ONLY")
+
+    def test_a_failure_alongside_an_error_is_reported_as_such(self):
+        status, _ = self._classify(1, "1 failed, 1 error, 3 passed in 0.50s")
+        self.assertEqual(status, "KILLED_WITH_ERRORS")
+
+    def test_a_subtest_failure_counts(self):
+        status, _ = self._classify(
+            1, "1 failed, 4 passed, 2 subtests failed in 0.50s")
+        self.assertEqual(status, "KILLED")
+
+    def test_only_behavioural_kills_count_as_killed_in_the_summary(self):
+        """Static: `main` must not fall back to "not SURVIVED means killed"."""
+        import ast
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "tools",
+                "astra_mutation_probe.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        main = next(n for n in ast.walk(tree)
+                    if isinstance(n, ast.FunctionDef) and n.name == "main")
+        text = ast.unparse(main)
+        self.assertIn("surviving_effective_safety_mutations", text)
+        self.assertIn("startswith('KILLED')", text)
+        self.assertIn("inconclusive", text)
+
+    def test_every_ra_finding_has_a_mutation(self):
+        from tools.astra_mutation_probe import MUTATIONS
+        described = " ".join(d for d, *_rest in MUTATIONS.values())
+        for index in range(1, 16):
+            finding = f"RA-{index:02d}"
+            with self.subTest(finding=finding):
+                if finding == "RA-15":
+                    # RA-15 is the runner itself: M26 is its named subject
+                    # and `RA15b_*` above is what tests the classification.
+                    self.assertIn("M26", MUTATIONS)
+                    continue
+                self.assertIn(finding, described,
+                              f"{finding} was closed with no negative "
+                              f"control behind it")
+
+    def test_the_named_m26_mutation_exists_and_targets_the_barrier(self):
+        from tools.astra_mutation_probe import MUTATIONS
+        _desc, filename, old, new, selectors = MUTATIONS["M26"]
+        self.assertEqual(filename, "durable_append.py")
+        self.assertIn("DurabilityUnknown", old)
+        self.assertNotIn("DurabilityUnknown", new)
+        self.assertTrue(any("RA15" in s for s in selectors),
+                        "M26 names no semantic test")
+
+
+# ════════════════════════════════════════════════════════════════════════
+# AA-18, carried forward: hosted CI must run on THIS branch
+# ════════════════════════════════════════════════════════════════════════
+class RA_HostedCITargetsThisBranch(unittest.TestCase):
+    """AA-18's finding was that "CI-proven" named a different commit.
+
+    The same claim is being made for v4, so the same check applies: the
+    workflow has to trigger on this branch and has to invoke the suites the
+    counter-audit asked to see.
+    """
+
+    BRANCH = "alpha/astra-candidate-feed-v4-remediation"
+
+    def text(self):
+        path = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), ".github", "workflows",
+            "alpha-learning-v1.yml")
+        self.assertTrue(os.path.exists(path), path)
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_workflow_triggers_on_this_branch(self):
+        import yaml
+        parsed = yaml.safe_load(self.text())
+        triggers = parsed.get(True) or parsed.get("on")
+        self.assertIn(self.BRANCH, triggers["push"]["branches"])
+        self.assertIn(self.BRANCH, triggers["pull_request"]["branches"])
+
+    def test_the_earlier_branches_are_preserved(self):
+        text = self.text()
+        for branch in ("alpha/astra-learning-v1",
+                       "alpha/astra-candidate-feed-v2-remediation",
+                       "alpha/astra-candidate-feed-v3-remediation"):
+            with self.subTest(branch=branch):
+                self.assertIn(branch, text)
+
+    def test_the_v4_suites_are_invoked(self):
+        text = self.text()
+        for needle in ("tests/test_astra_v4_remediation.py",
+                       "tests/test_astra_v3_remediation.py",
+                       "tests/test_astra_aa01_aa18_remediation.py",
+                       "surviving_effective_safety_mutations",
+                       "pytest tests/ -q"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
+
+    def test_the_mutation_probe_step_asserts_zero_survivors(self):
+        text = self.text()
+        self.assertIn("summary['surviving_effective_safety_mutations'] == 0",
+                      text)
+        self.assertIn("summary['inconclusive'] == 0", text)

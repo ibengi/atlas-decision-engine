@@ -50,6 +50,7 @@ AA-15 -- R4 IS A VERIFIED JOIN, NOT A prediction_id LOOKUP
     remains an external blocker (see `settlement_authority` in the report).
 """
 
+from alpha_ledger import verify_source_evidence
 from candidate_contract import ContractError, strict_text, strict_timestamp
 
 #: Binding fields a settlement may carry. Each one, WHEN SUPPLIED, must agree
@@ -69,10 +70,41 @@ BINDING_CHECKS = {
 #:   market_snapshot_id    which observation of it the prediction was made on
 #:   source_record_sha256  which exact evidence bytes that observation was
 #:
-#: `environment` and `contract_schema` stay optional: they narrow a match when
-#: present and their absence does not make the join ambiguous.
+#: RA-11 -- AND THE OTHER TWO, AND THE TWO THAT WERE NOT IN THE BINDING.
+#:
+#: `environment` and `contract_schema` were left optional with the reasoning
+#: that they "narrow a match when present and their absence does not make the
+#: join ambiguous". Written out, that means:
+#:
+#:   environment       a settlement from DEMO could be attached to a
+#:                     prediction made in PROD, or the reverse, and nothing in
+#:                     the chain would notice. The environment is not a
+#:                     narrowing detail; it is WHICH market this outcome is
+#:                     about.
+#:   contract_schema   a settlement could be attached across a CONTRACT
+#:                     VERSION boundary. That field is in the binding
+#:                     precisely because v2 and v3 records make different
+#:                     claims about the same field names -- which is why v2
+#:                     records are refused rather than migrated.
 REQUIRED_BINDING = ("contract_id", "market_snapshot_id",
-                    "source_record_sha256")
+                    "source_record_sha256", "environment",
+                    "contract_schema")
+
+#: Settlement fields that are not part of the binding and were required by
+#: nothing at all (RA-11):
+#:
+#:   resolved_at              absent, `AlphaLedger.resolve` filled in
+#:                            `_now_iso()`. The stored "resolution time" was
+#:                            then the INGESTION time, so every time-ordered
+#:                            calibration statistic computed from it measured
+#:                            when somebody ran a script.
+#:   settlement_evidence_id   absent, the resolution recorded no external
+#:                            identity, so the outcome could never be traced
+#:                            back to the document that established it.
+#:
+#: Missing or null is a QUARANTINE, not a rejection: the row is not malformed,
+#: it simply cannot be tied to the prediction it names.
+REQUIRED_SETTLEMENT_FIELDS = ("resolved_at", "settlement_evidence_id")
 
 
 def _prediction_binding(prediction: dict) -> dict:
@@ -113,7 +145,15 @@ def _normalise(row, index):
     except ContractError as exc:
         raise ValueError(f"row {index}: {exc}")
 
+    # RA-11: ABSENT and MALFORMED are different outcomes for these two, and
+    # a blank string means absent -- exactly as it already does for every
+    # binding key below. An absent one falls through to the QUARANTINE in
+    # `ingest_settlements`, where an operator sees "this settlement cannot be
+    # tied to anything"; a PRESENT one that will not parse is a malformed row
+    # and is REJECTED here, which is what AA-15 asked for.
     resolved_at = row.get("resolved_at")
+    if isinstance(resolved_at, str) and not resolved_at.strip():
+        resolved_at = None
     if resolved_at is not None:
         # AA-15: "Do not accept malformed resolved_at." Previously any string
         # survived; a settlement timestamp that is not a timestamp makes every
@@ -125,6 +165,8 @@ def _normalise(row, index):
             raise ValueError(f"row {index}: {exc}")
 
     evidence_id = row.get("settlement_evidence_id")
+    if isinstance(evidence_id, str) and not evidence_id.strip():
+        evidence_id = None
     if evidence_id is not None:
         try:
             evidence_id = strict_text(evidence_id,
@@ -151,6 +193,12 @@ def _normalise(row, index):
         "settlement_evidence_id": evidence_id,
         "supplied_binding": supplied,
     }
+
+
+def _missing_settlement_fields(row: dict) -> list:
+    """Required non-binding settlement fields that are absent or null (RA-11)."""
+    return sorted(field for field in REQUIRED_SETTLEMENT_FIELDS
+                  if not str(row.get(field) or "").strip())
 
 
 def _missing_binding(supplied: dict, committed: dict) -> list:
@@ -216,6 +264,10 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
         # that cannot be tied to the prediction it names, and an operator
         # needs to see those separately from rows that actively conflict.
         "quarantined": [],
+        # RA-12: settlements refused because the prediction's own retained
+        # evidence did not recompute. Its own bucket, because it is a
+        # statement about the LEDGER rather than about the feed.
+        "evidence_unverified": [],
         "resolved_prediction_ids": [],
         "trusted_sources_enforced": True,
         "trusted_sources": sorted(allowed),
@@ -265,12 +317,16 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
         # AA-15. The join is verified here, not assumed from the id.
         committed = _prediction_binding(prediction)
         missing = _missing_binding(row["supplied_binding"], committed)
-        if missing:
+        absent = _missing_settlement_fields(row)
+        if missing or absent:
             detail = {"row": index, "prediction_id": prediction_id,
                       "missing_binding": missing,
+                      "missing_fields": absent,
                       "reason": "settlement binding is incomplete; a "
                                 "prediction_id alone does not identify the "
-                                "market an outcome is about"}
+                                "market an outcome is about, and an outcome "
+                                "with no resolution instant or evidence "
+                                "identity cannot be traced to anything"}
             result["quarantined"].append(detail)
             result["rejected"].append(dict(detail))
             continue
@@ -283,6 +339,34 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
                 "row": index, "prediction_id": prediction_id,
                 "reason": "settlement binding does not match the prediction",
                 "mismatches": mismatches})
+            continue
+
+        # RA-12 -- RECOMPUTE THE EVIDENCE, DO NOT COMPARE TWO COPIES OF THE
+        # CLAIM ABOUT IT.
+        #
+        # The check above compares the settlement's `source_record_sha256`
+        # against the prediction's `record_sha256`. Those are two copies of
+        # the SAME claim: agreement says the settlement quoted the digest
+        # correctly, and says nothing about whether that digest describes the
+        # evidence the prediction actually carries -- which is the only
+        # question the retained copy exists to answer, and the reason
+        # `verify_source_evidence` was written in v3.
+        #
+        # It was never called from here, so a prediction whose evidence had
+        # been dropped, or edited after the fact, was settled and QUALIFIED
+        # exactly like one whose evidence recomputes. The recomputation is a
+        # precondition now, and its verdict travels into the resolution row.
+        evidence = verify_source_evidence(prediction)
+        if not evidence["verified"]:
+            detail = {"row": index, "prediction_id": prediction_id,
+                      "source_evidence": evidence,
+                      "reason": f"the prediction's retained source evidence "
+                                f"does not independently recompute to the "
+                                f"digest it claims, so this settlement "
+                                f"cannot be qualified: {evidence['reason']}"}
+            result["evidence_unverified"].append(detail)
+            result["quarantined"].append(dict(detail))
+            result["rejected"].append(dict(detail))
             continue
 
         existing = ledger.find_resolution(prediction_id)
@@ -312,6 +396,11 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
                     # supplied field agreed. That is what this flag now means;
                     # previously it meant "some binding was supplied".
                     "binding_verified": True,
+                    # RA-12: the independent recomputation, recorded with the
+                    # outcome so a calibration number can be defended
+                    # without re-deriving it.
+                    "source_evidence_verified": True,
+                    "source_record_sha256_recomputed": evidence["recomputed"],
                     # Re-audit: the trust decision travels WITH the outcome.
                     # A calibration number computed from these rows can then
                     # be traced back to the authority an operator named,

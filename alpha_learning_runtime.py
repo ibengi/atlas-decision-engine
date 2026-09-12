@@ -42,7 +42,8 @@ def learning_snapshot(ledger, *, astra_selector="astra",
 #: report is a VIEW; an `os.replace` onto a source ledger would destroy the
 #: append-only history the whole subsystem rests on, in one syscall, with no
 #: trace and no recovery.
-def _protected_source_paths(ledger, directory, processed_store=None) -> dict:
+def _protected_source_paths(ledger, directory, processed_store=None,
+                            budget_ledger=None) -> dict:
     """Every append-only source file a derived report must never replace.
 
     AA-16 (re-audit) -- PROTECT THE PATH THE STORE ACTUALLY USES.
@@ -63,6 +64,26 @@ def _protected_source_paths(ledger, directory, processed_store=None) -> dict:
         path resolved the way the store resolves it, and the old
         report-directory guess kept as well -- a superset is free, and each
         entry is a path something in this system genuinely opens for writing.
+
+    RA-14 -- AND THE OTHER TWO FILES THIS SYSTEM WRITES.
+        The guard knew about the prediction ledger, the cost ledger and the
+        processed store. It did not know about `alpha_budget_ledger.jsonl` --
+        append-only, and the file every cost cap is enforced against -- or
+        about the telemetry file.
+
+        AA-16's own argument applies unchanged. `write_learning_report`
+        finishes with `os.replace(tmp, target)`, and `filename` is
+        caller-supplied, so a report published as `alpha_budget_ledger.jsonl`
+        -- or as anything that RESOLVES to it -- destroys every dollar the
+        service has recorded spending, in one syscall, with no trace. The
+        next `spent_today()` then returns 0.0 and every cap silently means
+        "unlimited": RA-06's failure direction reached by deleting the
+        evidence instead of by mis-reading it.
+
+        Both are now protected by their real path when the caller has the
+        object to hand, by the configured path resolved the way the object
+        resolves it, and by the report-directory reading -- the same three
+        spellings AA-16's re-audit settled on, for the same reason.
     """
     from config import CFG, _p
     paths = {}
@@ -84,11 +105,35 @@ def _protected_source_paths(ledger, directory, processed_store=None) -> dict:
     paths.setdefault(
         os.path.realpath(os.path.join(directory, CFG.ALPHA_STATE_FILE)),
         "processed ledger")
+
+    # RA-14. The budget ledger, all three spellings: the object's own path,
+    # the module default resolved the way `BudgetLedger` resolves it, and the
+    # report-directory reading.
+    from alpha_cost import BUDGET_LEDGER_FILE
+    budget_path = getattr(budget_ledger, "path", None)
+    if budget_path:
+        paths.setdefault(os.path.realpath(budget_path), "budget ledger")
+    paths.setdefault(os.path.realpath(_p(BUDGET_LEDGER_FILE)),
+                     "budget ledger")
+    paths.setdefault(
+        os.path.realpath(os.path.join(directory, BUDGET_LEDGER_FILE)),
+        "budget ledger")
+
+    # RA-14. The telemetry file is rewritten rather than appended, so losing
+    # it loses less -- but a report published over it is still a report
+    # published over a file this system owns, and the cost of guarding it is
+    # one dictionary entry.
+    paths.setdefault(os.path.realpath(_p(CFG.ALPHA_TELEMETRY_FILE)),
+                     "telemetry ledger")
+    paths.setdefault(
+        os.path.realpath(os.path.join(directory, CFG.ALPHA_TELEMETRY_FILE)),
+        "telemetry ledger")
     return paths
 
 
 def _assert_not_a_source_ledger(target, ledger, directory,
-                                processed_store=None) -> None:
+                                processed_store=None,
+                                budget_ledger=None) -> None:
     """Refuse to publish a report over a ledger (AA-16).
 
     Both paths are canonicalised with `realpath` first, so a symlink, a `..`
@@ -98,7 +143,7 @@ def _assert_not_a_source_ledger(target, ledger, directory,
     `realpath` cannot see through.
     """
     protected = _protected_source_paths(ledger, directory,
-                                        processed_store)
+                                        processed_store, budget_ledger)
     resolved = os.path.realpath(target)
     if resolved in protected:
         raise ValueError(
@@ -122,12 +167,20 @@ def _assert_not_a_source_ledger(target, ledger, directory,
 
 
 def write_learning_report(ledger, directory, *, filename=DEFAULT_REPORT_FILE,
-                          processed_store=None, **kwargs) -> dict:
-    """Atomically publish a derived report without editing ledger history."""
+                          processed_store=None, budget_ledger=None,
+                          **kwargs) -> dict:
+    """Atomically publish a derived report without editing ledger history.
+
+    `processed_store` and `budget_ledger` are optional because the guard also
+    protects the CONFIGURED path of each; passing the object protects the path
+    it is actually using, which is what AA-16's re-audit found matters when
+    the two differ.
+    """
     report = learning_snapshot(ledger, **kwargs)
     os.makedirs(directory, exist_ok=True)
     target = os.path.join(directory, filename)
-    _assert_not_a_source_ledger(target, ledger, directory, processed_store)
+    _assert_not_a_source_ledger(target, ledger, directory, processed_store,
+                                budget_ledger)
     fd, tmp = tempfile.mkstemp(prefix=".alpha-learning-", suffix=".tmp",
                                dir=directory, text=True)
     try:

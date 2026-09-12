@@ -50,7 +50,8 @@ from config import CFG                                         # noqa: E402
 # contract, not in the producer. Importing them from their real home is part
 # of the point: three components can no longer hold three opinions.
 from candidate_contract import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS,  # noqa: E402
-                                REQUIRED_FIELDS)
+                                REQUIRED_FIELDS, canonical_content)
+from _candidate import valid_record                            # noqa: E402
 from research_feed import (ResearchFeed,                       # noqa: E402
                            candidate_from_market, spool_dir)
 
@@ -742,9 +743,23 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
     #: Since the AA-15 re-audit a settlement must carry the complete
     #: required binding and name a source an operator has qualified. The
     #: fixture carries both because a real one does.
+    #:
+    #: RA-11 widened that binding to the full VERSIONED identity -- the
+    #: environment and the contract version as well -- and made the actual
+    #: resolution instant and the settlement evidence identity required.
+    #: RA-12 made qualification RECOMPUTE the source digest from the
+    #: retained evidence, so the fixture carries a real record: the synthetic
+    #: `"e" * 64` it used to carry cannot be re-derived from anything, and a
+    #: prediction whose evidence does not recompute is quarantined rather
+    #: than settled -- which would leave every case below asserting on an
+    #: idempotency and a conflict that never got the chance to happen.
+    RECORD = valid_record()
     BINDING = {"contract_id": "KXBTCD-TRUTH",
                "market_snapshot_id": "snap-truth",
-               "record_sha256": "e" * 64}
+               "record_sha256": RECORD["record_sha256"],
+               "environment": "test",
+               "contract_schema": RECORD["schema"],
+               "source_evidence": canonical_content(RECORD)}
     TRUSTED = ["kalshi feed"]
 
     def ledger_with_prediction(self, pid="p-1"):
@@ -762,7 +777,11 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
         row = {"prediction_id": "p-1", "outcome": 1, "source": "kalshi feed",
                "contract_id": self.BINDING["contract_id"],
                "market_snapshot_id": self.BINDING["market_snapshot_id"],
-               "source_record_sha256": self.BINDING["record_sha256"]}
+               "source_record_sha256": self.BINDING["record_sha256"],
+               "environment": self.BINDING["environment"],
+               "contract_schema": self.BINDING["contract_schema"],
+               "resolved_at": "2026-09-12T20:10:00+00:00",
+               "settlement_evidence_id": "kalshi-settlement-truth-0001"}
         row.update(over)
         return row
 

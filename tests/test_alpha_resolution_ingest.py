@@ -2,8 +2,16 @@ import os
 import tempfile
 import unittest
 
-from alpha_ledger import AlphaLedger, ROW_PREDICTION, ROW_RESOLUTION
-from alpha_resolution_ingest import ingest_settlements
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _bootstrap  # noqa: F401,E402  (repo root onto sys.path)
+
+from _candidate import valid_record                           # noqa: E402
+from alpha_ledger import (AlphaLedger, ROW_PREDICTION,        # noqa: E402
+                          ROW_RESOLUTION)
+from alpha_resolution_ingest import ingest_settlements        # noqa: E402
+from candidate_contract import FEED_SCHEMA, canonical_content  # noqa: E402
 
 
 #: The binding a real prediction is committed with. The fixtures carry it
@@ -11,9 +19,20 @@ from alpha_resolution_ingest import ingest_settlements
 #: identify the market, the observation and the evidence bytes, not just
 #: quote a prediction_id, and a fixture without it would be testing an
 #: incomplete settlement rather than the behaviour each test names.
+#:
+#: RA-11 widened that identity to the full VERSIONED one -- environment and
+#: contract version as well -- and RA-12 made settlement qualification
+#: recompute the digest from the RETAINED evidence rather than compare two
+#: copies of the claim about it. So the fixture carries a real record: a
+#: synthetic `"f" * 64` cannot be re-derived from anything, and a prediction
+#: whose evidence does not recompute is quarantined rather than settled.
+RECORD = valid_record()
 BINDING = {"contract_id": "KX-FIXTURE",
            "market_snapshot_id": "snap-fixture",
-           "record_sha256": "f" * 64}
+           "record_sha256": RECORD["record_sha256"],
+           "environment": "test",
+           "contract_schema": FEED_SCHEMA,
+           "source_evidence": canonical_content(RECORD)}
 
 #: The operator's statement of which settlement feed they verified. Required
 #: since the re-audit: with no allow-list no authority has been qualified and
@@ -25,7 +44,14 @@ def settlement(source="trusted-settlement-feed", **over):
     row = {"prediction_id": "p1", "outcome": 1, "source": source,
            "contract_id": BINDING["contract_id"],
            "market_snapshot_id": BINDING["market_snapshot_id"],
-           "source_record_sha256": BINDING["record_sha256"]}
+           "source_record_sha256": BINDING["record_sha256"],
+           "environment": BINDING["environment"],
+           "contract_schema": BINDING["contract_schema"],
+           # RA-11: the ACTUAL resolution instant and the evidence identity.
+           # Absent, `resolve()` used to fill in the ingestion time, so every
+           # time-ordered statistic measured when a script ran.
+           "resolved_at": "2026-09-12T20:10:00+00:00",
+           "settlement_evidence_id": "fixture-settlement-0001"}
     row.update(over)
     return row
 

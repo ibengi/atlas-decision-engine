@@ -201,10 +201,18 @@ def similar_cases(memory: list, *, market_class=None, limit=5) -> list:
 
 def learning_report(ledger, *, astra_selector="astra", baseline_selector="atlasquant",
                     subscription_cost_usd=100.0) -> dict:
-    rows = ledger.resolved()
+    # RA-13: learning reads QUALIFIED settlements only. `resolved()` is the
+    # audit history and includes rows nobody can tie to a market -- a
+    # resolution appended with no binding, no trusted authority and no
+    # evidence verification was previously scored, weighted and reported as
+    # the model's calibration. The excluded count is reported so the
+    # exclusion cannot be silent.
+    rows = ledger.qualified_resolved()
+    excluded = len(ledger.unqualified_resolved())
     return {
         "mode": "SHADOW_ONLY",
         "broker_authority": False,
+        "settlements_excluded_unqualified": excluded,
         "astra": score_model(rows, astra_selector),
         "astra_by_category": score_by_category(rows, astra_selector),
         "memory": build_memory(rows, astra_selector),

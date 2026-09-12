@@ -24,8 +24,21 @@ def row(pid, market_class, p_astra, p_quant, outcome, yes=.40, no=.60,
 class FakeLedger:
     def __init__(self, rows):
         self._rows = rows
+
     def resolved(self):
         return list(self._rows)
+
+    # RA-13: learning reads QUALIFIED settlements only. This double stands in
+    # for a ledger whose settlements all came through the verified ingest
+    # path, which is what these cases are about -- the arithmetic and the
+    # shadow-only shape of the report, not the qualification rule. The
+    # qualification rule itself is asserted against the real ledger in
+    # `tests/test_astra_v4_remediation.py::RA13_*`.
+    def qualified_resolved(self):
+        return [dict(r, settlement_qualified=True) for r in self._rows]
+
+    def unqualified_resolved(self):
+        return []
 
 
 class AlphaLearningTests(unittest.TestCase):
