@@ -410,9 +410,31 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
             result["rejected"].append(dict(detail))
             continue
 
-        existing = ledger.find_resolution(prediction_id)
+        try:
+            existing = ledger.find_resolution(prediction_id)
+        except Exception as exc:
+            result["rejected"].append({
+                "row": index, "prediction_id": prediction_id,
+                "reason": "existing resolution read failed: "
+                          f"{type(exc).__name__}: {exc}",
+            })
+            continue
         if existing is not None:
-            existing_outcome = int(existing.get("actual_outcome"))
+            # A parseable old row is not necessarily a qualified resolution.
+            # Use the same replay gate before comparing outcomes: coercion
+            # could call malformed history idempotent or abort the whole batch.
+            existing_qualified, existing_reason = settlement_qualification(
+                prediction, existing)
+            if not existing_qualified:
+                detail = {
+                    "row": index, "prediction_id": prediction_id,
+                    "reason": "existing immutable resolution is unqualified: "
+                              + existing_reason,
+                }
+                result["quarantined"].append(detail)
+                result["rejected"].append(dict(detail))
+                continue
+            existing_outcome = existing["actual_outcome"]
             if existing_outcome == row["outcome"]:
                 result["idempotent"] += 1
                 continue

@@ -260,6 +260,84 @@ class SettlementQualificationTests(unittest.TestCase):
         self.assertEqual(learning_report(self.ledger)["memory"], [])
         self.assertEqual(Path(self.ledger.log.path).read_bytes(), original)
 
+    def test_malformed_existing_outcome_is_quarantined_without_aborting_batch(self):
+        resolution = resolution_fixture(self.prediction)
+        resolution["actual_outcome"] = {"unqualified": 1}
+        self.ledger.log.append(resolution)
+        next_prediction = copy.deepcopy(self.prediction)
+        next_prediction["prediction_id"] = "pred-second-synthetic-observation"
+        next_record = source_record(yes_bid=40, yes_ask=42)
+        next_snapshot = SpoolConsumer.mint(None, next_record)
+        next_prediction["market_snapshot_id"] = next_snapshot.market_snapshot_id
+        next_prediction["snapshot"] = next_snapshot.as_dict()
+        next_prediction["source_binding"]["market_snapshot_id"] = next_snapshot.market_snapshot_id
+        next_prediction["source_binding"]["source_evidence"] = canonical_content(next_record)
+        next_prediction["source_binding"]["record_sha256"] = next_record["record_sha256"]
+        # A second independent immutable prediction makes batch continuation
+        # observable. Appending a synthetic historical fixture does not edit
+        # the malformed resolution or create a provider request.
+        self.ledger.log.append(next_prediction)
+        before = Path(self.ledger.log.path).read_bytes()
+        result = ingest_settlements(self.ledger,
+            [incoming(self.prediction), incoming(next_prediction)],
+            trusted_sources=[AUTHORITY])
+        self.assertEqual(result["appended"], 1)
+        self.assertEqual(result["resolved_prediction_ids"], [next_prediction["prediction_id"]])
+        self.assertEqual(result["idempotent"], 0)
+        self.assertEqual(len(result["quarantined"]), 1)
+        self.assertTrue(Path(self.ledger.log.path).read_bytes().startswith(before))
+        self.assertEqual(self.ledger.find_resolution(self.prediction["prediction_id"]), resolution)
+        self.assertEqual([row["prediction_id"] for row in self.ledger.qualified_resolved()],
+                         [next_prediction["prediction_id"]])
+
+    def test_existing_outcome_types_never_coerce_into_idempotence(self):
+        values = (None, "1", "not-a-number", 1.0, True, False, [], {}, -1, 2, 10**500)
+        for index, value in enumerate(values):
+            with self.subTest(value=value):
+                history = AlphaLedger(str(self.root / f"malformed-outcome-{index}.jsonl"),
+                                      str(self.root / f"malformed-outcome-cost-{index}.jsonl"))
+                history.log.append(self.prediction)
+                resolution = resolution_fixture(self.prediction)
+                resolution["actual_outcome"] = value
+                history.log.append(resolution)
+                before = Path(history.log.path).read_bytes()
+                result = ingest_settlements(history, [incoming(self.prediction)], trusted_sources=[AUTHORITY])
+                self.assertEqual(result["appended"], 0)
+                self.assertEqual(result["idempotent"], 0)
+                self.assertEqual(len(result["quarantined"]), 1)
+                self.assertEqual(Path(history.log.path).read_bytes(), before)
+
+    def test_existing_same_outcome_with_unqualified_binding_is_not_idempotent(self):
+        resolution = resolution_fixture(self.prediction)
+        resolution["binding_verified"] = "true"
+        self.ledger.log.append(resolution)
+        before = Path(self.ledger.log.path).read_bytes()
+        result = ingest_settlements(self.ledger, [incoming(self.prediction)], trusted_sources=[AUTHORITY])
+        self.assertEqual(result["appended"], 0)
+        self.assertEqual(result["idempotent"], 0)
+        self.assertEqual(len(result["quarantined"]), 1)
+        self.assertEqual(Path(self.ledger.log.path).read_bytes(), before)
+
+    def test_existing_resolution_read_uncertainty_is_structured_refusal(self):
+        before = Path(self.ledger.log.path).read_bytes()
+        with patch.object(self.ledger, "find_resolution", side_effect=OSError("synthetic resolution read uncertainty")):
+            result = ingest_settlements(self.ledger, [incoming(self.prediction)], trusted_sources=[AUTHORITY])
+        self.assertEqual(result["appended"], 0)
+        self.assertEqual(result["idempotent"], 0)
+        self.assertEqual(len(result["rejected"]), 1)
+        self.assertEqual(Path(self.ledger.log.path).read_bytes(), before)
+
+    def test_existing_qualified_resolution_remains_idempotent_or_conflicting(self):
+        self.ledger.log.append(resolution_fixture(self.prediction))
+        before = Path(self.ledger.log.path).read_bytes()
+        repeated = ingest_settlements(self.ledger, [incoming(self.prediction)], trusted_sources=[AUTHORITY])
+        conflict = ingest_settlements(self.ledger, [incoming(self.prediction, outcome=0)], trusted_sources=[AUTHORITY])
+        self.assertEqual(repeated["idempotent"], 1)
+        self.assertEqual(repeated["quarantined"], [])
+        self.assertEqual(len(conflict["conflicts"]), 1)
+        self.assertEqual(conflict["appended"], 0)
+        self.assertEqual(Path(self.ledger.log.path).read_bytes(), before)
+
     def test_source_a_snapshot_b_same_labels_different_prices_is_refused(self):
         other = source_record(yes_bid=40, yes_ask=42)
         snapshot_b = SpoolConsumer.mint(None, other)
