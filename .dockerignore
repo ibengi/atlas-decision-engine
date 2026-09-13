@@ -1,6 +1,5 @@
 # Contexte de build. Ce qui n'est pas ici finit dans l'image.
 .git
-.github
 .venv
 venv
 __pycache__
