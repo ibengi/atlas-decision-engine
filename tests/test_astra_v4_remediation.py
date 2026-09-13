@@ -1668,7 +1668,10 @@ class RA13_LearningConsumedUnqualifiedSettlements(SettlementCase):
         self.assertEqual(ledger.calibration("astra")["samples"], 1)
         from alpha_learning import learning_report
         report = learning_report(ledger, astra_selector="astra")
-        self.assertEqual(report["astra"]["samples"], 1)
+        # LI05: settlement qualification alone no longer authenticates a
+        # configured/generated Astra label. Generic calibration stays above;
+        # joint positive coverage is test_alpha_provider_identity.py.
+        self.assertEqual(report["astra"]["samples"], 0)
         self.assertEqual(report["settlements_excluded_unqualified"], 0)
 
     def test_the_metrics_report_shows_both_series(self):

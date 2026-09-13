@@ -2,6 +2,8 @@ import json
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
+from tests._alpha_identity import attributed_row, MAPPINGS, POLICY
 
 from alpha_learning_runtime import (learning_snapshot, memory_context,
                                     write_learning_report)
@@ -9,7 +11,7 @@ from alpha_learning_runtime import (learning_snapshot, memory_context,
 
 class FakeLedger:
     def resolved(self):
-        return [
+        rows = [
             {
                 "prediction_id": "p1",
                 "contract_id": "c1",
@@ -38,6 +40,9 @@ class FakeLedger:
             },
         ]
 
+        return [attributed_row(row, row["per_model"]["gpt-astra-pro-max"]["p_yes"])
+                for row in rows]
+
     # RA-13: learning reads QUALIFIED settlements only. This double stands in
     # for a ledger whose settlements all came through the verified ingest
     # path, which is what these cases are about -- the arithmetic and the
@@ -53,6 +58,10 @@ class FakeLedger:
 
 
 class LearningRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch("alpha_identity.POLICY_VERSION", POLICY))
+        self.enterContext(patch("alpha_identity.REVIEWED_MODEL_MAPPINGS", MAPPINGS))
+
     def test_snapshot_is_shadow_only(self):
         report = learning_snapshot(FakeLedger(), subscription_cost_usd=100)
         self.assertEqual(report["mode"], "SHADOW_ONLY")

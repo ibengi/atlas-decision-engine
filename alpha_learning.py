@@ -24,7 +24,18 @@ def _clip(p, eps=1e-9):
 
 
 def _model_key_matches(key: str, selector: str) -> bool:
-    return str(selector).lower() in str(key).lower()
+    # Human-readable exact selectors are allowed. "astra" is a qualified
+    # role handled below, never a substring/alias interpretation.
+    normal = lambda value: str(value).casefold().replace("_", "")
+    return normal(key) == normal(selector)
+
+
+def _selected(row, key, signal, selector):
+    if str(selector).casefold().replace("_", "") == "astra":
+        from alpha_identity import qualified_prediction_signal
+        return qualified_prediction_signal(row, key, signal)
+    # Historical research labels remain searchable but carry no Astra claim.
+    return str(selector).casefold().replace("_", "") in str(key).casefold().replace("_", "")
 
 
 def score_model(rows, selector: str, *, market_class=None) -> dict:
@@ -39,7 +50,7 @@ def score_model(rows, selector: str, *, market_class=None) -> dict:
         if outcome not in (0, 1):
             continue
         for key, signal in (row.get("per_model") or {}).items():
-            if not _model_key_matches(key, selector):
+            if not _selected(row, key, signal, selector):
                 continue
             p = (signal or {}).get("p_yes")
             if _finite(p):
@@ -94,7 +105,7 @@ def hypothetical_model_pnl(rows, selector: str, *, notional_usd=1.0,
             continue
         signal = None
         for key, value in (row.get("per_model") or {}).items():
-            if _model_key_matches(key, selector):
+            if _selected(row, key, value, selector):
                 signal = value or {}
                 break
         if not signal or not _finite(signal.get("p_yes")):
@@ -162,7 +173,7 @@ def build_memory(rows, selector: str) -> list:
         if row.get("actual_outcome") not in (0, 1):
             continue
         for key, signal in (row.get("per_model") or {}).items():
-            if not _model_key_matches(key, selector):
+            if not _selected(row, key, signal, selector):
                 continue
             p = (signal or {}).get("p_yes")
             if not _finite(p):
@@ -209,15 +220,31 @@ def learning_report(ledger, *, astra_selector="astra", baseline_selector="atlasq
     # exclusion cannot be silent.
     rows = ledger.qualified_resolved()
     excluded = len(ledger.unqualified_resolved())
+    from alpha_identity import qualified_prediction_signal
+    # This report labels its target "Astra" regardless of selector settings.
+    # Therefore its target population is qualified independently of that
+    # optional display/search selector. A configured alias cannot bypass it.
+    astra_rows = [dict(row, per_model={key: signal
+                  for key, signal in (row.get("per_model") or {}).items()
+                  if qualified_prediction_signal(row, key, signal)}) for row in rows]
+    value = incremental_value(
+        astra_rows, target_selector=astra_selector, baseline_selector=baseline_selector,
+        subscription_cost_usd=subscription_cost_usd)
+    baseline = hypothetical_model_pnl(rows, baseline_selector)
+    value["baseline_pnl_usd"] = baseline["hypothetical_net_pnl_usd"]
+    value["incremental_alpha_usd"] = round(value["target_pnl_usd"] - value["baseline_pnl_usd"], 8)
+    value["net_value_after_subscription_usd"] = round(value["incremental_alpha_usd"] - float(subscription_cost_usd), 8)
+    value["worth_subscription"] = value["net_value_after_subscription_usd"] > 0
     return {
         "mode": "SHADOW_ONLY",
         "broker_authority": False,
         "settlements_excluded_unqualified": excluded,
-        "astra": score_model(rows, astra_selector),
-        "astra_by_category": score_by_category(rows, astra_selector),
-        "memory": build_memory(rows, astra_selector),
-        "astra_vs_baseline": incremental_value(
-            rows, target_selector=astra_selector,
-            baseline_selector=baseline_selector,
-            subscription_cost_usd=subscription_cost_usd),
+        "astra": score_model(astra_rows, astra_selector),
+        "astra_by_category": score_by_category(astra_rows, astra_selector),
+        "memory": build_memory(astra_rows, astra_selector),
+        "astra_vs_baseline": value,
+        "astra_identity_policy": "exact-reviewed-role-and-replayed-transport-receipt",
+        "astra_identity_unqualified_models": sum(
+            len(row.get("per_model") or {}) - len(filtered.get("per_model") or {})
+            for row, filtered in zip(rows, astra_rows)),
     }

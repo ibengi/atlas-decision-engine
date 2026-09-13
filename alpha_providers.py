@@ -30,6 +30,10 @@ ENDPOINTS ARE CONFIGURATION, AND THE DEFAULTS ARE UNVERIFIED
 """
 
 import json
+import base64
+import hashlib
+import uuid
+from collections.abc import Mapping
 import logging
 import os
 import time
@@ -235,18 +239,73 @@ class AlphaProvider:
 
     def _post(self, url: str, *, headers: dict, payload: dict,
               timeout: float) -> dict:
+        from alpha_identity import (ObservedResponse, TransportObservation,
+                                    canonical, digest, strict_json, secret_free,
+                                    valid_id, MAX_BODY_BYTES, current_capture)
+        from urllib.parse import urlsplit
+        endpoint = urlsplit(url)
+        if (endpoint.scheme != "https" or not endpoint.hostname or endpoint.username
+                or endpoint.password or endpoint.query or endpoint.fragment):
+            raise ProviderError("provider endpoint must be HTTPS without URL credentials or query")
         session = self.session
+        controlled_transport = session is None
         if session is None:
             import requests
             session = requests.Session()
+            session.trust_env = False
+        started = datetime.now(timezone.utc).isoformat()
+        request_id = "alpha-request-" + uuid.uuid4().hex
         response = session.post(url, headers=headers, json=payload,
-                                timeout=timeout)
+                                timeout=timeout, verify=True, allow_redirects=False)
+        received = datetime.now(timezone.utc).isoformat()
         status = getattr(response, "status_code", 0)
         if status >= 400:
             raise ProviderError(f"HTTP {status}: {self._safe_body(response)}")
+        if 300 <= status < 400:
+            raise ProviderError("provider redirects are refused")
         try:
-            return response.json()
-        except Exception as e:                                # noqa: BLE001
+            raw = getattr(response, "content", None)
+            wire = isinstance(raw, bytes)
+            if wire:
+                if len(raw) > MAX_BODY_BYTES:
+                    raise ValueError("response exceeds evidence bound")
+                body = strict_json(raw)
+            else:
+                # Compatibility for injected/offline transports: this is not
+                # exact wire capture and therefore cannot qualify identity.
+                body = response.json()
+                raw = canonical(body).encode("utf-8")
+            if not isinstance(body, dict) or len(raw) > MAX_BODY_BYTES:
+                raise ValueError("invalid response envelope")
+            if (not secret_free(body) or not secret_free(payload)
+                    or redact(raw.decode("utf-8")) != raw.decode("utf-8")
+                    or redact(canonical(body)) != canonical(body)
+                    or not secret_free(body, redactor=redact)
+                    or redact(canonical(payload)) != canonical(payload)):
+                raise ProviderError("response/request evidence refused by secret screening")
+            observed_headers = getattr(response, "headers", {})
+            transport_id = observed_headers.get("x-request-id") if isinstance(observed_headers, Mapping) else None
+            if not valid_id(transport_id) or redact(transport_id) != transport_id:
+                transport_id = None
+            final_url = getattr(response, "url", None)
+            if not isinstance(final_url, str):
+                final_url = None
+            observation = {
+                "request_id": request_id, "request_started_at": started,
+                "received_at": received, "endpoint": url, "final_url": final_url,
+                "http_status": status, "verified_tls": controlled_transport,
+                "redirected": bool(getattr(response, "history", [])),
+                "transport_request_id": transport_id,
+                "request_schema": "provider-json-request-v1",
+                "request_body": payload, "request_sha256": digest(payload),
+                "response_body_b64": base64.b64encode(raw).decode("ascii"),
+                "response_body_sha256": hashlib.sha256(raw).hexdigest(),
+                "wire_body_available": wire,
+            }
+            return ObservedResponse(body, TransportObservation(canonical(observation), current_capture()))
+        except ProviderError:
+            raise
+        except Exception as e:
             raise ProviderError(f"unreadable response body: {type(e).__name__}")
 
     @staticmethod
@@ -284,6 +343,28 @@ class AlphaProvider:
                 raise ProviderError(f"{self.env_key} is not set")
             response = self._call(build_prompt(snapshot), timeout)
             text, usage = self._extract(response)
+            from alpha_identity import make_receipt, verify_receipt
+            receipt = make_receipt(response, provider=self.name,
+                                   requested_model=self.model, snapshot=snapshot,
+                                   environment=CFG.ALPHA_ENVIRONMENT, output=text)
+            verification = verify_receipt(receipt, snapshot=snapshot,
+                                          environment=CFG.ALPHA_ENVIRONMENT,
+                                          provider=self.name, requested_model=self.model,
+                                          output=text)
+            from alpha_identity import current_capture, TransportObservation
+            observation = getattr(response, "observation", None)
+            if (isinstance(observation, TransportObservation)
+                    and observation.capture_token is current_capture()
+                    and current_capture() is not None):
+                meta["_identity_capture"] = current_capture()
+            # Unsupported endpoints/providers remain ordinary unqualified
+            # SHADOW research. Their capture is diagnostic metadata only;
+            # it cannot enter the qualified receipt or Astra learning path.
+            meta["provider_identity_receipt"] = receipt if verification["valid"] else None
+            if not verification["valid"]:
+                meta["provider_identity_unqualified_evidence"] = receipt
+            meta["provider_identity_verification"] = verification
+            meta["resolved_model"] = verification.get("model")
         except ProviderError as e:
             meta["error"] = redact(e)
         except Exception as e:                                # noqa: BLE001
@@ -476,6 +557,8 @@ class _ResponsesAPI(AlphaProvider):
         usage = response.get("usage") or {}
         details = usage.get("input_tokens_details") or {}
         return text, {
+            "response_id": response.get("id"),
+            "response_model": response.get("model"),
             "input_tokens": int(usage.get("input_tokens") or 0),
             "cached_input_tokens": int(details.get("cached_tokens") or 0),
             "output_tokens": int(usage.get("output_tokens") or 0),
@@ -674,3 +757,18 @@ def default_providers(*, session=None, quant_estimator=None) -> list:
             GeminiProvider(session=session),
             OpenAIProvider(session=session),
             AtlasQuantProvider(estimator=quant_estimator)]
+
+
+# Capture exact built-in method identities once. A custom provider, subclass,
+# injected session or replaced method cannot self-authenticate plain metadata.
+_IDENTITY_METHODS = {
+    "analyze": AlphaProvider.analyze, "_post": AlphaProvider._post,
+    "_call": _ResponsesAPI._call, "_extract": _ResponsesAPI._extract,
+}
+
+
+def trusted_identity_adapter(provider):
+    return (type(provider) in (OpenAIProvider, GrokProvider)
+            and provider.session is None
+            and all(getattr(getattr(provider, name, None), "__func__", None) is method
+                    for name, method in _IDENTITY_METHODS.items()))

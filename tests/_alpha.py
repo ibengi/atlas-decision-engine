@@ -155,7 +155,7 @@ def http_session(response_body, *, status=200, raises=None):
         def __init__(self):
             self.posts = []
 
-        def post(self, url, *, headers=None, json=None, timeout=None):
+        def post(self, url, *, headers=None, json=None, timeout=None, verify=True, allow_redirects=False):
             self.posts.append({"url": url, "headers": dict(headers or {}),
                                "json": json, "timeout": timeout})
             if raises is not None:

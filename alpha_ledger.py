@@ -240,6 +240,8 @@ class AlphaLedger:
                     "contract_id": snapshot.contract_id,
                     "provider": signal.provider or cost.get("provider"),
                     "model": signal.model,
+                    "pricing_model": cost.get("model"),
+                    "provider_identity_receipt": signal.as_dict().get("provider_identity_receipt"),
                     "input_tokens": int(cost.get("input_tokens") or 0),
                     "output_tokens": int(cost.get("output_tokens") or 0),
                     "api_cost_usd": float(cost.get("api_cost_usd") or 0.0),
@@ -440,6 +442,36 @@ class AlphaLedger:
                 row["supersedes_prediction_id"] = supersedes
             elif "supersedes_prediction_id" in row:
                 raise LedgerError("prediction names a nonexistent superseded attempt")
+            # Identity evidence shares this existing transaction and file
+            # barrier. A readable row from an interrupted writer is still
+            # considered when rejecting cross-request response-ID reuse.
+            from alpha_identity import verify_receipt, forecast_matches, prediction_binding_valid
+            invocation_ids = set()
+            response_ids = set()
+            for model_key, signal in (row.get("per_model") or {}).items():
+                receipt = (signal or {}).get("provider_identity_receipt")
+                if receipt is None:
+                    continue  # Immutable legacy/unqualified forecast.
+                binding = signal.get("provider_prediction_binding")
+                verdict = verify_receipt(receipt, snapshot=row.get("snapshot"),
+                                         environment=(row.get("source_binding") or {}).get("environment"))
+                if (verdict["valid"] is not True or verdict.get("model_key") != model_key
+                        or not forecast_matches(signal, verdict.get("forecast"))
+                        or not prediction_binding_valid(row, signal, receipt)):
+                    raise LedgerError("provider identity does not bind the prediction")
+                response_key = (receipt["provider"], receipt["response_id"])
+                request_key = receipt["transport"]["request_id"]
+                if response_key in response_ids or request_key in invocation_ids:
+                    raise LedgerError("provider identity reused within a prediction")
+                response_ids.add(response_key)
+                invocation_ids.add(request_key)
+                for prior in predictions:
+                    for prior_signal in (prior.get("per_model") or {}).values():
+                        old = (prior_signal or {}).get("provider_identity_receipt")
+                        if isinstance(old, dict) and (
+                                (old.get("provider"), old.get("response_id")) == response_key
+                                or (old.get("transport") or {}).get("request_id") == request_key):
+                            raise LedgerError("provider response/request identity reused across predictions")
             result = self.log.append(row)
             self._commit(aid, prediction_id, snapshot_id)
             return result
@@ -744,6 +776,10 @@ class AlphaLedger:
             per_model = (row.get("per_model") or {}).get(model)
             if not per_model or not _finite(per_model.get("p_yes")):
                 continue
+            if str(model).startswith(("openai/", "grok/", "gemini/")) or per_model.get("provider_identity_receipt") is not None:
+                from alpha_identity import qualified_prediction_signal
+                if not qualified_prediction_signal(row, model, per_model, role=None):
+                    continue
             outcome = row["actual_outcome"]
             total += (float(per_model["p_yes"]) - outcome) ** 2
             samples += 1

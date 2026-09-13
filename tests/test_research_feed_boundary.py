@@ -52,8 +52,13 @@ ALLOWED_IMPORTS = frozenset({"datetime", "hashlib", "json", "logging", "os",
 #: adding an Alpha import to `research_spool` would otherwise reach the engine
 #: transitively without touching `research_feed.py` at all.
 NEUTRAL_MODULES = {
-    "candidate_contract.py": frozenset({"hashlib", "json", "math", "datetime", "source_identity"}),
-    "source_identity.py": frozenset(),
+    "candidate_contract.py": frozenset({"hashlib", "json", "math", "datetime", "source_identity", "research_source_contract_v4"}),
+    "source_identity.py": frozenset({"research_source_contract_v4"}),
+    # Explicit source-contract v4 replay is pure: base64 retains wire bytes,
+    # Decimal enforces exact source units, and re validates fixed identifiers.
+    # Pin the complete transitive module; no I/O or Alpha dependency is added.
+    "research_source_contract_v4.py": frozenset({"base64", "hashlib", "json", "re", "decimal",
+                                                 "candidate_contract", "source_identity"}),
     # `re` parses the owner pid out of a partial's name; `durable_append`
     # supplies the advisory lock the capacity RESERVATION is serialized on
     # (AA-11 re-audit) and, since RA-05, the ONE honest directory fsync.

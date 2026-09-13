@@ -232,6 +232,10 @@ def ensemble(signals, snapshot, now, *, history=None) -> dict:
     never 0.5, never the market price.
     """
     valid = [s for s in signals if s.valid]
+    if len({signal.model for signal in valid}) != len(valid):
+        return {"p_meta": None, "models": 0, "weights": {}, "per_model": {},
+                "disagreement": None, "confidence": 0.0,
+                "reason": "duplicate provider/model identity"}
     if not valid:
         return {"p_meta": None, "models": 0, "weights": {},
                 "disagreement": None, "confidence": 0.0,
@@ -271,7 +275,11 @@ def ensemble(signals, snapshot, now, *, history=None) -> dict:
                                 "low": s.probability_low,
                                 "high": s.probability_high,
                                 "confidence": s.confidence,
-                                "latency_ms": s.analysis_latency_ms}
+                                "latency_ms": s.analysis_latency_ms,
+                                "provider": s.provider,
+                                "provider_identity_receipt": s.as_dict()["provider_identity_receipt"],
+                                "provider_identity_qualified": s.provider_identity_qualified,
+                                "provider_identity_reason": s.provider_identity_reason}
                       for s in valid},
         "reason": None,
     }

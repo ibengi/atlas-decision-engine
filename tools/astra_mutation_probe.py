@@ -610,6 +610,8 @@ MUTATIONS = {
         '    rows = ledger.resolved()',
         [
          "tests/test_astra_v4_remediation.py::RA13_LearningConsumedUnqualifiedSettlements",
+         # LI05: a valid provider identity must reach the separate settlement gate.
+         "tests/test_alpha_provider_identity.py::ProviderIdentityTests::test_qualified_provider_identity_cannot_bypass_unqualified_settlement",
         ],
     ),
     "M39": (

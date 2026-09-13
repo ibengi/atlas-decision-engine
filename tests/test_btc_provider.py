@@ -91,9 +91,8 @@ class TestFallbackChain(unittest.TestCase):
         self.assertIn("ok(30)", t)
 
     def test_context_valid_via_fallback(self):
-        ctx = bc.get_btc_context(
-            spot_sources=_spot_sources(), use_cache=False,
-            klines_fn=None)
+        # Install synthetic providers before the first context call. The old
+        # unused pre-mock call attempted public network I/O during this test.
         # court-circuit reseau : on injecte la chaine via monkeypatch
         orig = bc.fetch_klines_with_fallback
         bc.fetch_klines_with_fallback = lambda limit=30, providers=None, \

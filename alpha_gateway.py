@@ -251,6 +251,17 @@ class AlphaGateway:
         prediction_id = "pred-" + hashlib.sha256(
             f"{snapshot.market_snapshot_id}|{now.isoformat()}".encode()
         ).hexdigest()[:20]
+        # Bind the retained transport observation to these exact prediction
+        # bytes. Existing append/COMMIT barriers remain the only durability
+        # mechanism. No old prediction is rewritten.
+        import copy
+        per_model = copy.deepcopy(meta.get("per_model"))
+        for signal in (per_model or {}).values():
+            receipt = signal.get("provider_identity_receipt")
+            if isinstance(receipt, dict):
+                signal["provider_prediction_binding"] = {
+                    "prediction_id": prediction_id,
+                    "receipt_sha256": receipt.get("receipt_sha256")}
         horizon = None
         try:
             from alpha_snapshot import parse_utc
@@ -258,6 +269,13 @@ class AlphaGateway:
                        - now).total_seconds()
         except Exception:                                     # noqa: BLE001
             horizon = None
+        # Source joins and provider captures may finish in this same second.
+        # Preserve both observations' ordering; legacy rows keep their format.
+        precise_time = ((source_binding or {}).get("contract_schema") ==
+                        "atlas-research-candidate-v4" or any(
+                            isinstance(signal.get("provider_identity_receipt"), dict)
+                            for signal in (per_model or {}).values()))
+        precision = "microseconds" if precise_time else "seconds"
         return {
             "prediction_id": prediction_id,
             "market_snapshot_id": snapshot.market_snapshot_id,
@@ -271,7 +289,7 @@ class AlphaGateway:
             # copies it and never invents one.
             "source_binding": dict(source_binding or {}),
             "snapshot": snapshot.as_dict(),
-            "prediction_time": now.isoformat(timespec="seconds"),
+            "prediction_time": now.isoformat(timespec=precision),
             "market_class": snapshot.market_class,
             "time_to_resolution_s": horizon,
 
@@ -279,7 +297,7 @@ class AlphaGateway:
             "confidence": meta.get("confidence"),
             "disagreement": meta.get("disagreement"),
             "weights": meta.get("weights"),
-            "per_model": meta.get("per_model"),
+            "per_model": per_model,
             "envelope_low": meta.get("envelope_low"),
             "envelope_high": meta.get("envelope_high"),
 
