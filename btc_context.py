@@ -15,6 +15,8 @@ Aucun secret dans ce fichier.
 """
 
 import math
+import hashlib
+import json
 import os
 import time
 import logging
@@ -31,6 +33,9 @@ CACHE_TTL_S         = 10.0         # cache court : donnees "ultra fraiches"
 MAX_PRICE_AGE_S     = 90.0         # au-dela : donnee PERIMEE
 MAX_DISPERSION_PCT  = 0.5          # ecart max entre exchanges (aberrant sinon)
 MIN_VALID_SOURCES   = 2
+KLINE_INTERVAL_S = 60
+MAX_KLINE_CLOSE_AGE_S = 120.0
+KLINE_POLICY_VERSION = "closed-1m-v1"
 MIN_KLINES          = 11           # pour rendement 10m + vol realisee
 # P8 : cache PAR CYCLE (BTC_CONTEXT_CYCLE_CACHE=1). Le contexte BTC est
 # calcule UNE FOIS par cycle puis partage par TOUS les marches BTC : les
@@ -41,6 +46,155 @@ MIN_KLINES          = 11           # pour rendement 10m + vol realisee
 # en debut de cycle) purge les deux caches : aucun cycle ne voit les
 # donnees du precedent.
 CYCLE_CACHE_TTL_S = 3600.0
+
+
+def _finite_number(value, *, wire=False):
+    """Reject booleans, overflow and non-finite input before numeric use.
+
+    Wire adapters alone accept numeric strings: exchange OHLC prices use them.
+    The normalized row contract requires actual finite numbers.
+    """
+    if type(value) not in ((int, float, str) if wire else (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _wire_number(value):
+    number = _finite_number(value, wire=True)
+    if number is None:
+        raise ValueError("invalid wire number")
+    return number
+
+
+def qualify_klines(rows, now, closed_before=None):
+    """All-or-nothing row validation before any model or cache acceptance.
+
+    Bars are one-minute, UTC-grid-aligned and strictly consecutive. Bars not
+    completed at the conservative observation cutoff are omitted explicitly;
+    future or malformed bars invalidate the entire response. At least MIN_KLINES
+    completed bars are needed.
+    The age bound measures the last completed bar's close, never fetch time.
+    """
+    now = _finite_number(now)
+    if now is None or now <= 0:
+        return None, "invalid_clock"
+    cutoff = now if closed_before is None else _finite_number(closed_before)
+    if cutoff is None or cutoff <= 0 or cutoff > now:
+        return None, "invalid_observation_cutoff"
+    if not isinstance(rows, list) or not rows:
+        return None, "no_rows"
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None, "row_schema"
+        values = {key: _finite_number(row.get(key))
+                  for key in ("ts", "open", "high", "low", "close", "volume")}
+        if any(value is None for value in values.values()):
+            return None, "row_number"
+        ts = values["ts"]
+        if ts <= 0 or ts != int(ts) or ts % KLINE_INTERVAL_S:
+            return None, "timestamp_grid"
+        if ts > now:
+            return None, "future_bar"
+        if any(values[key] <= 0 for key in ("open", "high", "low", "close")):
+            return None, "nonpositive_price"
+        if values["volume"] < 0:
+            return None, "negative_volume"
+        if not (values["low"] <= min(values["open"], values["close"])
+                <= max(values["open"], values["close"]) <= values["high"]):
+            return None, "ohlc_range"
+        if normalized and ts - normalized[-1]["ts"] != KLINE_INTERVAL_S:
+            return None, "cadence_or_order"
+        normalized.append(values)
+    # This is the only permitted row omission, after complete schema validation.
+    normalized = [row for row in normalized
+                  if row["ts"] + KLINE_INTERVAL_S <= cutoff]
+    if len(normalized) < MIN_KLINES:
+        return None, "insufficient_closed_bars"
+    if now - (normalized[-1]["ts"] + KLINE_INTERVAL_S) > MAX_KLINE_CLOSE_AGE_S:
+        return None, "stale_closed_bar"
+    return normalized, "ok"
+
+
+def _klines_provenance(rows, source, now):
+    canonical = json.dumps(rows, sort_keys=True, separators=(",", ":"),
+                           allow_nan=False).encode("utf-8")
+    name = source.removeprefix("fresh:")
+    origin = {
+        "binance": ("https://api.binance.com/api/v3/klines", "BTCUSDT", "USDT"),
+        "kraken": ("https://api.kraken.com/0/public/OHLC", "XBTUSD", "USD"),
+        "coinbase": ("https://api.exchange.coinbase.com/products/BTC-USD/candles", "BTC-USD", "USD"),
+    }.get(name, (None, None, None))
+    return {"schema": KLINE_POLICY_VERSION, "source": source,
+            "endpoint": origin[0], "instrument": origin[1], "quote_currency": origin[2],
+            "interval_seconds": KLINE_INTERVAL_S,
+            "first_open_ts": rows[0]["ts"], "last_open_ts": rows[-1]["ts"],
+            "last_close_ts": rows[-1]["ts"] + KLINE_INTERVAL_S,
+            "validated_at": now, "row_count": len(rows),
+            "normalized_sha256": hashlib.sha256(canonical).hexdigest(),
+            "normalized_rows": rows,
+            "max_close_age_seconds": MAX_KLINE_CLOSE_AGE_S,
+            "degraded_cache_allowed": False,
+            "qualification": "schema_and_freshness_only"}
+
+
+def decision_candles_current(model_output, now=None):
+    """Recheck bound model inputs at the execution boundary; no I/O.
+
+    This verifies our retained normalization/preimage and its expiry. It does
+    not authenticate an exchange or qualify a provider's economic suitability.
+    Missing/foreign/malformed proof is refusal, including legacy predictions.
+    """
+    now = _finite_number(time.time() if now is None else now)
+    if now is None or not isinstance(model_output, dict) or model_output.get("valid") is not True:
+        return False
+    features = model_output.get("features")
+    proof = features.get("candle_provenance") if isinstance(features, dict) else None
+    if not isinstance(proof, dict):
+        return False
+    source = proof.get("source")
+    if source not in ("fresh:binance", "fresh:kraken", "fresh:coinbase"):
+        return False
+    validated_at = _finite_number(proof.get("validated_at"))
+    expires_at = _finite_number(proof.get("valid_until"))
+    if validated_at is None or expires_at is None or not validated_at <= now <= expires_at:
+        return False
+    if proof.get("degraded_cache_allowed") is not False:
+        return False
+    rows, _ = qualify_klines(proof.get("normalized_rows"), now)
+    if rows is None:
+        return False
+    expected = _klines_provenance(rows, source, validated_at)
+    if any(type(proof.get(key)) is not type(value) or proof.get(key) != value
+           for key, value in expected.items()):
+        return False
+    if expires_at > rows[-1]["ts"] + KLINE_INTERVAL_S + MAX_KLINE_CLOSE_AGE_S:
+        return False
+    # The scalar model inputs must still describe this exact retained window.
+    logs = [math.log(row["close"]) for row in rows]
+    sigma = statistics.pstdev(b-a for a, b in zip(logs, logs[1:]))
+    return (_finite_number(features.get("sigma_1m")) == sigma
+            and _finite_number(features.get("ret_5m")) == logs[-1] - logs[-6])
+
+
+def _context_still_fresh(ctx, now):
+    now = _finite_number(now)
+    if now is None or now < ctx.generated_ts:
+        return False
+    proof = ctx.klines_provenance
+    if not isinstance(proof, dict) or proof.get("schema") != KLINE_POLICY_VERSION:
+        return False
+    expires_at = _finite_number(proof.get("valid_until"))
+    last_close = _finite_number(proof.get("last_close_ts"))
+    if expires_at is None or last_close is None or now > expires_at:
+        return False
+    age = now - last_close
+    sources, _ = _validate_sources(ctx.sources, now)
+    return 0 <= age <= MAX_KLINE_CLOSE_AGE_S and len(sources) >= MIN_VALID_SOURCES
 
 
 def _cycle_cache_active() -> bool:
@@ -169,9 +323,17 @@ def fetch_klines_binance(limit: int = 30):
     if not d:
         return None, meta
     try:
-        return [{"ts": k[0] / 1000.0, "open": float(k[1]),
-                 "high": float(k[2]), "low": float(k[3]),
-                 "close": float(k[4]), "volume": float(k[5])}
+        if not isinstance(d, list):
+            raise ValueError("invalid Binance candle envelope")
+        for k in d:
+            if not isinstance(k, list) or len(k) != 12:
+                raise ValueError("invalid Binance candle row")
+            opened, closed = _wire_number(k[0]), _wire_number(k[6])
+            if opened != int(opened) or closed != opened + 59999:
+                raise ValueError("contradictory Binance candle interval")
+        return [{"ts": _wire_number(k[0]) / 1000.0, "open": _wire_number(k[1]),
+                 "high": _wire_number(k[2]), "low": _wire_number(k[3]),
+                 "close": _wire_number(k[4]), "volume": _wire_number(k[5])}
                 for k in d], meta
     except (TypeError, ValueError, IndexError):
         meta["error"] = "parse_error"
@@ -184,10 +346,18 @@ def fetch_klines_kraken(limit: int = 30):
     d, meta = _http_get_json_meta("https://api.kraken.com/0/public/OHLC",
                                   {"pair": "XBTUSD", "interval": 1})
     try:
-        rows = d["result"]["XXBTZUSD"]
-        out = [{"ts": float(k[0]), "open": float(k[1]), "high": float(k[2]),
-                "low": float(k[3]), "close": float(k[4]),
-                "volume": float(k[6])} for k in rows][-limit:]
+        if not isinstance(d, dict) or d.get("error") != []:
+            raise ValueError("uncertain Kraken response")
+        result = d.get("result")
+        if not isinstance(result, dict) or set(result) != {"XXBTZUSD", "last"}:
+            raise ValueError("unknown Kraken response identity")
+        _wire_number(result["last"])
+        rows = result["XXBTZUSD"]
+        if not isinstance(rows, list) or any(not isinstance(k, list) or len(k) != 8 for k in rows):
+            raise ValueError("invalid Kraken candle row")
+        out = [{"ts": _wire_number(k[0]), "open": _wire_number(k[1]), "high": _wire_number(k[2]),
+                "low": _wire_number(k[3]), "close": _wire_number(k[4]),
+                "volume": _wire_number(k[6])} for k in rows]
         return out, meta
     except (KeyError, TypeError, ValueError, IndexError):
         meta["error"] = meta.get("error") or "parse_error"
@@ -201,10 +371,17 @@ def fetch_klines_coinbase(limit: int = 30):
         "https://api.exchange.coinbase.com/products/BTC-USD/candles",
         {"granularity": 60})
     try:
-        rows = sorted(d, key=lambda k: k[0])[-limit:]
-        out = [{"ts": float(k[0]), "low": float(k[1]), "high": float(k[2]),
-                "open": float(k[3]), "close": float(k[4]),
-                "volume": float(k[5])} for k in rows]
+        if not isinstance(d, list):
+            raise ValueError("invalid candle envelope")
+        timestamps = [_wire_number(k[0]) for k in d]
+        if any(a <= b for a, b in zip(timestamps, timestamps[1:])):
+            raise ValueError("unexpected Coinbase candle ordering")
+        if any(not isinstance(k, list) or len(k) != 6 for k in d):
+            raise ValueError("invalid Coinbase candle row")
+        rows = list(reversed(d))
+        out = [{"ts": _wire_number(k[0]), "low": _wire_number(k[1]), "high": _wire_number(k[2]),
+                "open": _wire_number(k[3]), "close": _wire_number(k[4]),
+                "volume": _wire_number(k[5])} for k in rows]
         return out, meta
     except (TypeError, ValueError, IndexError, KeyError):
         meta["error"] = meta.get("error") or "parse_error"
@@ -215,58 +392,50 @@ DEFAULT_KLINES_PROVIDERS = (("binance", fetch_klines_binance),
                             ("kraken", fetch_klines_kraken),
                             ("coinbase", fetch_klines_coinbase))
 
-# cache des DERNIERES bougies valides : une panne TEMPORAIRE des
-# fournisseurs ne bloque plus toutes les decisions (mode degrade borne)
-KLINES_STALE_MAX_S = 600.0         # au-dela : donnees refusees
+# Compatibility constants only; outage cache is never executable input.
+KLINES_STALE_MAX_S = 600.0
 _last_good_klines = {"kl": None, "ts": 0.0, "provider": None}
 
 
 def fetch_klines_with_fallback(limit: int = 30, providers=None, now=None):
-    """Essaie chaque fournisseur dans l'ordre ; journalise chacun ;
-    retourne (klines, source_info). source_info distingue :
-      - fresh:<provider>                  donnees fraiches completes
-      - partial:<provider>(n)             reponses mais < MIN_KLINES
-      - stale_cache:<provider>(age)       secours cache borne
-      - none                              AUCUNE donnee nulle part"""
+    """Return only fresh, complete one-minute rows from a qualified adapter.
+
+    Qualification here is a local schema/freshness policy, not proof of a live
+    provider's availability or independent economic fitness. Outage => refusal.
+    """
     import os as _os
-    now = now if now is not None else time.time()
+    clock = (lambda: now) if now is not None else time.time
     if providers is None:
         order = [p.strip() for p in _os.getenv(
             "KLINES_PROVIDER_ORDER", "binance,kraken,coinbase").split(",")]
         by_name = dict(DEFAULT_KLINES_PROVIDERS)
         providers = [(n, by_name[n]) for n in order if n in by_name]
-    best_partial, best_name = None, None
+    if _finite_number(clock()) is None or type(limit) is not int or not MIN_KLINES <= limit <= 720:
+        return None, "none"
+    rejected = None
     for name, fn in providers:
         try:
+            closed_before = clock()
             res = fn(limit)
+            kl, meta = res if isinstance(res, tuple) and len(res) == 2 else (res, {})
+            meta = meta if isinstance(meta, dict) else {}
+            qualified, reason = qualify_klines(kl, clock(), closed_before=closed_before)
         except Exception as e:            # noqa: BLE001
             _report_provider(name, "klines",
                              {"http_status": None, "elapsed_ms": None,
                               "error": f"{type(e).__name__}: {e}"[:160]},
                              False, "exception")
             continue
-        kl, meta = res if isinstance(res, tuple) else (res, {})
-        n = len(kl or [])
-        if kl and n >= MIN_KLINES:
-            _report_provider(name, "klines", meta, True, f"ok({n})")
-            _last_good_klines.update(kl=kl, ts=now, provider=name)
-            return kl, f"fresh:{name}"
-        _report_provider(name, "klines", meta, False,
-                         f"insuffisant({n}/{MIN_KLINES})" if kl
-                         else "aucune_donnee")
-        if kl and (best_partial is None or n > len(best_partial)):
-            best_partial, best_name = kl, name
-    stale = _last_good_klines["kl"]
-    age = now - _last_good_klines["ts"]
-    if stale and age <= KLINES_STALE_MAX_S:
-        log.warning(f"[DATA_PROVIDER] klines: TOUS les fournisseurs "
-                    f"indisponibles -- secours cache "
-                    f"({_last_good_klines['provider']}, age {age:.0f}s)")
-        return stale, (f"stale_cache:{_last_good_klines['provider']}"
-                       f"({age:.0f}s)")
-    if best_partial:
-        return best_partial, f"partial:{best_name}({len(best_partial)})"
-    return None, "none"
+        if qualified is not None:
+            _report_provider(name, "klines", meta, True,
+                             f"ok({len(qualified)}),policy={KLINE_POLICY_VERSION}")
+            return qualified[-limit:], f"fresh:{name}"
+        _report_provider(name, "klines", meta, False, reason)
+        if kl is not None:
+            rejected = f"rejected:{name}:{reason}"
+    # An outage never reheats cached volatility into executable model inputs.
+    # Each fallback must independently satisfy the same complete bar contract.
+    return None, rejected or "none"
 
 
 DEFAULT_SPOT_SOURCES = (fetch_coinbase, fetch_kraken, fetch_bitstamp)
@@ -293,6 +462,7 @@ class BtcMarketContext:
     klines_count: int = 0
     data_quality_score: float = 0.0         # 0..100
     quality_flags: list = field(default_factory=list)
+    klines_provenance: dict = field(default_factory=dict)
 
     def to_dict(self):
         return asdict(self)
@@ -340,14 +510,21 @@ def get_btc_context(strike: Optional[float] = None,
     """Recupere, valide et normalise. spot_sources/klines_fn injectables
     (tests hors-ligne). Retourne TOUJOURS un BtcMarketContext ; valid=False
     avec 'reason' explicite si les donnees sont insuffisantes."""
-    now = now if now is not None else time.time()
+    explicit_now = now
+    clock = (lambda: explicit_now) if explicit_now is not None else time.time
+    now = clock()
+    if _finite_number(now) is None or now <= 0:
+        return BtcMarketContext(valid=False, reason="invalid_clock", generated_ts=0.0)
     # P8 : contexte memoise PAR CYCLE — meme strike/meme horizon => meme
     # objet contexte (les fetches reseau n'ont lieu qu'une fois par cycle).
     # Seuls les contextes VALIDES sont memoises (un invalide peut devenir
     # valide en cours de cycle sans nouveau fetch — on ne le fige pas).
     cycle_key = (strike, minutes_remaining)
     if use_cache and _cycle_cache_active() and cycle_key in _cycle_ctx_cache:
-        return _cycle_ctx_cache[cycle_key]
+        cached_ctx = _cycle_ctx_cache[cycle_key]
+        if _context_still_fresh(cached_ctx, now):
+            return cached_ctx
+        del _cycle_ctx_cache[cycle_key]
     spot_sources = spot_sources or DEFAULT_SPOT_SOURCES
     # klines_fn=None => chaine multi-fournisseurs avec secours (defaut).
     # L'injection d'un fournisseur unique reste possible (tests).
@@ -376,6 +553,7 @@ def get_btc_context(strike: Optional[float] = None,
             out.append(r)
         return out
     raw = _cached("spot_sources", _data_ttl(), pull) if use_cache else pull()
+    now = clock()
     sources, flags = _validate_sources(raw or [], now)
 
     ctx = BtcMarketContext(valid=False, reason="", generated_ts=now,
@@ -396,50 +574,55 @@ def get_btc_context(strike: Optional[float] = None,
 
     if klines_fn is not None:
         # compat tests/injection : un seul fournisseur, sortie brute
-        raw_kl = (_cached("klines", _data_ttl(), lambda: klines_fn())
-                  if use_cache else klines_fn())
-        raw_kl = raw_kl[0] if isinstance(raw_kl, tuple) else raw_kl
+        def pull_injected():
+            cutoff = clock()
+            raw = klines_fn()
+            raw = raw[0] if isinstance(raw, tuple) else raw
+            return qualify_klines(raw, clock(), closed_before=cutoff)[0]
+        raw_kl = (_cached("klines", _data_ttl(), pull_injected)
+                  if use_cache else pull_injected())
         kl, kl_src = (raw_kl or []), ("fresh:injected" if raw_kl else "none")
     else:
         def pull_kl():
-            return fetch_klines_with_fallback(now=now)
+            return fetch_klines_with_fallback(now=explicit_now)
         kl, kl_src = (_cached("klines_fb", _data_ttl(), pull_kl)
                       if use_cache else pull_kl())
         kl = kl or []
-    is_stale = kl_src.startswith("stale_cache")
     if kl_src != "none":
         flags.append(f"klines:source={kl_src}")
-    # validation des timestamps des bougies (chronologie + fraicheur)
-    kl = [k for k in kl if isinstance(k.get("close"), (int, float))
-          and k["close"] > 0]
-    if kl and any(kl[i]["ts"] >= kl[i + 1]["ts"] for i in range(len(kl) - 1)):
-        flags.append("klines:timestamps_non_monotones")
-        kl = []
-    max_age = KLINES_STALE_MAX_S if is_stale else 3 * 60
-    if kl and now - kl[-1]["ts"] > max_age:
-        flags.append("klines:perimees")
-        kl = []
+    # Provider I/O may take time. Revalidate both dependencies at completion.
+    now = clock()
+    ctx.generated_ts = now
+    current_sources, expired_flags = _validate_sources(sources, now)
+    if len(current_sources) < MIN_VALID_SOURCES:
+        ctx.sources = current_sources
+        ctx.n_valid_sources = len(current_sources)
+        flags.extend(expired_flags)
+        ctx.reason = "donnees_insuffisantes:spot_apres_klines"
+        return ctx
+    # Validate again after cache lookup and on injected paths. Readable cached
+    # data is not automatically fresh, and one malformed row is never dropped.
+    qualified, qualification = qualify_klines(kl, now)
+    if not kl_src.startswith("fresh:"):
+        qualified, qualification = None, "unqualified_source"
+    kl = qualified or []
+    if qualified is None:
+        flags.append(f"klines:{qualification}")
     ctx.klines_count = len(kl)
 
     if len(kl) >= MIN_KLINES:
-        closes = [k["close"] for k in kl]
-        def lr(n):  # log-rendement sur n minutes
-            return math.log(closes[-1] / closes[-1 - n])
-        if is_stale:
-            # mode degrade : la volatilite (ordre de grandeur stable sur
-            # quelques minutes) reste utilisable ; le MOMENTUM (directionnel,
-            # perime en secondes) est NEUTRALISE, jamais rechauffe.
-            ctx.returns = {}
-            ctx.momentum_per_min = None
-            flags.append("klines:momentum_neutralise_car_cache")
-        else:
-            ctx.returns = {"1m": lr(1), "3m": lr(3), "5m": lr(5),
-                           "10m": lr(10)}
-            ctx.momentum_per_min = (closes[-1] - closes[-6]) / 5 \
-                if len(closes) >= 6 else None
-        rets = [math.log(closes[i + 1] / closes[i])
-                for i in range(len(closes) - 1)]
-        ctx.realized_vol_1m = statistics.pstdev(rets) if len(rets) >= 2 else None
+        ctx.klines_provenance = _klines_provenance(kl, kl_src, now)
+        ctx.klines_provenance["valid_until"] = min(
+            kl[-1]["ts"] + KLINE_INTERVAL_S + MAX_KLINE_CLOSE_AGE_S,
+            *(source["ts"] + MAX_PRICE_AGE_S for source in sources))
+        log_closes = [math.log(k["close"]) for k in kl]
+        def lr(n):
+            return log_closes[-1] - log_closes[-1 - n]
+        ctx.returns = {"1m": lr(1), "3m": lr(3), "5m": lr(5), "10m": lr(10)}
+        ctx.momentum_per_min = (kl[-1]["close"] - kl[-6]["close"]) / 5
+        rets = [log_closes[i + 1] - log_closes[i]
+                for i in range(len(log_closes) - 1)]
+        ctx.realized_vol_1m = statistics.pstdev(rets)
     else:
         flags.append(f"klines:insuffisantes({len(kl)}/{MIN_KLINES})")
 
@@ -455,11 +638,7 @@ def get_btc_context(strike: Optional[float] = None,
     if ctx.realized_vol_1m is not None and ctx.realized_vol_1m > 0:
         score += 25.0                                       # vol mesurable
     if ctx.klines_count >= MIN_KLINES:
-        if is_stale:
-            age = now - _last_good_klines["ts"]
-            score += 15.0 * max(0.0, 1.0 - age / KLINES_STALE_MAX_S)
-        else:
-            score += 15.0                                   # historique 1m
+        score += 15.0                                       # historique 1m
     ctx.data_quality_score = round(score, 1)
 
     if ctx.realized_vol_1m is None or ctx.realized_vol_1m <= 0:

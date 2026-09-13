@@ -19,7 +19,7 @@ import btc_context as bc
 
 
 def _klines(n, base_ts=None, drift=0.0005):
-    base_ts = base_ts if base_ts is not None else time.time() - n * 60
+    base_ts = base_ts if base_ts is not None else (int(time.time()) // 60) * 60 - n * 60
     out, price = [], 65000.0
     for i in range(n):
         nxt = price * math.exp(drift * ((-1) ** i))
@@ -91,9 +91,6 @@ class TestFallbackChain(unittest.TestCase):
         self.assertIn("ok(30)", t)
 
     def test_context_valid_via_fallback(self):
-        ctx = bc.get_btc_context(
-            spot_sources=_spot_sources(), use_cache=False,
-            klines_fn=None)
         # court-circuit reseau : on injecte la chaine via monkeypatch
         orig = bc.fetch_klines_with_fallback
         bc.fetch_klines_with_fallback = lambda limit=30, providers=None, \
@@ -109,7 +106,7 @@ class TestFallbackChain(unittest.TestCase):
         self.assertTrue(any("source=fresh:kraken" in f
                             for f in ctx.quality_flags))
 
-    def test_stale_cache_keeps_engine_deciding(self):
+    def test_stale_cache_never_supplies_executable_inputs(self):
         now0 = time.time()
         # 1) passage nominal : amorce le cache des dernieres bougies valides
         bc.fetch_klines_with_fallback(
@@ -118,8 +115,8 @@ class TestFallbackChain(unittest.TestCase):
         kl, src = bc.fetch_klines_with_fallback(
             providers=[("binance", all_down), ("kraken", all_down)],
             now=now0 + 180)
-        self.assertEqual(len(kl), 30)
-        self.assertTrue(src.startswith("stale_cache:kraken"))
+        self.assertIsNone(kl)
+        self.assertEqual(src, "none")
         # contexte : valide, momentum NEUTRALISE, qualite penalisee, flags
         orig = bc.fetch_klines_with_fallback
         bc.fetch_klines_with_fallback = \
@@ -130,11 +127,11 @@ class TestFallbackChain(unittest.TestCase):
                 use_cache=False, now=now0 + 180)
         finally:
             bc.fetch_klines_with_fallback = orig
-        self.assertTrue(ctx.valid, ctx.reason)
+        self.assertFalse(ctx.valid, ctx.reason)
+        self.assertIsNone(ctx.realized_vol_1m)
         self.assertEqual(ctx.returns, {})              # jamais rechauffe
         self.assertIsNone(ctx.momentum_per_min)
-        self.assertIn("klines:momentum_neutralise_car_cache",
-                      ctx.quality_flags)
+        self.assertEqual(ctx.reason, "aucune_donnee:klines")
         self.assertLess(ctx.data_quality_score, 100.0)
 
     def test_stale_cache_is_bounded(self):
@@ -175,8 +172,7 @@ class TestDistinctReasons(unittest.TestCase):
                                 "error": None}
         ctx = self._ctx_with([("kraken", five)])
         self.assertFalse(ctx.valid)
-        self.assertTrue(ctx.reason.startswith(
-            "donnees_insuffisantes:klines(5/11"), ctx.reason)
+        self.assertIn("rejected:kraken:insufficient_closed_bars", ctx.reason)
 
     def test_zero_volatility_distinct(self):
         def flat(limit=30):

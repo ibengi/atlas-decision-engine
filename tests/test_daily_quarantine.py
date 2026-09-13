@@ -159,6 +159,8 @@ class _Dec:
         self.net_edge = 0.1
         self.net_ev = 0.1
         self.category = "Crypto"
+        from _candle_fixture import model_output
+        self.model_output = model_output()
 
 
 def _engine():

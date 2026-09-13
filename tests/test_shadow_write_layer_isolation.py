@@ -91,6 +91,10 @@ class _Decision:
     """A decision that clears every upstream gate, so the read-only branch is
     genuinely the thing that stops it — not an earlier refusal."""
 
+    def __init__(self):
+        from _candle_fixture import model_output
+        self.model_output = model_output()
+
     ticker = TICKER
     market_type = MARKET_TYPE
     strategy = "btc15m"

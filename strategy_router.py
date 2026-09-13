@@ -345,7 +345,8 @@ class _BtcAboveStrikeBase(Strategy):
                     "sigma_1m": ctx.realized_vol_1m,
                     "minutes_remaining": t,
                     "ret_5m": (ctx.returns or {}).get("5m"),
-                    "data_quality": ctx.data_quality_score}
+                    "data_quality": ctx.data_quality_score,
+                    "candle_provenance": dict(getattr(ctx, "klines_provenance", {}))}
         # Always stamped, including "field". Provenance encoded by ABSENCE
         # is provenance a consumer cannot check: a row missing the key was
         # indistinguishable from a genuine market-field strike, so anything

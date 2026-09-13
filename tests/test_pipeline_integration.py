@@ -50,7 +50,8 @@ class FakeCtx:
 
 
 def fake_ctx(strike=None, minutes_remaining=None, **kw):
-    return FakeCtx()
+    from _candle_fixture import attach_context
+    return attach_context(FakeCtx())
 
 
 class FakeClient:
@@ -93,7 +94,9 @@ class FakeClient:
 
     # -- ordres --
     def create_order(self, ticker, side, count, price_cents,
-                     client_order_id=None):
+                     client_order_id=None, qualification_check=None):
+        if qualification_check is not None:
+            assert qualification_check() is True
         oid = f"o{len(self.created_orders) + 1}"
         self.last_http_status = 201
         self.created_orders.append({"order_id": oid, "ticker": ticker,
