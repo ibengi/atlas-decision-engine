@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timezone
 
 from alpha_snapshot import snapshot_from_dict
-from candidate_contract import (FEED_SCHEMA, strict_text, strict_timestamp,
+from candidate_contract import (FEED_SCHEMA, MODERN_FEED_SCHEMA, SUPPORTED_FEED_SCHEMAS, strict_text, strict_timestamp,
                                 validate_record, verify_checksum)
 
 
@@ -121,9 +121,17 @@ def verify_source_evidence(prediction):
             known = strict_text(snapshot.get(key), field=key, max_length=300)
             if binding.get(key) != known or prediction.get(key) != known:
                 raise ValueError("prediction/source/snapshot disagree on " + key)
-        if binding.get("contract_schema") != FEED_SCHEMA:
+        if binding.get("contract_schema") not in SUPPORTED_FEED_SCHEMAS or \
+                binding.get("contract_schema") != record.get("schema"):
             raise ValueError("source binding contract schema is unsupported")
         strict_text(binding.get("environment"), field="environment", max_length=100)
+        if record.get("schema") == MODERN_FEED_SCHEMA:
+            source = record["source_binding_v4"]
+            if binding["environment"] != source["environment"]:
+                raise ValueError("source capture and prediction environments differ")
+            if _instant(prediction.get("prediction_time"), "prediction_time") < \
+                    _instant(source["latest_capture_at_utc"], "latest source capture"):
+                raise ValueError("prediction precedes its source metadata capture")
         verdict["verified"] = True
     except Exception as exc:
         verdict["reason"] = str(exc)[:700]

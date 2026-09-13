@@ -1,10 +1,11 @@
 """Isolated public-market capture and authenticated research export.
 
-This process has no financial authority. Its only outgoing request is a fixed,
-credential-free, verified-TLS GET. The HTTP listener cannot start a capture or
-alter state. Captures occur on an independent bounded-rate background worker.
-The audited candidate contract is unchanged: missing legacy market facts are
-refused, never filled using a similarly named event or a converted string.
+This process has no financial authority. Its default mode uses one fixed,
+credential-free, verified-TLS market GET and the unchanged v3 contract. The
+explicit v4 opt-in additionally captures fixed-host event and series GETs and
+replays their identities under a separate versioned contract. The listener
+cannot start captures or alter state. A bounded-rate background worker refuses
+missing facts or metadata; it never fabricates a source or authority.
 """
 import base64
 import hashlib
@@ -108,17 +109,20 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         raise CaptureRefused("source redirects are forbidden")
 
 
-def capture_public_markets():
-    """One fixed GET; no proxies, secrets, redirect or caller-supplied URL."""
+def capture_public_source(url):
+    """Fixed-host GET; identifiers cannot alter host, route class or query."""
+    metadata = r"https://external-api\.kalshi\.com/trade-api/v2/(?:events|series)/[A-Z0-9][A-Z0-9_-]{0,199}"
+    if type(url) is not str or (url != SOURCE_URL and not re.fullmatch(metadata, url)):
+        raise CaptureRefused("source endpoint outside fixed allowlist")
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}), _NoRedirect(),
         urllib.request.HTTPSHandler(context=ssl.create_default_context()))
-    request = urllib.request.Request(SOURCE_URL, method="GET", headers={
+    request = urllib.request.Request(url, method="GET", headers={
         "Accept": "application/json", "Accept-Encoding": "identity",
         "User-Agent": "Atlas-Shadow-ReadOnly-Research/1",
     })
     with opener.open(request, timeout=10) as response:
-        if response.status != 200 or response.geturl() != SOURCE_URL:
+        if response.status != 200 or response.geturl() != url:
             raise CaptureRefused("unexpected source response")
         if response.headers.get_content_type() != "application/json":
             raise CaptureRefused("source content type")
@@ -129,6 +133,11 @@ def capture_public_markets():
     if len(raw) > MAX_CAPTURE_BYTES:
         raise CaptureRefused("source response exceeds byte bound")
     return raw, observed
+
+
+def capture_public_markets():
+    """Legacy default: only the original fixed market GET."""
+    return capture_public_source(SOURCE_URL)
 
 
 class RollingResearchSpool(BoundedSpool):
@@ -160,7 +169,12 @@ def _new_spool(directory, *, records=100, byte_cap=33554432):
 
 
 class Producer:
-    def __init__(self, data_dir, *, fetch=capture_public_markets):
+    def __init__(self, data_dir, *, fetch=capture_public_markets,
+                 source_contract="legacy-v3", metadata_fetch=capture_public_source):
+        if source_contract not in ("legacy-v3", "market-event-series-v4"):
+            raise CaptureRefused("unsupported explicit source contract mode")
+        self.source_contract = source_contract
+        self.metadata_fetch = metadata_fetch
         self.data_dir = os.path.realpath(data_dir)
         self.spool = _new_spool(os.path.join(self.data_dir, "research_spool"))
         self.captures = _new_spool(os.path.join(self.data_dir, "research_captures"),
@@ -173,6 +187,7 @@ class Producer:
                         "candidates_durable": 0, "candidates_refused": 0,
                         "last_capture": None, "last_error": None,
                         "last_source_http_status": None,
+                        "last_schema_refusal": None,
                         "last_contract_refusal_fields": [],
                         "authenticated_reads": 0, "authenticated_200_reads": 0,
                         "authentication_refusals": 0}
@@ -187,6 +202,7 @@ class Producer:
         else:
             isolation["isolation_verified"] = True
         return {"service": "atlas-readonly-research-producer", "shadow_only": True,
+                "source_contract": self.source_contract,
                 "source": SOURCE_URL, "source_scope": "bounded public market sample",
                 "capture_authority_qualification": "not a settlement authority attestation",
                 "retention": "rolling bounded research opportunity window; not a ledger",
@@ -256,19 +272,100 @@ class Producer:
         return {"written": written, "refused": refused,
                 "capture_sha256": capture["record_sha256"]}
 
+    def ingest_bundle(self, bundle):
+        """Offline supplied complete v4 bundle; never exposed as HTTP control.
+
+        The default collector remains legacy; a separate explicit opt-in mode
+        captures parent metadata. No authority is invented by this interface. The
+        candidate retains all three raw preimages in its own durable record.
+        """
+        from research_source_contract_v4 import build_record
+        record = build_record(bundle)
+        if not self.spool.write(record):
+            raise CaptureRefused("versioned candidate durability not confirmed")
+        self._status["candidates_durable"] += 1
+        return {"written": 1, "record_sha256": record["record_sha256"],
+                "authority_qualification": "NOT_ESTABLISHED"}
+
+    def _ingest_v4(self, raw, observed_at):
+        """Bounded automatic join; no alternate source or metadata fallback.
+
+        At most ten event requests and one series request follow one market
+        response. Each is a fixed-host public GET. Any unsupported envelope,
+        403, missing identity or absent source refuses the affected poll.
+        """
+        from research_source_contract_v4 import (BUNDLE_SCHEMA, ORIGIN,
+            SourceContractError, capture_response, _identity, _capture)
+        try:
+            payload = parse_market_capture(raw)
+        except CaptureRefused as exc:
+            raise SourceContractError("market schema unqualified: " + str(exc)[:200]) from exc
+        market_capture = capture_response(raw, observed_at, role="market", url=SOURCE_URL)
+        if not self.captures.write(market_capture):
+            raise CaptureRefused("v4 market capture durability not confirmed")
+        self._status["captures_durable"] += 1
+        self._status["last_capture"] = market_capture["record_sha256"]
+        events, series_captures = {}, {}
+        bundles = []
+        for index, market in enumerate(payload["markets"]):
+            event_id = _identity(market.get("event_ticker"), "market event ticker")
+            if event_id not in events:
+                url = ORIGIN + "/events/" + event_id
+                event_raw, event_time = self.metadata_fetch(url)
+                evidence = capture_response(event_raw, event_time, role="event", url=url)
+                body = _capture(evidence, role="event", expected_url=url)
+                event = body.get("event")
+                if type(event) is not dict or event.get("event_ticker") != event_id:
+                    raise SourceContractError("event response identity/schema unqualified")
+                series_id = _identity(event.get("series_ticker"), "event series ticker")
+                if series_id != "KXBTC15M":
+                    raise SourceContractError("event series outside fixed source profile")
+                if not self.captures.write(evidence):
+                    raise CaptureRefused("v4 event capture durability not confirmed")
+                self._status["captures_durable"] += 1
+                events[event_id] = (evidence, series_id)
+            event_capture, series_id = events[event_id]
+            if series_id not in series_captures:
+                url = ORIGIN + "/series/" + series_id
+                series_raw, series_time = self.metadata_fetch(url)
+                evidence = capture_response(series_raw, series_time, role="series", url=url)
+                if not self.captures.write(evidence):
+                    raise CaptureRefused("v4 series capture durability not confirmed")
+                self._status["captures_durable"] += 1
+                series_captures[series_id] = evidence
+            bundles.append({"schema": BUNDLE_SCHEMA, "market_capture": market_capture,
+                "market_pointer": f"/markets/{index}", "event_capture": event_capture,
+                "series_capture": series_captures[series_id]})
+        # Validate the entire captured batch before publishing any candidate.
+        from research_source_contract_v4 import build_record
+        for bundle in bundles:
+            build_record(bundle)
+        written = 0
+        for bundle in bundles:
+            self.ingest_bundle(bundle)
+            written += 1
+        return {"written": written, "refused": 0,
+                "source_contract": self.source_contract,
+                "authority_qualification": "NOT_ESTABLISHED"}
+
     def poll(self):
         self._status["capture_attempts"] += 1
         self._status["last_source_http_status"] = None
+        self._status["last_schema_refusal"] = None
         try:
             raw, observed_at = self.fetch()
             self._status["last_source_http_status"] = 200
-            result = self.ingest(raw, observed_at)
+            result = (self._ingest_v4(raw, observed_at)
+                      if self.source_contract == "market-event-series-v4"
+                      else self.ingest(raw, observed_at))
             self._status["last_error"] = None
             return result
         except Exception as exc:  # no request headers, tokens or body in logs
             self._status["last_error"] = type(exc).__name__
             if isinstance(exc, urllib.error.HTTPError):
                 self._status["last_source_http_status"] = exc.code
+            if type(exc).__name__ == "SourceContractError":
+                self._status["last_schema_refusal"] = str(exc)[:300]
             return None
 
     def _run(self):
@@ -284,6 +381,8 @@ class Producer:
         """Recompute from retained exact bytes; never trust a capture label."""
         if validate_record(record):
             raise CaptureRefused("invalid persisted candidate")
+        if record.get("schema") == "atlas-research-candidate-v4":
+            return True  # shared validator independently replayed all raw captures
         binding = record.get("source_capture")
         if not isinstance(binding, dict) or binding.get("schema") != BINDING_SCHEMA:
             raise CaptureRefused("missing versioned capture binding")
@@ -362,7 +461,13 @@ class Producer:
                 break
             selected.append(row)
             total += size
-        return {"dataset": "candidates", "schema_version": "atlas-research-candidate-v3",
+        versions = sorted({row["schema"] for row in selected})
+        default_version = ("atlas-research-candidate-v4" if self.source_contract ==
+                           "market-event-series-v4" else "atlas-research-candidate-v3")
+        version = (versions[0] if len(versions) == 1 else
+                   "atlas-research-candidate-page-v1" if versions else default_version)
+        return {"dataset": "candidates", "schema_version": version,
+                **({"record_schema_versions": versions} if version != "atlas-research-candidate-v3" else {}),
                 "source_scope": "bounded public market sample", "rows": selected,
                 "has_more": len(rows) > len(selected),
                 "next_cursor": selected[-1]["record_sha256"] if selected else ""}
@@ -462,7 +567,8 @@ def main():
     data_dir = os.environ.get("DATA_DIR", "")
     if not data_dir or not os.path.isabs(data_dir):
         raise RuntimeError("absolute dedicated DATA_DIR required")
-    producer = Producer(data_dir)
+    producer = Producer(data_dir, source_contract=os.environ.get(
+        "RESEARCH_SOURCE_CONTRACT", "legacy-v3"))
     handler = handler_for(producer, token)
     isolation = assert_isolated()  # include imports made during construction
     print(canonical_json({"event": "RESEARCH_PRODUCER_STARTED", **isolation,

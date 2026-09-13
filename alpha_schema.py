@@ -102,6 +102,10 @@ class AlphaSignal:
     rejected_reason: str = None
     rejected_detail: str = ""
     cost: dict = field(default_factory=dict)
+    # Canonical JSON string is immutable even though AlphaSignal is frozen.
+    provider_identity_receipt_json: str = ""
+    provider_identity_qualified: bool = False
+    provider_identity_reason: str = "IDENTITY_UNVERIFIED"
 
     @property
     def valid(self) -> bool:
@@ -116,6 +120,8 @@ class AlphaSignal:
     def as_dict(self) -> dict:
         from dataclasses import asdict
         out = asdict(self)
+        encoded = out.pop("provider_identity_receipt_json")
+        out["provider_identity_receipt"] = json.loads(encoded) if encoded else None
         for key in ("key_drivers", "counterarguments",
                     "invalidation_triggers", "assumptions"):
             out[key] = list(out[key])
@@ -179,7 +185,7 @@ def parse_json_payload(raw) -> dict:
 
 def validate_signal(payload, snapshot, *, provider: str, model: str,
                     latency_ms: int = 0, received_at=None,
-                    cost: dict = None) -> AlphaSignal:
+                    cost: dict = None, provider_identity_receipt=None) -> AlphaSignal:
     """Validate one model's output against the snapshot it was asked about.
 
     Returns a VALID signal or an EXCLUDED one. Never raises to the caller
@@ -190,9 +196,24 @@ def validate_signal(payload, snapshot, *, provider: str, model: str,
            "contract_id": snapshot.contract_id,
            "latency_ms": latency_ms, "cost": cost}
     try:
-        return _validate(payload, snapshot, provider=provider, model=model,
+        signal = _validate(payload, snapshot, provider=provider, model=model,
                          latency_ms=latency_ms, received_at=received_at,
                          cost=cost)
+        if provider_identity_receipt is not None:
+            from dataclasses import replace
+            from alpha_identity import canonical, verify_receipt
+            from config import CFG
+            verdict = verify_receipt(provider_identity_receipt, snapshot=snapshot,
+                                     environment=CFG.ALPHA_ENVIRONMENT, provider=provider,
+                                     requested_model=model, output=payload)
+            if verdict["valid"] is not True:
+                return rejected(provider, model, "provider_identity_invalid", **ctx)
+            signal = replace(signal, model=verdict["model_key"],
+                             model_version=verdict["model"],
+                             provider_identity_receipt_json=canonical(provider_identity_receipt),
+                             provider_identity_qualified=verdict["qualified"],
+                             provider_identity_reason=verdict["reason"])
+        return signal
     except SignalRejected as e:
         return rejected(provider, model, e.reason, e.detail, **ctx)
     except (SnapshotError, TypeError, ValueError) as e:          # noqa: BLE001
@@ -299,8 +320,9 @@ def _validate(payload, snapshot, *, provider, model, latency_ms,
         schema_version=SCHEMA_VERSION,
         market_snapshot_id=snapshot.market_snapshot_id,
         contract_id=snapshot.contract_id,
-        model=str(data.get("model") or model),
-        model_version=str(data.get("model_version") or ""),
+        # Generated text cannot select attribution or earned calibration.
+        model=model,
+        model_version=str(data.get("model_version") or "") if provider == "atlas_quant" else "",
         generated_at_utc=generated_at.isoformat(timespec="seconds"),
         p_yes=p_yes, probability_low=low, probability_high=high,
         confidence=scalars["confidence"],

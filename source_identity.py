@@ -237,6 +237,15 @@ def verify_settlement_source_evidence(record):
     refused = lambda reason: {"verified": False, "reason": reason}
     if type(record) is not dict:
         return refused("source record is not an object")
+    if record.get("schema") == "atlas-research-candidate-v4":
+        from research_source_contract_v4 import validate_record as validate_v4
+        # This interface also receives canonical_content (outer digest omitted)
+        # after the prediction verifier has checked that digest. Raw capture
+        # hashes and the complete semantic replay remain mandatory here.
+        errors = validate_v4(record, require_checksum=False)
+        if errors:
+            return refused("; ".join(errors))
+        return {"verified": True, "reason": "independently replayed structured series source join; authority qualification remains separate"}
     evidence = record.get("settlement_source_evidence")
     if evidence is None:
         return refused("versioned settlement source preimage is missing")

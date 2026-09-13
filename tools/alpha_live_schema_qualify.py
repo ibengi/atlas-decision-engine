@@ -50,6 +50,26 @@ STATUS_PROVEN = "LIVE_SCHEMA_PROVEN"
 STATUS_UNPROVEN = "LIVE_SCHEMA_UNPROVEN"
 
 
+def qualify_bundle(bundle):
+    """Offline v4 semantic qualification; does not establish source trust."""
+    from research_source_contract_v4 import build_record
+    try:
+        record = build_record(bundle)
+        errors = validate_record(record)
+    except Exception as exc:
+        record, errors = None, [type(exc).__name__ + ": " + str(exc)[:500]]
+    return {"mode": "SHADOW_ONLY", "network_calls": 0,
+            "broker_authority": False, "capital_authority": False,
+            "markets_examined": 1, "markets_qualifying": int(not errors),
+            "status": STATUS_UNPROVEN,
+            "semantic_source_contract": "PASS" if not errors else "FAIL",
+            "capture_authenticity": "NOT_ESTABLISHED_BY_OFFLINE_VERIFIER",
+            "settlement_authority": "NOT_QUALIFIED_BY_OFFLINE_VERIFIER",
+            "note": "Only retained bytes and semantic joins are checked; authenticated capture and settlement authority require independent evidence.",
+            "results": [{"contract_id": record["contract_id"] if record else None,
+                         "qualifies": not errors, "errors": errors}]}
+
+
 def _markets(payload):
     if isinstance(payload, dict) and isinstance(payload.get("markets"), list):
         return payload["markets"]
@@ -115,6 +135,8 @@ def main(argv=None):
     parser.add_argument("--input", required=True,
                         help="path to a captured read-only market payload")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--versioned-bundle", action="store_true",
+                        help="check a complete v4 market/event/series capture bundle offline")
     args = parser.parse_args(argv)
 
     try:
@@ -125,12 +147,12 @@ def main(argv=None):
         return 3
 
     markets = _markets(payload)
-    if not markets:
+    if not args.versioned_bundle and not markets:
         print(f"[FATAL] {args.input} contains no market object",
               file=sys.stderr)
         return 3
 
-    verdict = qualify(markets)
+    verdict = qualify_bundle(payload) if args.versioned_bundle else qualify(markets)
     if args.json:
         print(json.dumps(verdict, indent=2, sort_keys=True))
     else:

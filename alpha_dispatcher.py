@@ -266,6 +266,8 @@ def _gate_verdict(gate, provider):
 
 def _run_one(provider, snapshot: MarketSnapshot, budget: float, now_fn):
     """One provider, start to validated signal. Never raises."""
+    from alpha_identity import begin_capture, end_capture
+    invocation, capture_token = begin_capture()
     try:
         raw, meta = provider.analyze(snapshot, budget)
     except Exception as e:                                    # noqa: BLE001
@@ -273,6 +275,8 @@ def _run_one(provider, snapshot: MarketSnapshot, budget: float, now_fn):
                         f"{type(e).__name__}: {e}",
                         snapshot_id=snapshot.market_snapshot_id,
                         contract_id=snapshot.contract_id)
+    finally:
+        end_capture(capture_token)
     received_at = now_fn()
     cost = meta.get("cost") or {}
     latency = int(meta.get("latency_ms") or 0)
@@ -289,11 +293,19 @@ def _run_one(provider, snapshot: MarketSnapshot, budget: float, now_fn):
                         snapshot_id=snapshot.market_snapshot_id,
                         contract_id=snapshot.contract_id,
                         latency_ms=latency, cost=cost)
+    if meta.get("provider_identity_receipt") is not None:
+        from alpha_providers import trusted_identity_adapter
+        if (not trusted_identity_adapter(provider)
+                or meta.get("_identity_capture") is not invocation):
+            return rejected(provider.name, provider.model, "provider_identity_untrusted_capture",
+                            snapshot_id=snapshot.market_snapshot_id,
+                            contract_id=snapshot.contract_id, latency_ms=latency, cost=cost)
     # The deadline is judged on ARRIVAL, inside the validator, so a provider
     # that answers one millisecond late is STALE rather than merged.
     signal = validate_signal(raw, snapshot, provider=provider.name,
                              model=provider.model, latency_ms=latency,
-                             received_at=received_at, cost=cost)
+                             received_at=received_at, cost=cost,
+                             provider_identity_receipt=meta.get("provider_identity_receipt"))
     if not signal.valid:
         log.warning(f"[ALPHA_SIGNAL_EXCLUDED] provider={provider.name} "
                     f"reason={signal.rejected_reason} "

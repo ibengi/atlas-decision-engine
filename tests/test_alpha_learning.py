@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+from tests._alpha_identity import attributed_row, MAPPINGS, POLICY
 
 from alpha_learning import (build_memory, classify_error, incremental_value,
                             learning_report, score_model, similar_cases)
@@ -6,7 +8,7 @@ from alpha_learning import (build_memory, classify_error, incremental_value,
 
 def row(pid, market_class, p_astra, p_quant, outcome, yes=.40, no=.60,
         invalidated=False):
-    return {
+    return attributed_row({
         "prediction_id": pid,
         "contract_id": f"C-{pid}",
         "market_class": market_class,
@@ -18,7 +20,7 @@ def row(pid, market_class, p_astra, p_quant, outcome, yes=.40, no=.60,
             "gpt-astra-pro-max": {"p_yes": p_astra},
             "atlasquant-v1": {"p_yes": p_quant},
         },
-    }
+    }, p_astra)
 
 
 class FakeLedger:
@@ -43,6 +45,8 @@ class FakeLedger:
 
 class AlphaLearningTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(patch("alpha_identity.POLICY_VERSION", POLICY))
+        self.enterContext(patch("alpha_identity.REVIEWED_MODEL_MAPPINGS", MAPPINGS))
         self.rows = [
             row("1", "macro", .80, .55, 1),
             row("2", "macro", .75, .55, 0),
@@ -54,7 +58,7 @@ class AlphaLearningTests(unittest.TestCase):
         score = score_model(self.rows, "astra")
         self.assertEqual(score["samples"], 3)
         self.assertIsNotNone(score["brier"])
-        self.assertIn("gpt-astra-pro-max", score["models_seen"])
+        self.assertIn("openai/gpt-astra-pro-max", score["models_seen"])
 
     def test_category_score(self):
         score = score_model(self.rows, "astra", market_class="macro")

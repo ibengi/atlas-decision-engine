@@ -34,6 +34,8 @@ from source_identity import verify_settlement_source_evidence
 #: distinguishable from an observation after the fact, so v2 records are
 #: refused rather than migrated -- they have to be re-observed.
 FEED_SCHEMA = "atlas-research-candidate-v3"
+MODERN_FEED_SCHEMA = "atlas-research-candidate-v4"
+SUPPORTED_FEED_SCHEMAS = (FEED_SCHEMA, MODERN_FEED_SCHEMA)
 
 #: Every schema this contract refuses outright. Listed rather than inferred so
 #: that "not the current schema" and "a known-unsafe older schema" are
@@ -484,6 +486,9 @@ def validate_record(record, *, require_checksum=True) -> list:
     answer a validator is allowed to give.
     """
     try:
+        if type(record) is dict and record.get("schema") == MODERN_FEED_SCHEMA:
+            from research_source_contract_v4 import validate_record as validate_v4
+            return validate_v4(record, require_checksum=require_checksum)
         return _validate_record(record, require_checksum=require_checksum)
     except ContractError as exc:                              # pragma: no cover
         return [str(exc)]

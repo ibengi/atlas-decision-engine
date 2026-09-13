@@ -35,7 +35,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from candidate_contract import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS,
+from candidate_contract import (FEED_SCHEMA, LEGACY_FEED_SCHEMAS, SUPPORTED_FEED_SCHEMAS,
                                       OPTIONAL_FIELDS, validate_record)
 
 #: AA-08. `event_id` is OPTIONAL in the contract and in the producer, so it is
@@ -220,7 +220,7 @@ def assess_record(row: dict) -> dict:
     if schema in LEGACY_FEED_SCHEMAS:
         contract_reason = (f"{schema!r} is a refused legacy schema; its facts "
                            f"may be substituted and must be re-observed")
-    elif schema != FEED_SCHEMA:
+    elif schema not in SUPPORTED_FEED_SCHEMAS:
         contract_reason = (f"record does not carry the {FEED_SCHEMA!r} "
                            f"contract (schema, recomputed checksum, "
                            f"provenance and per-quote observation are all "
