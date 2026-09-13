@@ -5,6 +5,9 @@ import json
 import logging
 import time
 import uuid
+import math
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -31,6 +34,105 @@ class BrokerWriteForbidden(KalshiAPIError):
 
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+POSITION_QUANTITY_FIELDS = ("position", "position_fp", "quantity", "count")
+MAX_EXACT_CONTRACTS = 2**53 - 1
+
+
+def portfolio_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate portfolio JSON member")
+        result[key] = value
+    return result
+
+
+def portfolio_json_constant(value):
+    raise ValueError("non-finite portfolio JSON constant")
+
+
+def portfolio_identity(value, field):
+    """Canonical, bounded broker identity; never coerce absence or numbers."""
+    if (not isinstance(value, str) or not value or len(value) > 300
+            or any(ord(c) < 33 or ord(c) > 126 for c in value)):
+        raise ValueError(field + " is not a canonical broker identity")
+    return value
+
+
+def portfolio_integer(value, field):
+    """Exact whole contracts, within the engine's lossless numeric range."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+        raise ValueError(field + " has an unsupported quantity type")
+    if isinstance(value, int):
+        if abs(value) > MAX_EXACT_CONTRACTS:
+            raise ValueError(field + " exceeds the exact contract range")
+        return value
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(field + " is not finite")
+    text = str(value)
+    if len(text) > 128 or not re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?", text):
+        raise ValueError(field + " is not a fixed-point contract quantity")
+    try:
+        exact = Decimal(text)
+        if not exact.is_finite() or exact != exact.to_integral_value() or abs(exact) > MAX_EXACT_CONTRACTS:
+            raise ValueError(field + " is fractional or outside the exact contract range")
+        return int(exact)
+    except InvalidOperation as exc:
+        raise ValueError(field + " is not a contract quantity") from exc
+
+
+def position_quantity(row):
+    if not isinstance(row, dict):
+        raise ValueError("position row is not an object")
+    values = [portfolio_integer(row[field], field) for field in POSITION_QUANTITY_FIELDS if field in row]
+    if not values or len(set(values)) != 1:
+        raise ValueError("position quantity fields are missing or contradictory")
+    return values[0]
+
+
+def event_position_identity(row):
+    """Validate supplemental event summaries without treating them as holdings."""
+    allowed = {"event_ticker", "total_cost_dollars", "total_cost_shares_fp",
+               "event_exposure_dollars", "realized_pnl_dollars", "fees_paid_dollars",
+               "total_cost", "total_cost_shares", "event_exposure", "realized_pnl", "fees_paid"}
+    if not isinstance(row, dict) or set(row) - allowed:
+        raise ValueError("unknown auxiliary event position schema")
+    identity = portfolio_identity(row.get("event_ticker"), "event_ticker")
+    for key, value in row.items():
+        if key == "event_ticker":
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
+            raise ValueError("malformed auxiliary event value")
+        text = str(value)
+        if len(text) > 128 or not re.fullmatch(r"[+-]?[0-9]+(?:\.[0-9]+)?", text):
+            raise ValueError("malformed auxiliary event value")
+    return identity
+
+
+def portfolio_json_compatible(value, field=""):
+    """Normalize only after schema/identity validation, before publication.
+
+    The wire decoder keeps lexical decimal precision until quantity checks
+    finish. Whole quantities then become integers; non-quantity finite JSON
+    numbers retain the legacy float interface. No Decimal escapes into order
+    persistence or JSON diagnostics. Fixed-point strings remain unchanged.
+    """
+    quantity_fields = set(POSITION_QUANTITY_FIELDS) | {
+        "fill_count", "fill_count_fp", "remaining_count", "remaining_count_fp",
+        "initial_count", "initial_count_fp", "total_cost_shares", "total_cost_shares_fp"}
+    if isinstance(value, Decimal):
+        if field in quantity_fields:
+            return portfolio_integer(value, field)
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError("non-quantity portfolio number exceeds finite JSON range")
+        return number
+    if isinstance(value, dict):
+        return {key: portfolio_json_compatible(item, key) for key, item in value.items()}
+    if isinstance(value, list):
+        return [portfolio_json_compatible(item) for item in value]
+    return value
 
 #: Verbes HTTP qui MUTENT l'etat cote broker. Tout ce qui n'est pas une
 #: lecture. La liste est volontairement exhaustive plutot que limitee aux
@@ -297,6 +399,13 @@ class KalshiClient:
                 raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
 
             try:
+                # Only the two read-enumeration routes use strict decoding.
+                # A duplicate cursor or envelope must not be discarded by
+                # JSON decoding before the collector can validate it.
+                if method == "GET" and path in ("/portfolio/positions", "/portfolio/orders"):
+                    return r.json(object_pairs_hook=portfolio_json_object,
+                                  parse_constant=portfolio_json_constant,
+                                  parse_float=Decimal) if r.text.strip() else {}
                 return r.json() if r.text.strip() else {}
             except ValueError:
                 raise KalshiAPIError(r.status_code, f"{method} {path}: JSON invalide", r.text)
@@ -521,84 +630,150 @@ class KalshiClient:
     #: documentee par Kalshi, et elle elargissait la surface acceptee.
     ORDERS_ENVELOPE_KEYS = ("orders",)
 
+    def _portfolio_pages(self, path, *, envelopes, params, max_pages,
+                         row_identity, extra_keys=(), cursor_required=False,
+                         log_name="portfolio"):
+        """Complete validated enumeration, never an atomic broker snapshot.
+
+        Return only after a recognized terminal cursor. Reject unfamiliar
+        top-level fields rather than silently overlooking a new pagination
+        indicator. Orders require a string cursor; positions may omit their
+        documented optional cursor. A supplied null is never a valid cursor.
+        A concurrent account change can still move rows between pages without
+        an API snapshot token; this method does not prove a broker freeze.
+        """
+        limit = params["limit"]
+        if type(limit) is not int or not 1 <= limit <= 1000 or \
+                type(max_pages) is not int or not 1 <= max_pages <= 1000:
+            raise KalshiAPIError(0, "listing incoherent: invalid page bounds")
+        out, cursor, seen_cursors, seen_rows, envelope = [], "", set(), set(), None
+        for page_number in range(max_pages):
+            query = dict(params)
+            if cursor:
+                query["cursor"] = cursor
+            response = self._req("GET", path, params=query)
+            if not isinstance(response, dict):
+                raise KalshiAPIError(0, "listing incoherent: response must be an object")
+            present = [key for key in envelopes if key in response]
+            if len(present) != 1 or set(response) - set(envelopes) - {"cursor"} - set(extra_keys):
+                raise KalshiAPIError(0, "listing incoherent: unknown or conflicting envelope/pagination schema")
+            if envelope is not None and present[0] != envelope:
+                raise KalshiAPIError(0, "listing incoherent: envelope changed between pages")
+            envelope = present[0]
+            rows = response[envelope]
+            if not isinstance(rows, list) or len(rows) > limit:
+                raise KalshiAPIError(0, "listing incoherent: entries are not a bounded list")
+            for extra in extra_keys:
+                if extra in response and (not isinstance(response[extra], list)
+                        or any(not isinstance(row, dict) for row in response[extra])):
+                    raise KalshiAPIError(0, "listing incoherent: malformed auxiliary positions")
+                try:
+                    auxiliary_ids = [event_position_identity(row) for row in response.get(extra, [])]
+                    if len(set(auxiliary_ids)) != len(auxiliary_ids):
+                        raise ValueError("duplicate auxiliary event identity")
+                except (ValueError, TypeError, OverflowError) as exc:
+                    raise KalshiAPIError(0, "listing incoherent: " + str(exc)) from exc
+            for row in rows:
+                try:
+                    identity = row_identity(row)
+                except (ValueError, TypeError, OverflowError) as exc:
+                    raise KalshiAPIError(0, "listing incoherent: " + str(exc)) from exc
+                if identity in seen_rows:
+                    raise KalshiAPIError(0, "listing incoherent: duplicate row identity across enumeration")
+                if any(field in params and row.get(field) != params[field]
+                       for field in ("ticker", "status")):
+                    raise KalshiAPIError(0, "listing incoherent: row contradicts requested account filter")
+                if any(key in row and (type(row[key]) is not int or row[key] != 0)
+                       for key in ("subaccount", "subaccount_number")):
+                    raise KalshiAPIError(0, "listing incoherent: row contradicts primary subaccount scope")
+                seen_rows.add(identity)
+                try:
+                    out.append(portfolio_json_compatible(row))
+                except (ValueError, OverflowError) as exc:
+                    raise KalshiAPIError(0, "listing incoherent: " + str(exc)) from exc
+            if page_number == 0:
+                try:
+                    self._log_raw_once(log_name, portfolio_json_compatible(response))
+                except (ValueError, OverflowError) as exc:
+                    raise KalshiAPIError(0, "listing incoherent: " + str(exc)) from exc
+            if "cursor" not in response and cursor_required:
+                raise KalshiAPIError(0, "listing incoherent: required cursor missing")
+            next_cursor = response.get("cursor", "")
+            if next_cursor == "":
+                return out
+            if (not isinstance(next_cursor, str) or len(next_cursor) > 4096
+                    or next_cursor != next_cursor.strip()
+                    or any(ord(c) < 33 or ord(c) > 126 for c in next_cursor)):
+                raise KalshiAPIError(0, "listing incoherent: cursor type or format invalid")
+            if next_cursor in seen_cursors:
+                raise KalshiAPIError(0, "listing incoherent: cursor ne progresse pas (cycle)")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        raise KalshiAPIError(0, "listing tronque: page limit reached with a live cursor")
+
+    @staticmethod
+    def _order_listing_identity(row):
+        if not isinstance(row, dict):
+            raise ValueError("order row is not an object")
+        identity = portfolio_identity(row.get("order_id"), "order_id")
+        if "id" in row and portfolio_identity(row["id"], "id") != identity:
+            raise ValueError("contradictory order identity aliases")
+        portfolio_identity(row.get("ticker"), "ticker")
+        client_ids = [portfolio_identity(row[key], key) for key in ("client_order_id", "client_id") if key in row]
+        if not client_ids or len(set(client_ids)) != 1:
+            raise ValueError("order client identity missing or contradictory")
+        if row.get("status") not in ("resting", "executed", "canceled", "pending"):
+            raise ValueError("unknown order status")
+        if row.get("side") not in ("yes", "no"):
+            raise ValueError("unknown order side")
+        if "outcome_side" in row and row["outcome_side"] != row["side"]:
+            raise ValueError("contradictory order outcome aliases")
+        if "action" in row and row["action"] not in ("buy", "sell"):
+            raise ValueError("unknown order action")
+        if "book_side" in row:
+            if row["book_side"] not in ("bid", "ask"):
+                raise ValueError("unknown order book side")
+            if "action" in row:
+                expected = "bid" if (row["side"] == "yes") == (row["action"] == "buy") else "ask"
+                if row["book_side"] != expected:
+                    raise ValueError("contradictory order action/book/outcome binding")
+        quantities = {}
+        for names in (("fill_count", "fill_count_fp"), ("remaining_count", "remaining_count_fp"),
+                      ("initial_count", "initial_count_fp")):
+            counts = [portfolio_integer(row[name], name) for name in names if name in row]
+            if any(count < 0 for count in counts) or len(set(counts)) > 1:
+                raise ValueError("order quantity is negative or contradictory")
+            if counts:
+                quantities[names[0]] = counts[0]
+        if "fill_count" not in quantities or "remaining_count" not in quantities:
+            raise ValueError("order fill/remaining quantities are missing")
+        # Initial count may refer to a pre-amendment size. Do not invent a
+        # conservation equation without the complete amendment history.
+        if row["status"] == "executed" and quantities["remaining_count"] != 0:
+            raise ValueError("executed order still has remaining quantity")
+        if row["status"] == "resting" and quantities["remaining_count"] <= 0:
+            raise ValueError("resting order has no remaining quantity")
+        return identity
+
     def list_orders(self, *, ticker: str = None, status: str = None,
                     limit: int = 200, max_pages: int = 10) -> list:
-        """Ordres du portefeuille, pagination cursor suivie jusqu'au bout.
-
-        Leve KalshiAPIError si le transport echoue OU si la reponse est
-        incoherente : l'appelant DOIT pouvoir distinguer « aucun ordre ne
-        correspond » de « je n'ai pas pu regarder ». Confondre les deux
-        apres un POST ambigu autoriserait un doublon.
-        """
-        out, cursor, pages = [], "", 0
-        while pages < max_pages:
-            pages += 1
-            params = {"limit": int(limit)}
-            if ticker:
-                params["ticker"] = ticker
-            if status:
+        """All matching known-schema orders, or an explicit read failure."""
+        # Both collectors cover primary subaccount 0, matching create_order's
+        # default. A full organizational inventory is a separate proof.
+        params = {"limit": limit, "subaccount": 0}
+        try:
+            if ticker is not None:
+                params["ticker"] = portfolio_identity(ticker, "ticker filter")
+            if status is not None:
+                if status not in ("resting", "executed", "canceled", "pending"):
+                    raise ValueError("unknown order status filter")
                 params["status"] = status
-            if cursor:
-                params["cursor"] = cursor
-            r = self._req("GET", self.ORDERS_LIST_PATH, params=params)
-            if not isinstance(r, dict):
-                raise KalshiAPIError(
-                    0, f"listing d'ordres incoherent: reponse "
-                       f"{type(r).__name__}, objet attendu")
-            # ENVELOPPE: uniquement les cles explicitement connues. Le code
-            # precedent faisait r.get("orders", r.get("data", [])) -- un
-            # defaut [] SILENCIEUX: si l'enveloppe reelle portait un autre
-            # nom, une reponse pleine se lisait comme un listing VIDE et
-            # COMPLET, donc comme une absence. Or l'absence est exactement
-            # ce qu'il ne faut jamais fabriquer: elle finit par cloturer une
-            # intention ambigue. Le precedent get_positions montre que
-            # Kalshi ne pluralise pas toujours l'evidence ("market_positions"
-            # et non "positions"): une enveloppe non reconnue est donc une
-            # reponse INCOMPREHENSIBLE, pas une reponse vide.
-            present = [k for k in self.ORDERS_ENVELOPE_KEYS if k in r]
-            if not present:
-                raise KalshiAPIError(
-                    0, f"listing d'ordres incoherent: aucune enveloppe "
-                       f"connue {list(self.ORDERS_ENVELOPE_KEYS)} dans la "
-                       f"reponse (cles vues: {sorted(r)[:8]})")
-            if len(present) > 1:
-                raise KalshiAPIError(
-                    0, f"listing d'ordres incoherent: enveloppes multiples "
-                       f"{present}, impossible de choisir")
-            orders = r[present[0]]
-            if not isinstance(orders, list):
-                raise KalshiAPIError(
-                    0, f"listing d'ordres incoherent: '{present[0]}' n'est "
-                       f"pas une liste ({type(orders).__name__})")
-            if any(not isinstance(o, dict) for o in orders):
-                raise KalshiAPIError(
-                    0, f"listing d'ordres incoherent: entree non-objet dans "
-                       f"'{present[0]}'")
-            if pages == 1:
-                self._log_raw_once("list_orders", r)
-            out.extend(orders)
-            # CURSEUR: absent = fin de pagination (terminal legitime). Present
-            # mais d'un type inattendu = pagination inexploitable, donc on
-            # leve plutot que de la traiter comme une fin de listing.
-            raw_cursor = r.get("cursor", "")
-            if raw_cursor is not None and not isinstance(raw_cursor, str):
-                raise KalshiAPIError(
-                    0, f"listing d'ordres incoherent: 'cursor' de type "
-                       f"{type(raw_cursor).__name__}, chaine attendue")
-            next_cursor = str(raw_cursor or "")
-            if next_cursor and next_cursor == cursor:
-                raise KalshiAPIError(
-                    0, "listing d'ordres incoherent: 'cursor' ne progresse "
-                       "pas (meme valeur renvoyee), pagination sans fin")
-            cursor = next_cursor
-            if not cursor:
-                return out
-        # Sortie par epuisement de max_pages AVEC un cursor encore actif :
-        # le listing est INCOMPLET. Conclure « aucun ordre ne correspond »
-        # ici serait une absence FABRIQUEE par la pagination. On leve.
-        raise KalshiAPIError(
-            0, f"listing d'ordres tronque: {max_pages} pages lues et le "
-               f"broker annonce encore une suite -- absence non concluante")
+        except ValueError as exc:
+            raise KalshiAPIError(0, "listing incoherent: " + str(exc)) from exc
+        return self._portfolio_pages(self.ORDERS_LIST_PATH,
+            envelopes=self.ORDERS_ENVELOPE_KEYS, params=params, max_pages=max_pages,
+            row_identity=self._order_listing_identity, cursor_required=True,
+            log_name="list_orders")
 
     def find_orders_by_client_order_id(self, client_order_id: str, *,
                                        ticker: str = None) -> list:
@@ -610,18 +785,30 @@ class KalshiClient:
         cid = str(client_order_id or "").strip()
         if not cid:
             raise KalshiAPIError(0, "recherche par client_order_id vide")
-        return [o for o in self.list_orders(ticker=ticker)
-                if str(pick(o, "client_order_id", "client_id",
-                            default="")).strip() == cid]
+        matches = [o for o in self.list_orders(ticker=ticker)
+                   if pick(o, "client_order_id", "client_id") == cid]
+        if not matches:
+            # Current-order listings exclude finalized history beyond the
+            # exchange retention cutoff. No timestamp/snapshot-bound history
+            # proof is available here. Keep ambiguous intents UNAVAILABLE;
+            # repeated incomplete absence readings cannot authorize a retry.
+            raise KalshiAPIError(0, "order absence unproven: historical retention scope unavailable")
+        return matches
 
-    def get_positions(self) -> list:
-        """Positions cote broker (source de verite pour la reconciliation)."""
-        try:
-            r = self._req("GET", "/portfolio/positions")
-            self._log_raw_once("positions", r)
-            return r.get("market_positions", r.get("positions", [])) or []
-        except KalshiAPIError as e:
-            log_api.warning(f"get_positions: {e}")
-            return None
+    def get_positions(self, *, limit: int = 200, max_pages: int = 50) -> list:
+        """Complete known-schema market positions; uncertainty raises.
 
-
+        Event aggregates are not substituted for individual market positions.
+        An exception preserves callers' reconciliation halt; no partial page
+        collection or unfamiliar envelope can be presented as a flat account.
+        """
+        def identity(row):
+            if not isinstance(row, dict):
+                raise ValueError("position row is not an object")
+            ticker = portfolio_identity(row.get("ticker"), "ticker")
+            position_quantity(row)
+            return ticker
+        return self._portfolio_pages("/portfolio/positions",
+            envelopes=("market_positions", "positions"), params={"limit": limit, "subaccount": 0},
+            max_pages=max_pages, row_identity=identity,
+            extra_keys=("event_positions",), log_name="positions")

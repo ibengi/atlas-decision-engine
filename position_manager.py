@@ -9,7 +9,8 @@ import time
 from datetime import datetime, timezone
 
 from config import CFG, _p
-from kalshi_client import KalshiClient, pick, pick_int
+from kalshi_client import (KalshiClient, pick, pick_int, position_quantity,
+                           portfolio_identity, portfolio_integer)
 from persistence import JsonStore
 from trade_logger import TradeLogger, now_iso
 
@@ -265,37 +266,26 @@ class PositionManager:
         et les quantites fractionnaires sont refusees tant que la
         specification broker ne les atteste pas.
         """
-        seen = []
-        for f in PositionManager.QTY_FIELDS:
-            v = bp.get(f)
-            if v is None:
-                continue
-            try:
-                fv = float(v)
-            except (TypeError, ValueError):
-                return None, f"{f}={v!r} illisible"
-            if not math.isfinite(fv):
-                return None, f"{f}={v!r} non fini (NaN/inf)"
-            if fv != int(fv):
-                return None, (f"{f}={v!r} non entier -- contrats "
-                              f"fractionnaires non attestes par l'API")
-            seen.append((f, int(fv)))
-        if not seen:
-            return None, ("aucun champ de quantite reconnu (attendus: "
-                          + ", ".join(PositionManager.QTY_FIELDS) + ")")
-        if len({q for _, q in seen}) > 1:
-            return None, f"champs de quantite contradictoires: {seen}"
-        return seen[0][1], None
+        try:
+            return position_quantity(bp), None
+        except (ValueError, TypeError, OverflowError) as exc:
+            return None, str(exc)
 
     def _broker_net_positions(self, broker):
         """(dict ticker->net signe, None) ou (None, raison UNKNOWN)."""
-        net = {}
+        if not isinstance(broker, list):
+            return None, "broker position enumeration is not a list"
+        net, seen = {}, set()
         for bp in broker:
             if not isinstance(bp, dict):
                 return None, f"ligne broker inexploitable: {bp!r}"
-            tk = bp.get("ticker")
-            if not tk:
-                return None, f"ligne broker sans ticker: {bp!r}"
+            try:
+                tk = portfolio_identity(bp.get("ticker"), "ticker")
+            except ValueError as exc:
+                return None, str(exc)
+            if tk in seen:
+                return None, "duplicate broker ticker: " + tk
+            seen.add(tk)
             qty, err = self.parse_broker_qty(bp)
             if err:
                 return None, f"{tk}: {err}"
@@ -304,10 +294,24 @@ class PositionManager:
 
     def _local_net_positions(self):
         net = {}
+        # Validate stored rows before _active_positions can silently filter
+        # an unfamiliar state into absence. Settled positions are removed;
+        # this manager's persisted holdings have only the open state.
+        if hasattr(self, "positions"):
+            if not isinstance(self.positions, dict):
+                raise ValueError("local positions are not an object")
+            for row in self.positions.values():
+                if not isinstance(row, dict) or row.get("state", "open") != "open":
+                    raise ValueError("unknown persisted local position state")
         for p in self._active_positions():
-            sign = 1 if p.get("side") == "yes" else -1
-            net[p["ticker"]] = net.get(p["ticker"], 0) \
-                + sign * int(p.get("count", 0))
+            ticker = portfolio_identity(p.get("ticker"), "local ticker")
+            if p.get("side") not in ("yes", "no"):
+                raise ValueError("unknown local position side")
+            count = portfolio_integer(p.get("count"), "local count")
+            if count < 0:
+                raise ValueError("negative local position count")
+            sign = 1 if p["side"] == "yes" else -1
+            net[ticker] = net.get(ticker, 0) + sign * count
         return {tk: q for tk, q in net.items() if q != 0}
 
     @staticmethod
@@ -386,7 +390,15 @@ class PositionManager:
                           f"({err}) -- soumissions bloquees fail-closed.")
             return report
 
-        local_net = self._local_net_positions()
+        try:
+            local_net = self._local_net_positions()
+        except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+            report["status"], report["detail"] = "UNKNOWN", "local position identity unavailable: " + str(exc)
+            if self.reconcile_halt is None:
+                self.reconcile_halt = {"status": "UNKNOWN", "detail": report["detail"], "at": now_iso()}
+            log_pos.error("[RECONCILE_VERIFY] local state UNKNOWN -- submissions blocked")
+            return report
+
 
         for tk in sorted(set(broker_net) | set(local_net)):
             b, l = broker_net.get(tk), local_net.get(tk)
@@ -481,7 +493,11 @@ class PositionManager:
         if err is not None:
             return _halt("UNKNOWN", f"reponse broker inexploitable: {err}")
 
-        local_net = self._local_net_positions()
+        try:
+            local_net = self._local_net_positions()
+        except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+            return _halt("UNKNOWN", "local position identity unavailable: " + str(exc))
+
         for tk in sorted(set(broker_net) | set(local_net)):
             b, l = broker_net.get(tk), local_net.get(tk)
             if b == l:
@@ -527,4 +543,3 @@ class PositionManager:
                     ": la reconciliation de demarrage bloquera les "
                     "soumissions (broker_only) au lieu de reconstruire.",
                     extra={"event": "state_empty_at_startup"})
-
