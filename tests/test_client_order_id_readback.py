@@ -66,7 +66,7 @@ class ClientListingTest(unittest.TestCase):
         c = self._client()
         with patch.object(KalshiClient, "_req") as req:
             req.return_value = {"orders": [order_row(), order_row(
-                order_id="ord-other", client_order_id="alpha_other")]}
+                order_id="ord-other", client_order_id="alpha_other")], "cursor": ""}
             found = c.find_orders_by_client_order_id(CID, ticker=TICKER)
 
         self.assertEqual(len(found), 1)
@@ -90,11 +90,12 @@ class ClientListingTest(unittest.TestCase):
                          "next-1")
         self.assertEqual([o["order_id"] for o in found], ["p2"])
 
-    def test_no_match_returns_empty_but_a_read_failure_raises(self):
+    def test_unqualified_absence_and_read_failure_both_raise(self):
         c = self._client()
         with patch.object(KalshiClient, "_req",
-                          return_value={"orders": []}):
-            self.assertEqual(c.find_orders_by_client_order_id(CID), [])
+                          return_value={"orders": [], "cursor": ""}):
+            with self.assertRaisesRegex(KalshiAPIError, "historical retention"):
+                c.find_orders_by_client_order_id(CID)
 
         with patch.object(KalshiClient, "_req",
                           side_effect=KalshiAPIError(0, "reseau: timeout")):

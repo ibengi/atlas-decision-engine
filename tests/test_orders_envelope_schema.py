@@ -88,7 +88,8 @@ class ClientSchemaTest(unittest.TestCase):
         with patch.object(KalshiClient, "_req",
                           return_value={"orders": [], "cursor": ""}):
             self.assertEqual(c.list_orders(ticker=TICKER), [])
-            self.assertEqual(c.find_orders_by_client_order_id(CID), [])
+            with self.assertRaisesRegex(KalshiAPIError, "historical retention"):
+                c.find_orders_by_client_order_id(CID)
 
     def test_a_normal_listing_parses(self):
         c = self._client()
@@ -100,20 +101,24 @@ class ClientSchemaTest(unittest.TestCase):
                 [o["order_id"]
                  for o in c.find_orders_by_client_order_id(CID)], ["a"])
 
-    def test_an_absent_cursor_ends_pagination_normally(self):
-        """Absence of `cursor` is a legitimate terminal condition; only a
-        cursor of the WRONG TYPE is a schema failure."""
+    def test_an_absent_required_cursor_refuses_completeness(self):
+        """LI-07: current Orders schema requires a string cursor.
+
+        The historical omission-acceptance witness remains and now refuses.
+        """
         c = self._client()
         with patch.object(KalshiClient, "_req",
                           return_value={"orders": [order_row()]}) as req:
-            self.assertEqual(len(c.list_orders(ticker=TICKER)), 1)
+            with self.assertRaises(KalshiAPIError):
+                c.list_orders(ticker=TICKER)
         self.assertEqual(req.call_count, 1)
 
-    def test_a_null_cursor_ends_pagination_normally(self):
+    def test_a_null_cursor_refuses_completeness(self):
         c = self._client()
         with patch.object(KalshiClient, "_req",
                           return_value={"orders": [], "cursor": None}):
-            self.assertEqual(c.list_orders(ticker=TICKER), [])
+            with self.assertRaises(KalshiAPIError):
+                c.list_orders(ticker=TICKER)
 
     def test_multi_page_pagination_collects_every_page(self):
         c = self._client()
@@ -271,17 +276,16 @@ class ResolutionOutcomeTest(unittest.TestCase):
                          "MALFORMED_ORDER_LISTING")
         self.assertTrue(res.status.endswith("malformed"))
 
-    def test_a_real_empty_listing_still_yields_not_found(self):
-        """The control: the fix must not turn a genuine absence into a
-        malformed report."""
+    def test_current_empty_listing_does_not_prove_historical_absence(self):
+        """LI-07: a current-view empty page is not complete order history."""
         om, _client = self._om_with_response({"orders": [], "cursor": ""})
 
         om.place_and_track(TICKER, SIDE, COUNT, PRICE)
 
         intent = om.pending_intents[TICKER]
-        self.assertEqual(intent["resolution"], "NOT_FOUND_PENDING")
-        self.assertEqual(intent["not_found_count"], 1)
-        self.assertIsNone(om.resolution_halt)
+        self.assertEqual(intent["resolution"], "UNAVAILABLE")
+        self.assertEqual(intent.get("not_found_count", 0), 0)
+        self.assertIsNotNone(om.pending_intents.get(TICKER))
 
     def test_a_real_match_is_still_found(self):
         om, client = self._om_with_response(
