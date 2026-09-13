@@ -57,7 +57,7 @@ class TestDailyHorizonExtension(unittest.TestCase):
             "sigma_1m": 8e-4, "minutes_remaining": 300.0,
             "ret_5m": 0.001, "data_quality": 85.0,
             # provenance is now stated explicitly, not implied by absence
-            "strike_source": "field",
+            "strike_source": "field", "candle_provenance": {},
         })
         self.assertAlmostEqual(
             out.probability_yes,

@@ -289,7 +289,7 @@ def _spot_sources(counters):
 def _klines_fn(counters):
     def f():
         counters["klines"] += 1
-        now = time.time()
+        now = (int(time.time()) // 60) * 60
         # 30 bougies 1m : fraiches, monotones, closes > 0 -> contexte VALIDE
         return [{"ts": now - (30 - i) * 60, "open": 65000.0, "high": 65100.0,
                  "low": 64900.0, "close": 65000.0 + i, "volume": 1.0}
@@ -407,7 +407,8 @@ class _EngCtx:
 
 
 def _fake_ctx(strike=None, minutes_remaining=None, **kw):
-    return _EngCtx()
+    from _candle_fixture import attach_context
+    return attach_context(_EngCtx())
 
 
 class _EngClient:
@@ -447,7 +448,9 @@ class _EngClient:
         return {"markets": [], "cursor": None}
 
     def create_order(self, ticker, side, count, price_cents,
-                     client_order_id=None):
+                     client_order_id=None, qualification_check=None):
+        if qualification_check is not None:
+            assert qualification_check() is True
         oid = f"o{len(self.created_orders) + 1}"
         self.last_http_status = 201
         self.created_orders.append({"order_id": oid, "ticker": ticker,

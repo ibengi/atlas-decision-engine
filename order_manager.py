@@ -595,7 +595,7 @@ class OrderManager:
 
     # -- cycle de vie complet d'un ordre --------------------------------------
     def place_and_track(self, ticker: str, side: str, count: int,
-                        limit_cents: int) -> ExecutionResult:
+                        limit_cents: int, qualification_check=None) -> ExecutionResult:
         # INVARIANT DUR : aucune ecriture broker apres une panne de
         # persistance critique. Si le verrou anti-doublon, le journal ou
         # l'etat des ordres ne peut plus etre ecrit, chaque garantie de
@@ -782,9 +782,31 @@ class OrderManager:
                                    "blocked:submission_guard_unwritable",
                                    "rejected")
         try:
+            if qualification_check is not None:
+                from kalshi_client import CandleQualificationExpired
+                try:
+                    qualified = qualification_check() is True
+                except Exception:
+                    qualified = False
+                if not qualified:
+                    raise CandleQualificationExpired(False)
+            create_options = {"client_order_id": client_order_id}
+            if qualification_check is not None:
+                create_options["qualification_check"] = qualification_check
             order = self.client.create_order(ticker, side, count, limit_cents,
-                                             client_order_id=client_order_id)
+                                             **create_options)
         except KalshiAPIError as e:
+            from kalshi_client import CandleQualificationExpired
+            if isinstance(e, CandleQualificationExpired) and e.request_started is False:
+                # This attempt never reached session.request. Preserve the row
+                # with explicit local (not broker) closure evidence. Existing
+                # duplicate TTL remains in force; persistence failure still halts.
+                intent = self.pending_intents[ticker]
+                intent["resolution"] = "CLOSED_ABSENT"
+                intent["closure_source"] = "local_transport_not_started"
+                self._flush_pending_intents()
+                return ExecutionResult(None, count, 0, limit_cents,
+                                       "blocked:candle_expired_not_sent", "rejected")
             log_api.error("[ORDER_SUBMIT_FAILED] "
                           f"http_status={e.status} error_code={e.status} "
                           f"error_message={e} "
@@ -820,9 +842,10 @@ class OrderManager:
                 return ExecutionResult(intent.get("order_id"), count, 0,
                                        limit_cents, "adopted_after_ambiguous",
                                        "resting")
-            return ExecutionResult(None, count, 0, limit_cents,
-                                   f"ambiguous:{e.status}:{outcome.lower()}",
-                                   "rejected")
+            status = f"ambiguous:{e.status}:{outcome.lower()}"
+            if isinstance(e, CandleQualificationExpired) and e.request_started is True:
+                status = f"ambiguous:candle_expired_after_send:{outcome.lower()}"
+            return ExecutionResult(None, count, 0, limit_cents, status, "rejected")
         self.exchange_pause_until = 0.0
         # Le verrou est deja pose et persiste avant l'appel ; on rafraichit
         # seulement l'horodatage sur le succes confirme.

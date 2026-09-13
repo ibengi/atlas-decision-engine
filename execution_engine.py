@@ -781,6 +781,22 @@ class ExecutionEngine:
             self.stats.log_summary()
         return placed
 
+    def _candle_input_gate(self, dec, report) -> bool:
+        """Local data qualification/expiry only; never refreshes or sends I/O."""
+        ticker = getattr(dec, "ticker", None)
+        prefix = ticker.strip().upper().split("-", 1)[0] if isinstance(ticker, str) else None
+        if (getattr(dec, "market_type", None) not in (
+                "btc_15m_above_strike", "btc_above_strike_daily")
+                and prefix not in ("KXBTC15M", "KXBTCD")):
+            return True
+        from btc_context import decision_candles_current
+        if decision_candles_current(getattr(dec, "model_output", None)):
+            return True
+        report["rejections"]["candle_evidence_expired_or_invalid"] = (
+            report["rejections"].get("candle_evidence_expired_or_invalid", 0) + 1)
+        log_trd.info("[CANDLE_DATA_REFUSED] missing, invalid or expired model evidence")
+        return False
+
     def _execute_decision(self, dec, report) -> int:
         ticker = dec.ticker
         # 5.0) QUARANTAINE QUOTIDIENNE + LISTE BLANCHE.
@@ -828,6 +844,8 @@ class ExecutionEngine:
                 extra={"ticker": ticker, "strategy": dec.strategy,
                        "market_type": mtype})
             return 0
+        if not self._candle_input_gate(dec, report):
+            return 0
         # 5a) carnet FRAIS une DERNIERE fois, juste avant l'ordre (TEST L)
         with timed("api_fetch"):
             m, book = self.fresh_book(ticker)
@@ -844,6 +862,8 @@ class ExecutionEngine:
                 return 0
             entry = int(ask)
 
+        if not self._candle_input_gate(dec, report):
+            return 0
         # 5b) budgets risque categorie / marche + taille (sur capital effectif)
         with timed("risk_check"):
             cat = getattr(dec, "category", None) or "Other"
@@ -902,6 +922,8 @@ class ExecutionEngine:
                             "edge_net": dec.net_edge, "ev_net": dec.net_ev,
                             "strategy": dec.strategy})
 
+        if not self._candle_input_gate(dec, report):
+            return 0
         # 5d-bis) LECTURE SEULE PRODUCTION : la decision est COMPLETE (modele,
         # probabilite marche, edge, EV, portes de risque, taille) et le
         # resultat est journalise comme WOULD_SUBMIT. Le chemin d'ecriture
@@ -948,14 +970,20 @@ class ExecutionEngine:
                 report["rejections"].get("half_open_already_claimed", 0) + 1)
             return 0
 
-        report["orders_submitted"] = report.get("orders_submitted", 0) + 1
         log_trd.info(f"[EXECUTION] {ticker} {dec.side.upper()} x{count} "
                      f"@ {entry}c -> envoi de l'ordre",
                      extra={"ticker": ticker, "side": dec.side, "size": count,
                             "price": entry, "edge": dec.net_edge})
         with timed("order_placement"):
-            exec_res = self.orders.place_and_track(ticker, dec.side, count,
-                                                   entry)
+            if not self._candle_input_gate(dec, report):
+                self.risk.release_half_open_attempt(ticker, "candle evidence expired before dispatch")
+                return 0
+            report["orders_submitted"] = report.get("orders_submitted", 0) + 1
+            exec_res = self.orders.place_and_track(
+                ticker, dec.side, count, entry,
+                qualification_check=lambda: self._candle_input_gate(dec, report))
+        if exec_res.status == "blocked:candle_expired_not_sent":
+            report["orders_submitted"] = max(0, report.get("orders_submitted", 0) - 1)
         from decision_tracer import current_tracer
         tracer = current_tracer()
         if tracer:
@@ -965,7 +993,8 @@ class ExecutionEngine:
             # Ne pas consumer l'unique essai si aucune soumission n'a ete
             # acceptee, ou si l'annulation sans fill est explicitement confirmee.
             # Un order_id avec etat incertain reste verrouille par prudence.
-            if exec_res.order_id is None:
+            if (exec_res.order_id is None and not str(exec_res.status).startswith(
+                    "ambiguous:candle_expired_after_send:")):
                 self.risk.release_half_open_attempt(ticker,
                     f"soumission non acceptee: {exec_res.status}")
             elif exec_res.state == "cancelled" and exec_res.status not in ("unverified", "unknown"):

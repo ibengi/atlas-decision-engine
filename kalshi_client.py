@@ -98,6 +98,13 @@ def pick_int(d: dict, *names, default=0) -> int:
 # S5. CLIENT KALSHI (env demo/prod, signature RSA, retry/backoff)
 # ══════════════════════════════════════════════════════════════════════════
 
+class CandleQualificationExpired(KalshiAPIError):
+    """Data expiry before transport; started distinguishes ambiguity from no send."""
+    def __init__(self, request_started):
+        super().__init__(0, "candle qualification expired before transport")
+        self.request_started = request_started
+
+
 class KalshiClient:
     """Client HTTP signe. env='demo' -> demo-api (cles demo si fournies),
     env='prod' -> production. TOUT (donnees, ordres, reglements) passe par
@@ -239,7 +246,8 @@ class KalshiClient:
                    f"Aucune requete reseau mutante n'a ete emise.")
 
     # -- Requete avec retry/backoff ------------------------------------------
-    def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
+    def _req(self, method: str, path: str, *, retries: int = 3,
+             qualification_check=None, **kw) -> dict:
         # BUTOIR DE TRANSPORT. Place AVANT tout le reste (y compris la
         # verification de cle) pour qu'une ecriture LIVE non autorisee soit
         # refusee quelle que soit la raison pour laquelle elle serait sinon
@@ -265,11 +273,20 @@ class KalshiClient:
                    f"paquet 'cryptography'.")
         url = self.base_url + path
         attempt, delay = 0, 1.0
+        request_started = False
         while True:
             attempt += 1
             try:
-                r = self.session.request(method, url,
-                                         headers=self._sign_headers(method, url),
+                headers = self._sign_headers(method, url)
+                if qualification_check is not None and _is_mutating_method(method):
+                    try:
+                        qualified = qualification_check() is True
+                    except Exception:
+                        qualified = False
+                    if not qualified:
+                        raise CandleQualificationExpired(request_started)
+                request_started = True
+                r = self.session.request(method, url, headers=headers,
                                          timeout=15, **kw)
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt > retries:
@@ -375,7 +392,8 @@ class KalshiClient:
     ORDERS_V2_PATH = "/portfolio/events/orders"
 
     def create_order(self, ticker: str, side: str, count: int,
-                     price_cents: int, client_order_id: str = None) -> dict:
+                     price_cents: int, client_order_id: str = None,
+                     qualification_check=None) -> dict:
         """Ordre limite ACHAT via le schema V2 : tout est cote sur le carnet
         YES ('bid'=acheter YES ; 'ask'=vendre YES = acheter NO a 1-prix),
         prix en dollars fixed-point, quantite en chaine. La reponse V2 n'a
@@ -427,7 +445,10 @@ class KalshiClient:
             "time_in_force":   "good_till_canceled",
             "self_trade_prevention_type": "taker_at_cross",
         }
-        r = self._req("POST", self.ORDERS_V2_PATH, json=payload)
+        request_options = {"json": payload}
+        if qualification_check is not None:
+            request_options["qualification_check"] = qualification_check
+        r = self._req("POST", self.ORDERS_V2_PATH, **request_options)
         self._log_raw_once("create_order_v2", r)
         raw = r.get("order", r) or {}
 
