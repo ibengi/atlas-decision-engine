@@ -768,6 +768,7 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
         return ledger
 
     def settlement(self, **over):
+        from _settlement import seal_settlement
         row = {"prediction_id": "p-1", "outcome": 1, "source": "kalshi feed",
                "contract_id": self.BINDING["contract_id"],
                "market_snapshot_id": self.BINDING["market_snapshot_id"],
@@ -776,6 +777,7 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
                "contract_schema": self.BINDING["contract_schema"],
                "resolved_at": self.SETTLEMENT["resolved_at"],
                "settlement_evidence_id": "kalshi-settlement-truth-0001"}
+        row = seal_settlement(row)
         row.update(over)
         return row
 
@@ -794,10 +796,11 @@ class ResolutionIngestionIsIdempotentAndNonDestructive(TruthCase):
         self.assertEqual(len(ledger.rows()), rows_after_first)
 
     def test_a_contradictory_settlement_is_reported_and_not_written(self):
+        from _settlement import seal_settlement
         ledger = self.ledger_with_prediction()
         self.ingest(ledger, [self.settlement(outcome=1)])
         before = len(ledger.rows())
-        result = self.ingest(ledger, [self.settlement(outcome=0)])
+        result = self.ingest(ledger, [seal_settlement(self.settlement(outcome=0))])
         self.assertEqual(result["appended"], 0)
         self.assertEqual(len(result["conflicts"]), 1)
         self.assertEqual(len(ledger.rows()), before)

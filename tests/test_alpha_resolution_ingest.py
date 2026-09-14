@@ -12,7 +12,7 @@ from alpha_ledger import (AlphaLedger, ROW_PREDICTION,        # noqa: E402
                           ROW_RESOLUTION)
 from alpha_resolution_ingest import ingest_settlements        # noqa: E402
 from candidate_contract import FEED_SCHEMA, canonical_content  # noqa: E402
-from _settlement import qualified_fixture                     # noqa: E402
+from _settlement import qualified_fixture, seal_settlement    # noqa: E402
 
 
 #: The binding a real prediction is committed with. The fixtures carry it
@@ -48,6 +48,7 @@ def settlement(source="trusted-settlement-feed", **over):
            # time-ordered statistic measured when a script ran.
            "resolved_at": SETTLEMENT["resolved_at"],
            "settlement_evidence_id": "fixture-settlement-0001"}
+    row = seal_settlement(row)
     row.update(over)
     return row
 
@@ -78,7 +79,7 @@ class AlphaResolutionIngestTests(unittest.TestCase):
         self.assertIsNone(self.ledger.find_prediction("p1").get("actual_outcome"))
 
     def test_duplicate_matching_resolution_is_idempotent(self):
-        feed = [settlement(source="feed", outcome=0)]
+        feed = [seal_settlement(settlement(source="feed", outcome=0))]
         self.assertEqual(self.ingest(feed)["appended"], 1)
         again = self.ingest(feed)
         self.assertEqual(again["idempotent"], 1)
@@ -86,7 +87,7 @@ class AlphaResolutionIngestTests(unittest.TestCase):
 
     def test_conflicting_resolution_is_not_written(self):
         self.ingest([settlement(source="feed-a", outcome=1)])
-        conflict = self.ingest([settlement(source="feed-b", outcome=0)])
+        conflict = self.ingest([seal_settlement(settlement(source="feed-b", outcome=0))])
         self.assertEqual(len(conflict["conflicts"]), 1)
         self.assertEqual(self.ledger.find_resolution("p1")["actual_outcome"], 1)
 

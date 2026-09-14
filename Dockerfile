@@ -41,6 +41,11 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
 
 COPY . .
 
+# The test stage has no external broker/provider transport. Its local
+# dashboard fixture may use loopback. These settings do not enter runtime.
+ENV PYTHONPATH=/src/tools/audit_isolation:/src \
+    ATLAS_AUDIT_ALLOW_LOOPBACK=1 PROBE_PROVIDERS_ON_START=0
+
 # Aucun reseau broker n'est joignable ni necessaire : la suite est
 # entierement mockee. Un `run_tests.py` non nul arrete le build ici (RUN
 # propage le code de sortie), donc une suite rouge ne produit pas d'image.

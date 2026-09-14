@@ -1173,16 +1173,16 @@ class AA14_MultiWriterRaces(RemediationCase):
         # carry cannot be re-derived from anything, so since RA-12 it lands in
         # the evidence-unverified quarantine -- which would leave this case
         # asserting on a conflict that never got the chance to happen.
-        from _settlement import qualified_fixture
+        from _settlement import qualified_fixture, seal_settlement
         record, snapshot, prediction, settlement = qualified_fixture(
             contract_id="KX-C", environment="demo")
         ledger.record_prediction(prediction)
         trusted = ["feed-a", "feed-b"]
-        ingest_settlements(ledger, [dict(settlement, outcome=1,
-                                         source="feed-a")],
+        ingest_settlements(ledger, [seal_settlement(dict(settlement, outcome=1,
+                                         source="feed-a"))],
                            trusted_sources=trusted)
-        result = ingest_settlements(ledger, [dict(settlement, outcome=0,
-                                                  source="feed-b")],
+        result = ingest_settlements(ledger, [seal_settlement(dict(settlement, outcome=0,
+                                                  source="feed-b"))],
                                     trusted_sources=trusted)
         self.assertEqual(result["appended"], 0)
         self.assertEqual(len(result["conflicts"]), 1)
@@ -1327,11 +1327,12 @@ class AA15_R4JoinIsNotVerified(RemediationCase):
             contract_schema=contract.FEED_SCHEMA,
             environment="demo",
             resolved_at=self.settlement_row["resolved_at"],
-            settlement_evidence_id="cf-rti-2026-09-12")])
+            settlement_evidence_id=self.settlement_row["settlement_evidence_id"])])
         self.assertEqual(result["appended"], 1, result["rejected"])
         row = ledger.find_resolution("p1")
         self.assertEqual(row["actual_outcome"], 1)
-        self.assertEqual(row["settlement_evidence_id"], "cf-rti-2026-09-12")
+        self.assertEqual(row["settlement_evidence_id"],
+                         self.settlement_row["settlement_evidence_id"])
         self.assertTrue(row["binding_verified"])
 
     def test_the_checksum_claim_is_not_overstated_anywhere(self):

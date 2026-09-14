@@ -224,7 +224,7 @@ class MetricsAreDerived(LedgerCase):
         from _candidate import valid_record
         from alpha_resolution_ingest import ingest_settlements
         from alpha_service import source_binding_for
-        from _settlement import qualified_fixture
+        from _settlement import qualified_fixture, seal_settlement
         from alpha_snapshot import parse_utc
         ledger = AlphaLedger()
         ids = []
@@ -237,7 +237,7 @@ class MetricsAreDerived(LedgerCase):
                 ledger=ledger,
                 now_fn=lambda: parse_utc(fixture["prediction_time"])
             ).analyze(snapshot, source_binding=binding)
-            result = ingest_settlements(ledger, [{
+            result = ingest_settlements(ledger, [seal_settlement({
                 "prediction_id": opportunity["prediction_id"],
                 "outcome": outcome,
                 "source": "trusted-settlement-feed",
@@ -247,7 +247,7 @@ class MetricsAreDerived(LedgerCase):
                 "market_snapshot_id": binding["market_snapshot_id"],
                 "source_record_sha256": binding["record_sha256"],
                 "environment": binding["environment"],
-                "contract_schema": binding["contract_schema"]}],
+                "contract_schema": binding["contract_schema"]})],
                 trusted_sources=["trusted-settlement-feed"])
             self.assertEqual(result["appended"], 1, result["rejected"])
             ids.append(opportunity["prediction_id"])

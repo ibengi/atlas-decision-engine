@@ -2,10 +2,12 @@
 """Ingest trusted Alpha settlement facts from JSONL. SHADOW ONLY.
 
 Each input line must be a JSON object carrying `prediction_id`, `outcome`
-(0/1), `source`, and the COMPLETE settlement binding -- `contract_id`,
-`market_snapshot_id` and `source_record_sha256`. Optional `resolved_at` and
-`settlement_evidence_id` are preserved. This tool never reaches a broker; it
-only appends RESOLUTION rows to the existing AlphaLedger.
+(strict integer 0/1), `source`, the complete versioned prediction/source
+binding, and the retained settlement evidence object, canonical response
+preimage, recomputed digest, content identity and actual resolution timestamp.
+Missing proof refuses qualification. Duplicate JSON members are rejected
+before decoding can discard evidence. This tool never reaches a broker;
+it only appends qualified RESOLUTION rows to the existing AlphaLedger.
 
 `--trusted-source` is REQUIRED, and that is the point of it (AA-15 re-audit).
 No settlement authority has been qualified for this deployment, and an
@@ -22,6 +24,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from alpha_ledger import AlphaLedger  # noqa: E402
+from alpha_evidence_json import strict_json_loads  # noqa: E402
 from alpha_resolution_ingest import ingest_settlements  # noqa: E402
 from config import CFG  # noqa: E402
 
@@ -33,8 +36,8 @@ def _read_jsonl(path):
             if not line.strip():
                 continue
             try:
-                rows.append(json.loads(line))
-            except json.JSONDecodeError as exc:
+                rows.append(strict_json_loads(line))
+            except ValueError as exc:
                 rows.append({"__parse_error__": f"line {line_number}: {exc}"})
     return rows
 

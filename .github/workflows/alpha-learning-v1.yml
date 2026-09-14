@@ -12,6 +12,7 @@ on:
       - alpha/astra-candidate-feed-v3-remediation
       - alpha/astra-candidate-feed-v4-remediation
       - alpha/astra-candidate-feed-v5-astra-remediation
+      - alpha/astra-settlement-evidence-binding-remediation
   pull_request:
     branches:
       - main
@@ -20,12 +21,15 @@ on:
       - alpha/astra-candidate-feed-v3-remediation
       - alpha/astra-candidate-feed-v4-remediation
       - alpha/astra-candidate-feed-v5-astra-remediation
+      - alpha/astra-shadow-integration-review
 
 jobs:
   test-learning:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -70,6 +74,12 @@ jobs:
 
       - name: Astra v5 independent counter-audit regressions
         run: python -m pytest tests/test_astra_v5_*.py -q
+
+      - name: Settlement evidence binding and strict JSON boundary regressions
+        run: python -m pytest tests/test_settlement_evidence_binding.py tests/test_settlement_evidence_json_boundary.py -q
+
+      - name: Settlement evidence semantic mutation gate
+        run: python tools/settlement_evidence_mutations.py --json > settlement-evidence-mutations.json
 
       # The classes the counter-audit asked to see run: crash/restart and
       # short/zero/EINTR/EIO writes, the stale-cache multiprocess case, the
@@ -132,6 +142,8 @@ jobs:
               pathlib.Path('source_identity.py'),
               pathlib.Path('alpha_persistence_paths.py'),
               pathlib.Path('alpha_settlement_validation.py'),
+              pathlib.Path('alpha_settlement_evidence.py'),
+              pathlib.Path('alpha_evidence_json.py'),
               pathlib.Path('alpha_learning.py'),
               pathlib.Path('alpha_learning_runtime.py'),
               pathlib.Path('alpha_resolution_ingest.py'),
@@ -217,6 +229,7 @@ jobs:
           from alpha_consumer import SpoolConsumer
           from alpha_service import source_binding_for
           from research_feed import ResearchFeed, candidate_from_market
+          from tests._settlement import seal_settlement
 
           now = datetime(2025, 1, 1, 10, tzinfo=timezone.utc)
           market = {
@@ -247,7 +260,9 @@ jobs:
               'snapshot': snapshot.as_dict(),
               'prediction_time': (now + timedelta(minutes=1)).isoformat(),
               'source_binding': binding})
-          row = {'prediction_id': 'ci-p1', 'outcome': 1,
+          # This response is explicitly synthetic CI evidence. The seal is
+          # independent stdlib encoding, not a production validator result.
+          row = seal_settlement({'prediction_id': 'ci-p1', 'outcome': 1,
                  'source': 'ci-trusted-feed',
                  'resolved_at': '2025-01-01T14:00:00+00:00',
                  'settlement_evidence_id': 'ci-settlement-0001',
@@ -255,7 +270,7 @@ jobs:
                  'market_snapshot_id': binding['market_snapshot_id'],
                  'source_record_sha256': binding['record_sha256'],
                  'environment': binding['environment'],
-                 'contract_schema': binding['contract_schema']}
+                 'contract_schema': binding['contract_schema']})
           with open(os.path.join(os.environ['DATA_DIR'],
                                  'settlements.jsonl'), 'w',
                     encoding='utf-8') as fh:
@@ -324,7 +339,11 @@ jobs:
           assert resolution['source_trusted'] is True, resolution
           # RA-11: the ACTUAL resolution instant, not the ingestion time.
           assert resolution['resolved_at'] == '2025-01-01T14:00:00+00:00', resolution
-          assert resolution['settlement_evidence_id'] == 'ci-settlement-0001', resolution
+          incoming = json.load(open(os.path.join(d, 'settlements.jsonl'), encoding='utf-8'))
+          assert resolution['settlement_evidence_id'] == incoming['settlement_evidence_id'], resolution
+          assert resolution['settlement_evidence'] == incoming['settlement_evidence'], resolution
+          assert resolution['settlement_response_preimage'] == incoming['settlement_response_preimage'], resolution
+          assert resolution['settlement_response_sha256'] == incoming['settlement_response_sha256'], resolution
           # RA-12: the evidence was independently recomputed.
           assert resolution['source_evidence_verified'] is True, resolution
           # RA-13: and this outcome is admissible in learning.

@@ -4,11 +4,67 @@ The source is built by the producer and the snapshot by the consumer. Times
 are relative to the test clock, so a positive fixture never silently becomes
 a future resolution or a prediction of an already known outcome.
 """
+import copy
+import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 
 from tests._candidate import raw_market, valid_record
 from alpha_consumer import SpoolConsumer
 from alpha_service import source_binding_for
+
+
+def _canonical(value):
+    """Independent test encoding: do not import the validator under test."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False, allow_nan=False)
+
+
+def seal_settlement(settlement):
+    """Return a fully bound SYNTHETIC response, with no real authority claim.
+
+    Seal positive fixtures before applying an invalid mutation. Deliberately
+    reseal only when a test needs a second genuinely consistent synthetic
+    outcome (for example the append-only conflicting-outcome test).
+    """
+    row = copy.deepcopy(settlement)
+    row["contract_schema_version"] = row["contract_schema"]
+    row["settlement_authority"] = row["source"]
+    response = {
+        "schema": "atlas-alpha-settlement-response-v1",
+        "contract_id": row["contract_id"],
+        "environment": row["environment"],
+        "contract_schema_version": row["contract_schema_version"],
+        "settlement_authority": row["settlement_authority"],
+        "outcome": row["outcome"],
+        "resolved_at": row["resolved_at"],
+        "authority_record_id": "SYNTHETIC-outcome-" + row["prediction_id"],
+    }
+    row["settlement_response_preimage"] = _canonical(response)
+    row["settlement_response_sha256"] = hashlib.sha256(
+        row["settlement_response_preimage"].encode("utf-8")).hexdigest()
+    evidence = {
+        "schema": "atlas-alpha-settlement-evidence-v1",
+        "binding": {key: row[key] for key in (
+            "prediction_id", "contract_id", "market_snapshot_id",
+            "source_record_sha256", "environment", "contract_schema_version")},
+        "settlement_authority": row["settlement_authority"],
+        "settlement_response_sha256": row["settlement_response_sha256"],
+    }
+    row["settlement_evidence_id"] = "sha256:" + hashlib.sha256(
+        _canonical(evidence).encode("utf-8")).hexdigest()
+    evidence["settlement_evidence_id"] = row["settlement_evidence_id"]
+    row["settlement_evidence"] = evidence
+    return row
+
+
+def synthetic_authority_policy(authorities):
+    """Only for disposable replay fixtures; never qualify a live authority."""
+    policy = {"schema": "atlas-alpha-settlement-authority-policy-v1",
+              "authorities": sorted(authorities)}
+    policy["policy_id"] = "sha256:" + hashlib.sha256(
+        _canonical(policy).encode("utf-8")).hexdigest()
+    return policy
 
 
 def qualified_fixture(*, prediction_id="p1", contract_id="KX-FIXTURE",
@@ -44,4 +100,4 @@ def qualified_fixture(*, prediction_id="p1", contract_id="KX-FIXTURE",
         "resolved_at": (now - timedelta(seconds=1)).isoformat(),
         "settlement_evidence_id": "synthetic-settlement-" + prediction_id,
     }
-    return record, snapshot, prediction, settlement
+    return record, snapshot, prediction, seal_settlement(settlement)
