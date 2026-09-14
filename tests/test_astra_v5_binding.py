@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from tests import _gates  # noqa: F401
 from tests._candidate import raw_market, valid_record
+from tests._settlement import seal_settlement, synthetic_authority_policy
 from alpha_consumer import SpoolConsumer
 from alpha_ledger import AlphaLedger, settlement_qualification, verify_source_evidence
 from alpha_learning import learning_report
@@ -70,19 +71,29 @@ def incoming(prediction, **changes):
         "source_record_sha256": binding["record_sha256"],
         "environment": binding["environment"], "contract_schema": binding["contract_schema"],
     }
+    row = seal_settlement(row)
     row.update(changes)
     return row
 
 
-def resolution_fixture(prediction):
-    row = incoming(prediction)
+def resolution_fixture(prediction, **response_fields):
+    # A historical chronology witness needs a coherent response receipt at
+    # the bad instant. Otherwise an unrelated digest mismatch can hide a
+    # missing chronology guard from the mutation experiment.
+    row = seal_settlement(incoming(prediction, **response_fields))
     return {
         "schema": "atlas-alpha-ledger-v1", "kind": "RESOLUTION",
         "prediction_id": row["prediction_id"], "actual_outcome": row["outcome"],
         "resolved_at": row["resolved_at"], "resolution_source": row["source"],
         "settlement_evidence_id": row["settlement_evidence_id"],
+        "settlement_evidence": row["settlement_evidence"],
+        "settlement_authority": row["settlement_authority"],
+        "settlement_response_preimage": row["settlement_response_preimage"],
+        "settlement_response_sha256": row["settlement_response_sha256"],
+        "contract_schema_version": row["contract_schema_version"],
+        "settlement_authority_policy": synthetic_authority_policy([AUTHORITY]),
         "settlement_binding": {key: row[key] for key in (
-            "contract_id", "market_snapshot_id", "source_record_sha256", "environment", "contract_schema")},
+            "contract_id", "market_snapshot_id", "source_record_sha256", "environment", "contract_schema", "contract_schema_version")},
         "binding_verified": True, "source_trusted": True,
         "source_evidence_verified": True, "trusted_sources": [AUTHORITY],
     }
@@ -121,20 +132,24 @@ class SettlementQualificationTests(unittest.TestCase):
         self.assertEqual(Path(self.ledger.log.path).read_bytes(), original)
 
     def test_resolution_just_before_prediction_is_refused(self):
-        self.assert_refused(incoming(self.prediction, resolved_at=(PREDICTED - timedelta(microseconds=1)).isoformat()))
+        self.assert_refused(seal_settlement(incoming(self.prediction,
+            resolved_at=(PREDICTED - timedelta(microseconds=1)).isoformat())))
 
     def test_resolution_equal_prediction_is_refused(self):
-        self.assert_refused(incoming(self.prediction, resolved_at=PREDICTED.isoformat()))
+        self.assert_refused(seal_settlement(incoming(self.prediction,
+            resolved_at=PREDICTED.isoformat())))
 
     def test_resolution_far_future_is_refused(self):
-        self.assert_refused(incoming(self.prediction, resolved_at="2999-01-01T00:00:00+00:00"))
+        self.assert_refused(seal_settlement(incoming(self.prediction,
+            resolved_at="2999-01-01T00:00:00+00:00")))
 
     def test_original_year_1900_counterexample_is_refused(self):
-        self.assert_refused(incoming(self.prediction, resolved_at="1900-01-01T00:00:00+00:00"))
+        self.assert_refused(seal_settlement(incoming(self.prediction,
+            resolved_at="1900-01-01T00:00:00+00:00")))
 
     def test_original_year_1900_historical_counterexample_is_excluded(self):
-        resolution = resolution_fixture(self.prediction)
-        resolution["resolved_at"] = "1900-01-01T00:00:00+00:00"
+        resolution = resolution_fixture(self.prediction,
+            resolved_at="1900-01-01T00:00:00+00:00")
         self.assert_history_excluded(self.prediction, resolution)
 
     def test_replay_rejects_unsupported_ledger_schema_and_row_kind(self):
@@ -167,8 +182,8 @@ class SettlementQualificationTests(unittest.TestCase):
         self.assertEqual(Path(history.log.path).read_bytes(), original)
 
     def test_resolution_microsecond_after_prediction_is_qualified(self):
-        result = ingest_settlements(self.ledger, [incoming(self.prediction,
-            resolved_at=(PREDICTED + timedelta(microseconds=1)).isoformat())], trusted_sources=[AUTHORITY])
+        result = ingest_settlements(self.ledger, [seal_settlement(incoming(self.prediction,
+            resolved_at=(PREDICTED + timedelta(microseconds=1)).isoformat()))], trusted_sources=[AUTHORITY])
         self.assertEqual(result["appended"], 1)
 
     def test_missing_required_identifiers_share_quarantine_classification(self):
@@ -331,7 +346,7 @@ class SettlementQualificationTests(unittest.TestCase):
         self.ledger.log.append(resolution_fixture(self.prediction))
         before = Path(self.ledger.log.path).read_bytes()
         repeated = ingest_settlements(self.ledger, [incoming(self.prediction)], trusted_sources=[AUTHORITY])
-        conflict = ingest_settlements(self.ledger, [incoming(self.prediction, outcome=0)], trusted_sources=[AUTHORITY])
+        conflict = ingest_settlements(self.ledger, [seal_settlement(incoming(self.prediction, outcome=0))], trusted_sources=[AUTHORITY])
         self.assertEqual(repeated["idempotent"], 1)
         self.assertEqual(repeated["quarantined"], [])
         self.assertEqual(len(conflict["conflicts"]), 1)

@@ -100,15 +100,16 @@ def prediction(record):
 
 
 def incoming(pred):
+    from tests._settlement import seal_settlement
     binding = pred["source_binding"]
-    return {
+    return seal_settlement({
         "prediction_id": pred["prediction_id"], "outcome": 1,
         "source": binding["source_evidence"]["resolution_source"],
         "resolved_at": RESOLVED, "settlement_evidence_id": "SYNTHETIC-outcome-receipt",
         "contract_id": binding["contract_id"], "market_snapshot_id": binding["market_snapshot_id"],
         "source_record_sha256": binding["record_sha256"],
         "environment": "prod", "contract_schema": binding["contract_schema"],
-    }
+    })
 
 
 class SourceV4Tests(unittest.TestCase):

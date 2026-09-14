@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Le build execute run_tests.py : s'il echoue, cette etape echoue.
       - name: Build the image (runs the suite inside)
@@ -57,6 +59,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       # Sans cette preuve, l'etape de tests du Dockerfile pourrait etre
       # inoperante (mauvais chemin, code de sortie avale) sans que rien ne

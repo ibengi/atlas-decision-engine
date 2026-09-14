@@ -50,8 +50,12 @@ AA-15 -- R4 IS A VERIFIED JOIN, NOT A prediction_id LOOKUP
     remains an external blocker (see `settlement_authority` in the report).
 """
 
+import copy
+
 from alpha_ledger import verify_source_evidence
 from alpha_settlement_validation import settlement_qualification
+from alpha_settlement_evidence import (INPUT_FIELDS, RETAINED_FIELDS,
+                                       authority_policy, canonical_json)
 from candidate_contract import ContractError, strict_text, strict_timestamp
 
 #: Binding fields a settlement may carry. Each one, WHEN SUPPLIED, must agree
@@ -62,6 +66,7 @@ BINDING_CHECKS = {
     "source_record_sha256": "record_sha256",
     "environment": "environment",
     "contract_schema": "contract_schema",
+    "contract_schema_version": "contract_schema",
 }
 
 #: The binding a settlement MUST carry. Each one answers a different question,
@@ -89,7 +94,7 @@ BINDING_CHECKS = {
 #:                     records are refused rather than migrated.
 REQUIRED_BINDING = ("contract_id", "market_snapshot_id",
                     "source_record_sha256", "environment",
-                    "contract_schema")
+                    "contract_schema", "contract_schema_version")
 
 #: Settlement fields that are not part of the binding and were required by
 #: nothing at all (RA-11):
@@ -105,7 +110,11 @@ REQUIRED_BINDING = ("contract_id", "market_snapshot_id",
 #:
 #: Missing or null is a QUARANTINE, not a rejection: the row is not malformed,
 #: it simply cannot be tied to the prediction it names.
-REQUIRED_SETTLEMENT_FIELDS = ("resolved_at", "settlement_evidence_id")
+REQUIRED_SETTLEMENT_FIELDS = (
+    "resolved_at", "settlement_evidence_id", "contract_schema_version",
+    "settlement_authority", "settlement_evidence",
+    "settlement_response_sha256", "settlement_response_preimage",
+)
 
 
 class IncompleteSettlement(ValueError):
@@ -134,6 +143,16 @@ def _normalise(row, index):
     """One settlement row, strictly typed, or raise (AA-02 types, AA-15)."""
     if not isinstance(row, dict):
         raise ValueError(f"row {index}: settlement must be an object")
+    if set(row) - INPUT_FIELDS:
+        raise ValueError(f"row {index}: unsupported settlement input fields")
+    # Freeze the submitted proof before any read/append. A caller's mutable
+    # nested object must not replace evidence after qualification.
+    row = copy.deepcopy(row)
+    for field in ("binding_verified", "source_trusted", "source_evidence_verified"):
+        if field in row and row[field] is not True:
+            raise ValueError(f"row {index}: {field} must be the boolean true")
+    if "quarantined" in row and row["quarantined"] is not False:
+        raise ValueError(f"row {index}: quarantined input cannot qualify")
     missing = [key for key in ("prediction_id", "source")
                if _absent(row.get(key))]
     if missing:
@@ -142,20 +161,22 @@ def _normalise(row, index):
     try:
         prediction_id = strict_text(row.get("prediction_id"),
                                     field="prediction_id", max_length=200)
+        if prediction_id != row["prediction_id"]:
+            raise ValueError("prediction_id must be canonical text")
     except ContractError as exc:
         raise ValueError(f"row {index}: {exc}")
 
     outcome = row.get("outcome")
-    # `True`/`False` are accepted as YES/NO, but nothing else is coerced: a
-    # string "1" is not an outcome, and `outcome in (0, 1)` would have let
-    # `True` and `1.0` through as the same fact by accident.
-    if not isinstance(outcome, (bool, int)) or isinstance(outcome, float) \
-            or int(outcome) not in (0, 1):
+    # The response and settlement must carry the same typed economic fact.
+    # Booleans, floats and text are not silently converted into outcomes.
+    if type(outcome) is not int or outcome not in (0, 1):
         raise ValueError(f"row {index}: outcome must be 0 or 1, got "
                          f"{outcome!r}")
 
     try:
         source = strict_text(row.get("source"), field="source", max_length=300)
+        if source != row["source"]:
+            raise ValueError("source must be canonical text")
     except ContractError as exc:
         raise ValueError(f"row {index}: {exc}")
 
@@ -173,8 +194,7 @@ def _normalise(row, index):
         # survived; a settlement timestamp that is not a timestamp makes every
         # time-ordered calibration statistic computed from it meaningless.
         try:
-            resolved_at = strict_timestamp(resolved_at,
-                                           field="resolved_at").isoformat()
+            strict_timestamp(resolved_at, field="resolved_at")
         except ContractError as exc:
             raise ValueError(f"row {index}: {exc}")
 
@@ -186,6 +206,8 @@ def _normalise(row, index):
             evidence_id = strict_text(evidence_id,
                                       field="settlement_evidence_id",
                                       max_length=300)
+            if evidence_id != row["settlement_evidence_id"]:
+                raise ValueError("settlement_evidence_id must be canonical text")
         except ContractError as exc:
             raise ValueError(f"row {index}: {exc}")
 
@@ -196,16 +218,19 @@ def _normalise(row, index):
             continue
         try:
             supplied[key] = strict_text(value, field=key, max_length=300)
+            if supplied[key] != value:
+                raise ValueError(key + " must be canonical text")
         except ContractError as exc:
             raise ValueError(f"row {index}: {exc}")
 
     return {
         "prediction_id": prediction_id,
-        "outcome": int(bool(outcome)),
+        "outcome": outcome,
         "source": source,
         "resolved_at": resolved_at,
         "settlement_evidence_id": evidence_id,
         "supplied_binding": supplied,
+        **{key: row[key] for key in RETAINED_FIELDS if key in row},
     }
 
 
@@ -401,6 +426,8 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
             "settlement_evidence_id": row["settlement_evidence_id"],
             "binding_verified": True, "source_trusted": True,
             "source_evidence_verified": True, "trusted_sources": sorted(allowed),
+            **{key: row[key] for key in RETAINED_FIELDS if key in row},
+            "settlement_authority_policy": authority_policy(allowed),
         }
         qualified, reason = settlement_qualification(prediction, candidate_resolution)
         if not qualified:
@@ -436,7 +463,22 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
                 continue
             existing_outcome = existing["actual_outcome"]
             if existing_outcome == row["outcome"]:
-                result["idempotent"] += 1
+                # A second valid but different receipt is not the same
+                # immutable resolution. Never discard new evidence as an
+                # outcome-only duplicate.
+                proof_keys = ("settlement_binding", "settlement_evidence_id",
+                              "resolved_at", "resolution_source", *RETAINED_FIELDS)
+                if all(canonical_json(existing.get(key)) ==
+                       canonical_json(candidate_resolution.get(key))
+                       for key in proof_keys):
+                    result["idempotent"] += 1
+                else:
+                    result["conflicts"].append({
+                        "row": index, "prediction_id": prediction_id,
+                        "reason": "different evidence for an immutable resolution",
+                        "existing_evidence_id": existing.get("settlement_evidence_id"),
+                        "incoming_evidence_id": row["settlement_evidence_id"],
+                    })
                 continue
             result["conflicts"].append({
                 "row": index,
@@ -470,6 +512,8 @@ def ingest_settlements(ledger, settlements, *, trusted_sources=None) -> dict:
                     # rather than to an unqualified string.
                     "source_trusted": True,
                     "trusted_sources": sorted(allowed),
+                    **{key: candidate_resolution[key] for key in RETAINED_FIELDS
+                       if key in candidate_resolution},
                 },
             )
         except Exception as exc:

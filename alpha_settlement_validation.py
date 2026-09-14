@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from alpha_snapshot import snapshot_from_dict
 from candidate_contract import (FEED_SCHEMA, MODERN_FEED_SCHEMA, SUPPORTED_FEED_SCHEMAS, strict_text, strict_timestamp,
                                 validate_record, verify_checksum)
+from alpha_settlement_evidence import verify_settlement_evidence
 
 
 BINDING_CHECKS = {
@@ -19,6 +20,7 @@ BINDING_CHECKS = {
     "source_record_sha256": "record_sha256",
     "environment": "environment",
     "contract_schema": "contract_schema",
+    "contract_schema_version": "contract_schema",
 }
 
 
@@ -190,6 +192,7 @@ def settlement_qualification(prediction, resolution, *, now=None):
         if authority != resolution["resolution_source"] or authority not in allowed:
             raise ValueError("settlement authority is not in the recorded allow-list")
         _identity(resolution.get("settlement_evidence_id"), "settlement_evidence_id")
+        verify_settlement_evidence(prediction, resolution)
         predicted_at = _instant(prediction.get("prediction_time"), "prediction_time")
         resolved_at = _instant(resolution.get("resolved_at"), "resolved_at")
         observed_at = _instant(prediction["snapshot"]["snapshot_time_utc"], "snapshot_time_utc")

@@ -647,6 +647,10 @@ MUTATIONS = {
 # remain readable, while these anchors target the current shared guards.
 # M16/M36 model illicitly inventing omitted binding data; M37 defeats the
 # shared source proof so a second independent call cannot hide the mutation.
+# The settlement evidence remediation makes the binding shape strict. M16
+# therefore translates prediction keys through BINDING_CHECKS; blindly merging
+# source_evidence/record_sha256 would only break the positive control without
+# testing whether omitted settlement identities can be invented.
 _V5_PORTS = {'M09': ('research_feed.py',
          '        except Exception:                                     # noqa: BLE001\n'
          '            self.rejected += 1\n'
@@ -667,7 +671,8 @@ _V5_PORTS = {'M09': ('research_feed.py',
          None),
  'M16': ('alpha_resolution_ingest.py',
          '        missing = _missing_binding(row["supplied_binding"], committed)',
-         '        row["supplied_binding"] = {**committed, **row["supplied_binding"]}\n'
+         '        invented = {key: committed.get(source_key) for key, source_key in BINDING_CHECKS.items()}\n'
+         '        row["supplied_binding"] = {**invented, **row["supplied_binding"]}\n'
          '        missing = _missing_binding(row["supplied_binding"], committed)',
          None),
  'M18': ('alpha_consumer.py',

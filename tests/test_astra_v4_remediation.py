@@ -1419,6 +1419,7 @@ class SettlementCase(AlphaCase):
         return binding
 
     def settlement(self, binding, **over):
+        from _settlement import seal_settlement
         payload = {
             "prediction_id": "pred-1",
             "outcome": 1,
@@ -1431,6 +1432,7 @@ class SettlementCase(AlphaCase):
             "environment": binding["environment"],
             "contract_schema": binding["contract_schema"],
         }
+        payload = seal_settlement(payload)
         payload.update(over)
         return {k: v for k, v in payload.items() if v is not DROP}
 
@@ -1509,7 +1511,7 @@ class RA11_TheRequiredSettlementBindingWasIncomplete(SettlementCase):
         self.assertTrue(row["source_trusted"])
         self.assertEqual(row["resolved_at"], self._resolution_time)
         self.assertEqual(row["settlement_evidence_id"],
-                         "kalshi-settlement-2026-09-12-0001")
+                         self.settlement(binding)["settlement_evidence_id"])
 
     def test_the_resolution_timestamp_is_never_the_ingestion_time(self):
         ledger, binding = self.fresh()

@@ -24,6 +24,7 @@ WHAT IS DELIBERATELY NOT COMPUTED
     figure instead.
 """
 
+import copy
 import json
 import hashlib
 import logging
@@ -35,6 +36,8 @@ from config import CFG, _p
 from durable_append import (append_line, exclusive_lock,
                             serialized_append, tail_is_torn, sync_path,
                             file_generation)
+from alpha_settlement_evidence import RETAINED_FIELDS
+from alpha_evidence_json import strict_json_loads
 
 log = logging.getLogger("ALPHA")
 
@@ -156,9 +159,12 @@ class _AppendOnlyLog:
         return exclusive_lock(self.path, timeout=timeout)
 
     def rows(self, *, with_generation=False):
-        """Every parseable row. A torn LAST line is a crash mid-append and
-        is skipped; a bad line anywhere else is reported and skipped, never
-        silently treated as the end of the file."""
+        """Read unambiguous finite JSON rows, preserving malformed history.
+
+        Duplicate members (at any depth) and non-finite numbers are invalid
+        before semantic qualification. A malformed row is reported and
+        skipped under the existing audit policy; its bytes are never edited.
+        """
         opened = False
         try:
             with open(self.path, "r", encoding="utf-8") as fh:
@@ -181,11 +187,11 @@ class _AppendOnlyLog:
             if not line.strip():
                 continue
             try:
-                row = json.loads(line)
+                row = strict_json_loads(line)
             except ValueError:
                 if i == len(lines) - 1:
-                    log.warning("[ALPHA_LEDGER] torn last row ignored "
-                                "(crash during append)")
+                    log.warning("[ALPHA_LEDGER] invalid last row ignored "
+                                "(torn or malformed; bytes preserved)")
                     break
                 log.error(f"[ALPHA_LEDGER] unparsable row at line {i + 1} "
                           f"-- skipped, NOT treated as end of file")
@@ -547,8 +553,21 @@ class AlphaLedger:
         predict" and "what happened" can never be conflated into one
         editable record.
         """
-        if outcome not in (0, 1, True, False):
+        if type(outcome) is not int or outcome not in (0, 1):
             raise LedgerError(f"outcome {outcome!r} must be 0 or 1")
+        if binding is not None and type(binding) is not dict:
+            raise LedgerError("settlement binding metadata must be an object")
+        proof = copy.deepcopy(binding or {})
+        allowed_proof = {
+            "settlement_binding", "settlement_evidence_id", "binding_verified",
+            "source_trusted", "source_evidence_verified", "trusted_sources",
+            "source_record_sha256_recomputed", "quarantined", *RETAINED_FIELDS,
+        }
+        if set(proof) - allowed_proof:
+            raise LedgerError("unsupported or reserved settlement metadata fields")
+        for field in ("binding_verified", "source_trusted", "source_evidence_verified", "quarantined"):
+            if field in proof and type(proof[field]) is not bool:
+                raise LedgerError(field + " must be a boolean")
         # AA-14: check and append under one lock, so two ingesters cannot both
         # observe "unresolved" and both append a resolution.
         with self.log.lock():
@@ -558,13 +577,22 @@ class AlphaLedger:
             if self.find_resolution(prediction_id) is not None:
                 raise LedgerError(f"prediction {prediction_id} is already "
                                   f"resolved; outcomes are written once")
-            return self.log.append({
+            row = {
                 "schema": LEDGER_SCHEMA, "kind": ROW_RESOLUTION,
                 "at": _now_iso(), "prediction_id": prediction_id,
-                "actual_outcome": int(bool(outcome)),
+                "actual_outcome": outcome,
                 "resolved_at": resolved_at or _now_iso(),
                 "resolution_source": source,
-                **{k: v for k, v in (binding or {}).items()}})
+                **proof,
+            }
+            # A direct caller cannot persist a qualification claim without
+            # the same complete gate used by ingestion and historical replay.
+            # Validate while holding the append lock against this prediction.
+            if row.get("binding_verified") is True:
+                qualified, reason = settlement_qualification(prediction, row)
+                if not qualified:
+                    raise LedgerError("settlement qualification failed: " + reason)
+            return self.log.append(row)
 
     # ── section 7: catalyst invalidation ────────────────────────────────
     def invalidate(self, prediction_id: str, reason: str,
@@ -714,6 +742,9 @@ class AlphaLedger:
             row["settlement_binding"] = resolution.get("settlement_binding")
             row["settlement_evidence_id"] = resolution.get(
                 "settlement_evidence_id")
+            for field in RETAINED_FIELDS:
+                if field in resolution:
+                    row[field] = copy.deepcopy(resolution[field])
             row["binding_verified"] = resolution.get("binding_verified")
             row["source_trusted"] = resolution.get("source_trusted")
             row["source_evidence_verified"] = resolution.get("source_evidence_verified")
@@ -725,6 +756,8 @@ class AlphaLedger:
                                                                    resolution)
             row["settlement_qualified"] = qualified
             row["settlement_disqualification"] = disqualification
+            row["recorded_binding_verified"] = resolution.get("binding_verified")
+            row["binding_verified"] = qualified
             invalidation = invalidations.get(prediction.get("prediction_id"))
             row["invalidated"] = bool(invalidation)
             row["invalidation_reason"] = (invalidation or {}).get("reason")
