@@ -44,7 +44,7 @@ def _engine(fills_per_decision=0):
     eng.scanner = type("Sc", (), {"shadow_population": lambda self: []})()
     eng.btc_daily_shadow = type("B", (), {"run": lambda self, pop, cid: {}})()
     eng.capital = eng.configured_capital = eng.last_balance = 9.84
-    eng._execute_decision = lambda dec, report: fills_per_decision
+    eng._execute_decision = lambda dec, report, **kw: fills_per_decision
     return eng
 
 
@@ -81,7 +81,7 @@ class ACompletedCycleKeepsItsNumber(shadow_iso._IsolatedState,
     def test_cycle_123_is_persisted_as_123_everywhere(self):
         eng = _engine()
         with self.assertLogs("BOT", level="INFO") as logs:
-            ExecutionEngine._finish_cycle(eng, 123, _res(), "sequential")
+            ExecutionEngine._finish_cycle(eng, 123, _res(), "sequential", None, eng._capture_access_mode())
         for where, value in self._records(eng).items():
             with self.subTest(record=where):
                 self.assertEqual(value, 123, f"{where} lost the cycle number")
@@ -91,14 +91,14 @@ class ACompletedCycleKeepsItsNumber(shadow_iso._IsolatedState,
     def test_zero_fills_does_not_turn_the_cycle_into_zero(self):
         """The historical failure: fills=0 became the cycle number."""
         eng = _engine(fills_per_decision=0)
-        ExecutionEngine._finish_cycle(eng, 264, _res(accepted=1), "sequential")
+        ExecutionEngine._finish_cycle(eng, 264, _res(accepted=1), "sequential", None, eng._capture_access_mode())
         self.assertEqual(eng.cycles_jsonl.rows[-1]["cycle"], 264)
         self.assertEqual(JsonStore.load(_p("cycle_report.json"), {})["fills"],
                          0, "the fill count itself must still be recorded")
 
     def test_non_zero_fills_do_not_replace_the_cycle_number(self):
         eng = _engine(fills_per_decision=1)
-        ExecutionEngine._finish_cycle(eng, 500, _res(accepted=2), "parallel")
+        ExecutionEngine._finish_cycle(eng, 500, _res(accepted=2), "parallel", None, eng._capture_access_mode())
         row = eng.cycles_jsonl.rows[-1]
         self.assertEqual(row["cycle"], 500)
         self.assertEqual(row["execution_path"], "parallel")
@@ -112,7 +112,7 @@ class ACompletedCycleKeepsItsNumber(shadow_iso._IsolatedState,
         res = _res()
         res["report"].update(model_evaluated=5, positive_edge=3,
                              positive_net_ev=3, risk_passed=0)
-        ExecutionEngine._finish_cycle(eng, 7, res, "sequential")
+        ExecutionEngine._finish_cycle(eng, 7, res, "sequential", None, eng._capture_access_mode())
         conv = JsonStore.load(_p("cycle_report.json"), {})["funnel_conversion"]
         self.assertEqual(conv["scanned_raw"]["n"], 201)
         self.assertEqual(conv["model_evaluated"]["n"], 5)
@@ -122,7 +122,7 @@ class ACompletedCycleKeepsItsNumber(shadow_iso._IsolatedState,
     def test_consecutive_cycles_are_uniquely_numbered(self):
         eng = _engine()
         for n in (10, 11, 12):
-            ExecutionEngine._finish_cycle(eng, n, _res(), "sequential")
+            ExecutionEngine._finish_cycle(eng, n, _res(), "sequential", None, eng._capture_access_mode())
         self.assertEqual([r["cycle"] for r in eng.cycles_jsonl.rows],
                          [10, 11, 12])
 
