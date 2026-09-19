@@ -1,12 +1,23 @@
 {
   "schema_version": 2,
-  "generated_at": "2026-09-11T19:10:00Z",
+  "generated_at": "2026-09-19T10:10:00Z",
   "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
   "tree_sha": "cf2b4ea2dd730808c0874fdb8b31045944b55dc8",
   "deployment_id": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da",
   "deployment_created_at": "2026-09-09T18:33:55Z",
   "deployment_ready_at": "2026-09-09T18:36:03Z",
-  "deployment_status": "SUCCESS",
+  "deployment_status": "REMOVED",
+  "deployed_release_now_running": {
+    "deployment_id": "7dfeab8e-24b5-4b76-b0e2-354f7c172924",
+    "git_sha": "033fb43e7858594e7f3d62844830f935bd0275c5",
+    "branch": "main",
+    "deployment_created_at": "2026-09-18T19:01:15Z",
+    "deployment_ready_at": "2026-09-18T19:05:04Z",
+    "deployment_status": "SUCCESS",
+    "commit_subject": "Reconcile READ_ONLY shadow scanning with current production baseline",
+    "evidence_status": "NOT ATTESTED BY THIS FILE. The git_sha, tree_sha, docker_build_pass, test_count and independent_review_pass fields above describe 5c4e789, which is no longer the deployed release. This watch performed no test run, no build and no independent review of 033fb43; the commit message's own claim of 999 local tests passing is the author's, unverified here. What this watch does attest for 033fb43 is runtime behaviour only: READ_ONLY banner and RECONCILE_STARTUP MATCH at boot, and zero broker writes across every cycle observed since.",
+    "observed_by_this_watch": "PROD_ACCESS_MODE=READ_ONLY confirmed at 2026-09-18T19:05:02Z; RECONCILE_STARTUP MATCH (tickers broker=0 local=0) at 19:05:10Z; 115 consecutive cycles to 2026-09-19T09:57Z with scan_executed=True, blocking_global_guard=None, orders_submitted 0 and fills 0."
+  },
   "docker_build_pass": true,
   "test_count": 954,
   "test_failures": 0,
@@ -24,8 +35,9 @@
   "cancels": 0,
   "ready_for_investor_demo": true,
   "ready_for_capital_live": false,
-  "stale": false,
-  "what_this_release_is": "ATLAS is connected to the REAL Kalshi production account in READ_ONLY. Authentication, balance and reconciliation are verified against the live account. Zero broker writes. The full live SHADOW IS RUNNING on the current deployment: on 2026-09-11T09:55:03Z the engine produced a production WOULD_SUBMIT (KXBTC15M-26SEP110600-00 NO x1 @ 3c) on cycle 2186, which recorded risk_passed=1 and orders_submitted=0 with rejection reason prod_read_only -- the decision completed and PROD_ACCESS_MODE=READ_ONLY stopped it before any call to the write path. 56 consecutive cycles around that event submitted nothing and filled nothing. This is the second confirmed shadow decision; the first was 2026-09-08T14:54:44Z on the previous deployment. The shadow remains deposit-dependent, not code-dependent: neither claude/railway-atlas-readonly-shadow-scan nor PR #64 has been merged or deployed, and the F2 accounting design (a deposit must never clear a loss-derived guard) is still awaiting cross-audit. CAPITAL remains NOT authorized.",
+  "stale": true,
+  "stale_reason": "The release this file attests (5c4e789, deployment 6f039c6e) is no longer deployed. Railway has been running 033fb43 as deployment 7dfeab8e since 2026-09-18T19:05Z. The build, test and independent-review fields here have NOT been re-established for 033fb43. Only the live_read_only_transition.live_shadow block and deployed_release_now_running describe the running release; everything else describes the superseded one.",
+  "what_this_release_is": "ATLAS is connected to the REAL Kalshi production account in READ_ONLY. Authentication, balance and reconciliation are verified against the live account. Zero broker writes. The full live SHADOW IS RUNNING on the deployment now in production: on 2026-09-19T09:38:20Z the engine produced a production WOULD_SUBMIT (KXBTC15M-26SEP190545-45 YES x1 @ 6c) on cycle 810, and a second at 09:54:37Z (KXBTC15M-26SEP190600-00 NO x1 @ 8c) on cycle 825. Both recorded risk_passed=1 and orders_submitted=0 with rejection reason prod_read_only -- the decision completed and the READ_ONLY cycle authorization stopped it before any call to the write path. 21 consecutive cycles around those events submitted nothing and filled nothing, and reconciliation read MATCH (broker=0 local=0) twice after them. These are the third and fourth confirmed shadow decisions; the first two were 2026-09-08T14:54:44Z and 2026-09-11T09:55:03Z on earlier deployments. The shadow remains deposit-dependent, not code-dependent: it was already running on two deployments that predate any shadow-scan merge, so the 2026-09-18 deployment of 033fb43 is not what started it. The F2 accounting design (a deposit must never clear a loss-derived guard) is still awaiting cross-audit. CAPITAL remains NOT authorized.",
   "binds_to": {
     "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
     "merged_pull_requests": [
@@ -118,44 +130,64 @@
       "fills": 0,
       "cancels": 0,
       "mutating_http_to_kalshi": 0,
-      "RECONCILE_LATEST": "MATCH (tickers broker=0 local=0) @ 2026-09-11T09:58:08Z, 3 minutes after the 2026-09-11 WOULD_SUBMIT; MATCH x4 in the 09:05-10:11Z window"
+      "RECONCILE_LATEST": "MATCH (tickers broker=0 local=0) @ 2026-09-19T10:01:59Z, 7 minutes after the second 2026-09-19 WOULD_SUBMIT; MATCH x4 in the 09:05-10:05Z window"
     },
     "live_shadow": {
       "status": "RUNNING",
-      "confirmed_on_current_deployment_at": "2026-09-11T09:55:03Z",
-      "deployment_id": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da",
-      "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
-      "cycle_id": "852f88df42",
-      "cycle": 2186,
-      "decision": "KXBTC15M-26SEP110600-00 NO x1 @ 3c | model 13.742% vs market 3.0% | edge_net +0.07742 | ev_net +0.08742 | est_fee_total 0.01 | strategy btc15m_above_strike",
-      "log_line": "[WOULD_SUBMIT] KXBTC15M-26SEP110600-00 NO x1 @ 3c -- PROD_ACCESS_MODE=READ_ONLY: decision complete, AUCUN appel au chemin d'ecriture.",
+      "confirmed_on_current_deployment_at": "2026-09-19T09:38:20Z",
+      "deployment_id": "7dfeab8e-24b5-4b76-b0e2-354f7c172924",
+      "git_sha": "033fb43e7858594e7f3d62844830f935bd0275c5",
+      "cycle_id": "25de4cbe84",
+      "cycle": 810,
+      "decision": "KXBTC15M-26SEP190545-45 YES x1 @ 6c | model 12.327% vs market 6.0% | edge_net +0.033273 | ev_net +0.043273 | est_fee_total 0.01 | strategy btc15m_above_strike",
+      "log_line": "[WOULD_SUBMIT] KXBTC15M-26SEP190545-45 YES x1 @ 6c -- cycle authorization READ_ONLY: decision complete, AUCUN appel au chemin d'ecriture.",
       "log_attributes": {
         "would_submit": true,
         "rejection_reason": "prod_read_only",
         "environment": "prod",
+        "cycle_read_only": true,
         "market_type": "btc_15m_above_strike"
       },
       "cycle_summary": "risk_passed 1, orders_submitted 0, fills 0, rejections_by_reason includes prod_read_only: 1",
+      "second_would_submit_same_hour": {
+        "at": "2026-09-19T09:54:37Z",
+        "cycle": 825,
+        "cycle_id": "4e8b57cd88",
+        "decision": "KXBTC15M-26SEP190600-00 NO x1 @ 8c | model 26.769% vs market 8.0% | edge_net +0.157691 | ev_net +0.167691 | est_fee_total 0.01",
+        "cycle_summary": "risk_passed 1, orders_submitted 0, fills 0, prod_read_only: 1"
+      },
       "zero_write_verification": {
-        "window": "2026-09-11T09:11:40Z to 10:11:05Z, cycles 2146-2201 inclusive (56 consecutive cycles, every one scan_executed with no blocking_global_guard)",
+        "window": "2026-09-19T09:36:12Z to 09:57:45Z, cycles 808-828 inclusive (21 consecutive cycles, every one scan_executed=True with blocking_global_guard=None)",
         "orders_submitted": 0,
         "fills": 0,
         "cancels": 0,
-        "would_submit_events_in_window": 1,
+        "would_submit_events_in_window": 2,
         "order_submit_log_lines": 0,
         "broker_write_log_lines": 0,
         "brokerwriteforbidden_log_lines": 0,
-        "reconciliation": "MATCH x4 in the window (09:12:42Z, 09:27:52Z, 09:43:04Z, 09:58:08Z)",
+        "reconciliation": "MATCH x4 in the 09:05-10:05Z hour (09:16:50Z, 09:31:51Z, 09:46:53Z, 10:01:59Z); the 09:46:53Z and 10:01:59Z checks both post-date the two WOULD_SUBMIT events and both read broker=0 local=0",
         "persistence_halt": "none",
-        "method": "Railway deploy logs for deployment 6f039c6e read twice: once filtered for ORDER_SUBMIT/BROKER_WRITE/BrokerWriteForbidden/FILL/REGLE and once for the cycle summaries themselves. Every CYCLE-SUMMARY in the window carries orders_submitted 0 and fills 0."
+        "method": "Railway deploy logs for deployment 7dfeab8e read twice: once filtered for ORDER_SUBMIT/BROKER_WRITE/BrokerWriteForbidden/WOULD_SUBMIT/PERSISTENCE/RECONCILE and once for the cycle summaries themselves. Every CYCLE-SUMMARY in the window carries orders_submitted 0 and fills 0.",
+        "wider_context": "This watch has observed 115 consecutive cycles on deployment 7dfeab8e since 2026-09-18T19:05Z with scan_executed=True and zero broker writes, and RECONCILE_VERIFY MATCH (broker=0 local=0) four times per hour for fourteen consecutive hours."
       },
       "why_it_started": {
-        "mechanism": "unchanged from the 2026-09-08 confirmation: balance, not code",
-        "detail": "No deployment or merge changed the shadow gating between the two confirmations. The active deployment moved from 471b446f (d0995a1) to 6f039c6e (5c4e789) on 2026-09-09 for an observability-only fix. The equity_drawdown guard has not cut a scan in any cycle observed by this watch since 2026-09-10T13:30Z; at a 3c ask, sizing produced 1 contract and the READ_ONLY decision reached WOULD_SUBMIT.",
+        "mechanism": "unchanged from the 2026-09-08 and 2026-09-11 confirmations: balance, not code",
+        "detail": "The shadow was already confirmed running on two earlier deployments (471b446f and 6f039c6e) before any shadow-scan code was merged. The deposit of 2026-09-07T18:02:20Z that lifted the balance from 0.04$ to 9.84$ is what took the equity_drawdown guard out of the blocking path. Deployment 7dfeab8e does carry the shadow-scan reconcile commit 033fb43, but that commit is not what started the shadow and this file does not credit it with doing so.",
         "dependency": "A withdrawal that pushes the cash-denominated drawdown back over 20% would re-trip the guard and silence the shadow with no trade. This is audit finding F2; the design that makes drawdown deposit-independent is docs/design/risk-equity-accounting.md (rev 2), not implemented.",
-        "branches_not_deployed": "claude/railway-atlas-readonly-shadow-scan (054a2e1) and PR #64 (e0d7448) both remain unreviewed/unmerged and undeployed. Neither is responsible for the shadow running."
+        "branch_now_merged": "claude/railway-atlas-readonly-shadow-scan is no longer the pending fix: its change was carried onto 5c4e789 as 033fb43 and merged to main, and Railway deployed it as 7dfeab8e at 2026-09-18T19:05Z. This watch did not merge or deploy it and holds no test or independent-review evidence for 033fb43; the test_count, docker_build_pass and independent_review_pass fields in this file attest to 5c4e789 only."
       },
       "previous_confirmations": [
+        {
+          "status": "RUNNING",
+          "confirmed_on_current_deployment_at": "2026-09-11T09:55:03Z",
+          "deployment_id": "6f039c6e-c7b1-40cd-9ed8-d7a1e97f59da",
+          "git_sha": "5c4e7897a0b99065f3a23bc4ed834b44dba9580c",
+          "cycle_id": "852f88df42",
+          "cycle": 2186,
+          "decision": "KXBTC15M-26SEP110600-00 NO x1 @ 3c | model 13.742% vs market 3.0% | edge_net +0.07742 | ev_net +0.08742 | est_fee_total 0.01 | strategy btc15m_above_strike",
+          "cycle_summary": "risk_passed 1, orders_submitted 0, fills 0, rejections_by_reason includes prod_read_only: 1",
+          "zero_write_verification": "2026-09-11T09:11:40Z to 10:11:05Z, cycles 2146-2201 inclusive (56 consecutive cycles); orders_submitted 0, fills 0, cancels 0, reconciliation MATCH x4"
+        },
         {
           "status": "RUNNING",
           "first_would_submit_at": "2026-09-08T14:54:44Z",
