@@ -17,6 +17,7 @@ os.environ["DATA_DIR"] = _TMP0
 os.environ.setdefault("KALSHI_DEMO_KEY_ID", "test")
 os.environ.setdefault("KALSHI_DEMO_PRIVATE_KEY", "test")
 import _bootstrap  # noqa: F401  (ajoute src/* au sys.path)
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot                        # noqa: E402
 from strategy_router import build_default_registry    # noqa: E402
@@ -86,7 +87,7 @@ class FakeClient:
                             "position": n if o["side"] == "yes" else -n,
                             "market_exposure": n * o["price"],
                             "realized_pnl": 0, "fees_paid": 2})
-        return out
+        return complete_positions(out)
 
     def _req(self, method, path, params=None, **kw):
         return {"markets": [], "cursor": None}

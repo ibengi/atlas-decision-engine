@@ -25,6 +25,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 os.environ.setdefault("KALSHI_DEMO_KEY_ID", "test")
 os.environ.setdefault("KALSHI_DEMO_PRIVATE_KEY", "test")
@@ -289,11 +290,8 @@ def _spot_sources(counters):
 def _klines_fn(counters):
     def f():
         counters["klines"] += 1
-        now = time.time()
-        # 30 bougies 1m : fraiches, monotones, closes > 0 -> contexte VALIDE
-        return [{"ts": now - (30 - i) * 60, "open": 65000.0, "high": 65100.0,
-                 "low": 64900.0, "close": 65000.0 + i, "volume": 1.0}
-                for i in range(30)]
+        from tests.candle_fixtures import candles
+        return candles()
     return f
 
 
@@ -441,7 +439,7 @@ class _EngClient:
                 out.append({"ticker": self.market["ticker"],
                             "position": n, "market_exposure": n * o["price"],
                             "realized_pnl": 0, "fees_paid": 2})
-        return out
+        return complete_positions(out)
 
     def _req(self, method, path, params=None, **kw):
         return {"markets": [], "cursor": None}

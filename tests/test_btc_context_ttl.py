@@ -34,10 +34,8 @@ def _spot_sources(counters):
 def _klines_fn(counters):
     def f():
         counters["klines"] += 1
-        now = time.time()
-        return [{"ts": now - (30 - i) * 60, "open": 65000.0, "high": 65100.0,
-                 "low": 64900.0, "close": 65000.0 + i, "volume": 1.0}
-                for i in range(30)]
+        from tests.candle_fixtures import candles
+        return candles()
     return f
 
 

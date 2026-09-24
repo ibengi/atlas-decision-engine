@@ -20,6 +20,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 
@@ -38,9 +39,9 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
         invented 50c entry price. Since the 2026-08-31 hardening, a
         broker-only position is a MISMATCH halt: no fabricated financial
         history, the operator decides."""
-        self.client.get_positions.return_value = [
+        self.client.get_positions.return_value = complete_positions([
             {"ticker": "KXBTCD-26AUG2808-T79599.99", "position_fp": "-5.00"}
-        ]
+        ])
 
         report = self.pm.reconcile_with_broker()
 
@@ -52,9 +53,9 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
 
     def test_repeated_reconciliation_stays_halted_without_adoption(self):
         """CRITICAL: repeated startup passes must not accumulate state."""
-        self.client.get_positions.return_value = [
+        self.client.get_positions.return_value = complete_positions([
             {"ticker": "KXTEST", "position": 4}
-        ]
+        ])
 
         self.pm.reconcile_with_broker()
         self.pm.reconcile_with_broker()
@@ -74,7 +75,7 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
             "opened_at": "2026-08-28T00:00:00+00:00", "order_ids": [],
             "fill_ids": [], "state": "open", "strategy": "reconciled",
         }
-        self.client.get_positions.return_value = []
+        self.client.get_positions.return_value = complete_positions([])
 
         report = self.pm.reconcile_with_broker()
 
@@ -85,9 +86,9 @@ class BrokerRebuildHonestyTest(unittest.TestCase):
         self.assertIsNotNone(self.pm.reconcile_halt)
 
     def test_a_zero_quantity_broker_row_never_opens_a_position(self):
-        self.client.get_positions.return_value = [
+        self.client.get_positions.return_value = complete_positions([
             {"ticker": "KXFLAT", "position": 0}
-        ]
+        ])
 
         report = self.pm.reconcile_with_broker()
 

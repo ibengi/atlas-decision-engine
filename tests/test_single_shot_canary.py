@@ -32,6 +32,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from config import CFG  # noqa: E402
@@ -104,7 +105,7 @@ class _CanaryBase(unittest.TestCase):
         c.get_fills.return_value = [{"fill_id": "f1", "count": 1,
                                      "price": PRICE, "yes_price": PRICE,
                                      "is_taker": True}]
-        c.get_positions.return_value = [{"ticker": TICKER, "position": 1}]
+        c.get_positions.return_value = complete_positions([{"ticker": TICKER, "position": 1}])
         return c
 
     def _om(self, client):

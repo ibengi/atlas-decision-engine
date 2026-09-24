@@ -24,6 +24,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from persistence import PersistenceSentinel, verify_state_root  # noqa: E402
@@ -140,8 +141,8 @@ class State5RestoreSimulationTest(unittest.TestCase):
         self.assertTrue(PersistenceSentinel.healthy())
         cli = MagicMock()
         cli.env = "demo"
-        cli.get_positions.return_value = [dict(e)
-                                          for e in REAL_BROKER_PAYLOAD]
+        cli.get_positions.return_value = complete_positions([dict(e)
+                                          for e in REAL_BROKER_PAYLOAD])
         tlog = bot.TradeLogger()
         pm = bot.PositionManager(cli, tlog)
         self.assertEqual(pm.open_count(), 3)
