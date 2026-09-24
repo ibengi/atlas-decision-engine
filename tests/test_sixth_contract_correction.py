@@ -39,6 +39,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 import performance  # noqa: E402
@@ -204,7 +205,7 @@ class SixthContractRegressionTest(_Base):
     def test_no_open_position_and_no_broker_write(self):
         tlog = self._tlog(production_journal())
         client = MagicMock()
-        client.get_positions.return_value = []
+        client.get_positions.return_value = complete_positions([])
         pm = bot.PositionManager(client, tlog)
         self.assertEqual(pm.open_count(), 0)
 
@@ -224,7 +225,7 @@ class SixthContractRegressionTest(_Base):
         must flow through them like any settled win."""
         tlog = self._tlog(production_journal())
         client = MagicMock()
-        client.get_positions.return_value = []
+        client.get_positions.return_value = complete_positions([])
         pm = bot.PositionManager(client, tlog)
         rm = bot.RiskManager(tlog, pm, capital=100.0)
         base_total = sum(t["net_pnl"] for t in tlog.settled_trades())
@@ -252,7 +253,7 @@ class AccountingSemanticsTest(_Base):
 
     def _metrics(self, tlog):
         client = MagicMock()
-        client.get_positions.return_value = []
+        client.get_positions.return_value = complete_positions([])
         pm = bot.PositionManager(client, tlog)
         rm = bot.RiskManager(tlog, pm, capital=100.0)
         st = bot.StatsEngine(tlog).compute()
@@ -367,7 +368,7 @@ class AccountingSemanticsTest(_Base):
                         net_pnl=-1.01)          # target trade is a LOSS too
         tlog = self._tlog(rows)
         client = MagicMock()
-        client.get_positions.return_value = []
+        client.get_positions.return_value = complete_positions([])
         rm = bot.RiskManager(tlog, bot.PositionManager(client, tlog), 100.0)
         before = rm.consecutive_losses()
         self.assertEqual(before, 3, "three losses in a row")
@@ -384,7 +385,7 @@ class AccountingSemanticsTest(_Base):
         correction applied days later must not reset that anchor."""
         tlog = self._tlog(production_journal())
         client = MagicMock()
-        client.get_positions.return_value = []
+        client.get_positions.return_value = complete_positions([])
         rm = bot.RiskManager(tlog, bot.PositionManager(client, tlog), 100.0)
         before = rm._last_settlement_anchor()
 

@@ -18,6 +18,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from config import CFG, contract_cap_config  # noqa: E402
@@ -63,7 +64,7 @@ class _GateBase(unittest.TestCase):
         c = MagicMock()
         c.env = "demo"
         c.last_http_status = 201
-        c.get_positions.return_value = []
+        c.get_positions.return_value = complete_positions([])
         c.create_order.return_value = {"order_id": "SHOULD-NEVER-HAPPEN",
                                        "status": "executed", "fill_count": 1,
                                        "remaining_count": 0}
@@ -107,8 +108,8 @@ class SubmissionPathGateMatrix(_GateBase):
 
     def test_2_reconciliation_unknown_blocks(self):
         """A broker quantity that cannot be parsed is UNKNOWN, never 0."""
-        self.client.get_positions.return_value = [
-            {"ticker": TICKER, "position_fp": "not-a-number"}]
+        self.client.get_positions.return_value = complete_positions([
+            {"ticker": TICKER, "position_fp": "not-a-number"}])
         rep = self.pm.reconcile_with_broker()
 
         self.assertEqual(rep["status"], "UNKNOWN")
@@ -124,7 +125,7 @@ class SubmissionPathGateMatrix(_GateBase):
             "count": 1, "count_initial": 1, "avg_price": 40, "fees": 0.0,
             "opened_at": "2026-08-28T00:00:00+00:00", "state": "open",
             "order_ids": [], "fill_ids": [], "strategy": "test"}
-        self.client.get_positions.return_value = []   # broker says flat
+        self.client.get_positions.return_value = complete_positions([])   # broker says flat
         rep = self.pm.reconcile_with_broker()
 
         self.assertEqual(rep["status"], "MISMATCH")
@@ -157,9 +158,9 @@ class SubmissionPathGateMatrix(_GateBase):
                 "count": 1, "count_initial": 1, "avg_price": 40, "fees": 0.0,
                 "opened_at": "2026-08-28T00:00:00+00:00", "state": "open",
                 "order_ids": [], "fill_ids": [], "strategy": "test"}
-        self.client.get_positions.return_value = [
+        self.client.get_positions.return_value = complete_positions([
             {"ticker": f"KXFULL-{i}", "position": 1}
-            for i in range(CFG.MAX_OPEN_POSITIONS)]
+            for i in range(CFG.MAX_OPEN_POSITIONS)])
         self.pm.reconcile_with_broker()      # MATCH: not a reconciliation halt
 
         ok, guard = self.engine_gate()

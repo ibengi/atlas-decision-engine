@@ -12,6 +12,7 @@ import tempfile
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot
 
@@ -49,7 +50,7 @@ class ProdLikeClient:
         return [{"count": 1, "price": 74, "fees": "0.0135"}]
 
     def get_positions(self):
-        return [{"ticker": "KXBTCD-26JUL2617-T63749.99", "position": 1}]
+        return complete_positions([{"ticker": "KXBTCD-26JUL2617-T63749.99", "position": 1}])
 
     def cancel_order(self, order_id):
         return {}

@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from persistence import PersistenceSentinel  # noqa: E402
@@ -49,7 +50,7 @@ class OrphanLifecycleTest(unittest.TestCase):
         c = MagicMock()
         c.env = "demo"
         c.get_positions.return_value = (
-            [{"ticker": TICKER, "position": position}] if position else [])
+            complete_positions([{"ticker": TICKER, "position": position}] if position else []))
         c.get_market.return_value = {"ticker": TICKER, "status": status,
                                      "result": result}
         return c

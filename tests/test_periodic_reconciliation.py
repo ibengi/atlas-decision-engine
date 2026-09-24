@@ -16,6 +16,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from persistence import PersistenceSentinel  # noqa: E402
@@ -52,13 +53,13 @@ class TestClassification(VerifyTestCase):
 
     def test_match_when_both_sides_agree(self):
         self.pm.positions["t1"] = _pos("t1", "KXA", "yes", 2)
-        self.cli.get_positions.return_value = [{"ticker": "KXA", "position": 2}]
+        self.cli.get_positions.return_value = complete_positions([{"ticker": "KXA", "position": 2}])
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "MATCH")
         self.assertIsNone(self.pm.reconcile_halt)
 
     def test_broker_position_missing_locally_is_mismatch(self):
-        self.cli.get_positions.return_value = [{"ticker": "KXB", "position": 3}]
+        self.cli.get_positions.return_value = complete_positions([{"ticker": "KXB", "position": 3}])
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "MISMATCH")
         self.assertEqual(rep["mismatches"][0]["kind"], "broker_only")
@@ -68,7 +69,7 @@ class TestClassification(VerifyTestCase):
 
     def test_local_position_missing_at_broker_is_mismatch(self):
         self.pm.positions["t1"] = _pos("t1", "KXC")
-        self.cli.get_positions.return_value = []
+        self.cli.get_positions.return_value = complete_positions([])
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "MISMATCH")
         self.assertEqual(rep["mismatches"][0]["kind"], "local_only")
@@ -78,7 +79,7 @@ class TestClassification(VerifyTestCase):
 
     def test_quantity_mismatch(self):
         self.pm.positions["t1"] = _pos("t1", "KXD", "yes", 2)
-        self.cli.get_positions.return_value = [{"ticker": "KXD", "position": 5}]
+        self.cli.get_positions.return_value = complete_positions([{"ticker": "KXD", "position": 5}])
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "MISMATCH")
         self.assertEqual(rep["mismatches"][0]["kind"], "quantity_mismatch")
@@ -87,7 +88,7 @@ class TestClassification(VerifyTestCase):
     def test_side_mismatch_is_a_mismatch(self):
         """Same ticker, opposite sign: never treated as equal."""
         self.pm.positions["t1"] = _pos("t1", "KXE", "no", 2)   # local net -2
-        self.cli.get_positions.return_value = [{"ticker": "KXE", "position": 2}]
+        self.cli.get_positions.return_value = complete_positions([{"ticker": "KXE", "position": 2}])
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "MISMATCH")
 
@@ -103,7 +104,7 @@ class TestClassification(VerifyTestCase):
         self.assertEqual(self.pm.positions, {})
 
     def test_api_none_halts_fail_closed(self):
-        self.cli.get_positions.return_value = None
+        self.cli.get_positions.return_value = complete_positions(None)
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "BROKER_UNAVAILABLE")
         self.assertIsNotNone(self.pm.reconcile_halt)
@@ -127,13 +128,13 @@ class TestClassification(VerifyTestCase):
         self.assertEqual(self.pm.reconcile_halt["status"], "MISMATCH")
 
     def test_unparsable_broker_rows_are_unknown_and_halt(self):
-        self.cli.get_positions.return_value = ["not-a-dict"]
+        self.cli.get_positions.return_value = complete_positions(["not-a-dict"])
         rep = self.pm.verify_against_broker()
         self.assertEqual(rep["status"], "UNKNOWN")
         self.assertEqual(self.pm.reconcile_halt["status"], "UNKNOWN")
 
     def test_recovery_clears_halt_on_consistent_state(self):
-        self.cli.get_positions.return_value = [{"ticker": "KXF", "position": 1}]
+        self.cli.get_positions.return_value = complete_positions([{"ticker": "KXF", "position": 1}])
         self.pm.verify_against_broker()
         self.assertIsNotNone(self.pm.reconcile_halt)     # broker_only
         self.pm.positions["t1"] = _pos("t1", "KXF", "yes", 1)
@@ -142,7 +143,7 @@ class TestClassification(VerifyTestCase):
         self.assertIsNone(self.pm.reconcile_halt)
 
     def test_verification_never_trades(self):
-        self.cli.get_positions.return_value = [{"ticker": "KXG", "position": 4}]
+        self.cli.get_positions.return_value = complete_positions([{"ticker": "KXG", "position": 4}])
         self.pm.verify_against_broker()
         self.cli.create_order.assert_not_called()
         self.cli.cancel_order.assert_not_called()
@@ -190,7 +191,7 @@ class TestHaltStateMachine(VerifyTestCase):
     def _set_broker(self, rows=None, exc=None):
         self.cli.get_positions.side_effect = exc
         if exc is None:
-            self.cli.get_positions.return_value = rows
+            self.cli.get_positions.return_value = complete_positions(rows)
 
     def test_match_then_submissions_eligible(self):
         self._set_broker(rows=[])

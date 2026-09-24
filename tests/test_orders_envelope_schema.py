@@ -31,6 +31,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from config import CFG  # noqa: E402
@@ -245,7 +246,7 @@ class ResolutionOutcomeTest(unittest.TestCase):
         client.env = "demo"
         client.last_http_status = 201
         client.create_order.side_effect = KalshiAPIError(0, "reseau: timeout")
-        client.get_positions.return_value = []
+        client.get_positions.return_value = complete_positions([])
         probe = KalshiClient.__new__(KalshiClient)
         probe._raw_logged = set()
 

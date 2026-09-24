@@ -4,12 +4,14 @@ Extrait de kalshi_alpha_bot.py (P3.6).
 """
 
 import logging
-import math
+import json
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from config import CFG, _p
-from kalshi_client import KalshiClient, pick, pick_int
+from kalshi_client import (KalshiClient, PositionSnapshot,
+                           PositionResponseIncomplete, position_row_error, pick, pick_int)
 from persistence import JsonStore
 from trade_logger import TradeLogger, now_iso
 
@@ -271,10 +273,12 @@ class PositionManager:
             if v is None:
                 continue
             try:
-                fv = float(v)
-            except (TypeError, ValueError):
+                if type(v) not in (str, int, float):
+                    raise ValueError("quantity must be numeric, not boolean")
+                fv = Decimal(str(v))
+            except (TypeError, ValueError, InvalidOperation):
                 return None, f"{f}={v!r} illisible"
-            if not math.isfinite(fv):
+            if not fv.is_finite():
                 return None, f"{f}={v!r} non fini (NaN/inf)"
             if fv != int(fv):
                 return None, (f"{f}={v!r} non entier -- contrats "
@@ -289,18 +293,40 @@ class PositionManager:
 
     def _broker_net_positions(self, broker):
         """(dict ticker->net signe, None) ou (None, raison UNKNOWN)."""
+        if type(broker) is not PositionSnapshot:
+            return None, "position response completeness not proven"
+        error = broker.completeness_error()
+        if error is not None:
+            return None, error
         net = {}
         for bp in broker:
-            if not isinstance(bp, dict):
-                return None, f"ligne broker inexploitable: {bp!r}"
+            error = position_row_error(bp)
+            if error:
+                return None, error
             tk = bp.get("ticker")
-            if not tk:
+            if type(tk) is not str or not tk.strip() or tk != tk.strip():
                 return None, f"ligne broker sans ticker: {bp!r}"
+            if tk in net:
+                return None, f"duplicate broker ticker: {tk}"
             qty, err = self.parse_broker_qty(bp)
             if err:
                 return None, f"{tk}: {err}"
+            if qty == 0 and any(Decimal(str(bp[field])) != 0
+                                for field in ("market_exposure", "market_exposure_dollars")
+                                if field in bp):
+                return None, f"{tk}: nonzero market exposure with zero position"
             net[tk] = net.get(tk, 0) + qty
-        return {tk: q for tk, q in net.items() if q != 0}, None
+        net = {tk: q for tk, q in net.items() if q != 0}
+        bindings = json.loads(broker.market_event_bindings_json)
+        for event in json.loads(broker.events_json):
+            error = position_row_error(event, event=True)
+            if error:
+                return None, error
+            if (any(Decimal(str(event[field])) != 0
+                    for field in ("event_exposure", "event_exposure_dollars") if field in event)
+                    and not any(bindings.get(ticker) == event["event_ticker"] for ticker in net)):
+                return None, "event exposure has no authoritative nonzero market-position binding"
+        return net, None
 
     def _local_net_positions(self):
         net = {}
@@ -363,8 +389,12 @@ class PositionManager:
                           f"bloquees fail-closed jusqu'a un MATCH.")
             return report
 
+        incomplete = None
         try:
             broker = self.client.get_positions()
+        except PositionResponseIncomplete as e:
+            incomplete = str(e)
+            broker = str(e)  # classified UNKNOWN below; never a complete response
         except Exception as e:                                # noqa: BLE001
             return _unavailable(str(e))
         if broker is None:
@@ -376,6 +406,8 @@ class PositionManager:
             broker_net, err = self._broker_net_positions(broker)
         except (TypeError, AttributeError) as e:
             broker_net, err = None, str(e)
+        if incomplete is not None:
+            err = incomplete
         if err is not None:
             report["status"] = "UNKNOWN"
             report["detail"] = f"reponse broker inexploitable: {err}"
@@ -459,6 +491,8 @@ class PositionManager:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 broker = self.client.get_positions()
+            except PositionResponseIncomplete as e:
+                return _halt("UNKNOWN", str(e))
             except Exception as e:                            # noqa: BLE001
                 return _halt("BROKER_UNAVAILABLE", str(e))
             if broker is not None:
@@ -496,6 +530,7 @@ class PositionManager:
                          f"broker/local: {report['mismatches']}")
 
         JsonStore.save(_p("reconciliation_report.json"), report)
+        self.reconcile_halt = None
         log_pos.info(f"[RECONCILE_STARTUP] MATCH (tickers "
                      f"broker={len(broker_net)} local={len(local_net)})")
         return report
@@ -527,4 +562,3 @@ class PositionManager:
                     ": la reconciliation de demarrage bloquera les "
                     "soumissions (broker_only) au lieu de reconstruire.",
                     extra={"event": "state_empty_at_startup"})
-

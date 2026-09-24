@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from position_manager import PositionManager  # noqa: E402
@@ -84,8 +85,8 @@ class _Base(unittest.TestCase):
         bot.CFG.DATA_DIR = self.tmp
         self.addCleanup(self._cleanup)
         self.client = MagicMock()
-        self.client.get_positions.return_value = [dict(e) for e in
-                                                  REAL_BROKER_PAYLOAD]
+        self.client.get_positions.return_value = complete_positions([dict(e) for e in
+                                                  REAL_BROKER_PAYLOAD])
         self.pm = PositionManager(self.client, MagicMock())
         self.pm.positions = {k: dict(v) for k, v in LOCAL_POSITIONS.items()}
 
@@ -115,7 +116,7 @@ class StartupReconcileRealPayloadTest(_Base):
 
     def test_false_flat_regression_broker_count_is_three_not_zero(self):
         net, err = self.pm._broker_net_positions(
-            [dict(e) for e in REAL_BROKER_PAYLOAD])
+            complete_positions([dict(e) for e in REAL_BROKER_PAYLOAD]))
         self.assertIsNone(err)
         self.assertEqual(len(net), 3,
                          "position_fp rows must parse: broker_count=3, "

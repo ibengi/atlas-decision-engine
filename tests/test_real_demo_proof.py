@@ -12,6 +12,7 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import io
 import json
@@ -147,7 +148,7 @@ class TestProofProtocolLogs(unittest.TestCase):
     def test_position_opened_requires_api_position(self):
         class NoPosClient(FakeClient):
             def get_positions(self):
-                return []                                 # jamais visible
+                return complete_positions([])                                 # jamais visible
         cli = NoPosClient(order_scenario="fill")
         eng, tmp = make_engine(cli)
         with _Cap() as cap:

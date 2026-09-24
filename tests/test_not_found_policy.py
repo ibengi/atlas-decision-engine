@@ -35,6 +35,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from config import CFG  # noqa: E402
@@ -92,7 +93,7 @@ class _PolicyBase(unittest.TestCase):
         c.env = "demo"
         c.last_http_status = 201
         c.create_order.side_effect = KalshiAPIError(0, "reseau: ReadTimeout")
-        c.get_positions.return_value = []
+        c.get_positions.return_value = complete_positions([])
         c.find_orders_by_client_order_id.return_value = list(matches)
         return c
 

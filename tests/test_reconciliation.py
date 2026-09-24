@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import _bootstrap  # noqa: F401,E402
+from position_snapshot_fixture import complete_positions
 
 import kalshi_alpha_bot as bot  # noqa: E402
 from position_manager import PositionManager  # noqa: E402
@@ -92,7 +93,7 @@ class _StartupBase(unittest.TestCase):
         if isinstance(broker, Exception):
             self.client.get_positions.side_effect = broker
         else:
-            self.client.get_positions.return_value = broker
+            self.client.get_positions.return_value = complete_positions(broker)
         with patch("position_manager.JsonStore.save"):
             return self.pm.reconcile_with_broker()
 
@@ -202,7 +203,7 @@ class StartupRetriesTest(_StartupBase):
         broker = [{"ticker": "KXA", "position_fp": "2.00"}]
         self.pm.positions = {"a": _pos("a", "KXA", "yes", 2)}
         with patch.object(self.client, "get_positions",
-                          side_effect=[None, broker]) as gp, \
+                          side_effect=[complete_positions(None), complete_positions(broker)]) as gp, \
                 patch.object(bot.time, "sleep") as sleep, \
                 patch("position_manager.JsonStore.save"):
             report = self.pm.reconcile_with_broker()
@@ -214,7 +215,7 @@ class StartupRetriesTest(_StartupBase):
         self.pm.positions = {"a": _pos("a", "KXA", "yes", 2)}
         before = {k: dict(v) for k, v in self.pm.positions.items()}
         with patch.object(self.client, "get_positions",
-                          return_value=None) as gp, \
+                          return_value=complete_positions(None)) as gp, \
                 patch.object(bot.time, "sleep") as sleep, \
                 patch("position_manager.JsonStore.save"):
             report = self.pm.reconcile_with_broker()
@@ -226,7 +227,7 @@ class StartupRetriesTest(_StartupBase):
 
     def test_first_attempt_succeeds_no_sleep(self):
         with patch.object(self.client, "get_positions",
-                          return_value=[]) as gp, \
+                          return_value=complete_positions([])) as gp, \
                 patch.object(bot.time, "sleep") as sleep, \
                 patch("position_manager.JsonStore.save"):
             report = self.pm.reconcile_with_broker()

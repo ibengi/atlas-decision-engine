@@ -5,6 +5,9 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -28,6 +31,135 @@ class BrokerWriteForbidden(KalshiAPIError):
     un operateur lisant un journal — puisse separer "le broker a refuse" de
     "nous avons refuse d'appeler le broker".
     """
+
+
+class PositionResponseIncomplete(KalshiAPIError):
+    """A positions read cannot prove a complete, supported account scope."""
+
+
+def _complete_json_object(pairs):
+    """Reject duplicate members before a JSON decoder can discard evidence.
+
+    object_pairs_hook is called recursively, including inventory rows and
+    market metadata. Last-member-wins decoding cannot prove completeness.
+    """
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise PositionResponseIncomplete(0, "duplicate JSON member in complete response")
+        result[key] = value
+    return result
+
+
+def _reject_complete_json_constant(value):
+    """NaN/Infinity are not JSON and cannot be ignored as harmless metadata."""
+    raise PositionResponseIncomplete(0, "non-standard numeric constant in complete JSON response")
+
+
+def position_row_error(row, *, event=False, require_provider_fields=False):
+    """Reject unknown control metadata and malformed row identity/scope."""
+    key = "event_ticker" if event else "ticker"
+    common = {"exchange_index", "realized_pnl", "realized_pnl_dollars",
+              "fees_paid", "fees_paid_dollars", "subaccount", "subaccount_number"}
+    allowed = common | ({"event_ticker", "total_cost", "total_cost_dollars",
+                         "total_cost_shares", "total_cost_shares_fp",
+                         "event_exposure", "event_exposure_dollars"} if event else
+                        {"ticker", "position", "position_fp", "quantity", "count",
+                         "total_traded", "total_traded_dollars", "market_exposure",
+                         "market_exposure_dollars", "last_updated_ts", "resting_orders_count"})
+    if (type(row) is not dict or set(row) - allowed
+            or type(row.get(key)) is not str or not row[key].strip()
+            or row[key] != row[key].strip()
+            or any(field in row and (type(row[field]) is not int or row[field] != 0)
+                   for field in ("subaccount", "subaccount_number"))
+            or ("exchange_index" in row and
+                (type(row["exchange_index"]) is not int or row["exchange_index"] < 0))):
+        return "malformed positions row or scope"
+    if require_provider_fields and not event:
+        required = {"ticker", "exchange_index", "total_traded_dollars", "position_fp",
+                    "market_exposure_dollars", "realized_pnl_dollars",
+                    "fees_paid_dollars", "last_updated_ts"}
+        if not required <= set(row):
+            return "incomplete market position row"
+        try:
+            if (type(row["last_updated_ts"]) is not str
+                    or datetime.fromisoformat(row["last_updated_ts"].replace("Z", "+00:00")).tzinfo is None):
+                return "malformed market position timestamp"
+        except ValueError:
+            return "malformed market position timestamp"
+    if event and not {"event_ticker", "total_cost_dollars", "total_cost_shares_fp",
+                      "event_exposure_dollars", "realized_pnl_dollars",
+                      "fees_paid_dollars"} <= set(row):
+        return "incomplete event position row"
+    for field, value in row.items():
+        if field in {key, "last_updated_ts", "exchange_index", "subaccount", "subaccount_number"}:
+            continue
+        try:
+            if type(value) not in (str, int, float) or not Decimal(str(value)).is_finite():
+                return f"malformed position numeric field: {field}"
+        except InvalidOperation:
+            return f"malformed position numeric field: {field}"
+    return None
+
+
+@dataclass(frozen=True)
+class PositionSnapshot:
+    """Complete primary-account response, with immutable response evidence.
+
+    JSON storage prevents later mutation of rows from changing the verified
+    response. Iteration produces copies for existing read-only consumers.
+    This proves response traversal, not an atomic exchange snapshot.
+    """
+
+    positions_json: str
+    page_cursors: tuple
+    subaccounts_before: tuple
+    subaccounts_after: tuple
+    requested_subaccount: int
+    events_json: str = "[]"
+    market_event_bindings_json: str = "{}"
+
+    def completeness_error(self):
+        if (type(self.requested_subaccount) is not int
+                or self.requested_subaccount != 0
+                or type(self.subaccounts_before) is not tuple
+                or type(self.subaccounts_after) is not tuple
+                or self.subaccounts_before != (0,)
+                or self.subaccounts_after != (0,)
+                or any(type(n) is not int for n in
+                       self.subaccounts_before + self.subaccounts_after)):
+            return "unproven or unsupported subaccount scope"
+        cursors = self.page_cursors
+        if (type(cursors) is not tuple or not cursors
+                or any(type(c) is not str for c in cursors)
+                or cursors[-1] != ""
+                or any(not c or c != c.strip() for c in cursors[:-1])
+                or len(set(cursors)) != len(cursors)):
+            return "unproven terminal pagination"
+        for payload in (self.positions_json, self.events_json):
+            if type(payload) is not str:
+                return "invalid immutable positions payload"
+            try:
+                if type(json.loads(payload)) is not list:
+                    return "positions payload is not a list"
+            except (ValueError, TypeError):
+                return "invalid positions JSON"
+        try:
+            bindings = json.loads(self.market_event_bindings_json)
+            if type(bindings) is not dict or any(
+                    type(k) is not str or not k.strip() or k != k.strip()
+                    or type(v) is not str or not v.strip() or v != v.strip()
+                    for k, v in bindings.items()):
+                return "invalid market/event binding evidence"
+        except (ValueError, TypeError):
+            return "invalid market/event binding JSON"
+        return None
+
+    def __iter__(self):
+        return iter(json.loads(self.positions_json))
+
+    def __len__(self):
+        return len(json.loads(self.positions_json))
 
 
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -239,7 +371,8 @@ class KalshiClient:
                    f"Aucune requete reseau mutante n'a ete emise.")
 
     # -- Requete avec retry/backoff ------------------------------------------
-    def _req(self, method: str, path: str, *, retries: int = 3, **kw) -> dict:
+    def _req(self, method: str, path: str, *, retries: int = 3,
+             expected_status: Optional[int] = None, **kw) -> dict:
         # BUTOIR DE TRANSPORT. Place AVANT tout le reste (y compris la
         # verification de cle) pour qu'une ecriture LIVE non autorisee soit
         # refusee quelle que soit la raison pour laquelle elle serait sinon
@@ -264,6 +397,10 @@ class KalshiClient:
                    f"complet avec les lignes -----BEGIN/END-----) et le "
                    f"paquet 'cryptography'.")
         url = self.base_url + path
+        if expected_status is not None:
+            # A completeness read must stay on the requested broker endpoint.
+            # Never follow a redirect while carrying authenticated headers.
+            kw["allow_redirects"] = False
         attempt, delay = 0, 1.0
         while True:
             attempt += 1
@@ -295,9 +432,22 @@ class KalshiClient:
                          f"(cf. docs.kalshi.com)", r.text)
             if r.status_code >= 400:
                 raise KalshiAPIError(r.status_code, f"{method} {path}", r.text)
+            if expected_status is not None and r.status_code != expected_status:
+                raise PositionResponseIncomplete(
+                    r.status_code, f"{method} {path}: expected complete HTTP "
+                    f"{expected_status} response", r.text)
+            if expected_status is not None and "Content-Range" in r.headers:
+                raise PositionResponseIncomplete(
+                    r.status_code, "partial Content-Range header in complete response")
 
             try:
-                return r.json() if r.text.strip() else {}
+                if not r.text.strip():
+                    return {}
+                if expected_status is not None:
+                    return r.json(object_pairs_hook=_complete_json_object,
+                                  parse_constant=_reject_complete_json_constant,
+                                  parse_float=Decimal)
+                return r.json()
             except ValueError:
                 raise KalshiAPIError(r.status_code, f"{method} {path}: JSON invalide", r.text)
 
@@ -614,14 +764,133 @@ class KalshiClient:
                 if str(pick(o, "client_order_id", "client_id",
                             default="")).strip() == cid]
 
-    def get_positions(self) -> list:
-        """Positions cote broker (source de verite pour la reconciliation)."""
-        try:
-            r = self._req("GET", "/portfolio/positions")
+    def _position_subaccounts(self) -> tuple:
+        """Read the documented *all* subaccount inventory, without filters.
+
+        The local ledger has no subaccount dimension. Until it does, any
+        non-primary account is unsupported, even when its balance is zero.
+        Unknown extensions (including pagination/partial/error metadata)
+        cannot silently establish completeness.
+        """
+        r = self._req("GET", "/portfolio/subaccounts/balances",
+                      expected_status=200)
+        if (type(r) is not dict or set(r) != {"subaccount_balances"}
+                or type(r["subaccount_balances"]) is not list):
+            raise PositionResponseIncomplete(0, "unproven subaccount inventory envelope")
+        scopes, seen = set(), set()
+        for row in r["subaccount_balances"]:
+            if type(row) is not dict:
+                raise PositionResponseIncomplete(0, "malformed subaccount inventory row")
+            number = row.get("subaccount_number")
+            shard = row.get("exchange_index")
+            if (type(number) is not int or not 0 <= number <= 63
+                    or type(shard) is not int or shard < 0
+                    or not {"subaccount_number", "exchange_index", "balance", "updated_ts"} <= set(row)
+                    or set(row) - {"subaccount_number", "exchange_index",
+                                   "balance", "updated_ts"}
+                    or type(row.get("updated_ts")) is not int or row["updated_ts"] < 0
+                    or (number, shard) in seen):
+                raise PositionResponseIncomplete(0, "malformed or duplicate subaccount scope")
+            try:
+                if type(row["balance"]) not in (str, int, float) or not Decimal(str(row["balance"])).is_finite():
+                    raise ValueError("invalid balance")
+            except (InvalidOperation, ValueError):
+                raise PositionResponseIncomplete(0, "malformed subaccount balance")
+            seen.add((number, shard))
+            scopes.add(number)
+        if scopes != {0}:
+            raise PositionResponseIncomplete(0, "unknown or unsupported subaccount scope")
+        return tuple(sorted(scopes))
+
+    def get_positions(self) -> PositionSnapshot:
+        """Return only a fully traversed, validated primary account response.
+
+        Contract: docs.kalshi.com/api-reference/portfolio/get-positions.
+        Required market/event arrays and explicit terminal cursor; every
+        page must be valid. No filters may hide positions. Inventory reads
+        bracket traversal; a late failure discards the entire observation.
+        """
+        before = self._position_subaccounts()
+        rows, events, cursors, seen_tickers = [], [], [], set()
+        cursor = ""
+        for _ in range(100):
+            params = {"limit": 1000, "subaccount": 0}
+            if cursor:
+                params["cursor"] = cursor
+            r = self._req("GET", "/portfolio/positions", params=params,
+                          expected_status=200)
+            if (type(r) is not dict
+                    or set(r) != {"market_positions", "event_positions", "cursor"}
+                    or type(r["market_positions"]) is not list
+                    or type(r["event_positions"]) is not list):
+                raise PositionResponseIncomplete(0, "incomplete or unknown positions envelope")
+            next_cursor = r["cursor"]
+            if (type(next_cursor) is not str or next_cursor != next_cursor.strip()
+                    or next_cursor in cursors):
+                raise PositionResponseIncomplete(0, "invalid or cyclic positions cursor")
+            for kind, key in (("market_positions", "ticker"),
+                              ("event_positions", "event_ticker")):
+                for row in r[kind]:
+                    error = position_row_error(row, event=kind == "event_positions",
+                                               require_provider_fields=True)
+                    if error:
+                        raise PositionResponseIncomplete(0, error)
+                    if kind == "market_positions":
+                        if row[key] in seen_tickers:
+                            raise PositionResponseIncomplete(0, "duplicate market in positions traversal")
+                        seen_tickers.add(row[key])
             self._log_raw_once("positions", r)
-            return r.get("market_positions", r.get("positions", [])) or []
-        except KalshiAPIError as e:
-            log_api.warning(f"get_positions: {e}")
-            return None
+            rows.extend(r["market_positions"])
+            events.extend(r["event_positions"])
+            cursors.append(next_cursor)
+            if next_cursor == "":
+                bindings = self._position_event_bindings(rows, events)
+                after = self._position_subaccounts()
+                if before != after:
+                    raise PositionResponseIncomplete(0, "subaccount scope changed during traversal")
+                try:
+                    payload = json.dumps(rows, allow_nan=False, sort_keys=True)
+                    event_payload = json.dumps(events, allow_nan=False, sort_keys=True)
+                except (TypeError, ValueError) as e:
+                    raise PositionResponseIncomplete(0, "non-JSON positions payload") from e
+                return PositionSnapshot(payload, tuple(cursors), before, after, 0,
+                                        event_payload, json.dumps(bindings, sort_keys=True))
+            cursor = next_cursor
+        raise PositionResponseIncomplete(0, "positions traversal exceeded page limit; incomplete")
 
+    def _position_event_bindings(self, rows, events) -> dict:
+        """Bind exposed events through authoritative market metadata.
 
+        Position tickers alone do not attest an event relationship. Do not
+        infer it from string prefixes or equate event exposure with a sum of
+        market exposures (netting semantics may differ).
+        """
+        if not any(Decimal(str(event[field])) != 0 for event in events
+                   for field in ("event_exposure", "event_exposure_dollars")
+                   if field in event):
+            return {}
+        bindings = {}
+        for row in rows:
+            if not any(Decimal(str(row[field])) != 0
+                       for field in ("position", "position_fp", "quantity", "count")
+                       if field in row):
+                continue
+            ticker = row["ticker"]
+            # Tickers are path components, never paths or queries.
+            if any(c in ticker for c in "/?#%"):
+                raise PositionResponseIncomplete(0, "invalid market ticker path component")
+            try:
+                response = self._req("GET", f"/markets/{ticker}", expected_status=200)
+            except KalshiAPIError as e:
+                raise PositionResponseIncomplete(e.status, "market/event binding unavailable") from e
+            market = response.get("market") if type(response) is dict else None
+            if (type(response) is not dict or set(response) != {"market"}
+                    or type(market) is not dict or market.get("ticker") != ticker
+                    or type(market.get("event_ticker")) is not str
+                    or not market["event_ticker"].strip()
+                    or market["event_ticker"] != market["event_ticker"].strip()
+                    or set(market) & {"error", "errors", "partial", "complete",
+                                      "has_more", "next_cursor", "cursor"}):
+                raise PositionResponseIncomplete(0, "unproven market/event binding")
+            bindings[ticker] = market["event_ticker"]
+        return bindings
