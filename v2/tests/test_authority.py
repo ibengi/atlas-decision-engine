@@ -10,13 +10,26 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from atlas_v2.approval import verify_review
 from atlas_v2.domain import Refused, canonical
-from atlas_v2.service import release_identity
+from atlas_v2.service import release_identity, persistent_directory
 from test_invariants import WithStore, H, quote
 from atlas_v2.execution import reserve_shadow
 from test_invariants import SCOPE
 
 
 class ApprovalTests(unittest.TestCase):
+    def test_persistent_directory_refuses_outside_relative_and_symlink_paths(self):
+        with patch.dict("os.environ", {"RAILWAY_VOLUME_MOUNT_PATH": "/data"}, clear=True):
+            self.assertEqual(persistent_directory(), Path("/data/atlas-v2"))
+            for bad in ("/tmp/atlas-v2", "atlas-v2", "/data/state5", "/data/../tmp/atlas-v2"):
+                with self.subTest(path=bad), patch.dict("os.environ", {"ATLAS_V2_DATA_DIR": bad}), self.assertRaises(Refused):
+                    persistent_directory()
+            # Simulate an operator-created symlink at the permitted spelling.
+            # Resolution is the OS trust boundary; do not alter the real /data.
+            with patch.object(Path, "resolve", return_value=Path("/tmp/atlas-v2")), self.assertRaises(Refused):
+                persistent_directory()
+            with patch.dict("os.environ", {"RAILWAY_VOLUME_MOUNT_PATH": "/other"}), self.assertRaises(Refused):
+                persistent_directory()
+
     def test_signed_review_is_bound_and_never_financial_authority(self):
         key = Ed25519PrivateKey.generate()
         public = key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)

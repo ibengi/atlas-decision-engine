@@ -13,6 +13,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ("persistent_volume_boundary", "service.py", 'if not data_dir.is_absolute() or data_dir.resolve() != Path("/data/atlas-v2"):', 'if data_dir.name != "atlas-v2":', "test_authority.ApprovalTests.test_persistent_directory_refuses_outside_relative_and_symlink_paths"),
     ("price_cap", "execution.py", "if ask > cap:", "if False:", "test_invariants.EconomicsTests.test_refresh_price_cap"),
     ("spread", "execution.py", "if ask - bid > spread_limit:", "if False:", "test_invariants.EconomicsTests.test_refresh_spread"),
     ("gross_edge", "execution.py", "if gross < min_gross:", "if False:", "test_invariants.EconomicsTests.test_refresh_gross_edge"),

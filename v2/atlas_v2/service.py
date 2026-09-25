@@ -29,6 +29,16 @@ def release_identity(root=None):
     return manifest
 
 
+def persistent_directory():
+    """Reject configuration drift before opening any research database."""
+    if os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") != "/data":
+        raise Refused("dedicated persistent /data volume required before collection")
+    data_dir = Path(os.environ.get("ATLAS_V2_DATA_DIR", "/data/atlas-v2"))
+    if not data_dir.is_absolute() or data_dir.resolve() != Path("/data/atlas-v2"):
+        raise Refused("resolved data directory must be /data/atlas-v2")
+    return data_dir
+
+
 def run():
     identity = release_identity()
     for name in ("KALSHI_PRIVATE_KEY", "KALSHI_KEY_ID", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"):
@@ -36,19 +46,17 @@ def run():
             raise Refused("V2 public collector must not receive financial/provider credentials")
     if os.environ.get("PROD_ACCESS_MODE", "READ_ONLY") != "READ_ONLY" or os.environ.get("CAPITAL", "OFF") != "OFF":
         raise Refused("read-only mode required")
-    if os.environ.get("RAILWAY_VOLUME_MOUNT_PATH") != "/data":
-        raise Refused("dedicated persistent /data volume required before collection")
-    data_dir = Path(os.environ.get("ATLAS_V2_DATA_DIR", "/data/atlas-v2"))
-    if data_dir.name != "atlas-v2":
-        raise Refused("dedicated V2 data directory required; no legacy migration")
+    data_dir = persistent_directory()
     data_dir.mkdir(parents=True, exist_ok=True)
     store = Store(data_dir / "observations.sqlite")
     state = {"service": "atlas-v2-data", "sha": identity["sha"], "mode": "READ_ONLY",
              "capital": "OFF", "broker_writes": 0, "real_orders_submitted": 0,
              "model_approved": False, "active_models": [], "state": "STARTING",
+             "database_path": str(store.path),
              "last_scan_at": None, "last_error": None, "anchor": store.anchor()}
     state_lock = threading.Lock()
     stop = threading.Event()
+    print(json.dumps({"at": now(), **state}), flush=True)
 
     def collect():
         reader = PublicReader()
