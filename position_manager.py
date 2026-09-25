@@ -257,15 +257,17 @@ class PositionManager:
 
     @staticmethod
     def parse_broker_qty(bp: dict):
-        """Quantite nette signee d'une ligne broker -> (int, None) ou
+        """Quantite nette signee d'une ligne broker -> (Decimal, None) ou
         (None, raison).
 
         Un echec de lecture n'est JAMAIS converti en 0 : le 2026-08-31,
         position_fp="-6.00" lu comme 0 a fait juger le broker "a plat" et le
-        demarrage a detruit les trois positions restaurees. Les champs
-        multiples doivent CONCORDER (aucune precedence documentee par l'API)
-        et les quantites fractionnaires sont refusees tant que la
-        specification broker ne les atteste pas.
+        demarrage a detruit les trois positions restaurees.
+
+        Kalshi documente position_fp comme un compte fixe a deux decimales :
+        les fractions de contrat sont valides avec une granularite minimale
+        de 0.01. Les anciens champs entiers restent acceptes uniquement comme
+        entiers. Si plusieurs champs sont presents, ils doivent CONCORDER.
         """
         seen = []
         for f in PositionManager.QTY_FIELDS:
@@ -280,10 +282,14 @@ class PositionManager:
                 return None, f"{f}={v!r} illisible"
             if not fv.is_finite():
                 return None, f"{f}={v!r} non fini (NaN/inf)"
-            if fv != int(fv):
-                return None, (f"{f}={v!r} non entier -- contrats "
-                              f"fractionnaires non attestes par l'API")
-            seen.append((f, int(fv)))
+            if f == "position_fp":
+                # API responses emit exactly two decimal places; accepting
+                # finer precision would silently invent unsupported units.
+                if fv.as_tuple().exponent < -2:
+                    return None, f"{f}={v!r} precision > 2 decimales"
+            elif fv != fv.to_integral_value():
+                return None, f"{f}={v!r} fractionnaire sur champ legacy"
+            seen.append((f, fv))
         if not seen:
             return None, ("aucun champ de quantite reconnu (attendus: "
                           + ", ".join(PositionManager.QTY_FIELDS) + ")")
@@ -332,9 +338,19 @@ class PositionManager:
         net = {}
         for p in self._active_positions():
             sign = 1 if p.get("side") == "yes" else -1
-            net[p["ticker"]] = net.get(p["ticker"], 0) \
-                + sign * int(p.get("count", 0))
+            net[p["ticker"]] = net.get(p["ticker"], Decimal("0")) \
+                + sign * Decimal(str(p.get("count", 0)))
         return {tk: q for tk, q in net.items() if q != 0}
+
+    @staticmethod
+    def _report_qty(q):
+        """JSON-safe reconciliation quantity preserving fractional evidence."""
+        if q is None:
+            return None
+        d = q if isinstance(q, Decimal) else Decimal(str(q))
+        if d == d.to_integral_value():
+            return int(d)
+        return format(d, "f")
 
     @staticmethod
     def _classify_mismatch(b, l) -> str:
@@ -426,7 +442,9 @@ class PositionManager:
                 continue
             kind = self._classify_mismatch(b, l)
             report["mismatches"].append(
-                {"ticker": tk, "kind": kind, "broker": b, "local": l})
+                {"ticker": tk, "kind": kind,
+                 "broker": self._report_qty(b),
+                 "local": self._report_qty(l)})
 
         if report["mismatches"]:
             report["status"] = "MISMATCH"
@@ -523,7 +541,8 @@ class PositionManager:
                 continue
             report["mismatches"].append(
                 {"ticker": tk, "kind": self._classify_mismatch(b, l),
-                 "broker": b, "local": l})
+                 "broker": self._report_qty(b),
+                 "local": self._report_qty(l)})
         if report["mismatches"]:
             return _halt("MISMATCH",
                          f"{len(report['mismatches'])} divergence(s) "
