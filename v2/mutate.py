@@ -13,6 +13,9 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ("alpha_market_baseline", "alpha_lab.py", "candidate, baseline = score(probabilities), score(baselines)", "candidate, baseline = score(probabilities), score(probabilities)", "test_alpha_lab.AlphaLabTests.test_market_baseline_is_paired_not_replaced_by_candidate"),
+    ("alpha_drawdown_units", "alpha_lab.py", "fraction = max(fraction, (peak-equity)/peak)", "fraction = max(fraction, peak-equity)", "test_alpha_lab.AlphaLabTests.test_drawdown_units_are_explicit"),
+    ("alpha_duplicate_event", "alpha_lab.py", 'elif row["event_id"] in seen:', 'elif False:', "test_alpha_lab.AlphaLabTests.test_cohort_is_outcome_blind_unique_event_and_derived_day"),
     ("persistent_volume_boundary", "service.py", 'if not data_dir.is_absolute() or data_dir.resolve() != Path("/data/atlas-v2"):', 'if data_dir.name != "atlas-v2":', "test_authority.ApprovalTests.test_persistent_directory_refuses_outside_relative_and_symlink_paths"),
     ("price_cap", "execution.py", "if ask > cap:", "if False:", "test_invariants.EconomicsTests.test_refresh_price_cap"),
     ("spread", "execution.py", "if ask - bid > spread_limit:", "if False:", "test_invariants.EconomicsTests.test_refresh_spread"),
