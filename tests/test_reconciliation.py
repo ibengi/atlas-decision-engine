@@ -11,6 +11,7 @@ journal and broker untouched. Parse failure is never converted to qty 0.
 import os
 import sys
 import unittest
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -69,9 +70,18 @@ class ParseBrokerQtyTest(unittest.TestCase):
     def test_missing_all_quantity_fields_is_unknown(self):
         self._err({"ticker": "KX", "market_exposure_dollars": "1.14"})
 
-    def test_fractional_contracts_are_refused(self):
-        self._err({"position_fp": "6.50"})
+    def test_fractional_position_fp_is_supported(self):
+        self._ok({"position_fp": "6.50"}, Decimal("6.50"))
+        self._ok({"position_fp": "17.06"}, Decimal("17.06"))
+        self._ok({"position_fp": "-0.01"}, Decimal("-0.01"))
+
+    def test_fractional_legacy_fields_are_refused(self):
         self._err({"position": 6.5})
+        self._err({"quantity": "6.5"})
+        self._err({"count": "6.5"})
+
+    def test_position_fp_finer_than_centicontract_is_refused(self):
+        self._err({"position_fp": "6.501"})
 
     def test_conflicting_fields_are_unknown(self):
         self._err({"position": 5, "position_fp": "6.00"})
@@ -129,6 +139,28 @@ class StartupNonDestructiveTest(_StartupBase):
                            "broker": 3, "local": None}])
         self.assertEqual(self.pm.positions, {},
                          "no brk- reconstruction, no invented entry price")
+
+    def test_fractional_broker_only_is_mismatch_not_unknown(self):
+        before = dict(self.pm.positions)
+        report = self._run([{"ticker": "KXINCSEP23",
+                             "position_fp": "17.06"}])
+        self._assert_halted_untouched(report, "MISMATCH", before)
+        self.assertEqual(
+            report["mismatches"],
+            [{"ticker": "KXINCSEP23", "kind": "broker_only",
+              "broker": "17.06", "local": None}],
+        )
+
+    def test_fractional_quantity_mismatch_preserves_exact_broker_value(self):
+        self.pm.positions = {"f": _pos("f", "KXF", "yes", 17)}
+        before = {k: dict(v) for k, v in self.pm.positions.items()}
+        report = self._run([{"ticker": "KXF", "position_fp": "17.06"}])
+        self._assert_halted_untouched(report, "MISMATCH", before)
+        self.assertEqual(
+            report["mismatches"],
+            [{"ticker": "KXF", "kind": "quantity_mismatch",
+              "broker": "17.06", "local": 17}],
+        )
 
     def test_local_only_halts_without_delete(self):
         self.pm.positions = {"x": _pos("x", "KXLOCAL", "yes", 1)}
