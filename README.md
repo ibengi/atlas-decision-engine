@@ -1,4 +1,18 @@
-# Atlas Decision Engine
+# Atlas V2 — RESEARCH / READ_ONLY
+
+This branch is the isolated V2 rebuild authority. The active image contains only
+the [V2 package](v2/README.md), a public GET-only data collector and offline
+research/simulation primitives. No predictive model is selected or approved;
+CAPITAL remains OFF and no broker mutation capability is shipped.
+
+See [authority and salvage decisions](docs/ATLAS_V2_AUTHORITY.md). V1 is frozen at
+`atlas-v1-final-readonly` / `bd810b4f3177108032f85e21a55729b6eb4b5a53`.
+The documentation and root modules below are retained as legacy history; their
+commands are not V2 entrypoints. Do not reactivate the failed V1 alpha.
+
+---
+
+# Legacy Atlas Decision Engine reference
 
 Moteur de décision autonome pour marchés de prédiction (Kalshi) :
 scan ciblé de l'univers, classification déterministe des marchés, modèles de
