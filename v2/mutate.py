@@ -13,6 +13,13 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ('mr_model_hash', 'reconstruction.py', 'digest(artifact)!=model["model_artifact_sha256"]', 'False', 'test_reconstruction.ReconstructionTests.test_model_hash_and_no_approval_gate'),
+    ('mr_no_approval', 'reconstruction.py', 'artifact["approved"] is not False', 'False', 'test_reconstruction.ReconstructionTests.test_model_hash_and_no_approval_gate'),
+    ('mr_native_recompute', 'reconstruction.py', 'canonical(rebuilt)!=canonical(features)', 'False', 'test_reconstruction.ReconstructionTests.test_feature_receipts_cannot_be_replaced'),
+    ('mr_drawdown_units', 'model_diagnosis.py', '(peak-equity)/peak*100', '(peak-equity)*100', 'test_reconstruction.ReconstructionTests.test_percentage_drawdown_is_not_dollars'),
+    ('mr_missing_cost_zero', 'model_diagnosis.py', 'except Refused: fee=None', 'except Refused: fee=0', 'test_reconstruction.DiagnosisTests.test_missing_cost_is_not_zero_profit'),
+    ('mr_fee_double_count', 'reconstruction.py', 'return count*outcome-decimal(economics["cost_bound"])', 'return count*outcome-decimal(economics["cost_bound"])-decimal(economics["fee_bound"])', 'test_reconstruction.ReconstructionTests.test_costs_recomputed_at_refresh_and_settlement_charged_once'),
+
     ('scope_artifact_trust', 'sports_scope_evidence.py', 'manifest_hash in REVIEWED_EVIDENCE_SHA256', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_pinned_manifest_and_no_self_authorization'),
     ('scope_artifact_key', 'sports_scope_evidence.py', 'hmac.compare_digest(body["key_id_sha256"], key_fingerprint(key_id))', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_installed_key_binding'),
     ('scope_artifact_source', 'sports_scope_evidence.py', 'body["provider"] == "Kalshi" and body["source_url"] in SOURCES', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_provider_and_hashes'),
