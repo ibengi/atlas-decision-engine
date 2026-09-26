@@ -1,8 +1,8 @@
 # Phase 2 Alpha Lab
 
 Five fixed formulas are defined in `atlas_v2.alpha_lab.plan()`. There is no model
-search, autonomous approval, external API call, financial mutation or service
-import of this research module. Historical diagnostics are not final OOS.
+search, autonomous approval, external API call or financial mutation. The opt-in
+learning observer reuses the frozen formulas. Historical diagnostics are not final OOS.
 
 ## Evidence access
 

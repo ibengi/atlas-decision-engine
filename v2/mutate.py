@@ -13,6 +13,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ("learning_label_conflict", "learning.py", 'if (old["outcome"], old["settlement_at"]) != (label["outcome"], label["settlement_at"]):', 'if False:', "test_learning.LearningTests.test_conflict_permanently_invalidates_even_if_later_label_reverts"),
+    ("learning_disqualification", "learning.py", 'if candidate in self.disqualified: reasons.append("CANDIDATE_DISQUALIFIED")', 'if False: reasons.append("CANDIDATE_DISQUALIFIED")', "test_learning.LearningTests.test_guard_rejection_is_not_bypass_and_bypass_survives_restart"),
+    ("learning_write_flag", "service.py", 'if os.environ.get(name, "0") != "0":', 'if False:', "test_learning_service.LearningStartupTests.test_learning_requires_readonly_zero_writes_and_qualification"),
+    ("learning_requires_sources", "service.py", 'if mode == "LIVE_MARKET_LEARNING" and os.environ.get("ATLAS_V2_QUALIFICATION_ON_START") != "1":', 'if False:', "test_learning_service.LearningStartupTests.test_learning_requires_readonly_zero_writes_and_qualification"),
     ("qualification_final_status", "qualification.py", 'm["status"] != "finalized"', 'False', "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"),
     ("qualification_provisional", "qualification.py", 'm.get("is_provisional", False) is not False', 'False', "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"),
     ("qualification_settlement_payout", "qualification.py", 'if decimal(m["settlement_value_dollars"]) != outcome:', 'if False:', "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"),
