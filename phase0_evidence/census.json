@@ -1,0 +1,51 @@
+{
+ "dataset_sha256": "b38de14681f21580052ff39b5751491064a6f516d90c3a3e1f8adbffaf05ac87",
+ "n_records_total": 182,
+ "n_settled": 147,
+ "n_usable": 147,
+ "attrition": {
+  "usable": 147,
+  "dropped": 35,
+  "by_reason": {
+   "unsettled": 35
+  }
+ },
+ "by_series": [
+  {
+   "series": "KXBTC15M",
+   "records": 182,
+   "settled": 147,
+   "usable": 147,
+   "drops": {
+    "unsettled": 35
+   },
+   "realised_yes_rate": 0.367347,
+   "mean_market_implied": 0.481905,
+   "base_rate_minus_market_implied": -0.114558
+  }
+ ],
+ "usable_time_span": {
+  "first_ts": "2026-09-01T06:02:39+00:00",
+  "last_ts": "2026-09-01T23:31:10+00:00"
+ },
+ "settlement_dates": {
+  "n_distinct": 1,
+  "max_rows_on_one_date": 147,
+  "top": {
+   "2026-09-01": 147
+  }
+ },
+ "by_data_quality": [
+  {
+   "band": "90-100",
+   "n": 147,
+   "realised_yes_rate": 0.367347,
+   "mean_market_implied": 0.481905,
+   "base_rate_minus_market_implied": -0.114558
+  }
+ ],
+ "n_without_recorded_data_quality": 0,
+ "model_versions": {
+  "btc15m-v1.0-ref": 147
+ }
+}

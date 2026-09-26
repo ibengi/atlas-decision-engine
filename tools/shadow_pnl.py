@@ -51,6 +51,15 @@ WHAT IT DOES NOT DO
     resting order, or the market moving between decision and fill.
 """
 
+import os
+import sys
+
+# `python tools/x.py` puts tools/ on sys.path, not the repository root, so
+# the package imports below would fail exactly where this tool is meant to
+# be used: from a shell, in the container. Prepending the root makes the
+# CLI and the test-suite import paths the same one.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import hashlib
 import json

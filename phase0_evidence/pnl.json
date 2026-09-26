@@ -1,0 +1,60 @@
+{
+ "dataset_sha256": "b38de14681f21580052ff39b5751491064a6f516d90c3a3e1f8adbffaf05ac87",
+ "n_records_total": 182,
+ "n_traded_decisions": 8,
+ "split": {
+  "chronological": true,
+  "ratios": [
+   0.6,
+   0.2,
+   0.2
+  ],
+  "train": 4,
+  "validation": 1,
+  "test": 3
+ },
+ "decisive_slice": "test",
+ "fill_assumption": "crosses the spread: filled at the recorded ask",
+ "test": {
+  "label": "test",
+  "n": 3,
+  "total_net": -0.95,
+  "mean_net_per_contract": -0.316667,
+  "win_rate": 0.0
+ },
+ "control": {
+  "label": "test_trade_everything_yes",
+  "n": 30,
+  "total_net": 5.96,
+  "mean_net_per_contract": 0.198667,
+  "win_rate": 0.666667
+ },
+ "selection_value_per_contract": -0.515334,
+ "test_pnl_by_settlement_date": {
+  "2026-09-01": -0.9500000000000002
+ },
+ "n_settlement_dates_in_test": 1,
+ "largest_single_date": {
+  "date": "2026-09-01",
+  "net": -0.95,
+  "share_of_total": 1.0
+ },
+ "brier_delta_model_minus_baseline": 0.0205,
+ "context_only_not_decisive": {
+  "train": {
+   "label": "train",
+   "n": 4,
+   "total_net": -2.5,
+   "mean_net_per_contract": -0.625,
+   "win_rate": 0.0
+  },
+  "validation": {
+   "label": "validation",
+   "n": 1,
+   "total_net": -0.74,
+   "mean_net_per_contract": -0.74,
+   "win_rate": 0.0
+  }
+ },
+ "verdict": "INDETERMINATE_SAMPLE_TOO_SMALL"
+}

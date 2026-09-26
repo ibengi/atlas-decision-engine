@@ -1,0 +1,89 @@
+{
+ "dataset_sha256": "b38de14681f21580052ff39b5751491064a6f516d90c3a3e1f8adbffaf05ac87",
+ "decisive_slice": "test",
+ "n_test_rows": 30,
+ "control_recompute": {
+  "rows_checked": 30,
+  "rows_mismatched": 0,
+  "max_abs_gap": 0.0,
+  "tolerance": 1e-06,
+  "model_in_tree_reproduces_the_store": true
+ },
+ "variants": [
+  {
+   "variant": "as_recorded",
+   "knobs": {
+    "none": "control"
+   },
+   "n_scored": 30,
+   "n_skipped_missing_inputs": 0,
+   "brier_model": 0.257714,
+   "brier_market_baseline": 0.23848,
+   "delta_model_minus_baseline": 0.019234,
+   "beats_market": false
+  },
+  {
+   "variant": "no_momentum",
+   "knobs": {
+    "use_momentum": false
+   },
+   "n_scored": 30,
+   "n_skipped_missing_inputs": 0,
+   "brier_model": 0.238946,
+   "brier_market_baseline": 0.23848,
+   "delta_model_minus_baseline": 0.000466,
+   "beats_market": false
+  },
+  {
+   "variant": "momentum_cap_0.10",
+   "knobs": {
+    "cap": 0.1
+   },
+   "n_scored": 30,
+   "n_skipped_missing_inputs": 0,
+   "brier_model": 0.241554,
+   "brier_market_baseline": 0.23848,
+   "delta_model_minus_baseline": 0.003074,
+   "beats_market": false
+  },
+  {
+   "variant": "momentum_cap_0.25",
+   "knobs": {
+    "cap": 0.25
+   },
+   "n_scored": 30,
+   "n_skipped_missing_inputs": 0,
+   "brier_model": 0.246236,
+   "brier_market_baseline": 0.23848,
+   "delta_model_minus_baseline": 0.007756,
+   "beats_market": false
+  },
+  {
+   "variant": "sigma_x1.5",
+   "knobs": {
+    "sigma_scale": 1.5
+   },
+   "n_scored": 30,
+   "n_skipped_missing_inputs": 0,
+   "brier_model": 0.245587,
+   "brier_market_baseline": 0.23848,
+   "delta_model_minus_baseline": 0.007107,
+   "beats_market": false
+  },
+  {
+   "variant": "sigma_x0.67",
+   "knobs": {
+    "sigma_scale": 0.67
+   },
+   "n_scored": 30,
+   "n_skipped_missing_inputs": 0,
+   "brier_model": 0.273958,
+   "brier_market_baseline": 0.23848,
+   "delta_model_minus_baseline": 0.035478,
+   "beats_market": false
+  }
+ ],
+ "variants_beating_market_in_sample": [],
+ "warning": "variant selection on this sample is in-sample. A winner must be fixed in advance and re-measured on a window it has never seen before it means anything.",
+ "verdict": "DIAGNOSTIC_ONLY_NO_VARIANT_BEATS_MARKET"
+}
