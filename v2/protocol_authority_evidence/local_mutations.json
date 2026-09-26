@@ -1,0 +1,446 @@
+{
+  "baseline": "PASS",
+  "mutations": [
+    {
+      "mutation": "authority_direct_fit_retired",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_direct_legacy_fit_and_oos_are_retired"
+    },
+    {
+      "mutation": "authority_overlap",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_active_overlap_rejected_and_disjoint_allowed"
+    },
+    {
+      "mutation": "authority_startup",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_startup_checks_authority_before_any_state_or_network"
+    },
+    {
+      "mutation": "authority_legacy_mr_rows",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_superseded_protocol_cannot_consume_mr_rows"
+    },
+    {
+      "mutation": "authority_protocol_hash",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_protocol_hash_mismatch_rejected"
+    },
+    {
+      "mutation": "authority_row_binding",
+      "killed": true,
+      "test": "test_protocol_authority.MRDecisionAuthorityTests.test_decision_binding_and_row_protocol_checks"
+    },
+    {
+      "mutation": "authority_consumed_rows",
+      "killed": true,
+      "test": "test_protocol_authority.MRDecisionAuthorityTests.test_decision_binding_and_row_protocol_checks"
+    },
+    {
+      "mutation": "authority_stage_boundary",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_exact_dates_no_overlap_and_boundary_ownership"
+    },
+    {
+      "mutation": "authority_oos_length",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_oos_next_midnight_strictly_after_lock_and_28_days"
+    },
+    {
+      "mutation": "authority_two_families",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_only_two_family_multiplicity"
+    },
+    {
+      "mutation": "authority_retired_lifecycle",
+      "killed": true,
+      "test": "test_phase2.NativeCoordinatorTests.test_superseded_lifecycle_never_fits_or_locks"
+    },
+    {
+      "mutation": "shadow_pnl_missing_cost",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_missing_fee_or_slippage_never_zero"
+    },
+    {
+      "mutation": "mr_model_hash",
+      "killed": true,
+      "test": "test_reconstruction.ReconstructionTests.test_model_hash_and_no_approval_gate"
+    },
+    {
+      "mutation": "mr_no_approval",
+      "killed": true,
+      "test": "test_reconstruction.ReconstructionTests.test_model_hash_and_no_approval_gate"
+    },
+    {
+      "mutation": "mr_native_recompute",
+      "killed": true,
+      "test": "test_reconstruction.ReconstructionTests.test_feature_receipts_cannot_be_replaced"
+    },
+    {
+      "mutation": "mr_drawdown_units",
+      "killed": true,
+      "test": "test_reconstruction.ReconstructionTests.test_percentage_drawdown_is_not_dollars"
+    },
+    {
+      "mutation": "mr_missing_cost_zero",
+      "killed": true,
+      "test": "test_reconstruction.DiagnosisTests.test_missing_cost_is_not_zero_profit"
+    },
+    {
+      "mutation": "mr_fee_double_count",
+      "killed": true,
+      "test": "test_reconstruction.ReconstructionTests.test_costs_recomputed_at_refresh_and_settlement_charged_once"
+    },
+    {
+      "mutation": "scope_artifact_trust",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_pinned_manifest_and_no_self_authorization"
+    },
+    {
+      "mutation": "scope_artifact_key",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_installed_key_binding"
+    },
+    {
+      "mutation": "scope_artifact_source",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_provider_and_hashes"
+    },
+    {
+      "mutation": "scope_artifact_permissions",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_permissions"
+    },
+    {
+      "mutation": "scope_artifact_trade",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_permissions"
+    },
+    {
+      "mutation": "scope_artifact_transfer",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_permissions"
+    },
+    {
+      "mutation": "scope_artifact_expiry",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_expiry_future_and_utc"
+    },
+    {
+      "mutation": "scope_artifact_validity",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_expiry_future_and_utc"
+    },
+    {
+      "mutation": "scope_artifact_hash",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_provider_and_hashes"
+    },
+    {
+      "mutation": "scope_artifact_api_denial",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_api_conflicts_cannot_be_overridden"
+    },
+    {
+      "mutation": "scope_artifact_unavailable_only",
+      "killed": true,
+      "test": "test_sports_scope_evidence.ScopeEvidenceTests.test_fallback_only_when_unavailable"
+    },
+    {
+      "mutation": "sports_read_scope",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_scope_requires_exact_matching_read_only_record"
+    },
+    {
+      "mutation": "sports_signer_path",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_signature_binding_and_mutation_paths_refused"
+    },
+    {
+      "mutation": "sports_secret_output",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_secrets_never_persist_even_provider_echo"
+    },
+    {
+      "mutation": "sports_quote_age",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_quote_stale_future_clock_incomplete_and_close"
+    },
+    {
+      "mutation": "sports_clock_uncertainty",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_quote_stale_future_clock_incomplete_and_close"
+    },
+    {
+      "mutation": "sports_snapshot_complete",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_snapshot_missing_skew_stale"
+    },
+    {
+      "mutation": "sports_snapshot_source_skew",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_snapshot_missing_skew_stale"
+    },
+    {
+      "mutation": "sports_snapshot_receive_skew",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_snapshot_missing_skew_stale"
+    },
+    {
+      "mutation": "sports_sequence_gap",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_book_sequence_delta_baseline_and_unknown_messages"
+    },
+    {
+      "mutation": "sports_ack_required",
+      "killed": true,
+      "test": "test_sports_probe.SportsProbeTests.test_ack_and_reconnect_clear_quotes_and_books"
+    },
+    {
+      "mutation": "phase2_daily_minimum",
+      "killed": true,
+      "test": "test_phase2.ProtocolTests.test_minimum_is_per_day_not_total_or_copies"
+    },
+    {
+      "mutation": "phase2_late_oos_prediction",
+      "killed": true,
+      "test": "test_phase2.ProtocolTests.test_oos_must_be_future_and_prospectively_recorded"
+    },
+    {
+      "mutation": "phase2_frozen_source",
+      "killed": true,
+      "test": "test_phase2.NativeCoordinatorTests.test_protocol_rejects_late_initialization_and_changed_source"
+    },
+    {
+      "mutation": "phase2_native_quote_binding",
+      "killed": true,
+      "test": "test_phase2.NativeCoordinatorTests.test_raw_transport_cannot_be_replaced_by_normalized_quote"
+    },
+    {
+      "mutation": "learning_label_conflict",
+      "killed": true,
+      "test": "test_learning.LearningTests.test_conflict_permanently_invalidates_even_if_later_label_reverts"
+    },
+    {
+      "mutation": "learning_disqualification",
+      "killed": true,
+      "test": "test_learning.LearningTests.test_guard_rejection_is_not_bypass_and_bypass_survives_restart"
+    },
+    {
+      "mutation": "learning_write_flag",
+      "killed": true,
+      "test": "test_learning_service.LearningStartupTests.test_learning_requires_readonly_zero_writes_and_qualification"
+    },
+    {
+      "mutation": "learning_requires_sources",
+      "killed": true,
+      "test": "test_learning_service.LearningStartupTests.test_learning_requires_readonly_zero_writes_and_qualification"
+    },
+    {
+      "mutation": "qualification_final_status",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"
+    },
+    {
+      "mutation": "qualification_provisional",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"
+    },
+    {
+      "mutation": "qualification_settlement_payout",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"
+    },
+    {
+      "mutation": "qualification_raw_hash",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_receipt_transport_hash_and_scope_are_mandatory"
+    },
+    {
+      "mutation": "qualification_transport",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_receipt_transport_hash_and_scope_are_mandatory"
+    },
+    {
+      "mutation": "qualification_reference_time",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_reference_native_time_and_exact_sixty_seconds_are_not_manufactured"
+    },
+    {
+      "mutation": "qualification_candle_closed",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_candles_complete_closed_consecutive_precise"
+    },
+    {
+      "mutation": "qualification_refresh_time",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_refresh_requires_fresh_after_decision_quotes_and_positive_slippage"
+    },
+    {
+      "mutation": "qualification_ladder_terminal",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_ladder_rejects_partial_stale_incomparable_or_wrong_center"
+    },
+    {
+      "mutation": "qualification_ladder_direction",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_ladder_rejects_partial_stale_incomparable_or_wrong_center"
+    },
+    {
+      "mutation": "qualification_zero_slippage",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_refresh_requires_fresh_after_decision_quotes_and_positive_slippage"
+    },
+    {
+      "mutation": "qualification_fee_autoapproval",
+      "killed": true,
+      "test": "test_qualification.QualificationTests.test_fee_is_nonzero_and_does_not_self_qualify"
+    },
+    {
+      "mutation": "alpha_external_probability",
+      "killed": true,
+      "test": "test_alpha_lab.AlphaLabTests.test_cohort_is_outcome_blind_unique_event_and_derived_day"
+    },
+    {
+      "mutation": "export_private_scope",
+      "killed": true,
+      "test": "test_alpha_lab.AlphaLabTests.test_export_bundle_deterministic_complete_and_private_scope_only"
+    },
+    {
+      "mutation": "alpha_market_baseline",
+      "killed": true,
+      "test": "test_alpha_lab.AlphaLabTests.test_market_baseline_is_paired_not_replaced_by_candidate"
+    },
+    {
+      "mutation": "alpha_drawdown_units",
+      "killed": true,
+      "test": "test_alpha_lab.AlphaLabTests.test_drawdown_units_are_explicit"
+    },
+    {
+      "mutation": "alpha_duplicate_event",
+      "killed": true,
+      "test": "test_alpha_lab.AlphaLabTests.test_cohort_is_outcome_blind_unique_event_and_derived_day"
+    },
+    {
+      "mutation": "persistent_volume_boundary",
+      "killed": true,
+      "test": "test_authority.ApprovalTests.test_persistent_directory_refuses_outside_relative_and_symlink_paths"
+    },
+    {
+      "mutation": "price_cap",
+      "killed": true,
+      "test": "test_invariants.EconomicsTests.test_refresh_price_cap"
+    },
+    {
+      "mutation": "spread",
+      "killed": true,
+      "test": "test_invariants.EconomicsTests.test_refresh_spread"
+    },
+    {
+      "mutation": "gross_edge",
+      "killed": true,
+      "test": "test_invariants.EconomicsTests.test_refresh_gross_edge"
+    },
+    {
+      "mutation": "net_edge",
+      "killed": true,
+      "test": "test_invariants.EconomicsTests.test_refresh_net_edge"
+    },
+    {
+      "mutation": "ev",
+      "killed": true,
+      "test": "test_invariants.EconomicsTests.test_ev_independent_stricter_threshold"
+    },
+    {
+      "mutation": "freshness",
+      "killed": true,
+      "test": "test_invariants.EconomicsTests.test_stale_future_closed_and_no_liquidity"
+    },
+    {
+      "mutation": "rounded_fee_economics",
+      "killed": true,
+      "test": "test_invariants.EconomicsTests.test_rounded_cost_bound_also_drives_net_edge"
+    },
+    {
+      "mutation": "duplicate_intent",
+      "killed": true,
+      "test": "test_invariants.IntentTests.test_duplicate_is_durable_across_restart"
+    },
+    {
+      "mutation": "risk_version_fence",
+      "killed": true,
+      "test": "test_invariants.IntentTests.test_control_change_during_refresh_aborts"
+    },
+    {
+      "mutation": "drawdown_limit",
+      "killed": true,
+      "test": "test_invariants.IntentTests.test_manual_unknown_scope_kill_and_drawdown_abort"
+    },
+    {
+      "mutation": "reuse_reserved_cash",
+      "killed": true,
+      "test": "test_authority.ReservationBudgetTests.test_market_reservations_cannot_reuse_same_cash"
+    },
+    {
+      "mutation": "position_ceiling",
+      "killed": true,
+      "test": "test_authority.ReservationBudgetTests.test_position_ceiling_is_retained"
+    },
+    {
+      "mutation": "completeness",
+      "killed": true,
+      "test": "test_invariants.CompletenessTests.test_every_unknown_completeness_fails_closed"
+    },
+    {
+      "mutation": "scope",
+      "killed": true,
+      "test": "test_invariants.CompletenessTests.test_every_unknown_completeness_fails_closed"
+    },
+    {
+      "mutation": "partial_range",
+      "killed": true,
+      "test": "test_invariants.DataTests.test_partial_redirect_and_unknown_envelope_fail_closed"
+    },
+    {
+      "mutation": "cashflow_nav",
+      "killed": true,
+      "test": "test_invariants.AccountingTests.test_withdrawal_does_not_amplify_drawdown_or_erase_loss"
+    },
+    {
+      "mutation": "model_baseline_binding",
+      "killed": true,
+      "test": "test_invariants.ValidationTests.test_baseline_and_consumed_dataset_binding"
+    },
+    {
+      "mutation": "post_close_prediction",
+      "killed": true,
+      "test": "test_research.PairedScoringTests.test_prediction_crossing_close_boundary_rolls_back"
+    },
+    {
+      "mutation": "signature",
+      "killed": true,
+      "test": "test_authority.ApprovalTests.test_signed_review_is_bound_and_never_financial_authority"
+    },
+    {
+      "mutation": "release_lineage",
+      "killed": true,
+      "test": "test_authority.ApprovalTests.test_deployment_lineage_refuses_old_main"
+    },
+    {
+      "mutation": "settlement_authority",
+      "killed": true,
+      "test": "test_invariants.IntentTests.test_ambiguous_partial_fill_restart_and_unknown_settlement"
+    },
+    {
+      "mutation": "fill_conservation",
+      "killed": true,
+      "test": "test_invariants.IntentTests.test_fill_and_payout_conservation"
+    },
+    {
+      "mutation": "transaction_thread_ownership",
+      "killed": true,
+      "test": "test_invariants.DurabilityTests.test_thread_cannot_join_another_threads_rollback"
+    }
+  ],
+  "all_killed": true
+}

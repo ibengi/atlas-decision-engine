@@ -1,7 +1,7 @@
-"""One bounded public-data collector and cheap read-only health endpoint.
+"""Bounded public-data collection and opt-in prospective shadow observation.
 
-No account credentials, models, research execution, live approval or broker
-mutations. V1 volumes are never opened. Storage is an explicit new V2 volume.
+No account credentials, model promotion, live approval or broker mutations.
+V1 volumes are never opened. Storage is an explicit new V2 volume.
 """
 import json
 import hashlib
@@ -39,17 +39,37 @@ def persistent_directory():
     return data_dir
 
 
-def run():
-    identity = release_identity()
+def authorized_mode():
+    """Fail closed before opening stores, including inconsistent safety flags."""
     for name in ("KALSHI_PRIVATE_KEY", "KALSHI_KEY_ID", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "GOOGLE_API_KEY", "GEMINI_API_KEY"):
         if os.environ.get(name):
             raise Refused("V2 public collector must not receive financial/provider credentials")
     if os.environ.get("PROD_ACCESS_MODE", "READ_ONLY") != "READ_ONLY" or os.environ.get("CAPITAL", "OFF") != "OFF":
         raise Refused("read-only mode required")
+    for name in ("BROKER_WRITES", "REAL_ORDERS_SUBMITTED"):
+        if os.environ.get(name, "0") != "0":
+            raise Refused(name + " must remain 0")
+    mode = os.environ.get("ATLAS_V2_MODE", "PUBLIC_DATA_ONLY")
+    if mode not in {"PUBLIC_DATA_ONLY", "LIVE_MARKET_LEARNING"}:
+        raise Refused("unknown V2 mode")
+    if mode == "LIVE_MARKET_LEARNING" and os.environ.get("ATLAS_V2_QUALIFICATION_ON_START") != "1":
+        raise Refused("learning requires supplementary qualification collection")
+    return mode
+
+
+def run():
+    from .protocol_authority import authority
+    authority()  # before stores, network, probes or research startup
+    identity = release_identity()
+    mode = authorized_mode()
+    if os.environ.get("ATLAS_V2_SPORTS_PROBE_ONLY") == "1":
+        from .sports_probe import serve_probe
+        serve_probe(identity)
+        return
     data_dir = persistent_directory()
     data_dir.mkdir(parents=True, exist_ok=True)
     store = Store(data_dir / "observations.sqlite")
-    state = {"service": "atlas-v2-data", "sha": identity["sha"], "mode": "READ_ONLY",
+    state = {"service": "atlas-v2-data", "sha": identity["sha"], "mode": "READ_ONLY", "authorized_mode": mode,
              "capital": "OFF", "broker_writes": 0, "real_orders_submitted": 0,
              "model_approved": False, "active_models": [], "state": "STARTING",
              "database_path": str(store.path),
@@ -57,17 +77,93 @@ def run():
     state_lock = threading.Lock()
     stop = threading.Event()
     print(json.dumps({"at": now(), **state}), flush=True)
+    qualifier = None
+    learner = None
+    learning_lock = threading.RLock()
+    if os.environ.get("ATLAS_V2_QUALIFICATION_ON_START") == "1":
+        from .qualification import Collector, export_qualification
+        # Explicit opt-in separate database; no schema change or V1 migration.
+        qualifier = Collector(Store(data_dir / "qualification.sqlite"))
+        print(json.dumps({"at":now(),"state":"QUALIFICATION_READY","sha":identity["sha"],
+                          "database_path":str(qualifier.store.path),"anchor":qualifier.store.anchor(),
+                          "mode":"READ_ONLY","capital":"OFF","broker_writes":0,"real_orders_submitted":0}),flush=True)
+    if mode == "LIVE_MARKET_LEARNING":
+        from .learning import LearningObserver
+        from .learning_phase2 import LearningPhase2
+        learner = LearningObserver(Store(data_dir / "learning.sqlite"), identity["sha"])
+        phase2 = LearningPhase2(learner, store, qualifier.store, data_dir / "learning-reports")
+        phase2.tick()
+        state["learning"] = learner.status()
+        print(json.dumps({"at": now(), "state": "LIVE_MARKET_LEARNING_READY",
+                          "sha": identity["sha"], "learning": state["learning"],
+                          "capital": "OFF", "broker_writes": 0, "real_orders_submitted": 0}), flush=True)
+    if os.environ.get("ATLAS_V2_EXPORT_ON_START") == "1":
+        # Before the collection thread starts: coherent final anchor, private
+        # immutable files, no new route or access to any V1/account database.
+        from .research_export import write_bundle
+        try:
+            exported = write_bundle(store.path, data_dir / "exports")
+            print(json.dumps({"at":now(), "state":"RESEARCH_EXPORT_READY", "sha":identity["sha"],
+                              "capital":"OFF", "broker_writes":0, **exported}), flush=True)
+        except Exception as exc:
+            print(json.dumps({"at":now(),"state":"RESEARCH_EXPORT_BLOCKED",
+                              "reason":type(exc).__name__+":"+str(exc)[:240]}),flush=True)
+        if qualifier:
+            try:
+                exported = export_qualification(qualifier.store.path,data_dir / "qualification-exports")
+                print(json.dumps({"at":now(),"state":"QUALIFICATION_EXPORT_READY","sha":identity["sha"],**exported}),flush=True)
+            except Exception as exc:
+                print(json.dumps({"at":now(),"state":"QUALIFICATION_EXPORT_BLOCKED","reason":str(exc)[:240]}),flush=True)
+
+    def observations():
+        return [{"hash":e["hash"],**e["payload"]} for e in store.events("OBSERVATION")]
+
+    def settlements():
+        from .qualification import pending_settlements
+        while not stop.is_set():
+            try:
+                pending_settlements(qualifier,observations())
+                if learner:
+                    with learning_lock:
+                        learner.settle(observations(), qualifier.store)
+                        phase2.tick()
+                        learning_state = learner.status()
+                    with state_lock:
+                        state["learning"] = learning_state
+                    print(json.dumps({"at": now(), "state": "LEARNING_SETTLEMENT_CHECK",
+                                      "sha": identity["sha"], "learning": learning_state}), flush=True)
+            except Exception as exc:
+                print(json.dumps({"at":now(),"state":"SETTLEMENT_CAPTURE_BLOCKED","reason":str(exc)[:240]}),flush=True)
+            stop.wait(60)
 
     def collect():
         reader = PublicReader()
         while not stop.is_set():
             try:
+                pages = {}
+                if qualifier:
+                    from .qualification import prepare
+                    pages = prepare(qualifier,observations())
                 result = capture_scan(store, reader)
+                if qualifier:
+                    from .qualification import complete_decisions
+                    complete_decisions(qualifier,observations(),pages)
+                if learner:
+                    with learning_lock:
+                        learner.observe(observations(), qualifier.store)
+                        phase2.tick()
+                        learning_state = learner.status()
+                    with state_lock:
+                        state["learning"] = learning_state
                 update = {"state": "COLLECTING_PUBLIC_DATA", "last_scan_at": result["recorded_at"],
                           "last_error": None, "market_count": result["payload"]["market_count"]}
             except Exception as exc:
                 update = {"state": "COLLECTION_BLOCKED", "last_error": type(exc).__name__ + ":" + str(exc)[:240]}
             update["anchor"] = store.anchor()
+            if qualifier:update["qualification_anchor"] = qualifier.store.anchor()
+            if learner:
+                with learning_lock:
+                    update["learning"] = learner.status()
             with state_lock:
                 state.update(update)
             print(json.dumps({"at": now(), **update}), flush=True)
@@ -95,6 +191,7 @@ def run():
             pass
 
     threading.Thread(target=collect, daemon=True).start()
+    if qualifier:threading.Thread(target=settlements,daemon=True).start()
     server = HTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler)
     try:
         server.serve_forever()
