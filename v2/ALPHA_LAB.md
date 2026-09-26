@@ -28,8 +28,8 @@ PYTHONPATH=v2 python -m atlas_v2.research_export /data/atlas-v2/observations.sql
 ```
 
 This opens SQLite in `mode=ro`, sets query-only and uses one read transaction.
-It includes committed WAL contents and refuses partial export beyond 10,000
-events/32 MiB. Existing output files cannot be overwritten. Retain an independent
+It includes committed WAL contents and refuses partial export beyond 50,000
+events/128 MiB. Existing output files cannot be overwritten. Retain an independent
 collector log anchor matching the final export sequence/hash. Never copy only
 the main file while SQLite WAL writes continue. Transfer the snapshot and the
 native log receipt to research, then:

@@ -18,8 +18,8 @@ from urllib.parse import urlsplit, parse_qs
 from .domain import Refused, canonical, digest, strict_json, utc
 from .data import observation
 
-MAX_EVENTS = 10000
-MAX_BYTES = 32 * 1024 * 1024
+MAX_EVENTS = 50000
+MAX_BYTES = 128 * 1024 * 1024
 CHUNK_BYTES = 60000
 PUBLIC_KINDS = frozenset({"RAW_HTTP", "SCAN", "OBSERVATION", "REJECTED_OBSERVATION", "SCAN_FAILED"})
 
@@ -87,7 +87,7 @@ def read_bundle(directory, expected_manifest_hash, external_anchor):
     manifest = strict_json((directory/"manifest.json").read_bytes())
     if digest(manifest) != expected_manifest_hash:
         raise Refused("native export manifest mismatch")
-    if not 0 < manifest["uncompressed_bytes"] <= MAX_BYTES or len(manifest["chunks"]) > 1000:
+    if not 0 < manifest["uncompressed_bytes"] <= MAX_BYTES or len(manifest["chunks"]) > 2*MAX_BYTES//CHUNK_BYTES+2:
         raise Refused("bundle bounds")
     encoded = []
     for i, part in enumerate(manifest["chunks"]):
