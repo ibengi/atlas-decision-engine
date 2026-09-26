@@ -67,10 +67,16 @@ class LearningObserver:
         cursor = store.latest("L_LABEL_CURSOR")
         self.cursor = cursor["payload"]["sequence"] if cursor else 0
 
-    def _sources(self, observation, supplements, at):
+    def _sources(self, observation, supplements, at, event_hashes=None):
         """Reconstruct bounded recent evidence; normalized payloads cannot attest."""
         features, refs, bars, refresh, fee, errors, provenance = {}, [], [], None, None, [], []
         eligible = _events(supplements, ("Q_REFERENCE", "Q_CANDLES", "Q_LADDER", "Q_REFRESH", "Q_FEE"), latest=True)
+        if event_hashes is not None:
+            if len(event_hashes)>512: raise Refused("feature receipt bound")
+            with supplements.mutex:
+                eligible = [supplements._decode(supplements.db.execute("SELECT * FROM events WHERE hash=?",(h,)).fetchone()) for h in event_hashes]
+            if any(e is None for e in eligible): raise Refused("feature receipt missing")
+            eligible.sort(key=lambda e:e["seq"],reverse=True)
         for event in reversed(eligible):
             p, kind = event["payload"], event["kind"]
             if utc(event["recorded_at"]) > utc(at):
@@ -170,6 +176,8 @@ class LearningObserver:
                             "decision_spread": str(decimal(o["ask"])-decimal(o["bid"])),
                             "refreshed_bid": quote["bid"] if quote else None, "refreshed_ask": quote["ask"] if quote else None,
                             "spread": quote["spread"] if quote else None, "fees": fee["fee_bound"] if fee else None,
+                            "liquidity": quote["available"] if quote else None,
+                            "liquidity_kind": "DISPLAYED_ONLY_NOT_FILL" if quote else "MISSING",
                             "fee_evidence": fee, "slippage_assumption": quote["slippage_assumption"] if quote else None,
                             "slippage_policy": quote["slippage_policy"] if quote else None,
                             "intended_size": 1, "hypothetical_size": 0, "accepted_size": 0,
@@ -181,9 +189,13 @@ class LearningObserver:
                             "would_submit": False, "model_approved": False, "prospective_oos_qualified": False,
                             "observation": o, "observation_hash": o["hash"], "source_errors": errors,
                             "qualification_anchor": qualification_store.anchor(), "source_evidence": provenance,
-                            "features_hash": digest(features), "plan_hash": digest(plan()), "champion": None}
+                            "features_hash": digest({"cohort":{k:v for k,v in row.items() if k != "observation"},"sources":features}), "feature_snapshot": features,
+                            "cohort_snapshot": {k:v for k,v in row.items() if k != "observation"},
+                            "plan_hash": digest(plan()), "champion": None}
+                        if getattr(self,"phase2",None): payload["training_protocol_hash"] = self.phase2.protocol_hash
                         identity = "learning:decision:" + digest([o["event_id"], family])
                         written = self.store.append(identity, "L_DECISION", payload)
+                        if getattr(self,"phase2",None): self.phase2.capture_challengers(written, at)
                         commit_at = utc(now())
                         if (commit_at >= utc(o["close_at"]) or
                                 not 0 <= (commit_at-utc(o["observed_at"])).total_seconds() <= 5 or
@@ -249,6 +261,12 @@ class LearningObserver:
                         "predictive_training_eligible_at_knowledge_time": model is not None and d["candidate_hash"] not in self.disqualified and identity not in self.invalid,
                         "eligibility_policy": "current invalidation/disqualification ledger overrides this historical snapshot",
                         "economic_reward": None, "hypothetical_realized_pnl": None,
+                        "settlement_receipt_hash": label["source_receipt"], "authoritative_outcome": y,
+                        "gross_pnl": None, "fees_realized": None, "slippage_realized": None, "net_pnl": None,
+                        "brier_contribution": str(model) if model is not None else None,
+                        "prediction_residual": str(decimal(d["model_probability"])-y) if model is not None else None,
+                        "calibration_error": None, "calibration_reason": "AGGREGATE_ECE_IN_PHASE2_REPORT",
+                        "drawdown_contribution": None,
                         "pnl_reason": "REJECTED_NO_EXECUTION", "maximum_adverse_excursion": None,
                         "maximum_favorable_excursion": None, "excursion_reason": "NO_ACCEPTED_EXECUTION",
                         "qualification_anchor": qualification_store.anchor()}
@@ -274,6 +292,7 @@ class LearningObserver:
             return event
 
     def _checkpoints(self, at):
+        if getattr(self,"phase2",None): return
         first = utc(self.activation["activated_at"]).date() + timedelta(days=1)
         latest = self.store.latest("L_DATASET_CHECKPOINT")
         if latest: first = utc(latest["payload"]["day"]+"T00:00:00Z").date() + timedelta(days=1)
@@ -300,7 +319,7 @@ class LearningObserver:
 
     def status(self):
         with self.lock:
-            return {"mode": "LIVE_MARKET_LEARNING", "learner_enabled": True,
+            result = {"mode": "LIVE_MARKET_LEARNING", "learner_enabled": True,
                 "activated_at": self.activation["activated_at"], "capital": "OFF", "broker_writes": 0,
                 "real_orders_submitted": 0, "active_models": [], "champion": None, "model_approved": False,
                 "hypothesis_observers": list(HYPOTHESES), "decisions": len(self.decisions),
@@ -312,3 +331,8 @@ class LearningObserver:
                 "retraining_status": "BLOCKED", "retraining_blocking_reasons": RETRAIN_BLOCKERS,
                 "execution_blocking_reasons": BLOCKERS, "blocking_reasons": BLOCKERS,
                 "self_promotion": False, "learning_anchor": self.store.anchor()}
+            if getattr(self,"phase2",None):
+                result["phase2"] = self.phase2.status()
+                result["retraining_status"] = result["phase2"]["status"]
+                result["retraining_blocking_reasons"] = result["phase2"]["blocking_reasons"]
+            return result
