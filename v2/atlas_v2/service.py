@@ -83,7 +83,10 @@ def run():
                           "mode":"READ_ONLY","capital":"OFF","broker_writes":0,"real_orders_submitted":0}),flush=True)
     if mode == "LIVE_MARKET_LEARNING":
         from .learning import LearningObserver
+        from .learning_phase2 import LearningPhase2
         learner = LearningObserver(Store(data_dir / "learning.sqlite"), identity["sha"])
+        phase2 = LearningPhase2(learner, store, qualifier.store, data_dir / "learning-reports")
+        phase2.tick()
         state["learning"] = learner.status()
         print(json.dumps({"at": now(), "state": "LIVE_MARKET_LEARNING_READY",
                           "sha": identity["sha"], "learning": state["learning"],
@@ -117,6 +120,7 @@ def run():
                 if learner:
                     with learning_lock:
                         learner.settle(observations(), qualifier.store)
+                        phase2.tick()
                         learning_state = learner.status()
                     with state_lock:
                         state["learning"] = learning_state
@@ -141,6 +145,7 @@ def run():
                 if learner:
                     with learning_lock:
                         learner.observe(observations(), qualifier.store)
+                        phase2.tick()
                         learning_state = learner.status()
                     with state_lock:
                         state["learning"] = learning_state

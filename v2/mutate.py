@@ -13,6 +13,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ("phase2_daily_minimum", "training_protocol.py", 'counts[(utc(start)+timedelta(days=i)).date().isoformat()] < 30', 'counts[(utc(start)+timedelta(days=i)).date().isoformat()] < 0', "test_phase2.ProtocolTests.test_minimum_is_per_day_not_total_or_copies"),
+    ("phase2_late_oos_prediction", "training_protocol.py", 'utc(r["prediction_recorded_at"]) < utc(r["close_at"])', 'utc(r["prediction_recorded_at"]) <= utc(r["close_at"])', "test_phase2.ProtocolTests.test_oos_must_be_future_and_prospectively_recorded"),
+    ("phase2_frozen_source", "learning_phase2.py", 'freeze["payload"]["source_sha"] != observer.source_sha', 'False', "test_phase2.NativeCoordinatorTests.test_protocol_rejects_late_initialization_and_changed_source"),
+    ("phase2_native_quote_binding", "learning_phase2.py", 'or matches != [p]', '', "test_phase2.NativeCoordinatorTests.test_raw_transport_cannot_be_replaced_by_normalized_quote"),
     ("learning_label_conflict", "learning.py", 'if (old["outcome"], old["settlement_at"]) != (label["outcome"], label["settlement_at"]):', 'if False:', "test_learning.LearningTests.test_conflict_permanently_invalidates_even_if_later_label_reverts"),
     ("learning_disqualification", "learning.py", 'if candidate in self.disqualified: reasons.append("CANDIDATE_DISQUALIFIED")', 'if False: reasons.append("CANDIDATE_DISQUALIFIED")', "test_learning.LearningTests.test_guard_rejection_is_not_bypass_and_bypass_survives_restart"),
     ("learning_write_flag", "service.py", 'if os.environ.get(name, "0") != "0":', 'if False:', "test_learning_service.LearningStartupTests.test_learning_requires_readonly_zero_writes_and_qualification"),
