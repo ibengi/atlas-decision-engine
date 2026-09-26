@@ -10,7 +10,7 @@
 
 The historical PHASE2 payload and its canonical hash `751652ff4e2f5a9e9aa223952a655a34cc598dcc8d179f564d597c18002f41df` are preserved. Supersession metadata is outside that payload. No old observations, labels, locks, outcomes or ledgers are rewritten or deleted.
 
-PHASE2 **MUST NOT** contribute TRAIN, CALIBRATION, VALIDATION or OOS rows to MR. It **MUST NOT** fit, calibrate, select, lock or promote any MR candidate. Its old pure diagnostic calculations remain available solely for historical reproduction, are labeled superseded/unadmitted, and reject MR-tagged inputs. The PHASE2 coordinator's automatic fitting, challenger capture, locking and OOS lifecycle are disabled under the new authority. Historical lifecycle regression tests explicitly emulate the retired authority inside synthetic test fixtures; production has no such bypass.
+PHASE2 **MUST NOT** contribute TRAIN, CALIBRATION, VALIDATION or OOS rows to MR. It **MUST NOT** fit, calibrate, select, lock or promote any MR candidate. Its old calculations are preserved for historical reproduction, are labeled superseded/unadmitted, and reject MR-tagged inputs. Public legacy fit and OOS entry points also require active authority and are now refused, even for otherwise valid legacy inputs. The PHASE2 coordinator's automatic fitting, challenger capture, locking and OOS lifecycle are disabled under the new authority. Historical arithmetic and lifecycle regression tests explicitly emulate the retired authority inside synthetic test fixtures; production has no such bypass.
 
 ## Fail-closed enforcement
 

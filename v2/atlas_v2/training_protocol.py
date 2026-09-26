@@ -7,6 +7,7 @@ import math
 from .alpha_lab import HYPOTHESES, plan
 from .domain import Refused, digest, utc
 from .protocol_authority import reject_mr_rows
+from . import protocol_authority as governance
 
 START = "2026-09-27T00:00:00Z"
 TRAIN_END = "2026-10-04T00:00:00Z"
@@ -141,6 +142,7 @@ def paired_gate(rows, parameters):
 
 def train_family(family, rows, at):
     reject_mr_rows(rows)
+    governance.require_active(governance.PHASE2)
     if family not in HYPOTHESES or utc(at) < utc(FIT_AT) or utc(at) >= utc(DEADLINE):
         raise Refused("unregistered family or training time")
     if any(r["family"] != family for r in rows):
@@ -169,6 +171,7 @@ def oos_window(locked_at):
 
 def evaluate_oos(challenger, rows, at):
     reject_mr_rows(rows)
+    governance.require_active(governance.PHASE2)
     start,end,cutoff = oos_window(challenger["locked_at"])
     if utc(at) < utc(cutoff):
         raise Refused("OOS period incomplete")

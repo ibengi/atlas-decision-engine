@@ -13,6 +13,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ('authority_direct_fit_retired', 'training_protocol.py', 'def train_family(family, rows, at):\n    reject_mr_rows(rows)\n    governance.require_active(governance.PHASE2)', 'def train_family(family, rows, at):\n    reject_mr_rows(rows)', 'test_protocol_authority.AuthorityTests.test_direct_legacy_fit_and_oos_are_retired'),
     ('authority_overlap', 'protocol_authority.py', "if not set(a['markets']) & set(b['markets']): continue", 'if True: continue', 'test_protocol_authority.AuthorityTests.test_active_overlap_rejected_and_disjoint_allowed'),
     ('authority_startup', 'service.py', 'authority()  # before stores, network, probes or research startup', 'pass  # deliberate missing startup authority check', 'test_protocol_authority.AuthorityTests.test_startup_checks_authority_before_any_state_or_network'),
     ('authority_legacy_mr_rows', 'protocol_authority.py', 'for row in rows:', 'for row in []:', 'test_protocol_authority.AuthorityTests.test_superseded_protocol_cannot_consume_mr_rows'),

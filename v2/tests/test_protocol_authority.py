@@ -56,6 +56,10 @@ class AuthorityTests(unittest.TestCase):
                               lambda:old.paired_gate([row],{})):
                 with self.assertRaisesRegex(Refused,'SUPERSEDED_PROTOCOL_CANNOT_CONSUME_MR_ROWS'):operation()
 
+    def test_direct_legacy_fit_and_oos_are_retired(self):
+        for operation in (lambda:old.train_family('time_structure_v1',[],old.FIT_AT),lambda:old.evaluate_oos({},[],old.FIT_AT)):
+            with self.assertRaisesRegex(Refused,a.SUPERSEDED):operation()
+
     def test_protocol_hash_mismatch_rejected(self):
         plan=deepcopy(a.authority());plan['baseline']='changed'
         with self.assertRaisesRegex(Refused,'MR_PROTOCOL_HASH_MISMATCH'):a.assert_registry(plan)

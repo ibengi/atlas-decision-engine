@@ -40,6 +40,11 @@ def sample_rows(start=START,days=17):
 
 
 class ProtocolTests(unittest.TestCase):
+    def setUp(self):
+        # Historical arithmetic regression only; public fitting is retired.
+        self.authority_patch=patch("atlas_v2.protocol_authority.require_active")
+        self.authority_patch.start();self.addCleanup(self.authority_patch.stop)
+
     def test_fixed_splits_deterministic_fit_and_no_promotion(self):
         rows=sample_rows()
         result=train_family(FAMILY,rows,FIT_AT)

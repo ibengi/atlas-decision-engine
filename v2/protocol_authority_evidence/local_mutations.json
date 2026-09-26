@@ -2,6 +2,11 @@
   "baseline": "PASS",
   "mutations": [
     {
+      "mutation": "authority_direct_fit_retired",
+      "killed": true,
+      "test": "test_protocol_authority.AuthorityTests.test_direct_legacy_fit_and_oos_are_retired"
+    },
+    {
       "mutation": "authority_overlap",
       "killed": true,
       "test": "test_protocol_authority.AuthorityTests.test_active_overlap_rejected_and_disjoint_allowed"
