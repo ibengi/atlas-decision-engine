@@ -9,7 +9,7 @@ import of this research module. Historical diagnostics are not final OOS.
 The current public collector stores raw responses, complete scans and quotes.
 It does **not** collect authoritative labels, underlying candles, synchronized
 strike ladders, refreshed executable depth or fee/slippage receipts. Consequently
-the native-cohort runner reports `FAIL_EVIDENCE`, with unavailable metrics null.
+the native-cohort runner reports `NOT_TESTABLE`, with unavailable metrics null.
 It does not reject a statistical hypothesis from absent data. `paired_metrics`
 and `labelled_diagnostics` support historical diagnostics once inputs exist;
 they do not authenticate a supplied label receipt or qualify an edge.
@@ -58,6 +58,28 @@ are not assumed to be nested events.
 
 No surviving candidate means no lock, no OOS start timestamp, no deployment and
 no Claude candidate review. Retain failed runs and V1 consumed-data labels.
+
+## Phase 2B private export
+
+The V2 collector can create an export before its collection thread starts when
+`ATLAS_V2_EXPORT_ON_START=1`. This exports the existing dedicated V2 public ledger
+to `/data/atlas-v2/exports/<dataset_sha256>/` as deterministic gzip/base64 text
+chunks of at most 60,000 bytes and `manifest.json`. It adds no HTTP route. The
+manifest includes raw event and observation counts, distinct markets, UTC
+coverage, kind counts, full snapshot SHA-256 and final chain anchor. Pagination
+receipts, invalid rows and failed scans remain present; non-public event kinds
+cause the entire export to fail. It never silently filters a mixed ledger.
+
+The `RESEARCH_EXPORT_READY` native log binds the manifest hash, dataset hash,
+anchor and exact runtime SHA. Retrieve every chunk and use `read_bundle` plus
+`observations_from_snapshot`; truncated, changed or incomplete artifacts are
+refused. An export failure is logged and does not stop public collection.
+
+An export-only V2 collector release is distinct from a shadow model deployment.
+It leaves all five formulas and the preregistered plan hash unchanged. The
+drawdown helper now explicitly reports dollars, fraction, percentage and its
+hypothetical equity base. Neither diagnostic calculations nor export grant
+candidate qualification or financial authority.
 
 Software verification (synthetic inputs only):
 

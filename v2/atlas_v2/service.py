@@ -57,6 +57,17 @@ def run():
     state_lock = threading.Lock()
     stop = threading.Event()
     print(json.dumps({"at": now(), **state}), flush=True)
+    if os.environ.get("ATLAS_V2_EXPORT_ON_START") == "1":
+        # Before the collection thread starts: coherent final anchor, private
+        # immutable files, no new route or access to any V1/account database.
+        from .research_export import write_bundle
+        try:
+            exported = write_bundle(store.path, data_dir / "exports")
+            print(json.dumps({"at":now(), "state":"RESEARCH_EXPORT_READY", "sha":identity["sha"],
+                              "capital":"OFF", "broker_writes":0, **exported}), flush=True)
+        except Exception as exc:
+            print(json.dumps({"at":now(),"state":"RESEARCH_EXPORT_BLOCKED",
+                              "reason":type(exc).__name__+":"+str(exc)[:240]}),flush=True)
 
     def collect():
         reader = PublicReader()

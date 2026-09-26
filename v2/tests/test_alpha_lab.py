@@ -5,12 +5,15 @@ from decimal import Decimal
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import json
 
 from atlas_v2.alpha_lab import (cohort, drawdown, economic_diagnostic, labelled_diagnostics,
     paired_metrics, plan, preregister, probability, run_experiments)
 from atlas_v2.domain import Refused, digest
 from atlas_v2.execution import Quote
-from atlas_v2.research_export import export_database, observations_from_snapshot, verify_snapshot
+from atlas_v2.research_export import (export_database, observations_from_snapshot, verify_snapshot,
+                                     write_bundle, read_bundle)
 from atlas_v2.store import Store
 
 
@@ -28,6 +31,7 @@ class AlphaLabTests(unittest.TestCase):
             value = preregister(path,"a"*40)
             self.assertEqual(value["plan_hash"],digest(plan()))
             self.assertEqual(len(value["plan"]["families"]),5)
+            self.assertEqual(digest(plan()),"5f9b96e20314c1bc361f3f782a4d5ef28171ee7ecf126e87491ed10026eb96b1")
             with self.assertRaises(FileExistsError): preregister(path,"a"*40)
 
     def test_cohort_is_outcome_blind_unique_event_and_derived_day(self):
@@ -67,6 +71,8 @@ class AlphaLabTests(unittest.TestCase):
         self.assertEqual(a["maximum_drawdown_dollars"],"1")
         self.assertEqual(a["maximum_drawdown_fraction"],"0.1")
         self.assertEqual(b["maximum_drawdown_fraction"],"0.01")
+        self.assertEqual(a["maximum_drawdown_percent"],"10.0")
+        self.assertEqual(a["hypothetical_starting_equity_dollars"],"10")
         with self.assertRaises(Refused): drawdown(["-1"],"0")
 
     def test_shared_economics_refuses_stale_spread_cost_and_no_liquidity(self):
@@ -109,6 +115,43 @@ class AlphaLabTests(unittest.TestCase):
             missing=Path(directory)/"does-not-exist.sqlite"
             with self.assertRaises(FileNotFoundError): export_database(missing)
             self.assertFalse(missing.exists())
+
+    def test_export_bundle_deterministic_complete_and_private_scope_only(self):
+        from atlas_v2.data import capture_scan
+        from test_invariants import DataTests
+        helper = DataTests()
+        class Reader:
+            def get_markets(self, series, cursor): return helper.response()
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"data.sqlite"
+            store=Store(path)
+            capture_scan(store,Reader())
+            anchor=store.anchor()
+            first=write_bundle(path,Path(directory)/"exports")
+            self.assertEqual(first,write_bundle(path,Path(directory)/"exports"))
+            self.assertEqual(first["observation_count"],1)
+            folder=Path(first["manifest_path"]).parent
+            imported=read_bundle(folder,first["manifest_sha256"],anchor)
+            self.assertEqual(len(observations_from_snapshot(imported,anchor)),1)
+            self.assertEqual(imported["events"],store.events())
+            part=folder/"part-0000.txt"
+            part.write_bytes(part.read_bytes()[:-1])
+            with self.assertRaises(Refused): read_bundle(folder,first["manifest_sha256"],anchor)
+            self.assertEqual(store.anchor(),anchor)
+            store.append("private","CONTROL",{"private":"must not export"})
+            with self.assertRaises(Refused): write_bundle(path,Path(directory)/"blocked")
+            self.assertFalse((Path(directory)/"blocked").exists())
+            store.close()
+
+    def test_export_bounds_refuse_partial_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/"data.sqlite"
+            store=Store(path)
+            store.append("one","SCAN_FAILED",{})
+            store.append("two","SCAN_FAILED",{})
+            with patch("atlas_v2.research_export.MAX_EVENTS",1):
+                with self.assertRaises(Refused): export_database(path)
+            store.close()
 
 
 if __name__ == "__main__": unittest.main()

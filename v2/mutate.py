@@ -13,6 +13,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ("alpha_external_probability", "alpha_lab.py", 'if "candidate_probability" in row or "period" in row:', 'if False:', "test_alpha_lab.AlphaLabTests.test_cohort_is_outcome_blind_unique_event_and_derived_day"),
+    ("export_private_scope", "research_export.py", 'if event["kind"] not in PUBLIC_KINDS:', 'if False:', "test_alpha_lab.AlphaLabTests.test_export_bundle_deterministic_complete_and_private_scope_only"),
     ("alpha_market_baseline", "alpha_lab.py", "candidate, baseline = score(probabilities), score(baselines)", "candidate, baseline = score(probabilities), score(probabilities)", "test_alpha_lab.AlphaLabTests.test_market_baseline_is_paired_not_replaced_by_candidate"),
     ("alpha_drawdown_units", "alpha_lab.py", "fraction = max(fraction, (peak-equity)/peak)", "fraction = max(fraction, peak-equity)", "test_alpha_lab.AlphaLabTests.test_drawdown_units_are_explicit"),
     ("alpha_duplicate_event", "alpha_lab.py", 'elif row["event_id"] in seen:', 'elif False:', "test_alpha_lab.AlphaLabTests.test_cohort_is_outcome_blind_unique_event_and_derived_day"),

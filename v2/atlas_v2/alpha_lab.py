@@ -213,7 +213,9 @@ def drawdown(pnls, hypothetical_starting_equity):
         peak = max(peak, equity)
         dollars = max(dollars, peak-equity)
         fraction = max(fraction, (peak-equity)/peak)
-    return {"maximum_drawdown_dollars":str(dollars), "maximum_drawdown_fraction":str(fraction)}
+    return {"hypothetical_starting_equity_dollars":str(decimal(hypothetical_starting_equity)),
+            "maximum_drawdown_dollars":str(dollars), "maximum_drawdown_fraction":str(fraction),
+            "maximum_drawdown_percent":str(fraction*100)}
 
 
 def labelled_diagnostics(family, rows, features_by_hash, labels_by_ticker):
@@ -289,7 +291,7 @@ def run_experiments(observations, registration, snapshot_hash, cutoff):
                 predictions.append({"observation_hash":row["observation"]["hash"], "p":str(p),
                                     "market_probability":row["mid"], "ask":row["ask"],
                                     "gross_edge_at_decision_ask":str(p-decimal(row["ask"]))})
-        experiments.append({"hypothesis_id":family, "status":"FAIL_EVIDENCE",
+        experiments.append({"hypothesis_id":family, "status":"NOT_TESTABLE",
             "scientific_rejection":False, "predictions":predictions, "missing_features":dict(missing),
             "paired_rows":0,"brier":None,"log_loss":None,"calibration":None,"baseline_brier":None,
             "delta_vs_baseline":None,"gross_edge":None,"expected_edge_after_fees":None,
@@ -305,7 +307,7 @@ def run_experiments(observations, registration, snapshot_hash, cutoff):
         "cohort_hash":digest(rows),"cohort_rows":len(rows),"exclusions":excluded,
         "train_days":train_days,"validation_days":validation_days,
         "experiments":experiments,"future_oos_start":None,"candidate_lock":None,
-        "verdict":"NO_EDGE_FOUND_IN_CURRENT_HYPOTHESES",
+        "verdict":"NO_CANDIDATE_READY_FOR_LOCK",
         "interpretation":"No edge established; missing evidence is not statistical rejection."}
 
 
