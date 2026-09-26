@@ -31,6 +31,7 @@ from .data import NoRedirect
 from .domain import Refused, canonical, decimal, digest, now, strict_json, utc
 from .sports_capture import identifier, levels
 from .store import Store
+from .sports_scope_evidence import ENV_NAME as SCOPE_EVIDENCE_ENV, verify_provider_evidence
 
 REST = "https://external-api.kalshi.com/trade-api/v2"
 WS = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
@@ -89,6 +90,36 @@ def verify_scope(body, key_id):
     matches = [r for r in body["api_keys"] if isinstance(r, dict) and r.get("api_key_id") == key_id]
     require(len(matches) == 1 and matches[0].get("scopes") == ["read"], "READ_ONLY_SCOPE_NOT_PROVEN")
     return {"matching_key_found": True, "scopes": ["read"], "key_id_redacted": True}
+
+
+def establish_scope(reader, credentials, env):
+    # Only unavailable scope evidence permits fallback. An explicit denial,
+    # ambiguity, or current conflicting permission record cannot be overridden.
+    try:
+        body = reader.get("/api_keys", credentials=credentials)
+    except Refused as exc:
+        if str(exc) not in {"REST_HTTP_403", "REST_HTTP_404", "REST_CONNECTION_FAILED"}:
+            raise
+        api_reason = str(exc)
+    else:
+        require(isinstance(body, dict) and set(body) <= {"api_keys", "api_key_region_expiration_ts"}
+                and isinstance(body.get("api_keys"), list),
+                "SCOPE_ENVELOPE_REFUSED")
+        records = body["api_keys"]
+        require(all(isinstance(r, dict) and isinstance(r.get("api_key_id"), str) for r in records),
+                "SCOPE_ENVELOPE_REFUSED")
+        matches = [r for r in records if r["api_key_id"] == credentials.key_id]
+        require(len(matches) == 1, "SCOPE_KEY_ABSENT_OR_AMBIGUOUS")
+        record = matches[0]
+        require(not any(record.get(k) is True for k in ("revoked", "disabled")), "SCOPE_KEY_REVOKED")
+        if "scopes" in record and record["scopes"] is not None:
+            require(record["scopes"] == ["read"], "SCOPE_EVIDENCE_CONFLICT")
+            return verify_scope(body, credentials.key_id)
+        # A matching key with omitted/null scopes cannot establish permission.
+        api_reason = "SCOPE_FIELD_UNAVAILABLE"
+    scope = verify_provider_evidence(env.get(SCOPE_EVIDENCE_ENV), credentials.key_id, now())
+    scope["api_scope_unavailable_reason"] = api_reason
+    return scope
 
 
 class Evidence:
@@ -445,7 +476,7 @@ def run_probe(directory, source_sha, env=None):
             "frozen_relationship_graph_sha256":"da7cfcc393312fc31ba7f090f146550e9febfd6d3362e2aee391283798b4df83",
             "frozen_admission_policy_sha256":"c88af435f649df2966ba2ff26a2619932520dc43115bdf3c9268c4b39ded890f"})
         reader = Reader(evidence, deadline)
-        scope = verify_scope(reader.get("/api_keys", credentials=credentials), credentials.key_id)
+        scope = establish_scope(reader, credentials, env)
         evidence.add("SCOPE", scope)
         summary["scope_verified"] = True
         before = membership(reader)

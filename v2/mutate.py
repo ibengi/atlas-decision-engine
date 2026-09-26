@@ -13,6 +13,17 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ('scope_artifact_trust', 'sports_scope_evidence.py', 'manifest_hash in REVIEWED_EVIDENCE_SHA256', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_pinned_manifest_and_no_self_authorization'),
+    ('scope_artifact_key', 'sports_scope_evidence.py', 'hmac.compare_digest(body["key_id_sha256"], key_fingerprint(key_id))', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_installed_key_binding'),
+    ('scope_artifact_source', 'sports_scope_evidence.py', 'body["provider"] == "Kalshi" and body["source_url"] in SOURCES', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_provider_and_hashes'),
+    ('scope_artifact_permissions', 'sports_scope_evidence.py', 'body["write_allowed"] is False', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_permissions'),
+    ('scope_artifact_trade', 'sports_scope_evidence.py', 'body["trade_allowed"] is False', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_permissions'),
+    ('scope_artifact_transfer', 'sports_scope_evidence.py', 'body["transfer_allowed"] is False', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_permissions'),
+    ('scope_artifact_expiry', 'sports_scope_evidence.py', 'observed <= current < expires', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_expiry_future_and_utc'),
+    ('scope_artifact_validity', 'sports_scope_evidence.py', '0 < (expires-observed).total_seconds() <= MAX_VALIDITY_SECONDS', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_expiry_future_and_utc'),
+    ('scope_artifact_hash', 'sports_scope_evidence.py', 'isinstance(body[field], str) and re.fullmatch(r"[0-9a-f]{64}", body[field])', 'True', 'test_sports_scope_evidence.ScopeEvidenceTests.test_provider_and_hashes'),
+    ('scope_artifact_api_denial', 'sports_probe.py', 'require(record["scopes"] == ["read"], "SCOPE_EVIDENCE_CONFLICT")', 'return {"scopes": ["read"]}', 'test_sports_scope_evidence.ScopeEvidenceTests.test_api_conflicts_cannot_be_overridden'),
+    ('scope_artifact_unavailable_only', 'sports_probe.py', 'if str(exc) not in {"REST_HTTP_403", "REST_HTTP_404", "REST_CONNECTION_FAILED"}:', 'if False:', 'test_sports_scope_evidence.ScopeEvidenceTests.test_fallback_only_when_unavailable'),
     ('sports_read_scope', 'sports_probe.py', 'matches[0].get("scopes") == ["read"]', 'True', 'test_sports_probe.SportsProbeTests.test_scope_requires_exact_matching_read_only_record'),
     ('sports_signer_path', 'sports_probe.py', 'path in {"/trade-api/v2/api_keys", "/trade-api/ws/v2"}', 'True', 'test_sports_probe.SportsProbeTests.test_signature_binding_and_mutation_paths_refused'),
     ('sports_secret_output', 'sports_probe.py', 'not any(s and s in encoded for s in self.secrets)', 'True', 'test_sports_probe.SportsProbeTests.test_secrets_never_persist_even_provider_echo'),

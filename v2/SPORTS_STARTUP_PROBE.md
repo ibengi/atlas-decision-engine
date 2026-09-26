@@ -8,7 +8,7 @@ Set `ATLAS_V2_SPORTS_PROBE_ONLY=1` on an explicitly authorized exact candidate o
 
 This mode addresses the absence of remote shell execution; it requires no interactive command. The current separately deployed learning release is `55cd4530dc4fc143f9c041eceaada9a1ba88bef4`. Do not deploy a normal-mode replacement into its existing learning ledger under another SHA: its frozen source binding must continue to reject that change. No main/PR79/PR80 merge is necessary or authorized.
 
-Read credentials only from Railway variables `KALSHI_SPORTS_READ_KEY_ID` and `KALSHI_SPORTS_READ_PRIVATE_KEY`. No local copy, source secret, private key log, signature log, account query or financial mutation route is provided. GET `/api_keys` is used only to match the active key to exactly `["read"]`; its body is hash-retained, not persisted verbatim. The key identifier is redacted. Unknown/broader scopes refuse the proof.
+Read credentials only from Railway variables `KALSHI_SPORTS_READ_KEY_ID` and `KALSHI_SPORTS_READ_PRIVATE_KEY`. No local copy, source secret, private key log, signature log, account query or financial mutation route is provided. GET `/api_keys` is used only to match the active key to exactly `["read"]`; its body is hash-retained, not persisted verbatim. The key identifier is redacted. Explicit broader scopes refuse the proof. When scope is unavailable, only release-pinned, independently verified provider evidence bound to the installed key can supply authority; see `SPORTS_SCOPE_EVIDENCE.md`. The production evidence-pin set is initially empty, so user claims alone still fail closed.
 
 ## Scope and finite bounds
 
