@@ -94,7 +94,7 @@ class ReconstructionTests(unittest.TestCase):
             "transport_complete":True,"body_base64":base64.b64encode(raw).decode(),"body_sha256":hashlib.sha256(raw).hexdigest()}
         with patch("atlas_v2.store.now",return_value=AT):return self.store.append(key,"Q_RAW",p)
     def model(self):
-        artifact={"family":"structural","candidate_identity":"MR-STRUCTURAL-1","scales":[1.0],"slope":1.,"intercept":0.,
+        artifact={"protocol_id":r.authority.MR,"candidate_family":"MR-STRUCTURAL-1","family":"structural","candidate_identity":"MR-STRUCTURAL-1","scales":[1.0],"slope":1.,"intercept":0.,
             "protocol_hash":r.PROTOCOL_HASH,"source_git_sha":SHA,"implementation_sha256":hashlib.sha256(Path(r.__file__).read_bytes()).hexdigest(),
             "feature_schema":"MR-FEATURES-1","approved":False}
         return {"artifact":artifact,"model_artifact_sha256":digest(artifact)}
@@ -150,7 +150,7 @@ class ReconstructionTests(unittest.TestCase):
     def test_future_splits_refuse_small_consumed_or_early_data(self):
         with self.assertRaises(Refused):r.check_rows([],"TRAIN",AT)
         with self.assertRaises(Refused):r.check_rows([],"TRAIN","2026-11-01T00:00:00Z")
-        row={"features":self.features,"event_id":self.features["event_id"],"outcome":1,"settled_at":"2026-09-27T00:15:00Z",
+        row={**r.authority.binding(AT,"structural"),"source_protocol_id":r.authority.MR,"prior_candidate_uses":[],"features":self.features,"event_id":self.features["event_id"],"outcome":1,"settled_at":"2026-09-27T00:15:00Z",
              "label_received_at":"2026-09-27T00:16:00Z","settlement_receipt":"b"*64,"collector_source_sha":SHA,"consumed_v1":True}
         with self.assertRaisesRegex(Refused,"consumed"):r.check_rows([row],"TRAIN","2026-11-01T00:00:00Z")
     def test_registered_parameters_and_market_scope(self):
@@ -182,7 +182,7 @@ class ReconstructionTests(unittest.TestCase):
                     f=deepcopy(self.features);f.update(decision_at=at.isoformat(),close_at=(at+timedelta(minutes=5)).isoformat(),
                         candle_end=at.isoformat(),event_id=stage+str(day)+"-"+str(j))
                     f["feature_hash"]=digest({k:v for k,v in f.items() if k!="feature_hash"})
-                    rows.append({"features":f,"event_id":f["event_id"],"consumed_v1":False,"outcome":j%2,
+                    rows.append({**r.authority.binding(f["decision_at"],"structural"),"source_protocol_id":r.authority.MR,"prior_candidate_uses":[],"features":f,"event_id":f["event_id"],"consumed_v1":False,"outcome":j%2,
                         "settled_at":f["close_at"],"label_received_at":(at+timedelta(minutes=6)).isoformat(),
                         "settlement_receipt":"b"*64,"collector_source_sha":SHA})
             return rows

@@ -6,6 +6,7 @@ import math
 
 from .alpha_lab import HYPOTHESES, plan
 from .domain import Refused, digest, utc
+from .protocol_authority import reject_mr_rows
 
 START = "2026-09-27T00:00:00Z"
 TRAIN_END = "2026-10-04T00:00:00Z"
@@ -16,6 +17,7 @@ DEADLINE = "2026-10-25T00:00:00Z"
 
 
 def protocol():
+    """Historical payload only; active authority comes from protocol_authority."""
     return {
         "schema": "atlas-training-protocol/1", "version": "PHASE2-20260926-1",
         "eligible_not_before": START, "parent_plan_hash": digest(plan()),
@@ -96,6 +98,7 @@ def scores(rows, probability_key="probability"):
 
 
 def _validate_rows(rows, start, end, cutoff):
+    reject_mr_rows(rows)
     selected = [r for r in rows if utc(start) <= utc(r["observed_at"]) < utc(end)]
     seen = set()
     for r in selected:
@@ -114,6 +117,7 @@ def _validate_rows(rows, start, end, cutoff):
 
 
 def paired_gate(rows, parameters):
+    reject_mr_rows(rows)
     evaluated = [dict(r, challenger_probability=predict(parameters, r["probability"])) for r in rows]
     candidate = scores(evaluated, "challenger_probability")
     baselines = {k: scores(rows,k) for k in ("market_probability", "ask_baseline", "probability")}
@@ -132,10 +136,11 @@ def paired_gate(rows, parameters):
     passed = all(v["brier_advantage"] > 0 and v["day_sign_flip_p"] <= 0.01 for v in comparisons.values())
     passed = passed and all(candidate["logloss"] < baselines[k]["logloss"] for k in ("market_probability", "ask_baseline"))
     return {"predictive_pass": passed, "candidate": candidate, "baselines": baselines, "comparisons": comparisons,
-            "independence_established": False, "qualification": "DIAGNOSTIC_UNADMITTED", "promotion": False}
+            "independence_established": False, "qualification": "DIAGNOSTIC_UNADMITTED", "authority_status":"SUPERSEDED_FOR_MODEL_RECONSTRUCTION", "mr_eligible":False, "promotion": False}
 
 
 def train_family(family, rows, at):
+    reject_mr_rows(rows)
     if family not in HYPOTHESES or utc(at) < utc(FIT_AT) or utc(at) >= utc(DEADLINE):
         raise Refused("unregistered family or training time")
     if any(r["family"] != family for r in rows):
@@ -153,7 +158,7 @@ def train_family(family, rows, at):
     parameters = dict(a=a,b=b,c=c)
     return {"family": family, "parameters": parameters, "protocol_hash": protocol_hash(),
             "dataset_hash": digest(train+calibration+validation), "counts": [len(train),len(calibration),len(validation)],
-            "validation": paired_gate(validation,parameters), "qualification": "DIAGNOSTIC_UNADMITTED", "promotion": False}
+            "validation": paired_gate(validation,parameters), "qualification": "DIAGNOSTIC_UNADMITTED", "authority_status":"SUPERSEDED_FOR_MODEL_RECONSTRUCTION", "mr_eligible":False, "promotion": False}
 
 
 def oos_window(locked_at):
@@ -163,6 +168,7 @@ def oos_window(locked_at):
 
 
 def evaluate_oos(challenger, rows, at):
+    reject_mr_rows(rows)
     start,end,cutoff = oos_window(challenger["locked_at"])
     if utc(at) < utc(cutoff):
         raise Refused("OOS period incomplete")

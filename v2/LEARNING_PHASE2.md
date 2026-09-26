@@ -1,3 +1,5 @@
+> **SUPERSEDED_FOR_MODEL_RECONSTRUCTION**: PHASE2-20260926-1 is historical learning evidence only. It cannot supply MR TRAIN/CALIBRATION/VALIDATION/OOS rows or fit, calibrate, select, lock or promote an MR candidate. See [PROTOCOL_AUTHORITY.md](PROTOCOL_AUTHORITY.md). The historical protocol payload/hash below is preserved.
+
 # Atlas V2 — qualified learning protocol
 
 Version: PHASE2-20260926-1. The canonical JSON and SHA-256 are in TRAINING_PROTOCOL.json. The live append-only L_TRAINING_PROTOCOL event binds that same document to the exact deployed source and must be recorded before 2026-09-27T00:00:00Z. A changed protocol or source is refused. Existing historical observations cannot enter this experiment.

@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .domain import Refused, canonical, decimal, digest, hash_id, strict_json, utc, now
 from . import qualification as q
+from . import protocol_authority as authority
 from .execution import Quote, Limits, reprice
 from .model_diagnosis import score, block_ci
 
@@ -20,7 +21,7 @@ PROTOCOL_HASH = "ae644e7fa113b7d5177626d43408cd6ac4f6f3913d5a679a076ec1793a53407
 
 
 def protocol():
-    value = strict_json(Path(__file__).with_name("CHALLENGER_REGISTRY.json").read_bytes())
+    value = authority.authority()
     if digest(value) != PROTOCOL_HASH: raise Refused("reconstruction protocol changed")
     return value
 
@@ -104,11 +105,12 @@ def calibrated(p, a, b):
     return min(1-1e-6,max(1e-6,1/(1+math.exp(-z))))
 
 
-def check_rows(rows, stage, at):
+def check_rows(rows, stage, at, family=None):
     plan=protocol();start,end=map(utc,plan["windows"][stage]);counts={}
     seen=set()
     if utc(at)<end: raise Refused("stage has not ended")
     for r in rows:
+        authority.assert_row(r,stage,family)
         f=r["features"];check_features(f)
         if not start<=utc(f["decision_at"])<end or r.get("consumed_v1") is not False: raise Refused("wrong split/consumed row")
         if r["event_id"]!=f["event_id"] or r["event_id"] in seen: raise Refused("duplicate/mismatched event")
@@ -137,6 +139,14 @@ def reconstruct_features(store, features):
 
 def reconstruct_row(store, row):
     reconstruct_features(store,row["features"])
+    decision=store.get(row.get("mr_decision_id"))
+    if not decision or decision["kind"]!="MR_PREDICTION": raise Refused("MR_NATIVE_DECISION_REQUIRED")
+    payload=decision["payload"]
+    keys=("protocol_id","protocol_hash","candidate_family","feature_schema","stage","source_protocol_id","prior_candidate_uses")
+    if any(payload.get(k)!=row.get(k) for k in keys) or payload["features"]!=row["features"]:
+        raise Refused("MR_NATIVE_DECISION_BINDING_MISMATCH")
+    if not utc(decision["recorded_at"])<utc(row["features"]["close_at"]): raise Refused("MR_LATE_DECISION")
+    reject_phase2_exposure(store,row["features"])
     matches=[e for e in store.events("Q_RAW") if e["hash"]==row["settlement_receipt"]]
     if len(matches)!=1: raise Refused("native settlement missing")
     f=row["features"]
@@ -148,7 +158,7 @@ def reconstruct_row(store, row):
 def fit(train, calibration, family, git_sha, at, native_store):
     plan=protocol();source_sha(git_sha)
     if family not in {c["family"] for c in plan["candidates"]}: raise Refused("unregistered family")
-    a=check_rows(train,"TRAIN",at);b=check_rows(calibration,"CALIBRATION",at)
+    a=check_rows(train,"TRAIN",at,family);b=check_rows(calibration,"CALIBRATION",at,family)
     if a & b: raise Refused("event leakage")
     for row in train+calibration: reconstruct_row(native_store,row)
     options=list(itertools.product((.75,1.,1.25),repeat=1 if family=="structural" else 2))
@@ -161,7 +171,7 @@ def fit(train, calibration, family, git_sha, at, native_store):
     ps=[structural(r["features"],scales,family) for r in calibration];ys=[r["outcome"] for r in calibration]
     cal=[(score([calibrated(p,a,b) for p in ps],ys)["brier"],a,b) for a in (.75,1.,1.25) for b in (-.25,0.,.25)]
     _,slope,intercept=min(cal)
-    artifact={"family":family,"candidate_identity":"MR-"+family.upper()+"-1","scales":scales,
+    artifact={"protocol_id":authority.MR,"candidate_family":authority.FAMILIES[family],"family":family,"candidate_identity":"MR-"+family.upper()+"-1","scales":scales,
         "slope":slope,"intercept":intercept,"protocol_hash":PROTOCOL_HASH,"source_git_sha":git_sha,
         "implementation_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         "feature_schema":"MR-FEATURES-1","train_dataset_sha256":digest(train),"calibration_dataset_sha256":digest(calibration),
@@ -171,7 +181,10 @@ def fit(train, calibration, family, git_sha, at, native_store):
 
 
 def predict(model, features, git_sha):
+    protocol()
     artifact=model["artifact"]
+    if artifact.get("protocol_id")!=authority.MR or artifact.get("candidate_family")!=authority.FAMILIES.get(artifact["family"]):
+        raise Refused("MR_MODEL_PROTOCOL_BINDING_MISMATCH")
     if digest(artifact)!=model["model_artifact_sha256"]: raise Refused("model artifact hash")
     if artifact["source_git_sha"]!=source_sha(git_sha) or artifact["protocol_hash"]!=PROTOCOL_HASH:
         raise Refused("release/protocol lineage")
@@ -182,9 +195,26 @@ def predict(model, features, git_sha):
     return calibrated(structural(features,artifact["scales"],artifact["family"]),artifact["slope"],artifact["intercept"])
 
 
-def record_prediction(store, model, features, git_sha):
+def reject_phase2_exposure(store, features):
+    for event in store.events():
+        if event["kind"].startswith("L_"):
+            encoded=canonical(event["payload"])
+            if canonical(features["ticker"]) in encoded or canonical(features["event_id"]) in encoded:
+                raise Refused("MR_PHASE2_EXPOSURE")
+
+
+def record_prediction(store, model, features, git_sha, *, lock_id=None):
     # Caller probabilities are not an input. Artifact implementation recomputes.
     reconstruct_features(store,features)
+    reject_phase2_exposure(store,features)
+    lock=None
+    if lock_id is not None:
+        lock=store.get(lock_id)
+        if (not lock or lock["kind"]!="MR_LOCK" or lock["payload"].get("protocol_id")!=authority.MR
+                or lock["payload"].get("protocol_hash")!=PROTOCOL_HASH
+                or lock["payload"].get("model_artifact_sha256")!=model["model_artifact_sha256"]):
+            raise Refused("MR_IMMUTABLE_LOCK_BINDING_REQUIRED")
+    bound=authority.binding(features["decision_at"],model["artifact"]["family"],lock["recorded_at"] if lock else None)
     p=predict(model,features,git_sha)
     at=now()
     if not 0<=(utc(at)-utc(features["decision_at"])).total_seconds()<=5: raise Refused("prediction not fresh")
@@ -192,7 +222,7 @@ def record_prediction(store, model, features, git_sha):
         store.verify()
         identity="MR-PRED:"+model["model_artifact_sha256"]+":"+features["ticker"]
         if store.get(identity): raise Refused("one prediction per market")
-        value=store.append(identity,"MR_PREDICTION",{"model_artifact_sha256":model["model_artifact_sha256"],
+        value=store.append(identity,"MR_PREDICTION",{**bound,"source_protocol_id":authority.MR,"prior_candidate_uses":[],"lock_hash":lock["hash"] if lock else None,"model_artifact_sha256":model["model_artifact_sha256"],
             "candidate_identity":model["artifact"]["candidate_identity"],"source_git_sha":git_sha,
             "features":features,"feature_hash":features["feature_hash"],"feature_schema":"MR-FEATURES-1",
             "probability":str(p),"market_probability":features["market_probability"],
@@ -204,6 +234,7 @@ def record_prediction(store, model, features, git_sha):
 
 
 def attach_settlement(store, prediction_id, receipt, observation):
+    protocol()
     label=q.settlement(receipt,observation)
     with store.transaction():
         store.verify();prediction=store.get(prediction_id)
@@ -245,19 +276,20 @@ def settled_pnl(economics, label):
 
 
 def validation_binding(model, dataset_sha, candidate_id, feature_schema, git_sha, results):
+    protocol()
     if candidate_id!=model["artifact"]["candidate_identity"] or feature_schema!=model["artifact"]["feature_schema"]:
         raise Refused("validation candidate/schema mismatch")
     if git_sha!=model["artifact"]["source_git_sha"] or digest(model["artifact"])!=model["model_artifact_sha256"]:
         raise Refused("validation release/model mismatch")
     hash_id(dataset_sha);source_sha(git_sha)
-    body={"candidate_identity":candidate_id,"model_artifact_sha256":model["model_artifact_sha256"],
+    body={"protocol_id":authority.MR,"candidate_family":model["artifact"]["candidate_family"],"candidate_identity":candidate_id,"model_artifact_sha256":model["model_artifact_sha256"],
           "source_git_sha":git_sha,"dataset_sha256":dataset_sha,"feature_schema":feature_schema,
           "protocol_hash":PROTOCOL_HASH,"results_sha256":digest(results),"results":results,"approved":False}
     return {"payload":body,"sha256":digest(body),"authority":"INTEGRITY_ONLY_REQUIRES_INDEPENDENT_SIGNED_REVIEW"}
 
 
 def validate(model, rows, git_sha, at, native_store):
-    check_rows(rows,"VALIDATION",at)
+    check_rows(rows,"VALIDATION",at,model["artifact"]["family"])
     for row in rows: reconstruct_row(native_store,row)
     ps=[predict(model,r["features"],git_sha) for r in rows]
     ys=[r["outcome"] for r in rows]

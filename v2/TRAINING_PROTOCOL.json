@@ -1,4 +1,7 @@
 {
+  "authority_scope": "KXBTC15M_MODEL_RECONSTRUCTION",
+  "authority_status": "SUPERSEDED_FOR_MODEL_RECONSTRUCTION",
+  "historical_evidence_policy": "Historical protocol payload and protocol_hash preserved. MUST NOT contribute TRAIN, CALIBRATION, VALIDATION or OOS rows to MR-20260926-1; MUST NOT fit, calibrate, select, lock or promote any MR candidate.",
   "protocol": {
     "baseline": "paired same-decision midpoint AND ask; fixed incumbent family probability also compared",
     "calibration": {
@@ -198,5 +201,6 @@
       ]
     }
   },
-  "protocol_hash": "751652ff4e2f5a9e9aa223952a655a34cc598dcc8d179f564d597c18002f41df"
+  "protocol_hash": "751652ff4e2f5a9e9aa223952a655a34cc598dcc8d179f564d597c18002f41df",
+  "superseded_by": "MR-20260926-1"
 }

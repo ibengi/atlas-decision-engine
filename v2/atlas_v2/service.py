@@ -58,6 +58,8 @@ def authorized_mode():
 
 
 def run():
+    from .protocol_authority import authority
+    authority()  # before stores, network, probes or research startup
     identity = release_identity()
     mode = authorized_mode()
     if os.environ.get("ATLAS_V2_SPORTS_PROBE_ONLY") == "1":

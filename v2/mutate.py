@@ -13,6 +13,18 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ('authority_overlap', 'protocol_authority.py', "if not set(a['markets']) & set(b['markets']): continue", 'if True: continue', 'test_protocol_authority.AuthorityTests.test_active_overlap_rejected_and_disjoint_allowed'),
+    ('authority_startup', 'service.py', 'authority()  # before stores, network, probes or research startup', 'pass  # deliberate missing startup authority check', 'test_protocol_authority.AuthorityTests.test_startup_checks_authority_before_any_state_or_network'),
+    ('authority_legacy_mr_rows', 'protocol_authority.py', 'for row in rows:', 'for row in []:', 'test_protocol_authority.AuthorityTests.test_superseded_protocol_cannot_consume_mr_rows'),
+    ('authority_protocol_hash', 'protocol_authority.py', 'digest(plan)!=MR_HASH', 'False', 'test_protocol_authority.AuthorityTests.test_protocol_hash_mismatch_rejected'),
+    ('authority_row_binding', 'protocol_authority.py', 'any(row.get(k)!=v for k,v in expected.items())', 'False', 'test_protocol_authority.MRDecisionAuthorityTests.test_decision_binding_and_row_protocol_checks'),
+    ('authority_consumed_rows', 'protocol_authority.py', "row.get('source_protocol_id')!=MR or row.get('prior_candidate_uses')!=[]", 'False', 'test_protocol_authority.MRDecisionAuthorityTests.test_decision_binding_and_row_protocol_checks'),
+    ('authority_stage_boundary', 'protocol_authority.py', 'if utc(start)<=point<utc(end): return stage', 'if utc(start)<=point<=utc(end): return stage', 'test_protocol_authority.AuthorityTests.test_exact_dates_no_overlap_and_boundary_ownership'),
+    ('authority_oos_length', 'protocol_authority.py', 'start+timedelta(days=28)', 'start+timedelta(days=7)', 'test_protocol_authority.AuthorityTests.test_oos_next_midnight_strictly_after_lock_and_28_days'),
+    ('authority_two_families', 'protocol_authority.py', "len(plan['candidates'])!=2 or {c['family']:c['id'] for c in plan['candidates']}!=FAMILIES", 'False', 'test_protocol_authority.AuthorityTests.test_only_two_family_multiplicity'),
+    ('authority_retired_lifecycle', 'learning_phase2.py', 'return  # historical evidence retained; no new fitting, locks or OOS', 'pass  # deliberate reactivation', 'test_phase2.NativeCoordinatorTests.test_superseded_lifecycle_never_fits_or_locks'),
+    ('shadow_pnl_missing_cost', '../tools/shadow_pnl.py', 'if value is None or isinstance(value,bool): return None', 'if value is None or isinstance(value,bool): value=0', 'test_protocol_authority.AuthorityTests.test_missing_fee_or_slippage_never_zero'),
+
     ('mr_model_hash', 'reconstruction.py', 'digest(artifact)!=model["model_artifact_sha256"]', 'False', 'test_reconstruction.ReconstructionTests.test_model_hash_and_no_approval_gate'),
     ('mr_no_approval', 'reconstruction.py', 'artifact["approved"] is not False', 'False', 'test_reconstruction.ReconstructionTests.test_model_hash_and_no_approval_gate'),
     ('mr_native_recompute', 'reconstruction.py', 'canonical(rebuilt)!=canonical(features)', 'False', 'test_reconstruction.ReconstructionTests.test_feature_receipts_cannot_be_replaced'),
@@ -106,6 +118,11 @@ def main():
             target = Path(directory)
             shutil.copytree(ROOT / "atlas_v2", target / "atlas_v2", ignore=shutil.ignore_patterns("__pycache__"))
             shutil.copytree(ROOT / "tests", target / "tests", ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copy2(ROOT / "TRAINING_PROTOCOL.json", target / "TRAINING_PROTOCOL.json")
+            tool_root = ROOT / "tools" if (ROOT / "tools").exists() else ROOT.parent / "tools"
+            (target / "tools").mkdir()
+            for tool in ("__init__.py","brier_oos.py","shadow_pnl.py"):
+                shutil.copy2(tool_root / tool, target / "tools" / tool)
             source = target / "atlas_v2" / filename
             text = source.read_text()
             if text.count(before) != 1:

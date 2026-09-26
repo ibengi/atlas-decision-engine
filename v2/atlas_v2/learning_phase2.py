@@ -61,6 +61,8 @@ def _observation(store, value):
 
 class LearningPhase2:
     def __init__(self, observer, observations, qualification, directory):
+        from .protocol_authority import authority
+        authority()
         self.observer, self.store = observer, observer.store
         self.observations, self.qualification = observations, qualification
         self.directory = Path(directory)
@@ -86,6 +88,8 @@ class LearningPhase2:
 
     def _admit(self, decision, selected, native_observations):
         d = decision["payload"]
+        from .protocol_authority import reject_mr_rows
+        reject_mr_rows([d])
         o = _observation(self.observations,d["observation_hash"])
         row = selected.get(o["hash"])
         if row is None or o != d["observation"]: raise Refused("not canonical native cohort")
@@ -122,7 +126,14 @@ class LearningPhase2:
                 "observation_anchor":self.observations.anchor(), "qualification_anchor":self.qualification.anchor()}
 
     def capture_challengers(self, decision, at):
-        """Called within the decision transaction; late append rolls back both."""
+        """Historical capture path is disabled under the MR authority."""
+        from .protocol_authority import require_active, PHASE2
+        from .protocol_authority import reject_mr_rows, SUPERSEDED
+        reject_mr_rows([decision["payload"]])
+        try: require_active(PHASE2)
+        except Refused as exc:
+            if str(exc)!=SUPERSEDED: raise
+            return
         d = decision["payload"]
         if d["model_probability"] is None: return
         for candidate, event in self.challengers.items():
@@ -183,6 +194,11 @@ class LearningPhase2:
         return self.status()
 
     def _lifecycle(self, at):
+        from .protocol_authority import require_active, PHASE2, SUPERSEDED
+        try: require_active(PHASE2)
+        except Refused as exc:
+            if str(exc)!=SUPERSEDED: raise
+            return  # historical evidence retained; no new fitting, locks or OOS
         batch = self.store.get("phase2:batch")
         if batch:
             members = [m for r in batch["payload"]["results"] for m in r.get("result",{}).get("training_members",[])]
@@ -308,7 +324,7 @@ class LearningPhase2:
         invalidated = [e["payload"]["candidate_hash"] for e in self.store.events("L_CHALLENGER_INVALIDATION")]
         evaluations = [{k:v for k,v in e["payload"].items() if k!="oos_members"} for e in self.store.events("L_OOS_EVALUATION")]
         if invalidated or self.store.latest("L_PHASE2_DATA_INVALIDATION"): status="EVIDENCE_INVALIDATED_NO_RETRAIN"
-        return {"status":status,"protocol_version":protocol()["version"],"protocol_hash":self.protocol_hash,
+        return {"status":status,"authority_status":"SUPERSEDED_FOR_MODEL_RECONSTRUCTION","mr_eligible":False,"protocol_version":protocol()["version"],"protocol_hash":self.protocol_hash,
                 "protocol_frozen_at":self.freeze["recorded_at"],"protocol_freeze_hash":self.freeze["hash"],
                 "eligible_not_before":START,"training_at":FIT_AT,"deadline":DEADLINE,
                 "qualified_predictive_decisions":len(self.decisions()),"qualified_settlements":len(self.rows()),

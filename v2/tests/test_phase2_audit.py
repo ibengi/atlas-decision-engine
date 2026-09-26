@@ -19,7 +19,12 @@ from atlas_v2.training_protocol import FIT_AT, evaluate_oos, oos_window
 
 
 class Phase2AuditTests(unittest.TestCase):
-    setUp = support.NativeCoordinatorTests.setUp
+    def setUp(self):
+        support.NativeCoordinatorTests.setUp(self)
+        # Replay the retired release's lifecycle only inside these historical
+        # regression fixtures. Production retirement is tested independently.
+        retired = patch("atlas_v2.protocol_authority.require_active")
+        retired.start(); self.patches.append(retired)
     tearDown = support.NativeCoordinatorTests.tearDown
     scan = support.NativeCoordinatorTests.scan
     decide = support.NativeCoordinatorTests.decide

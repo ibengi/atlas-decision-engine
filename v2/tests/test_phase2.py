@@ -168,15 +168,13 @@ class NativeCoordinatorTests(unittest.TestCase):
             with self.assertRaises(Refused): LearningPhase2(LearningObserver(new,"a"*40),self.o,self.q,self.root/"reports")
         finally:new.close()
 
-    def test_fixed_batch_cannot_repeat_and_insufficient_is_not_no_edge(self):
-        self.clock=FIT_AT; self.phase.tick()
-        self.assertEqual(self.phase.status()["status"],"DATA_QUALIFICATION_FAILED")
-        self.assertEqual(len(self.l.events("L_TRAINING_BATCH")),1)
-        self.clock=DEADLINE
-        restarted=LearningPhase2(LearningObserver(self.l,"a"*40),self.o,self.q,self.root/"reports")
-        restarted.tick(); restarted.tick()
-        self.assertEqual(len(self.l.events("L_TRAINING_BATCH")),1)
-        self.assertFalse(self.l.get("phase2:terminal")["payload"]["further_retraining"])
+    def test_superseded_lifecycle_never_fits_or_locks(self):
+        for at in (FIT_AT,DEADLINE):
+            self.clock=at;self.phase.tick()
+        self.assertEqual(self.phase.status()["authority_status"],"SUPERSEDED_FOR_MODEL_RECONSTRUCTION")
+        self.assertEqual(self.l.events("L_TRAINING_BATCH"),[])
+        self.assertEqual(self.l.events("L_CHALLENGER_LOCK"),[])
+        self.assertEqual(self.l.events("L_TRAINING_BATCH_STARTED"),[])
 
     def test_raw_transport_cannot_be_replaced_by_normalized_quote(self):
         self.scan("2026-09-27T00:10:02Z")
