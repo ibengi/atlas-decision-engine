@@ -13,6 +13,18 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parent
 MUTANTS = [
+    ("qualification_final_status", "qualification.py", 'm["status"] != "finalized"', 'False', "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"),
+    ("qualification_provisional", "qualification.py", 'm.get("is_provisional", False) is not False', 'False', "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"),
+    ("qualification_settlement_payout", "qualification.py", 'if decimal(m["settlement_value_dollars"]) != outcome:', 'if False:', "test_qualification.QualificationTests.test_final_settlement_requires_status_scope_time_payout_and_no_provisional"),
+    ("qualification_raw_hash", "qualification.py", 'hashlib.sha256(raw).hexdigest() != p["body_sha256"]', 'False', "test_qualification.QualificationTests.test_receipt_transport_hash_and_scope_are_mandatory"),
+    ("qualification_transport", "qualification.py", 'p["transport_complete"] is not True', 'False', "test_qualification.QualificationTests.test_receipt_transport_hash_and_scope_are_mandatory"),
+    ("qualification_reference_time", "qualification.py", 'not 0 <= (received-at).total_seconds() <= 5', 'False', "test_qualification.QualificationTests.test_reference_native_time_and_exact_sixty_seconds_are_not_manufactured"),
+    ("qualification_candle_closed", "qualification.py", 'end_at > utc(receipt["payload"]["started_at"])', 'False', "test_qualification.QualificationTests.test_candles_complete_closed_consecutive_precise"),
+    ("qualification_refresh_time", "qualification.py", 'not 0 <= (utc(at)-utc(observation["observed_at"])).total_seconds() <= 5', 'False', "test_qualification.QualificationTests.test_refresh_requires_fresh_after_decision_quotes_and_positive_slippage"),
+    ("qualification_ladder_terminal", "qualification.py", 'if (not cursor) != (i==len(receipts)-1):', 'if False:', "test_qualification.QualificationTests.test_ladder_rejects_partial_stale_incomparable_or_wrong_center"),
+    ("qualification_ladder_direction", "qualification.py", 'm["strike_type"] != "greater"', 'False', "test_qualification.QualificationTests.test_ladder_rejects_partial_stale_incomparable_or_wrong_center"),
+    ("qualification_zero_slippage", "qualification.py", 'slip = max(steps) + max(decimal(0), ask-decimal(observation["ask"]))', 'slip = decimal(0)', "test_qualification.QualificationTests.test_refresh_requires_fresh_after_decision_quotes_and_positive_slippage"),
+    ("qualification_fee_autoapproval", "qualification.py", '"fee_qualified":False', '"fee_qualified":True', "test_qualification.QualificationTests.test_fee_is_nonzero_and_does_not_self_qualify"),
     ("alpha_external_probability", "alpha_lab.py", 'if "candidate_probability" in row or "period" in row:', 'if False:', "test_alpha_lab.AlphaLabTests.test_cohort_is_outcome_blind_unique_event_and_derived_day"),
     ("export_private_scope", "research_export.py", 'if event["kind"] not in PUBLIC_KINDS:', 'if False:', "test_alpha_lab.AlphaLabTests.test_export_bundle_deterministic_complete_and_private_scope_only"),
     ("alpha_market_baseline", "alpha_lab.py", "candidate, baseline = score(probabilities), score(baselines)", "candidate, baseline = score(probabilities), score(probabilities)", "test_alpha_lab.AlphaLabTests.test_market_baseline_is_paired_not_replaced_by_candidate"),

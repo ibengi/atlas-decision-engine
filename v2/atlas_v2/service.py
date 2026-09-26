@@ -57,6 +57,14 @@ def run():
     state_lock = threading.Lock()
     stop = threading.Event()
     print(json.dumps({"at": now(), **state}), flush=True)
+    qualifier = None
+    if os.environ.get("ATLAS_V2_QUALIFICATION_ON_START") == "1":
+        from .qualification import Collector, export_qualification
+        # Explicit opt-in separate database; no schema change or V1 migration.
+        qualifier = Collector(Store(data_dir / "qualification.sqlite"))
+        print(json.dumps({"at":now(),"state":"QUALIFICATION_READY","sha":identity["sha"],
+                          "database_path":str(qualifier.store.path),"anchor":qualifier.store.anchor(),
+                          "mode":"READ_ONLY","capital":"OFF","broker_writes":0,"real_orders_submitted":0}),flush=True)
     if os.environ.get("ATLAS_V2_EXPORT_ON_START") == "1":
         # Before the collection thread starts: coherent final anchor, private
         # immutable files, no new route or access to any V1/account database.
@@ -68,17 +76,42 @@ def run():
         except Exception as exc:
             print(json.dumps({"at":now(),"state":"RESEARCH_EXPORT_BLOCKED",
                               "reason":type(exc).__name__+":"+str(exc)[:240]}),flush=True)
+        if qualifier:
+            try:
+                exported = export_qualification(qualifier.store.path,data_dir / "qualification-exports")
+                print(json.dumps({"at":now(),"state":"QUALIFICATION_EXPORT_READY","sha":identity["sha"],**exported}),flush=True)
+            except Exception as exc:
+                print(json.dumps({"at":now(),"state":"QUALIFICATION_EXPORT_BLOCKED","reason":str(exc)[:240]}),flush=True)
+
+    def observations():
+        return [{"hash":e["hash"],**e["payload"]} for e in store.events("OBSERVATION")]
+
+    def settlements():
+        from .qualification import pending_settlements
+        while not stop.is_set():
+            try:pending_settlements(qualifier,observations())
+            except Exception as exc:
+                print(json.dumps({"at":now(),"state":"SETTLEMENT_CAPTURE_BLOCKED","reason":str(exc)[:240]}),flush=True)
+            stop.wait(60)
 
     def collect():
         reader = PublicReader()
         while not stop.is_set():
             try:
+                pages = {}
+                if qualifier:
+                    from .qualification import prepare
+                    pages = prepare(qualifier,observations())
                 result = capture_scan(store, reader)
+                if qualifier:
+                    from .qualification import complete_decisions
+                    complete_decisions(qualifier,observations(),pages)
                 update = {"state": "COLLECTING_PUBLIC_DATA", "last_scan_at": result["recorded_at"],
                           "last_error": None, "market_count": result["payload"]["market_count"]}
             except Exception as exc:
                 update = {"state": "COLLECTION_BLOCKED", "last_error": type(exc).__name__ + ":" + str(exc)[:240]}
             update["anchor"] = store.anchor()
+            if qualifier:update["qualification_anchor"] = qualifier.store.anchor()
             with state_lock:
                 state.update(update)
             print(json.dumps({"at": now(), **update}), flush=True)
@@ -106,6 +139,7 @@ def run():
             pass
 
     threading.Thread(target=collect, daemon=True).start()
+    if qualifier:threading.Thread(target=settlements,daemon=True).start()
     server = HTTPServer(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler)
     try:
         server.serve_forever()
