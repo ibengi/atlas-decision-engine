@@ -3,7 +3,7 @@
 Inputs remain immutable. Missing features/labels/costs are reported, not imputed.
 Caller probabilities, period names and in-sample winner selection are forbidden.
 Outcome scoring is diagnostic: source authentication and future OOS are separate
-gates. This research module is never imported by the collector service.
+gates. The opt-in learning observer reuses these frozen formulas without approval.
 """
 import argparse
 from collections import Counter

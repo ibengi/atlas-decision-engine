@@ -1,0 +1,202 @@
+{
+  "protocol": {
+    "baseline": "paired same-decision midpoint AND ask; fixed incumbent family probability also compared",
+    "calibration": {
+      "c": [
+        -0.2,
+        -0.1,
+        0,
+        0.1,
+        0.2
+      ],
+      "method": "fixed intercept grid on separate CALIBRATION only",
+      "objective": "minimum mean Brier",
+      "report": "10 equal-width ECE bins; per-row residual is not calibration quality",
+      "ties": "ascending c"
+    },
+    "champion": "retain existing active research champion; if none, report null; fixed family references are not promoted champions",
+    "dataset_schema": {
+      "admission": "native V2 ledgers; reconstruct raw observations, features and authoritative labels; reject synthetic/imported rows",
+      "identity": [
+        "decision_id",
+        "decision_hash",
+        "event_id",
+        "ticker",
+        "domain",
+        "family",
+        "candidate_hash"
+      ],
+      "inputs": [
+        "features_hash",
+        "feature_snapshot",
+        "probability",
+        "market_probability",
+        "ask_baseline",
+        "protocol_hash"
+      ],
+      "outcome": [
+        "outcome",
+        "settlement_hash",
+        "settlement_receipt_hash"
+      ],
+      "timing": [
+        "decision_at",
+        "observed_at",
+        "close_at",
+        "label_available_at"
+      ]
+    },
+    "economic_gate": "positive net PnL AND reward after evidenced costs; qualified fees, slippage, reconciliation, approval, allocation and risk controls; no self-attestation",
+    "eligible_not_before": "2026-09-27T00:00:00Z",
+    "families": {
+      "cross_market_consistency_v1": {
+        "features": [
+          "same_expiry",
+          "same_rules",
+          "same_reference",
+          "strictly_ordered_strikes",
+          "both_leg_quotes"
+        ],
+        "formula": "clip midpoint to interval [higher_strike_mid,lower_strike_mid] only if interval coherent",
+        "why": "Separate books can temporarily disagree on nested strike probabilities.",
+        "why_unpriced": "Multi-leg execution, depth and spread may erase apparent arbitrage."
+      },
+      "microstructure_dislocation_v1": {
+        "features": [
+          "spread",
+          "prior_mid",
+          "quote_drift",
+          "seconds_since_change",
+          "depth",
+          "seconds_to_close"
+        ],
+        "formula": "clip(mid + 0.5 * (prior_mid - mid)); prior same-ticker quote age 30..90 seconds",
+        "why": "Temporary inventory pressure may overshoot a recent quote midpoint.",
+        "why_unpriced": "Thin depth and maker inventory constraints may delay reversion; this is unproven."
+      },
+      "time_structure_v1": {
+        "features": [
+          "seconds_to_close",
+          "spread",
+          "depth",
+          "quote_drift"
+        ],
+        "formula": "logistic(0.9*logit(mid)) in fixed 240..300 second time-to-close cohort",
+        "why": "Near settlement, thin books may express excessive confidence.",
+        "why_unpriced": "Short horizon execution costs may exceed calibration gains."
+      },
+      "underlying_kalshi_lag_v1": {
+        "features": [
+          "reference_return_60s",
+          "spread",
+          "depth",
+          "seconds_to_close"
+        ],
+        "formula": "clip(mid + 10 * log(reference_now/reference_60s_ago))",
+        "why": "Asynchronous reference and Kalshi updates may leave temporarily stale probabilities.",
+        "why_unpriced": "Feed latency and scarce liquidity may prevent immediate correction; fast makers may eliminate it."
+      },
+      "volatility_regime_v1": {
+        "features": [
+          "rms_30m",
+          "volatility_contraction",
+          "jump",
+          "trend",
+          "reversal"
+        ],
+        "formula": "0.9*mid+0.05 if RMS(last 30 closed 1m log returns)>=0.001, else mid",
+        "why": "A volatility jump can make probabilities overconfident before makers widen distributions.",
+        "why_unpriced": "Regime estimation is noisy and inventory costly; no systematic mispricing assumed."
+      }
+    },
+    "features": "fixed family probability only as logit input; original family formulas/features unchanged; no new feature search",
+    "financial_state": {
+      "broker_writes": 0,
+      "capital": "OFF",
+      "real_orders_submitted": 0
+    },
+    "fit_at": "2026-10-14T01:00:00Z",
+    "independence": "UTC day blocks, not five family copies; disjoint underlying events; independence assumption must pass external review before promotion",
+    "knowledge_cutoff": "2026-10-14T01:00:00Z",
+    "minimum": {
+      "calibration_days": 3,
+      "calibration_events": 90,
+      "distinct_events_per_complete_day_per_family": 30,
+      "oos_days": 7,
+      "oos_events": 210,
+      "train_days": 7,
+      "train_events": 210,
+      "validation_days": 7,
+      "validation_events": 210
+    },
+    "missing": "no imputation; all qualified family decisions in each fixed window require labels by cutoff; missing family data => DATA_QUALIFICATION_FAILED",
+    "oos": "7 full UTC days beginning next midnight strictly after actual immutable challenger lock; predictions must be appended before close; evaluate once at end+1h; no reconstructed post-outcome forecasts",
+    "optimization": {
+      "a": [
+        0.5,
+        0.75,
+        1,
+        1.25,
+        1.5
+      ],
+      "b": [
+        -0.25,
+        0,
+        0.25
+      ],
+      "model": "clip(logistic(a*logit(p)+b+c),0.001,0.999)",
+      "objective": "minimum mean Brier on TRAIN only",
+      "ties": "ascending (a,b)"
+    },
+    "parent_plan_hash": "5f9b96e20314c1bc361f3f782a4d5ef28171ee7ecf126e87491ed10026eb96b1",
+    "promotion": "manual external independent review after validation, future OOS, baseline and positive economics; no auto-promotion or self-approval",
+    "rejection": [
+      "insufficient samples or periods",
+      "unqualified or missing evidence",
+      "overlap or late predictions",
+      "baseline or reference not beaten",
+      "nonpositive economics",
+      "failed independent review",
+      "any control bypass"
+    ],
+    "reward": {
+      "consistency": "positive net-PnL day fraction; descriptive until independent-period review; at least 7 complete days for economic admission",
+      "control_violation": "permanent disqualification, never compensated by profits",
+      "eligibility": "authoritatively settled native accepted qualified shadow cohort only; any open accepted position blocks aggregate; rejected or synthetic rows earn no reward; n<2 leaves variance/reward unavailable",
+      "formula": "mean(net_pnl/U)+mean(market_brier-model_brier)+positive_day_fraction-ECE10-max_drawdown_fraction-sample_variance(net_pnl/U)-mean(slippage/U)-stale_rate-liquidity_failure_rate",
+      "hypothetical_starting_equity_dollars": 100,
+      "reward_total": "settled accepted count * normalized score",
+      "slippage": "deduct once in net PnL; additional explicit risk surcharge in reward",
+      "unit_dollars": 1,
+      "weights": "all 1, frozen"
+    },
+    "schema": "atlas-training-protocol/1",
+    "scope": "KXBTC15M; first valid observed quote per event in 240..300 seconds before close",
+    "selection": "one challenger per family; validation and OOS Brier/logloss strictly beat midpoint and ask; Brier beats fixed family; paired day sign-flip one-sided p<=0.01 for each baseline and family; report all five families",
+    "stopping": {
+      "deadline": "2026-10-25T00:00:00Z",
+      "insufficient_or_unqualified": "DATA_QUALIFICATION_FAILED",
+      "maximum_challengers": 5,
+      "registered_batches": 1,
+      "retraining_after_terminal": false,
+      "sufficient_evaluated_losers": "NO_LEARNABLE_EDGE_DEMONSTRATED"
+    },
+    "target": "authoritative finalized YES payout, integer 0 or 1",
+    "version": "PHASE2-20260926-1",
+    "windows": {
+      "calibration": [
+        "2026-10-04T00:00:00Z",
+        "2026-10-07T00:00:00Z"
+      ],
+      "train": [
+        "2026-09-27T00:00:00Z",
+        "2026-10-04T00:00:00Z"
+      ],
+      "validation": [
+        "2026-10-07T00:00:00Z",
+        "2026-10-14T00:00:00Z"
+      ]
+    }
+  },
+  "protocol_hash": "751652ff4e2f5a9e9aa223952a655a34cc598dcc8d179f564d597c18002f41df"
+}

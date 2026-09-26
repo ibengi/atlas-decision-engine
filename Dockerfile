@@ -14,7 +14,8 @@ RUN python -c 'import os,re,json,hashlib,pathlib; sha=os.environ.get("RAILWAY_GI
 FROM python:3.13-slim AS runtime
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PROD_ACCESS_MODE=READ_ONLY CAPITAL=OFF
-# Standard-library collection; no broker/provider SDK or key.
+# Market-data WebSocket and signing dependencies only; no broker SDK.
+COPY --from=verified /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=verified /app/atlas_v2 ./atlas_v2
 COPY --from=verified /app/release.json /app/mutation_report.json ./
 RUN python -c 'from atlas_v2.service import release_identity; release_identity()'
