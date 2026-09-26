@@ -33,7 +33,14 @@ WHAT IT DOES
         probability. A wide gap on a large sample is a label-integrity
         smell, not a proof: `daily_label_audit.py` is the tool that decides
         a label, and only for KXBTCD;
-      * the model versions present, so a sample can be bound to a lineage.
+      * the model versions present, so a sample can be bound to a lineage;
+      * the spread of `data_quality`, the only recorded witness to how good
+        the model's inputs were. The engine's primary klines provider is
+        Binance, which answers 451 to the US region this service runs in,
+        so every prediction in the store was made on a fallback venue or on
+        the bounded stale cache. Which one is not recorded per row, but
+        `data_quality` moves with staleness, so scoring the strata
+        separately says whether a failure is the model's or its inputs'.
 
 WHAT IT DOES NOT DO
     It emits no verdict, no threshold and no PASS. It never writes to the
@@ -98,6 +105,25 @@ def series_of(r):
     return t.strip().split("-")[0]
 
 
+#: `confidence_from_quality`: below 60 the router refuses the market
+#: outright, so rows at or above it are the ones that reached a decision.
+QUALITY_BANDS = ((0, 60, "refused_below_router_floor"), (60, 75, "60-75"),
+                 (75, 90, "75-90"), (90, 101, "90-100"))
+
+
+def quality_band(r):
+    """The data_quality band a row's inputs fell in, or None if unrecorded."""
+    v = (r.get("features") or {}).get("data_quality")
+    try:
+        q = float(v)
+    except (TypeError, ValueError):
+        return None
+    for lo, hi, name in QUALITY_BANDS:
+        if lo <= q < hi:
+            return name
+    return "out_of_range"
+
+
 def _mean(xs):
     return round(sum(xs) / len(xs), 6) if xs else None
 
@@ -149,6 +175,31 @@ def census(records, dataset_sha256: str) -> dict:
                                                and mkt is not None else None),
         })
 
+    # Per quality band: realised outcome against what the market implied.
+    # A band whose realised rate tracks the market is one the model had
+    # sound inputs for; a band that diverges is one it did not.
+    bands, unrecorded = {}, 0
+    for r in usable:
+        b = quality_band(r)
+        if b is None:
+            unrecorded += 1
+            continue
+        bands.setdefault(b, []).append(r)
+    quality_report = []
+    for name in [b[2] for b in QUALITY_BANDS] + ["out_of_range"]:
+        rows = bands.get(name)
+        if not rows:
+            continue
+        base = _mean([1 if r["result"] == "yes" else 0 for r in rows])
+        mkt = _mean([float(r["yes_ask"]) / 100.0 for r in rows])
+        quality_report.append({
+            "band": name, "n": len(rows),
+            "realised_yes_rate": base, "mean_market_implied": mkt,
+            "base_rate_minus_market_implied": (round(base - mkt, 6)
+                                               if base is not None
+                                               and mkt is not None else None),
+        })
+
     ts = sorted(str(r.get("ts")) for r in usable if r.get("ts"))
     return {
         "dataset_sha256": dataset_sha256,
@@ -172,6 +223,8 @@ def census(records, dataset_sha256: str) -> dict:
             "max_rows_on_one_date": max(dates.values()) if dates else 0,
             "top": dict(dates.most_common(10)),
         },
+        "by_data_quality": quality_report,
+        "n_without_recorded_data_quality": unrecorded,
         "model_versions": dict(Counter(
             str((r.get("features") or {}).get("model_version"))
             for r in usable).most_common()),

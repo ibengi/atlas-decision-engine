@@ -118,3 +118,53 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DataQualityTest(unittest.TestCase):
+    """The census must not let a degraded-input row pass as a sound one."""
+
+    def q(self, score):
+        r = row()
+        r["features"] = dict(r["features"], data_quality=score)
+        return r
+
+    def test_the_control_row_lands_in_a_band(self):
+        # Anti-vacuity: without this, a tool that banded nothing would pass
+        # every assertion below.
+        self.assertEqual(sc.quality_band(self.q(95)), "90-100")
+
+    def test_a_score_under_the_router_floor_is_named_as_refused(self):
+        # confidence_from_quality rejects below 60; that row never reached a
+        # decision and must not be averaged in with ones that did.
+        self.assertEqual(sc.quality_band(self.q(59.9)),
+                         "refused_below_router_floor")
+
+    def test_the_floor_itself_is_not_refused(self):
+        self.assertEqual(sc.quality_band(self.q(60)), "60-75")
+
+    def test_an_unrecorded_quality_is_not_guessed(self):
+        r = row()
+        r["features"] = {}
+        self.assertIsNone(sc.quality_band(r))
+
+    def test_an_unparseable_quality_is_not_guessed_either(self):
+        self.assertIsNone(sc.quality_band(self.q("n/a")))
+
+    def test_an_impossible_score_is_flagged_rather_than_binned(self):
+        self.assertEqual(sc.quality_band(self.q(140)), "out_of_range")
+
+    def test_rows_without_a_recorded_quality_are_counted_not_dropped(self):
+        r = row()
+        r["features"] = {}
+        rep = sc.census([r, self.q(95)], "sha")
+        self.assertEqual(rep["n_without_recorded_data_quality"], 1)
+        self.assertEqual(sum(b["n"] for b in rep["by_data_quality"]), 1)
+        self.assertEqual(rep["n_usable"], 2)
+
+    def test_each_band_is_scored_against_the_market_separately(self):
+        lo = [dict(self.q(65), result="no") for _ in range(4)]
+        hi = [self.q(95) for _ in range(4)]
+        rep = sc.census(lo + hi, "sha")
+        got = {b["band"]: b["realised_yes_rate"] for b in rep["by_data_quality"]}
+        self.assertEqual(got["60-75"], 0.0)
+        self.assertEqual(got["90-100"], 1.0)
